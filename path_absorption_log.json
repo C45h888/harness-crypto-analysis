@@ -1,0 +1,20 @@
+{
+  "px": 75.98,
+  "spread_bps": 1.3160492202396399,
+  "obi_top20": -0.06157566917278387,
+  "required_buy_vol_sol": 0.0,
+  "available_bid_fuel_sol": 774766.1200000001,
+  "fuel_ratio": 999,
+  "verdict": "BUYERS HAVE AMPLE FUEL",
+  "confidence": "HIGH",
+  "fall_short_at": null,
+  "wall_qty_74_30_to_74_44": 0,
+  "wall_levels_74_30_to_74_44": 0,
+  "large_buy_qty": 736.04,
+  "large_sell_qty": 856.3500000000001,
+  "large_net": -120.31000000000017,
+  "tbr_trend": "STABLE",
+  "oi_trend": "OI FALLING (positions closing)",
+  "combo": ">>> MIXED / STABLE",
+  "smart_dir": "CROWD STABLE (67.6% long)"
+}
