@@ -30,8 +30,15 @@ import sys
 import time
 from typing import Any
 
-from binance import Binance, normalize_fut_trade, normalize_spot_trade
-from flow import summarize
+import os
+import sys
+
+# make the canonical `market_service` package importable when run directly:
+#   .venv/bin/python legacy/demand_diagnostic.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from market_service.clients.binance import Binance, normalize_fut_trade, normalize_spot_trade
+from market_service.calculations.flow import summarize
 
 log = logging.getLogger(__name__)
 

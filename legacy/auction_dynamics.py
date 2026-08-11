@@ -1,4 +1,4 @@
-/modle"""
+"""
 Auction dynamics: WHO is winning the current auction?
 
 Markets are continuous double auctions. Every trade is a price discovery
@@ -28,7 +28,14 @@ import sys
 import time
 from typing import Any
 
-from binance import Binance, normalize_fut_trade, normalize_spot_trade
+import os
+import sys
+
+# make the canonical `market_service` package importable when run directly:
+#   .venv/bin/python legacy/auction_dynamics.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from market_service.clients.binance import Binance, normalize_fut_trade, normalize_spot_trade
 
 log = logging.getLogger(__name__)
 

@@ -10,7 +10,6 @@ RUN addgroup --system marketflow && adduser --system --ingroup marketflow market
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY binance.py ./
 COPY market_service ./market_service
 
 USER marketflow

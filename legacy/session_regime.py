@@ -3,10 +3,15 @@
 Pulls macro snapshot across BTC/ETH/SOL, then SOL orderbook + recent trades +
 futures flow + positioning. Data-only output.
 """
-import asyncio, sys, json
+import asyncio, sys, json, os
 from datetime import datetime, timezone
-from binance import Binance, normalize_spot_trade, normalize_fut_trade
-import flow as F
+
+# make the canonical `market_service` package importable when run directly:
+#   .venv/bin/python legacy/session_regime.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from market_service.clients.binance import Binance, normalize_spot_trade, normalize_fut_trade
+from market_service.calculations import flow as F
 
 SYMS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 

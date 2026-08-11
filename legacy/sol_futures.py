@@ -42,8 +42,15 @@ import sys
 import time
 from typing import Any
 
-from binance import Binance, normalize_fut_trade
-from flow import bucketed_cvd, cvd_series_corr, summarize
+import os
+import sys
+
+# make the canonical `market_service` package importable when run directly:
+#   .venv/bin/python legacy/sol_futures.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from market_service.clients.binance import Binance, normalize_fut_trade
+from market_service.calculations.flow import bucketed_cvd, cvd_series_corr, summarize
 
 log = logging.getLogger(__name__)
 

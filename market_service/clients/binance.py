@@ -274,6 +274,37 @@ class Binance:
             raise ValueError(f"fut_open_interest: no data for symbol={symbol!r}")
         return _camel_to_snake(r, ("openInterest",))
 
+    async def fut_klines(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        limit: int = 100,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[list]:
+        """USD-M futures OHLCV candles with the same shape as spot klines."""
+        self._require_symbol(symbol, "fut_klines")
+        _require_kline_interval(interval)
+        return await self._fut._get(
+            "/fapi/v1/klines", symbol=symbol, interval=interval,
+            limit=limit, startTime=start_time, endTime=end_time,
+        )
+
+    async def fut_price(self, symbol: str) -> dict:
+        """Current USD-M contract price."""
+        self._require_symbol(symbol, "fut_price")
+        return await self._fut._get("/fapi/v1/ticker/price", symbol=symbol)
+
+    async def fut_funding_history(self, symbol: str, limit: int = 30) -> list[dict]:
+        """Historical USD-M funding events, normalized to snake_case."""
+        self._require_symbol(symbol, "fut_funding_history")
+        rows = await self._fut._get("/fapi/v1/fundingRate", symbol=symbol, limit=limit)
+        if not isinstance(rows, list):
+            raise ValueError("fut_funding_history: expected a list")
+        for row in rows:
+            _camel_to_snake(row, ("fundingTime", "fundingRate", "markPrice"))
+        return rows
+
     async def fut_mark_price(self, symbol: str) -> dict:
         """Mark price + funding snapshot. Symbol required."""
         self._require_symbol(symbol, "fut_mark_price")

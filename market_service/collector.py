@@ -9,31 +9,21 @@ from typing import Any
 
 import asyncpg
 
-from binance import Binance, normalize_fut_trade, normalize_spot_trade
+from market_service.clients.binance import Binance, normalize_fut_trade, normalize_spot_trade
 from market_service.config import Settings
-from market_service.signals import deterministic_signals
+from market_service.calculations.flow import summarize
+from market_service.calculations.signals import deterministic_signals
 
 log = logging.getLogger(__name__)
 
 
-def _flow(trades: list[dict[str, Any]], now_ms: int, window_seconds: int) -> dict[str, float | int]:
+def _window_flow(trades: list[dict[str, Any]], now_ms: int, window_seconds: int, book: dict[str, Any], levels: int) -> dict[str, Any]:
     cutoff = now_ms - window_seconds * 1000
     in_window = [t for t in trades if int(t["ts"]) >= cutoff]
-    buy_usd = sum(t["price"] * t["qty"] for t in in_window if not t["is_buyer_maker"])
-    sell_usd = sum(t["price"] * t["qty"] for t in in_window if t["is_buyer_maker"])
-    total = buy_usd + sell_usd
-    timestamps = [int(t["ts"]) for t in in_window]
-    coverage = (max(timestamps) - min(timestamps)) // 1000 if len(timestamps) > 1 else 0
-    return {"buy_share": buy_usd / total if total else 0.5, "cvd_usd": buy_usd - sell_usd, "coverage_seconds": coverage, "trade_count": len(in_window)}
-
-
-def _obi(book: dict[str, Any], levels: int) -> float:
-    bids = book.get("bids", [])[:levels]
-    asks = book.get("asks", [])[:levels]
-    bid_notional = sum(float(p) * float(q) for p, q in bids)
-    ask_notional = sum(float(p) * float(q) for p, q in asks)
-    total = bid_notional + ask_notional
-    return (bid_notional - ask_notional) / total if total else 0.0
+    result = summarize(in_window, book, depth_levels=levels)
+    timestamps = [int(t["ts"]) for t in in_window if int(t["ts"]) > 0]
+    result["coverage_seconds"] = (max(timestamps) - min(timestamps)) // 1000 if len(timestamps) > 1 else 0
+    return result
 
 
 async def _previous(pool: asyncpg.Pool, symbol: str) -> dict[str, float] | None:
@@ -56,16 +46,26 @@ async def collect_symbol(client: Binance, pool: asyncpg.Pool, settings: Settings
     )
     spot_trades = [normalize_spot_trade({"time": t["T"], "id": t["a"], "price": t["p"], "qty": t["q"], "isBuyerMaker": t["m"]}) for t in spot_raw]
     futures_trades = [normalize_fut_trade({"time": t["T"], "id": t["a"], "price": t["p"], "qty": t["q"], "isBuyerMaker": t["m"]}) for t in futures_raw]
-    spot_flow, futures_flow = _flow(spot_trades, now_ms, settings.flow_window_seconds), _flow(futures_trades, now_ms, settings.flow_window_seconds)
+    spot_flow = _window_flow(spot_trades, now_ms, settings.flow_window_seconds, spot_book, settings.depth_levels)
+    futures_flow = _window_flow(futures_trades, now_ms, settings.flow_window_seconds, futures_book, settings.depth_levels)
     snapshot = {
         "observed_at": datetime.now(timezone.utc), "symbol": symbol,
         "price": float(funding["mark_price"]), "spot_buy_share": spot_flow["buy_share"], "futures_buy_share": futures_flow["buy_share"],
         "spot_cvd_usd": spot_flow["cvd_usd"], "futures_cvd_usd": futures_flow["cvd_usd"],
-        "spot_obi_top_n": _obi(spot_book, settings.depth_levels), "futures_obi_top_n": _obi(futures_book, settings.depth_levels),
+        "spot_obi_top_n": spot_flow["obi"] or 0.0, "futures_obi_top_n": futures_flow["obi"] or 0.0,
         "funding_rate": float(funding["last_funding_rate"]), "mark_price": float(funding["mark_price"]), "index_price": float(funding["index_price"]),
         "open_interest": float(oi["open_interest"]), "flow_window_seconds": settings.flow_window_seconds,
         "spot_flow_coverage_seconds": spot_flow["coverage_seconds"], "futures_flow_coverage_seconds": futures_flow["coverage_seconds"],
-        "source_payload": {"spot_trade_count": spot_flow["trade_count"], "futures_trade_count": futures_flow["trade_count"]},
+        "source_payload": {
+            "spot_trade_count": spot_flow["trade_count"],
+            "futures_trade_count": futures_flow["trade_count"],
+            "spot_order_book": spot_book,
+            "futures_order_book": futures_book,
+            "spot_trades": spot_raw,
+            "futures_trades": futures_raw,
+            "funding": funding,
+            "open_interest": oi,
+        },
     }
     previous = await _previous(pool, symbol)
     async with pool.acquire() as conn, conn.transaction():

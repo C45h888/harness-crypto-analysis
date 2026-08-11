@@ -27,8 +27,12 @@ import sys
 import time
 from typing import Any
 
-from binance import Binance, normalize_fut_trade, normalize_spot_trade
-from flow import bucketed_cvd, cvd_series_corr, summarize
+from market_service.clients.binance import Binance, normalize_fut_trade, normalize_spot_trade
+from market_service.calculations.flow import bucketed_cvd, cvd_series_corr, summarize
+from market_service.calculations.signals import deterministic_signals
+from market_service.analysis.oi import analyze_open_interest
+from market_service.analysis.liquidations import analyze_liquidation_pressure
+from market_service.analysis.macro import analyze_macro
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +46,7 @@ def cryptoquant_context(asset: str = "btc") -> dict:
     On the basic plan numeric data is locked but description text still flows.
     """
     try:
-        from cryptoquant_client import describe_metric
+        from market_service.clients.cryptoquant import describe_metric
     except Exception as e:
         return {"available": False, "reason": f"import failed: {e}"}
 
@@ -113,13 +117,22 @@ async def analyze(
     trade_limit: int = 500,
     depth_limit: int = 50,
     bucket_window_s: int = 60,
+    include_extended: bool = True,
 ) -> dict:
-    """One-shot combined snapshot of spot + futures flow + on-chain context."""
+    """One-shot combined snapshot with raw Binance evidence and derived metrics."""
+    started_at_ms = int(time.time() * 1000)
     out: dict[str, Any] = {
+        "contract": {
+            "name": "crypto-ai-market-snapshot",
+            "version": 1,
+            "raw_evidence_included": True,
+            "derived_metrics_are_deterministic": True,
+            "null_semantics": "null means the source did not return a value; it is not zero",
+        },
         "symbol": symbol,
-        "generated_at_ms": int(time.time() * 1000),
+        "generated_at_ms": started_at_ms,
         "data_source": "binance_public_rest_live",
-        "requested": {"trade_limit": trade_limit, "depth_limit": depth_limit, "bucket_window_s": bucket_window_s},
+        "requested": {"trade_limit": trade_limit, "depth_limit": depth_limit, "bucket_window_s": bucket_window_s, "include_extended": include_extended},
         "errors": [],
     }
 
@@ -148,16 +161,53 @@ async def analyze(
         for name, err in zip(endpoint_names, endpoint_errs):
             if err:
                 out["errors"].append({"endpoint": name, "error": err})
+        if include_extended:
+            extended_results = await asyncio.gather(
+                _safe(lambda: analyze_open_interest(b, symbol), "open_interest_analysis"),
+                _safe(lambda: analyze_liquidation_pressure(b, symbol), "liquidation_pressure"),
+                _safe(lambda: analyze_macro(b), "macro_analysis"),
+            )
+        else:
+            extended_results = []
         out["latency_ms"] = round((time.time() - t0) * 1000, 1)
+
+    if include_extended:
+        for name, (value, error) in zip(("open_interest_analysis", "liquidation_pressure", "macro_analysis"), extended_results):
+            if error:
+                out["errors"].append({"endpoint": name, "error": error})
+            out[name] = value
 
     spot_trades = [dict(normalize_spot_trade(t), venue="spot") for t in (spot_trades_raw or [])]
     fut_trades = [normalize_fut_trade(t) for t in (fut_trades_raw or [])]
+    spot_flow = summarize(spot_trades, spot_book, depth_levels=depth_limit)
+    fut_flow = summarize(fut_trades, fut_book, depth_levels=depth_limit)
+    spot_cvd = bucketed_cvd(spot_trades, window_s=bucket_window_s)
+    fut_cvd = bucketed_cvd(fut_trades, window_s=bucket_window_s)
+
+    # Preserve successful source payloads alongside the normalized inputs used
+    # by the deterministic calculations. Nothing is silently reduced to a label.
+    out["evidence"] = {
+        "spot": {
+            "ticker_24h": spot_24h,
+            "order_book": spot_book,
+            "trades": spot_trades_raw,
+            "normalized_trades": spot_trades,
+        },
+        "futures": {
+            "ticker_24h": fut_24h,
+            "order_book": fut_book,
+            "trades": fut_trades_raw,
+            "normalized_trades": fut_trades,
+            "funding": fut_fund,
+            "open_interest": fut_oi,
+        },
+    }
 
     out["spot"] = {
         "ticker_24h": spot_24h,
         "order_book": {"levels": depth_limit, "raw": spot_book},
-        "flow": summarize(spot_trades, spot_book, depth_levels=depth_limit),
-        "bucketed_cvd": bucketed_cvd(spot_trades, window_s=bucket_window_s),
+        "flow": spot_flow,
+        "bucketed_cvd": spot_cvd,
     }
 
     out["futures"] = {
@@ -165,17 +215,23 @@ async def analyze(
         "funding": fut_fund,
         "open_interest": fut_oi,
         "order_book": {"levels": depth_limit, "raw": fut_book},
-        "flow": summarize(fut_trades, fut_book, depth_levels=depth_limit),
-        "bucketed_cvd": bucketed_cvd(fut_trades, window_s=bucket_window_s),
+        "flow": fut_flow,
+        "bucketed_cvd": fut_cvd,
     }
 
+    spot_times = [t["ts"] for t in spot_trades if t["ts"] > 0]
+    fut_times = [t["ts"] for t in fut_trades if t["ts"] > 0]
     out["coverage"] = {
         "spot_trade_count": len(spot_trades),
         "futures_trade_count": len(fut_trades),
-        "spot_oldest_trade_ms": min((t["ts"] for t in spot_trades), default=None),
-        "futures_oldest_trade_ms": min((t["ts"] for t in fut_trades), default=None),
-        "spot_newest_trade_ms": max((t["ts"] for t in spot_trades), default=None),
-        "futures_newest_trade_ms": max((t["ts"] for t in fut_trades), default=None),
+        "spot_oldest_trade_ms": min(spot_times, default=None),
+        "futures_oldest_trade_ms": min(fut_times, default=None),
+        "spot_newest_trade_ms": max(spot_times, default=None),
+        "futures_newest_trade_ms": max(fut_times, default=None),
+        "spot_trade_span_seconds": (max(spot_times) - min(spot_times)) / 1000 if len(spot_times) > 1 else 0,
+        "futures_trade_span_seconds": (max(fut_times) - min(fut_times)) / 1000 if len(fut_times) > 1 else 0,
+        "generated_at_ms": started_at_ms,
+        "completed_at_ms": int(time.time() * 1000),
     }
     out["correlation"] = cvd_series_corr(
         out["spot"]["bucketed_cvd"],
@@ -183,6 +239,17 @@ async def analyze(
         window_s=bucket_window_s,
     )
 
+    spot_buy_share = spot_flow.get("buy_share", 0.5)
+    futures_buy_share = fut_flow.get("buy_share", 0.5)
+    signal_snapshot = {
+        "spot_buy_share": spot_buy_share,
+        "futures_buy_share": futures_buy_share,
+        "spot_obi_top_n": spot_flow.get("obi") or 0.0,
+        "open_interest": float(fut_oi["open_interest"]) if isinstance(fut_oi, dict) and fut_oi.get("open_interest") is not None else None,
+    }
+    out["signals"] = deterministic_signals(signal_snapshot, None)
+    out["signal_inputs"] = signal_snapshot
+    out["status"] = "degraded" if out["errors"] else "healthy"
     out["cryptoquant"] = cryptoquant_context(_asset(symbol))
     return out
 
