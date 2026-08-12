@@ -1,3 +1,7 @@
+# Canonical runtime topology (data-access -> calculations -> analysis -> collator)
+# plus the existing collector. The containerization contract keeps the unified
+# collector path working unchanged and adds four new domain services that
+# communicate exclusively through Redis streams.
 services:
   redis:
     image: redis:7.4-alpine
@@ -29,11 +33,170 @@ services:
       timeout: 3s
       retries: 12
 
-  collector:
+  # Domain service: data-access.
+  # ONLY this service receives external API credentials (Binance, CoinGecko,
+  # CryptoQuant). It publishes MarketStateEnvelope(source="data-access") to
+  # <prefix>:latest:<SYM>:data-access and <prefix>:stream:domain:data-access:<SYM>.
+  data-access:
     build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.nodes.data_access"]
     env_file:
       - path: .env
         required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      POLL_SECONDS: ${POLL_SECONDS:-30}
+      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # External API creds (only here; not propagated to other services).
+      BINANCE_BASE_URL: ${BINANCE_BASE_URL:-}
+      CRYPTOQUANT_API_KEY: ${CRYPTOQUANT_API_KEY:-}
+      COINGECKO_BASE_URL: ${COINGECKO_BASE_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import market_service.nodes.data_access; import market_service.runtime.redis_store as r; print(\"ok\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Domain service: calculations. Reads latest data-access payload and runs
+  # pure math. NO network I/O. NO creds.
+  calculations:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.nodes.calculations"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      POLL_SECONDS: ${POLL_SECONDS:-30}
+      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      data-access:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import market_service.nodes.calculations; print(\"ok\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Domain service: analysis. Reads latest calculations + data-access and
+  # produces interpretation. NO trading, no threshold overrides.
+  analysis:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.nodes.analysis"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      POLL_SECONDS: ${POLL_SECONDS:-30}
+      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      calculations:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import market_service.nodes.analysis; print(\"ok\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Orchestrator: the ONLY timer-driven application service. Each
+  # POLL_SECONDS it sequences data-access -> calculations -> analysis -> collate
+  # via <prefix>:stream:commands.
+  orchestrator:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.nodes.orchestrator"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      POLL_SECONDS: ${POLL_SECONDS:-30}
+      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
+      MAX_DOMAIN_STATE_AGE_SECONDS: ${MAX_DOMAIN_STATE_AGE_SECONDS:-90}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      data-access:
+        condition: service_healthy
+      calculations:
+        condition: service_healthy
+      analysis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import market_service.nodes.orchestrator; print(\"ok\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Legacy collector: writes market_snapshot + signal_event. Unchanged path.
+  collector:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.collector"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      POLL_SECONDS: ${POLL_SECONDS:-30}
+      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       postgres:
         condition: service_healthy
@@ -41,12 +204,20 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Legacy collator: one-shot per invocation. Stable entrypoint.
   collator:
     build: .
+    user: "marketflow"
     command: ["python", "-m", "market_service.commands.collate", "SOLUSDT", "--json"]
     env_file:
       - path: .env
         required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       postgres:
         condition: service_healthy

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, AsyncIterator
 
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
-from .contracts import MarketEvent, MarketRunEnvelope, MarketStateEnvelope, RefreshCommand
+from .contracts import MarketEvent, MarketRunEnvelope, MarketStateEnvelope, RefreshCommand, RuntimeRunState
 
 
 class RedisRuntimeStore:
@@ -17,6 +18,10 @@ class RedisRuntimeStore:
         self.redis: Redis = Redis.from_url(url, decode_responses=True)
         self.prefix = prefix.strip(":")
         self.stream_maxlen = stream_maxlen
+
+    @staticmethod
+    def _prefixed(prefix: str, key: str) -> str:
+        return f"{prefix.strip(':')}:{key}"
 
     def latest_key(self, symbol: str, source: str) -> str:
         return f"{self.prefix}:latest:{symbol.upper()}:{source}"
@@ -29,6 +34,25 @@ class RedisRuntimeStore:
 
     def collated_stream(self, symbol: str) -> str:
         return f"{self.prefix}:stream:collated:{symbol.upper()}"
+
+    def domain_stream(self, symbol: str, source: str) -> str:
+        """Per-domain append-only projection stream.
+
+        Sources: ``data-access``, ``calculations``, ``analysis``.
+        These streams are bounded by ``stream_maxlen``; the collated stream
+        is intentionally left unbounded by default so downstream replay and
+        auditing have the full history.
+        """
+        return f"{self.prefix}:stream:domain:{source.lower()}:{symbol.upper()}"
+
+    def domain_latest_key(self, symbol: str, source: str) -> str:
+        return f"{self.prefix}:latest:{symbol.upper()}:{source.lower()}"
+
+    def run_state_key(self, run_id: str) -> str:
+        return f"{self.prefix}:runtime-run:{run_id}"
+
+    def run_domain_state_key(self, run_id: str, source: str) -> str:
+        return f"{self.prefix}:runtime-run:{run_id}:domain:{source.lower()}"
 
     @property
     def command_stream(self) -> str:
@@ -109,3 +133,137 @@ class RedisRuntimeStore:
 
     async def has_run(self, run_id: str) -> bool:
         return bool(await self.redis.exists(f"{self.prefix}:run:{run_id}"))
+
+    async def publish_domain_state(self, state: MarketStateEnvelope) -> str:
+        """Publish a domain service envelope to its latest projection + stream."""
+        if state.source not in ("data-access", "calculations", "analysis"):
+            raise ValueError(f"unknown domain source: {state.source}")
+        state.validate() if hasattr(state, "validate") else None
+        payload = state.to_json()
+        latest_key = self.domain_latest_key(state.symbol, state.source)
+        stream = self.domain_stream(state.symbol, state.source)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.set(latest_key, payload)
+            if state.run_id:
+                pipe.set(self.run_domain_state_key(state.run_id, state.source), payload)
+            pipe.xadd(
+                stream,
+                {
+                    "event_type": "market_state",
+                    "source": state.source,
+                    "symbol": state.symbol,
+                    "schema_version": str(state.schema_version),
+                    "status": state.status,
+                    "payload": payload,
+                },
+                maxlen=self.stream_maxlen,
+                approximate=True,
+            )
+            results = await pipe.execute()
+        return str(results[-1])
+
+    async def read_latest_domain_state(
+        self, symbol: str, source: str
+    ) -> MarketStateEnvelope | None:
+        raw = await self.redis.get(self.domain_latest_key(symbol, source))
+        if not raw:
+            return None
+        try:
+            return MarketStateEnvelope.from_mapping(json.loads(raw))
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    async def read_run_domain_state(
+        self, run_id: str, source: str
+    ) -> MarketStateEnvelope | None:
+        raw = await self.redis.get(self.run_domain_state_key(run_id, source))
+        if not raw:
+            return None
+        try:
+            state = MarketStateEnvelope.from_mapping(json.loads(raw))
+            return state if state.run_id == run_id else None
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    async def write_runtime_run(self, state: RuntimeRunState) -> None:
+        await self.redis.set(
+            self.run_state_key(state.run_id),
+            json.dumps(state.to_dict(), separators=(",", ":")),
+        )
+
+    async def consume_commands(
+        self,
+        domain: str,
+        last_id: str = "$",
+        block_ms: int = 5_000,
+        count: int = 16,
+    ) -> AsyncIterator[tuple[str, RefreshCommand]]:
+        """Yield ``(stream_id, RefreshCommand)`` pairs from ``stream:commands``.
+
+        Filters by ``command.domain``. ``last_id`` starts at ``$`` so a freshly
+        started node does not replay history; pass an explicit id to resume.
+        """
+        current_id: str = last_id
+        while True:
+            try:
+                rows = await self.redis.xread(
+                    {self.command_stream: current_id},
+                    block=block_ms,
+                    count=count,
+                )
+            except ResponseError:
+                # If the stream does not exist yet, xread raises; sleep and retry.
+                rows = []
+            if not rows:
+                continue
+            for _stream, entries in rows:
+                for entry_id, fields in entries:
+                    current_id = entry_id
+                    command = RefreshCommand.from_fields(fields)
+                    if command.domain == domain:
+                        yield entry_id, command
+
+    async def read_results(
+        self,
+        run_id: str | None = None,
+        count: int = 16,
+    ) -> list[tuple[str, MarketEvent]]:
+        """Read recent completion events from ``stream:results``.
+
+        If ``run_id`` is supplied, only events whose payload contains a matching
+        ``run_id`` are returned (used by the orchestrator to await pipeline
+        steps deterministically).
+        """
+        rows = await self.redis.xrevrange(self.result_stream, count=count * 4)
+        out: list[tuple[str, MarketEvent]] = []
+        for entry_id, fields in rows:
+            event = MarketEvent.from_fields(fields)
+            if run_id is None:
+                out.append((entry_id, event))
+            elif event.payload.get("run_id") == run_id:
+                out.append((entry_id, event))
+            if len(out) >= count:
+                break
+        return out
+
+    async def wait_for_result(
+        self,
+        run_id: str,
+        source: str,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.25,
+    ) -> MarketEvent | None:
+        """Block (poll) until a result event for ``(run_id, source)`` arrives.
+
+        Used by the orchestrator between pipeline steps. Returns ``None`` on
+        timeout so the caller can decide whether to fail or retry.
+        """
+        import asyncio
+        import time
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            for _entry_id, event in await self.read_results(run_id=run_id, count=32):
+                if event.payload.get("source") == source:
+                    return event
+            await asyncio.sleep(poll_interval_s)
+        return None

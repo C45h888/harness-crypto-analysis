@@ -18,4 +18,6 @@ RUN chmod -R a+rX /app/market_service
 
 USER marketflow
 
-CMD ["python", "-m", "market_service.collector"]
+# Each service specifies its own command via docker-compose. No default CMD
+# here so the image is reusable for data-access, calculations, analysis,
+# orchestrator, collector, and collator.

@@ -90,10 +90,12 @@ zero. Use `--trades N` / `--depth N` to cap raw payload size.
 
 ## Stack (database)
 
-`docker compose up --build` runs Redis, PostgreSQL, and the collector. PostgreSQL
+`docker compose up --build` runs Redis, PostgreSQL, and the collector. The
+one-shot `collator` service can be run separately for live envelope validation.
+PostgreSQL
 is bound to `127.0.0.1:5433`; Redis is bound to `127.0.0.1:6379` for local
 inspection. Redis uses AOF persistence and capped streams. Schema:
-`market_snapshot` + `signal_event`. Run against your own `.env` (see
+`market_snapshot` + `signal_event` + `market_run`. Run against your own `.env` (see
 `.env.example`) — `.env` is private and gitignored.
 
 The infrastructure adapters are in `market_service/runtime/`:
@@ -146,5 +148,9 @@ docker compose exec postgres psql -U marketflow -d marketflow \
 ## Docs
 
 - `ARCHITECTURE.md` — Phase 1 architecture, operating rules, migration path
+- `docs/CONTAINERIZATION_CONTRACT.md` — implementation contract for the domain
+  container split
+- `docs/DOCKER_RUNTIME_VERIFICATION_DOCTRINE.md` — independent Docker test and
+  acceptance doctrine for the live runtime seam
 - `docs/CANONICAL_RUNTIME_DOCTRINE.md` — governing authority, state, evidence,
   determinism, and agent-boundary doctrine

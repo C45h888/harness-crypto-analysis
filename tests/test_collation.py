@@ -2,8 +2,9 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from market_service.commands.collate import _domain_outputs, build_envelope
-from market_service.runtime.contracts import MarketRunEnvelope
+from market_service.commands.collate import _domain_outputs, build_envelope, build_envelope_from_domain_states
+from market_service.runtime.contracts import MarketRunEnvelope, MarketStateEnvelope
+from market_service.config import Settings
 
 
 CORE = {
@@ -51,6 +52,49 @@ class CollationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(envelope.status, "degraded")
         self.assertTrue(envelope.run_id)
         self.assertEqual(envelope.source_metadata["requested"]["depth"], 20)
+
+    @patch("market_service.commands.collate.RedisRuntimeStore")
+    async def test_domain_collation_uses_exact_run_envelopes(self, store_cls):
+        run_id = "00000000-0000-4000-8000-000000000001"
+        def state(source, status="healthy"):
+            return MarketStateEnvelope(
+                symbol="SOLUSDT", source=source, run_id=run_id,
+                observed_at="2026-08-12T00:00:00+00:00",
+                produced_at="2026-08-12T00:00:00+00:00",
+                status=status, data={"source_marker": source},
+            )
+        store = store_cls.return_value
+        store.read_run_domain_state = AsyncMock(side_effect=[
+            state("data-access"), state("calculations"), state("analysis"),
+        ])
+        store.close = AsyncMock()
+        settings = Settings(
+            database_url="postgresql://x/y", redis_url="redis://x:6379/0",
+            redis_key_prefix="marketflow", redis_stream_maxlen=1000,
+            symbols=("SOLUSDT",), poll_seconds=30, flow_window_seconds=300,
+            depth_levels=20, max_domain_state_age_seconds=999999999,
+        )
+        envelope = await build_envelope_from_domain_states("SOLUSDT", run_id, settings)
+        self.assertEqual(envelope.run_id, run_id)
+        self.assertEqual(envelope.status, "healthy")
+        self.assertEqual(envelope.domain_outputs["calculations"]["run_id"], run_id)
+        self.assertEqual(envelope.canonical_state["analysis"]["source_marker"], "analysis")
+
+    @patch("market_service.commands.collate.RedisRuntimeStore")
+    async def test_missing_domain_makes_run_invalid(self, store_cls):
+        run_id = "00000000-0000-4000-8000-000000000002"
+        store = store_cls.return_value
+        store.read_run_domain_state = AsyncMock(return_value=None)
+        store.close = AsyncMock()
+        settings = Settings(
+            database_url="postgresql://x/y", redis_url="redis://x:6379/0",
+            redis_key_prefix="marketflow", redis_stream_maxlen=1000,
+            symbols=("SOLUSDT",), poll_seconds=30, flow_window_seconds=300,
+            depth_levels=20, max_domain_state_age_seconds=999999999,
+        )
+        envelope = await build_envelope_from_domain_states("SOLUSDT", run_id, settings)
+        self.assertEqual(envelope.status, "invalid")
+        self.assertEqual(envelope.canonical_state["domain_status"]["analysis"], "missing")
 
 
 if __name__ == "__main__":

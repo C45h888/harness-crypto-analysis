@@ -21,6 +21,7 @@ class Settings:
     poll_seconds: int
     flow_window_seconds: int
     depth_levels: int
+    max_domain_state_age_seconds: int = 90
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -40,4 +41,5 @@ class Settings:
             poll_seconds=_positive_int("POLL_SECONDS", 30),
             flow_window_seconds=_positive_int("FLOW_WINDOW_SECONDS", 300),
             depth_levels=_positive_int("DEPTH_LEVELS", 20),
+            max_domain_state_age_seconds=_positive_int("MAX_DOMAIN_STATE_AGE_SECONDS", 90),
         )

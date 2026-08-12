@@ -2,6 +2,10 @@
 
 The governing design contract for all future runtime and agent work is
 [`docs/CANONICAL_RUNTIME_DOCTRINE.md`](docs/CANONICAL_RUNTIME_DOCTRINE.md).
+The implementation contract for the next containerization task is
+[`docs/CONTAINERIZATION_CONTRACT.md`](docs/CONTAINERIZATION_CONTRACT.md).
+The Docker acceptance procedure is defined in
+[`docs/DOCKER_RUNTIME_VERIFICATION_DOCTRINE.md`](docs/DOCKER_RUNTIME_VERIFICATION_DOCTRINE.md).
 This document describes the current Phase 1 implementation beneath that
 doctrine.
 
@@ -45,7 +49,9 @@ Raw every-trade storage is intentionally deferred. It is expensive, retention-he
 
 1. Start the collector and compare its snapshots against the current scripts during live sessions.
 2. ✅ DONE — reusable calculations extracted from the legacy scripts into tested canonical modules; legacy scripts migrated and deleted (provenance: `market_service/manifest.MIGRATIONS`).
-3. Add a read-only `market briefing` query for Nous/Hermes over `latest_market_state` and recent `signal_event` rows.
+3. Add a read-only `market briefing` query for Nous/Hermes over the collated
+   Redis/PostgreSQL run envelope, `latest_market_state`, and recent
+   `signal_event` rows.
 4. Add dashboards, replay/backtests, and optional LLM summarization only after data quality is proven.
 
 ## Run
@@ -107,14 +113,41 @@ All legacy exploratory scripts have been fully migrated into `market_service`
 | calculation | `calculations.flow`, `orderbook`, `volume_profile`, `technical`, `signals` |
 | analysis | `analysis.market`, `oi`, `liquidations`, `macro`, `auction`, `demand`, `regime`, `wall_migration`, `path_absorption`, `stage` |
 
-## Phase 1 deliverable (done)
+## Current implementation status
 
 "All scripts run and give clean market data to the Hermes harness." Verified:
-every canonical module compiles and imports, the `run_all` gate is green, and
-the 45 unit tests pass. Aggregation into Redis/Postgres is the next phase.
+every canonical module imports, the `run_all` gate is green, and the canonical
+test suite is green. The live collation seam is also operational: a SOLUSDT
+`MarketRunEnvelope` can be persisted to PostgreSQL and published to Redis with
+the same `run_id`.
+
+## Domain container split (in progress)
+
+Per `docs/CONTAINERIZATION_CONTRACT.md` the unified runtime is split into
+independently-runnable domain services:
+
+  * `data-access`     - reads external APIs, publishes raw evidence
+  * `calculations`    - runs pure deterministic math over evidence
+  * `analysis`        - produces interpretation over calculations
+  * `orchestrator`    - timer-driven; sequences the three via `stream:commands`
+  * `collector`       - unchanged snapshot + signal-event path
+  * `collator`        - stable entrypoint `python -m market_service.commands.collate`
+
+The orchestrator mints a `run_id`, sends one `RefreshCommand` per domain
+keyed on that `run_id`, then invokes the collator with
+`--from-domain-state --run-id <run_id>`. The collator reads the three
+domain envelopes from Redis, **verifies** they all carry the orchestrator's
+`run_id`, and persists a `MarketRunEnvelope` whose `run_id` matches. The
+orchestrator also asserts the persisted `run_id` matches the one it tracked
+so a cycle is never silently attributed to a different run.
+
+Adapter discipline: every canonical function call goes through
+`market_service.nodes.contracts.strict_call` with shape adapters that raise
+`ContractViolation` on wrong input shape. The handler captures violations as
+structured `errors` on the envelope and produces `degraded` or `invalid`
+status - never silently swallows them.
 
 ## Deferred (next phases)
 
-- Build/connect the domain-split containers (data-access / calculation / analysis images).
-- Redis node with instance/session keyspaces; the model reads Redis only.
+- Add Redis node instance/session keyspaces for future model reads.
 - Deterministic-logic layer over Redis; Postgres as durable ledger.

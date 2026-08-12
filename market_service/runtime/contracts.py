@@ -15,6 +15,10 @@ from typing import Any, Literal
 MARKET_STATE_SCHEMA_VERSION = 1
 MARKET_RUN_SCHEMA_VERSION = 1
 StateStatus = Literal["healthy", "degraded", "invalid"]
+RuntimePhase = Literal[
+    "INITIALIZING", "COLLECTING", "CALCULATING", "ANALYZING",
+    "COLLATING", "PUBLISHED", "DEGRADED", "INVALID", "STALE", "FAILED",
+]
 
 
 def _utc_iso(value: datetime | None = None) -> str:
@@ -34,6 +38,7 @@ class MarketStateEnvelope:
     produced_at: str
     status: StateStatus
     data: dict[str, Any]
+    run_id: str | None = None
     errors: tuple[dict[str, Any], ...] = ()
     coverage_seconds: int | None = None
     schema_version: int = MARKET_STATE_SCHEMA_VERSION
@@ -47,6 +52,7 @@ class MarketStateEnvelope:
             produced_at=str(value.get("produced_at") or _utc_iso()),
             status=value.get("status", "degraded"),
             data=dict(value.get("data") or {}),
+            run_id=str(value["run_id"]) if value.get("run_id") else None,
             errors=tuple(value.get("errors") or ()),
             coverage_seconds=value.get("coverage_seconds"),
             schema_version=int(value.get("schema_version", MARKET_STATE_SCHEMA_VERSION)),
@@ -67,6 +73,7 @@ class MarketStateEnvelope:
             "status": self.status,
             "coverage_seconds": self.coverage_seconds,
             "data": self.data,
+            "run_id": self.run_id,
             "errors": list(self.errors),
         }
 
@@ -94,6 +101,20 @@ class MarketEvent:
             "payload": json.dumps(self.payload, default=str, separators=(",", ":")),
         }
 
+    @classmethod
+    def from_fields(cls, fields: dict[str, str]) -> "MarketEvent":
+        payload_raw = fields.get("payload", "{}")
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        return cls(
+            event_type=str(fields.get("event_type", "")),
+            symbol=str(fields.get("symbol", "")).upper(),
+            payload=payload,
+            occurred_at=fields.get("occurred_at"),
+        )
+
 
 @dataclass(frozen=True)
 class RefreshCommand:
@@ -112,6 +133,50 @@ class RefreshCommand:
             "symbol": self.symbol.upper(),
             "requested_by": self.requested_by,
             "parameters": json.dumps(self.parameters or {}, separators=(",", ":")),
+        }
+
+    @classmethod
+    def from_fields(cls, fields: dict[str, str]) -> "RefreshCommand":
+        parameters_raw = fields.get("parameters", "{}")
+        try:
+            parameters = json.loads(parameters_raw) if parameters_raw else {}
+        except json.JSONDecodeError:
+            parameters = {}
+        cmd_id = fields.get("command_id") or None
+        return cls(
+            domain=str(fields.get("domain", "")),
+            symbol=str(fields.get("symbol", "")).upper(),
+            requested_by=str(fields.get("requested_by", "runtime")),
+            command_id=cmd_id,
+            parameters=parameters or None,
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeRunState:
+    """Operational lifecycle record for one orchestrated symbol refresh."""
+
+    run_id: str
+    symbol: str
+    phase: RuntimePhase
+    started_at: str
+    updated_at: str
+    domains: dict[str, str]
+    publication: str = "pending"
+    errors: tuple[dict[str, Any], ...] = ()
+    schema_version: int = MARKET_STATE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "symbol": self.symbol.upper(),
+            "phase": self.phase,
+            "started_at": self.started_at,
+            "updated_at": self.updated_at,
+            "domains": self.domains,
+            "publication": self.publication,
+            "errors": list(self.errors),
         }
 
 
