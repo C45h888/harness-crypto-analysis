@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
 import json
+import uuid
+from datetime import datetime
+from typing import Any
 
 import asyncpg
 
@@ -54,8 +56,9 @@ class PostgresRuntimeStore:
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT (run_id) DO NOTHING
                RETURNING run_id""",
-            envelope.run_id, envelope.symbol, envelope.generated_at,
-            envelope.completed_at, envelope.status, envelope.data_source,
+            uuid.UUID(envelope.run_id), envelope.symbol,
+            datetime.fromisoformat(envelope.generated_at),
+            datetime.fromisoformat(envelope.completed_at), envelope.status, envelope.data_source,
             envelope.schema_version, json.dumps(envelope.coverage),
             json.dumps(envelope.canonical_state), json.dumps(envelope.domain_outputs),
             json.dumps(list(envelope.errors)), json.dumps(envelope.source_metadata or {}),
@@ -83,3 +86,9 @@ class PostgresRuntimeStore:
         if raw is None:
             return None
         return MarketRunEnvelope.from_mapping(json.loads(raw) if isinstance(raw, str) else raw)
+
+    async def has_run(self, run_id: str) -> bool:
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        return bool(await self.pool.fetchval("SELECT EXISTS (SELECT 1 FROM market_run WHERE run_id = $1)", uuid.UUID(run_id)))

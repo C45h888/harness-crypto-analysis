@@ -16,17 +16,15 @@ crypto-ai-anal/
 │   ├── commands/snapshot.py #   harness snapshot CLI
 │   ├── collector.py         #   persistent DB collector
 │   └── config.py
-├── legacy/                  # archived one-off tools (see legacy/README.md)
-│   └── data/                #   historical runtime logs
 ├── db/init/001_schema.sql   # Postgres schema
 ├── tests/
 ├── Dockerfile               # runs market_service.collector
 └── docker-compose.yml
 ```
 
-`market_service/` is the single runtime authority. **No code inside
-`market_service/` imports from `legacy/`.** All legacy scripts are tucked under
-`legacy/` so the root stays clean.
+`market_service/` is the single runtime authority. All former legacy
+exploratory scripts have been fully migrated into it (`market_service/manifest.py`
+`MIGRATIONS` records provenance) and deleted — there is no legacy tree.
 
 ## Entrypoints
 
@@ -41,31 +39,27 @@ crypto-ai-anal/
 # All clean data for a symbol in one contract (core snapshot + signals + OI +
 # liquidation + macro). The model reads THIS, not scattered scripts.
 .venv/bin/python -m market_service.commands.harness SOLUSDT --json
-.venv/bin/python -m market_service.commands.harness SOLUSDT --json --with-scripts
 
-# Verify every manifest script runs (Phase 1 gate)
+# Verify every canonical runtime module imports cleanly
 .venv/bin/python -m market_service.commands.run_all
-.venv/bin/python -m market_service.commands.run_all --domain analysis
+.venv/bin/python -m market_service.commands.run_all --domain calculation
 
 # Persistent collector (needs DATABASE_URL; see docker-compose.yml)
 .venv/bin/python -m market_service.collector
-
-# Archived exploratory tools still run from their old home:
-.venv/bin/python legacy/session_regime.py
 ```
 
 ## Shared-domain map (container-split prep)
 
-`market_service/manifest.py` classifies every runnable script into one shared
-domain. This is the single source of truth for the target multi-container
-architecture and drives `harness` / `run_all`.
+`market_service/manifest.py` classifies every canonical module into one shared
+domain (`CLEAN_MODULES`). This is the single source of truth for the target
+multi-container architecture.
 
-| Domain | What | Members |
+| Domain | What | Modules |
 |---|---|---|
-| `data-access` | pulls raw evidence | `market_service.clients.*`; legacy: `continue_monitor`, `sol_deep_monitor`, `sol_monitor_alerts`, `cryptoquant_client` |
-| `calculation` | pure math over inputs | `market_service.calculations.*`; legacy: `flow5m` |
-| `analysis` | derived interpretation | `market_service.analysis.*`; most legacy tools |
-| `monitor` | watch / summarise | legacy: `summarize_monitor` |
+| `data-access` | pulls raw evidence | `market_service.clients.*` |
+| `calculation` | pure math over inputs | `calculations.flow`, `orderbook`, `volume_profile`, `technical`, `signals` |
+| `analysis` | derived interpretation | `analysis.market`, `oi`, `liquidations`, `macro`, `auction`, `demand`, `regime`, `wall_migration`, `path_absorption`, `stage` |
+| `monitor` | watch / summarise | (collector / long-running monitors) |
 
 ## Live JSON contract
 
@@ -122,6 +116,18 @@ projection and its symbol telemetry stream after the PostgreSQL transaction
 commits. Redis is therefore a live projection and command bus; PostgreSQL
 remains the durable ledger.
 
+The one-shot canonical collation seam is:
+
+```bash
+.venv/bin/python -m market_service.commands.collate SOLUSDT --json
+```
+
+It writes one immutable `market_run` envelope to PostgreSQL first, then writes
+the same envelope to `marketflow:latest:SOLUSDT:collated` and
+`marketflow:stream:collated:SOLUSDT`. The Docker `collator` service runs this
+same SOLUSDT path once for live validation. The collated stream is intentionally
+untrimmed; apply retention manually when required.
+
 ```bash
 .venv/bin/python -m market_service.commands.health
 ```
@@ -142,4 +148,3 @@ docker compose exec postgres psql -U marketflow -d marketflow \
 - `ARCHITECTURE.md` — Phase 1 architecture, operating rules, migration path
 - `docs/CANONICAL_RUNTIME_DOCTRINE.md` — governing authority, state, evidence,
   determinism, and agent-boundary doctrine
-- `legacy/README.md` — classification of every archived script

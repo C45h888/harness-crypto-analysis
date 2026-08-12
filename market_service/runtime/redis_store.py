@@ -81,13 +81,23 @@ class RedisRuntimeStore:
     async def publish_run(self, envelope: MarketRunEnvelope) -> str:
         envelope.validate()
         payload = envelope.to_json()
-        await self.redis.set(self.collated_latest_key(envelope.symbol), payload)
-        return await self.redis.xadd(
-            self.collated_stream(envelope.symbol),
-            {"event_type": "market_run", "run_id": envelope.run_id,
-             "symbol": envelope.symbol, "schema_version": str(envelope.schema_version),
-             "payload": payload},
-        )
+        dedupe_key = f"{self.prefix}:run:{envelope.run_id}"
+        # One Redis-side transaction makes the latest projection, stream entry,
+        # and idempotency marker succeed or fail together.
+        script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then return 'duplicate' end
+        redis.call('SET', KEYS[2], ARGV[1])
+        local id = redis.call('XADD', KEYS[3], '*',
+            'event_type', 'market_run', 'run_id', ARGV[2],
+            'symbol', ARGV[3], 'schema_version', ARGV[4], 'payload', ARGV[1])
+        redis.call('SET', KEYS[1], ARGV[1])
+        return id
+        """
+        return str(await self.redis.eval(
+            script, 3, dedupe_key, self.collated_latest_key(envelope.symbol),
+            self.collated_stream(envelope.symbol), payload, envelope.run_id,
+            envelope.symbol, str(envelope.schema_version),
+        ))
 
     async def read_latest_run(self, symbol: str) -> MarketRunEnvelope | None:
         raw = await self.redis.get(self.collated_latest_key(symbol))
@@ -96,3 +106,6 @@ class RedisRuntimeStore:
     async def read_runs(self, symbol: str, count: int = 100) -> list[MarketRunEnvelope]:
         rows = await self.redis.xrevrange(self.collated_stream(symbol), count=count)
         return [MarketRunEnvelope.from_mapping(json.loads(fields["payload"])) for _, fields in rows]
+
+    async def has_run(self, run_id: str) -> bool:
+        return bool(await self.redis.exists(f"{self.prefix}:run:{run_id}"))

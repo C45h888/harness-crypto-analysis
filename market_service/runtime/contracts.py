@@ -40,7 +40,7 @@ class MarketStateEnvelope:
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "MarketStateEnvelope":
-        return cls(
+        envelope = cls(
             symbol=str(value["symbol"]).upper(),
             source=str(value["source"]),
             observed_at=str(value["observed_at"]),
@@ -51,6 +51,11 @@ class MarketStateEnvelope:
             coverage_seconds=value.get("coverage_seconds"),
             schema_version=int(value.get("schema_version", MARKET_STATE_SCHEMA_VERSION)),
         )
+        if envelope.schema_version != MARKET_STATE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported market state schema version: {envelope.schema_version}")
+        if envelope.status not in ("healthy", "degraded", "invalid"):
+            raise ValueError(f"invalid market state status: {envelope.status}")
+        return envelope
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -41,6 +41,19 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  collator:
+    build: .
+    command: ["python", "-m", "market_service.commands.collate", "SOLUSDT", "--json"]
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
 volumes:
   postgres_data:
   redis_data:
