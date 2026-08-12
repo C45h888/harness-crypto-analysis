@@ -44,3 +44,29 @@ CREATE VIEW latest_market_state AS
 SELECT DISTINCT ON (symbol) *
 FROM market_snapshot
 ORDER BY symbol, observed_at DESC;
+
+CREATE TABLE IF NOT EXISTS market_run (
+    run_id UUID PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'invalid')),
+    data_source TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    canonical_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    domain_outputs JSONB NOT NULL DEFAULT '{}'::jsonb,
+    errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    envelope JSONB NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS market_run_symbol_completed_at_idx
+    ON market_run (symbol, completed_at DESC);
+
+CREATE INDEX IF NOT EXISTS market_run_status_idx
+    ON market_run (status);
+
+CREATE INDEX IF NOT EXISTS market_run_data_source_idx
+    ON market_run (data_source);

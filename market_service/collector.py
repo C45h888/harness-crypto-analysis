@@ -13,6 +13,8 @@ from market_service.clients.binance import Binance, normalize_fut_trade, normali
 from market_service.config import Settings
 from market_service.calculations.flow import summarize
 from market_service.calculations.signals import deterministic_signals
+from market_service.runtime.contracts import MarketStateEnvelope
+from market_service.runtime.redis_store import RedisRuntimeStore
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +36,13 @@ async def _previous(pool: asyncpg.Pool, symbol: str) -> dict[str, float] | None:
     return dict(row) if row else None
 
 
-async def collect_symbol(client: Binance, pool: asyncpg.Pool, settings: Settings, symbol: str) -> None:
+async def collect_symbol(
+    client: Binance,
+    pool: asyncpg.Pool,
+    redis: RedisRuntimeStore,
+    settings: Settings,
+    symbol: str,
+) -> None:
     now_ms = int(time.time() * 1000)
     spot_book, futures_book, spot_raw, futures_raw, funding, oi = await asyncio.gather(
         client.spot_book(symbol, settings.depth_levels),
@@ -76,22 +84,36 @@ async def collect_symbol(client: Binance, pool: asyncpg.Pool, settings: Settings
         )
         for signal in deterministic_signals(snapshot, previous):
             await conn.execute("INSERT INTO signal_event (observed_at, symbol, signal_type, severity, summary, evidence, snapshot_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING", snapshot["observed_at"], symbol, signal["signal_type"], signal["severity"], signal["summary"], json.dumps(signal["evidence"]), snapshot_id)
+    await redis.publish_state(MarketStateEnvelope(
+        symbol=symbol,
+        source="collector",
+        observed_at=snapshot["observed_at"].isoformat(),
+        produced_at=datetime.now(timezone.utc).isoformat(),
+        status="healthy",
+        data=snapshot,
+        coverage_seconds=min(
+            snapshot["spot_flow_coverage_seconds"],
+            snapshot["futures_flow_coverage_seconds"],
+        ),
+    ))
     log.info("stored %s price=%.4f spot_buy=%.1f%% fut_buy=%.1f%%", symbol, snapshot["price"], 100 * snapshot["spot_buy_share"], 100 * snapshot["futures_buy_share"])
 
 
 async def main() -> None:
     settings = Settings.from_env()
     pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=5)
+    redis = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
     try:
         async with Binance() as client:
             while True:
                 started = time.monotonic()
-                results = await asyncio.gather(*(collect_symbol(client, pool, settings, symbol) for symbol in settings.symbols), return_exceptions=True)
+                results = await asyncio.gather(*(collect_symbol(client, pool, redis, settings, symbol) for symbol in settings.symbols), return_exceptions=True)
                 for symbol, result in zip(settings.symbols, results):
                     if isinstance(result, Exception):
                         log.exception("collection failed for %s", symbol, exc_info=result)
                 await asyncio.sleep(max(0, settings.poll_seconds - (time.monotonic() - started)))
     finally:
+        await redis.close()
         await pool.close()
 
 

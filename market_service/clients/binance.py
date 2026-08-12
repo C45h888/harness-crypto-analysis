@@ -229,6 +229,42 @@ class Binance:
             endTime=end_time,
         )
 
+    async def fut_agg_trades_paginated(
+        self,
+        symbol: str,
+        start_time: int,
+        end_time: int,
+        limit: int = 1000,
+        max_pages: int = 200,
+    ) -> list[dict]:
+        """Pull all USD-M aggTrades in ``[start_time, end_time]`` via fromId walk.
+
+        Migrated from legacy ``long_term_flow.pull_trades``. Rows return the raw
+        Binance aggTrades shape (``a/p/q/T/m``) so callers can normalize with
+        ``normalize_fut_trade``. Stops when a page is empty or crosses ``end_time``.
+        """
+        self._require_symbol(symbol, "fut_agg_trades_paginated")
+        out: list[dict] = []
+        batch = await self.fut_agg_trades(symbol, limit=limit, start_time=start_time, end_time=end_time)
+        out.extend(batch)
+        last_id = batch[-1]["a"] if batch else None
+        page = 1
+        while batch and page < max_pages:
+            if last_id is None:
+                break
+            page += 1
+            batch = await self._fut._get(
+                "/fapi/v1/aggTrades", symbol=symbol, limit=limit,
+                fromId=last_id + 1, endTime=end_time,
+            )
+            if not batch:
+                break
+            if batch[0]["T"] > end_time:
+                break
+            out.extend(batch)
+            last_id = batch[-1]["a"]
+        return out
+
     async def fut_book_ticker(self, symbol: str) -> list[dict]:
         """Best bid/ask for one symbol. Returns a one-element list (shape
         consistency with `spot_book_ticker`)."""

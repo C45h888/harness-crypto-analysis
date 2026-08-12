@@ -51,13 +51,38 @@ async def analyze_macro(client: Binance, symbols: tuple[str, ...] = DEFAULT_SYMB
     returns = {symbol: _returns(rows) for symbol, rows in series.items()}
     funding_rows = [{"symbol": symbol, "funding": row} for symbol, row in zip(symbols, funding) if isinstance(row, dict)]
     btc, eth, sol = returns.get("BTCUSDT", []), returns.get("ETHUSDT", []), returns.get("SOLUSDT", [])
+    relationships = {"sol_btc_correlation": _corr(sol, btc), "sol_btc_beta": _beta(sol, btc),
+                     "sol_eth_correlation": _corr(sol, eth), "btc_eth_correlation": _corr(btc, eth)}
     return {
         "evidence": {"spot_24h": ticker_rows, "hourly_klines": series, "funding": funding_rows},
         "relative_strength": [{"symbol": x.get("symbol"), "change_percent": float(x.get("price_change_percent", 0)), "last_price": x.get("last_price"), "quote_volume": x.get("quote_volume")} for x in ticker_rows],
         "returns_24h_percent": {"BTCUSDT": _compound(btc), "ETHUSDT": _compound(eth), "SOLUSDT": _compound(sol)},
-        "relationships": {"sol_btc_correlation": _corr(sol, btc), "sol_btc_beta": _beta(sol, btc), "sol_eth_correlation": _corr(sol, eth), "btc_eth_correlation": _corr(btc, eth)},
+        "relationships": relationships,
+        "idiosyncratic_sol": idiosyncratic(sol, btc, relationships["sol_btc_beta"]),
         "funding": funding_rows,
     }
+
+
+def idiosyncratic(asset_rets: list[float], benchmark_rets: list[float], beta: float | None) -> dict:
+    """Alt-specific move residual = asset 24h return - beta * benchmark return.
+
+    If SOL's move exceeds what BTC-beta explains, that residual is
+    idiosyncratic alt-rotation (into or out of SOL). Restrained to the doctrine:
+    returns the figure plus a neutral label, never a trade instruction.
+
+    Legacy source: macro.py idiosyncratic-SOL-move block.
+    """
+    asset_ret = _compound(asset_rets)
+    expected = beta * _compound(benchmark_rets) if beta is not None else None
+    residual = (asset_ret - expected) if expected is not None else None
+    label = None
+    if residual is not None:
+        if abs(residual) > 1.0:
+            label = "OUTPERFORMING" if residual > 0 else "UNDERPERFORMING"
+        else:
+            label = "TRACKING"
+    return {"asset_return_percent": asset_ret, "expected_beta_percent": expected,
+            "residual_percent": residual, "label": label}
 
 
 async def analyze_global_market(coingecko: CoinGecko | None = None) -> dict:

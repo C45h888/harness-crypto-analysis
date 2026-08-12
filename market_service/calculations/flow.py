@@ -32,6 +32,7 @@ def summarize(trades: list[dict], book: dict | None = None, depth_levels: int = 
         "spread_bps": ((asks[0][0] - bids[0][0]) / ((asks[0][0] + bids[0][0]) / 2) * 10000)
         if bids and asks and asks[0][0] + bids[0][0] else None,
         "obi": (bid_notional - ask_notional) / depth_total if depth_total else None,
+        "micro_price_skew_bps": microprice_skew_bps(bids, asks),
         "book_levels": min(len(bids), len(asks)),
         "book_bid_notional": bid_notional,
         "book_ask_notional": ask_notional,
@@ -131,3 +132,86 @@ def cvd_series_corr(spot_buckets: list[dict], fut_buckets: list[dict], window_s:
         "spot_buckets": spot_buckets, "fut_buckets": fut_buckets,
         "window_seconds": window_s,
     }
+
+
+def microprice_skew_bps(bids: Iterable, asks: Iterable) -> float | None:
+    """Top-of-book microprice vs simple mid, in basis points.
+
+    microprice = size-weighted mid of the best bid/ask. A positive skew means
+    the size-weighted price sits above the simple mid (aggressive sellers being
+    absorbed), negative means the reverse. Returns None when the book is empty.
+
+    Legacy source: continue_monitor.micro_skew_bps.
+    ``bids``/``asks`` are iterables of ``(price, qty)`` pairs.
+    """
+    bids = list(bids)
+    asks = list(asks)
+    if not bids or not asks:
+        return None
+    bb_p, bb_q = float(bids[0][0]), float(bids[0][1])
+    ba_p, ba_q = float(asks[0][0]), float(asks[0][1])
+    if bb_p <= 0 or ba_p <= 0 or (bb_q + ba_q) == 0:
+        return None
+    mid = 0.5 * (bb_p + ba_p)
+    micro = (ba_p * bb_q + bb_p * ba_q) / (bb_q + ba_q)
+    return (micro / mid - 1.0) * 1e4
+
+
+def spot_turnover_share(spot_notional_usd: float | None, futures_notional_usd: float | None) -> float | None:
+    """Spot's share of combined spot+futures turnover (0..1).
+
+    A cross-venue activity-split: how much of the tradable flow is happening on
+    spot vs the perpetual. High spot share = real-money venue leading; low = the
+    perp (leveraged) is dominating. Returns None if either leg is missing.
+
+    Legacy source: continue_monitor.spot_pct_of_turnover.
+    """
+    if spot_notional_usd is None or futures_notional_usd is None:
+        return None
+    grand = float(spot_notional_usd) + float(futures_notional_usd)
+    if grand <= 0:
+        return None
+    return float(spot_notional_usd) / grand
+
+
+def price_bucketed_flow(
+    trades: Iterable[dict],
+    bucket_size: float = 0.05,
+    window_s: int = 300,
+    now_ts: int | None = None,
+) -> list[dict]:
+    """PRICE-bucketed buy/sell flow (vs the time-bucketed `bucketed_cvd`).
+
+    Buckets trades by price rounded to the nearest ``bucket_size`` and sums
+    buy/sell qty, net, and trade count per price level. This exposes level-by-
+    level absorption (which price steps are being defended/broken), used by the
+    keystone framework. Only trades within the trailing ``window_s`` are kept.
+
+    Legacy source: spot_fut_assess.bucket_flow / flow5m price-bucket logic.
+
+    Returns a list of ``{"price", "buy", "sell", "net", "trades"}`` sorted by price.
+    """
+    if window_s <= 0:
+        raise ValueError("window_s must be positive")
+    if bucket_size <= 0:
+        raise ValueError("bucket_size must be positive")
+    now_ts = now_ts or 0
+    cutoff = now_ts - window_s * 1000 if now_ts else 0
+    buckets: dict[float, dict] = defaultdict(lambda: {"buy": 0.0, "sell": 0.0, "trades": 0})
+    for trade in trades:
+        ts = int(trade.get("ts", 0) or 0)
+        if now_ts and ts < cutoff:
+            continue
+        price = float(trade["price"])
+        qty = float(trade["qty"])
+        bucket = round(round(price / bucket_size) * bucket_size, 10)
+        side = "sell" if trade.get("is_buyer_maker") else "buy"
+        buckets[bucket][side] += qty
+        buckets[bucket]["trades"] += 1
+    return [{
+        "price": price,
+        "buy": value["buy"],
+        "sell": value["sell"],
+        "net": value["buy"] - value["sell"],
+        "trades": value["trades"],
+    } for price, value in sorted(buckets.items())]
