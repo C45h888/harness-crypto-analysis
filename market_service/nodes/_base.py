@@ -51,10 +51,9 @@ def build_envelope(
 ) -> MarketStateEnvelope:
     """Construct a versioned envelope that satisfies the wire contract.
 
-    The wire shape is intentionally NOT extended with ``run_id`` (that would
-    require a schema-version bump). Instead ``run_id`` lives under
-    ``data["run_id"]`` as an additive field - the collator reads it from
-    there to verify provenance.
+    ``run_id`` is attached by ``_handle_one`` after the domain handler has
+    returned. It remains an explicit top-level transport field while the
+    schema version stays compatible with the existing envelope contract.
     """
     now = _utc_iso()
     return MarketStateEnvelope(

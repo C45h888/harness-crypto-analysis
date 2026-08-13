@@ -57,6 +57,7 @@ async def fetch_binance_evidence(
     symbol: str,
     depth_levels: int,
     flow_window_seconds: int,
+    scope: str = "all",
 ) -> dict[str, Any]:
     """Pull the eight canonical Binance endpoints in parallel.
 
@@ -65,6 +66,14 @@ async def fetch_binance_evidence(
     """
     now_ms = _now_ms()
     start = now_ms - flow_window_seconds * 1000
+    scopes = {
+        "order_book": {"spot_book", "fut_book"},
+        "trades": {"spot_trades", "fut_trades"},
+        "funding": {"fut_funding"},
+        "open_interest": {"fut_open_interest"},
+        "tickers": {"spot_24h", "fut_24h"},
+    }
+    requested = set().union(*scopes.values()) if scope == "all" else scopes.get(scope, set())
 
     async def _safe(coro_factory, name: str):
         try:
@@ -73,15 +82,20 @@ async def fetch_binance_evidence(
             log.warning("data-access endpoint %s failed: %s", name, exc)
             return None, f"{type(exc).__name__}: {exc}"
 
+    async def _requested(coro_factory, name: str):
+        if name not in requested:
+            return None, None
+        return await _safe(coro_factory, name)
+
     results = await asyncio.gather(
-        _safe(lambda: client.spot_book(symbol, limit=depth_levels), "spot_book"),
-        _safe(lambda: client.fut_book(symbol, limit=depth_levels), "fut_book"),
-        _safe(lambda: client.spot_24h(symbol), "spot_24h"),
-        _safe(lambda: client.fut_24h(symbol), "fut_24h"),
-        _safe(lambda: client.fut_funding(symbol), "fut_funding"),
-        _safe(lambda: client.fut_open_interest(symbol), "fut_open_interest"),
-        _safe(lambda: client.spot_agg_trades(symbol, limit=1000, start_time=start), "spot_trades"),
-        _safe(lambda: client.fut_agg_trades(symbol, limit=1000, start_time=start), "fut_trades"),
+        _requested(lambda: client.spot_book(symbol, limit=depth_levels), "spot_book"),
+        _requested(lambda: client.fut_book(symbol, limit=depth_levels), "fut_book"),
+        _requested(lambda: client.spot_24h(symbol), "spot_24h"),
+        _requested(lambda: client.fut_24h(symbol), "fut_24h"),
+        _requested(lambda: client.fut_funding(symbol), "fut_funding"),
+        _requested(lambda: client.fut_open_interest(symbol), "fut_open_interest"),
+        _requested(lambda: client.spot_agg_trades(symbol, limit=1000, start_time=start), "spot_trades"),
+        _requested(lambda: client.fut_agg_trades(symbol, limit=1000, start_time=start), "fut_trades"),
     )
     (spot_book, e_book), (fut_book, e_fbook), (spot_24h, e24), (fut_24h, ef24), \
     (fut_fund, efund), (fut_oi, eoi), (spot_raw, est), (fut_raw, eft) = results
@@ -108,6 +122,7 @@ async def fetch_binance_evidence(
         "observed_at": _iso_now(),
         "fetch_window_ms": flow_window_seconds * 1000,
         "depth_levels": depth_levels,
+        "requested_scope": scope,
         "errors": errors,
         "spot": {
             "ticker_24h": spot_24h,
@@ -143,21 +158,32 @@ async def make_handler(settings: Settings):
         params = command.parameters or {}
         depth = int(params.get("depth_levels", settings.depth_levels))
         window = int(params.get("flow_window_seconds", settings.flow_window_seconds))
+        scope = str(params.get("scope", "all"))
         evidence = await fetch_binance_evidence(
             client,
             symbol=symbol,
             depth_levels=depth,
             flow_window_seconds=window,
+            scope=scope,
         )
         # Per contract: null means unavailable, never zero. Status reflects
         # whether at least the spot/futures books came back.
-        ok = evidence["spot"]["order_book"] is not None and evidence["futures"]["order_book"] is not None
+        required = {
+            "all": (evidence["spot"]["order_book"], evidence["futures"]["order_book"]),
+            "order_book": (evidence["spot"]["order_book"], evidence["futures"]["order_book"]),
+            "trades": (evidence["spot"]["trades_raw"], evidence["futures"]["trades_raw"]),
+            "funding": (evidence["futures"]["funding"],),
+            "open_interest": (evidence["futures"]["open_interest"],),
+            "tickers": (evidence["spot"]["ticker_24h"], evidence["futures"]["ticker_24h"]),
+        }[scope]
+        ok = all(value is not None for value in required)
         status = "healthy" if ok and not evidence["errors"] else "degraded" if ok else "invalid"
         return {
             "status": status,
             "errors": evidence.pop("errors", []),
             "evidence": evidence,
             "coverage_seconds": window,
+            "requested_scope": scope,
         }
 
     handle.close = _close  # type: ignore[attr-defined]
@@ -171,7 +197,7 @@ async def main() -> int:
     stop = asyncio.Event()
     install_signal_handlers(stop)
     try:
-        if not await redis.ping():
+        if not await redis.ping_with_retry():
             log.error("redis ping failed; aborting data-access")
             return 1
         handler = await make_handler(settings)

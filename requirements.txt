@@ -1,3 +1,5 @@
 aiohttp==3.12.15
 asyncpg==0.30.0
 redis[hiredis]==6.4.0
+alembic==1.13.3
+psycopg2-binary==2.9.12

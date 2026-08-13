@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, AsyncIterator
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
-from .contracts import MarketEvent, MarketRunEnvelope, MarketStateEnvelope, RefreshCommand, RuntimeRunState
+from .contracts import (
+    HarnessRunRequest, MarketEvent, MarketRunEnvelope, MarketStateEnvelope,
+    RefreshCommand, RuntimeRunState,
+)
 
 
 class RedisRuntimeStore:
@@ -62,11 +67,27 @@ class RedisRuntimeStore:
     def result_stream(self) -> str:
         return f"{self.prefix}:stream:results"
 
+    @property
+    def harness_request_stream(self) -> str:
+        return f"{self.prefix}:stream:harness:requests"
+
     async def close(self) -> None:
         await self.redis.aclose()
 
     async def ping(self) -> bool:
         return bool(await self.redis.ping())
+
+    async def ping_with_retry(self, attempts: int = 12, delay_s: float = 1.0) -> bool:
+        """Tolerate transient Docker DNS/network readiness during startup."""
+        for attempt in range(attempts):
+            try:
+                if await self.ping():
+                    return True
+            except Exception:
+                if attempt == attempts - 1:
+                    raise
+            await asyncio.sleep(delay_s)
+        return False
 
     async def publish_state(self, state: MarketStateEnvelope) -> str:
         payload = state.to_json()
@@ -125,6 +146,10 @@ class RedisRuntimeStore:
 
     async def read_latest_run(self, symbol: str) -> MarketRunEnvelope | None:
         raw = await self.redis.get(self.collated_latest_key(symbol))
+        return MarketRunEnvelope.from_mapping(json.loads(raw)) if raw else None
+
+    async def read_run(self, run_id: str) -> MarketRunEnvelope | None:
+        raw = await self.redis.get(f"{self.prefix}:run:{run_id}")
         return MarketRunEnvelope.from_mapping(json.loads(raw)) if raw else None
 
     async def read_runs(self, symbol: str, count: int = 100) -> list[MarketRunEnvelope]:
@@ -191,6 +216,45 @@ class RedisRuntimeStore:
             json.dumps(state.to_dict(), separators=(",", ":")),
         )
 
+    async def read_runtime_run(self, run_id: str) -> dict[str, Any] | None:
+        raw = await self.redis.get(self.run_state_key(run_id))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    async def request_harness_run(self, request: HarnessRunRequest) -> str:
+        return await self.redis.xadd(
+            self.harness_request_stream,
+            request.to_fields(),
+            maxlen=self.stream_maxlen,
+            approximate=True,
+        )
+
+    async def consume_harness_requests(
+        self, last_id: str = "$", block_ms: int = 2000, count: int = 8,
+    ) -> AsyncIterator[tuple[str, HarnessRunRequest]]:
+        current_id = last_id
+        while True:
+            try:
+                rows = await self.redis.xread(
+                    {self.harness_request_stream: current_id},
+                    block=block_ms,
+                    count=count,
+                )
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+            if not rows:
+                continue
+            for _stream, entries in rows:
+                for entry_id, fields in entries:
+                    current_id = entry_id
+                    yield entry_id, HarnessRunRequest.from_fields(fields)
+
     async def consume_commands(
         self,
         domain: str,
@@ -211,9 +275,12 @@ class RedisRuntimeStore:
                     block=block_ms,
                     count=count,
                 )
-            except ResponseError:
-                # If the stream does not exist yet, xread raises; sleep and retry.
+            except (ResponseError, RedisConnectionError, OSError, ConnectionError):
+                # Docker DNS/network interruptions must not terminate a long-lived
+                # node. Reconnect is handled by redis-py's lazy connection path
+                # on the next read; this loop keeps the consumer alive.
                 rows = []
+                await asyncio.sleep(1.0)
             if not rows:
                 continue
             for _stream, entries in rows:

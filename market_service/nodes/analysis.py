@@ -376,22 +376,37 @@ async def make_handler(settings: Settings, redis: RedisRuntimeStore):
             }
         data_latest = await redis.read_run_domain_state(run_id, "data-access") if run_id else None
         evidence = (data_latest.data.get("evidence") if data_latest else None) or {}
+        requested_scope = str(
+            (data_latest.data.get("requested_scope") if data_latest else None)
+            or evidence.get("requested_scope")
+            or "all"
+        )
         calc_data = calc_latest.data
         calculations = calc_data.get("calculations") or {}
 
         errors: list[dict[str, Any]] = []
-        auction = _run_section("auction", lambda: adapt_auction(evidence), errors)
-        oi = _run_section("open_interest", lambda: adapt_oi(evidence), errors)
-        walls = _run_section("wall_migration", lambda: adapt_wall_migration(evidence), errors)
-        path = _run_section("path_absorption", lambda: adapt_path_absorption(evidence), errors)
-        demand = _run_section("demand", lambda: adapt_demand(evidence), errors)
-        regime = _run_section("regime", lambda: adapt_regime(evidence, calculations), errors)
-        stage = _run_section("stage", lambda: adapt_stage(evidence), errors)
-        macro = _run_section("macro", lambda: adapt_macro(evidence), errors)
+        def unavailable(name: str) -> dict[str, str]:
+            return {
+                "status": "unavailable",
+                "reason": f"{name} inputs not requested in scope '{requested_scope}'",
+            }
+
+        order_book_scope = requested_scope in ("all", "order_book")
+        full_scope = requested_scope == "all"
+        auction = _run_section("auction", lambda: adapt_auction(evidence), errors) if order_book_scope else unavailable("auction")
+        oi = _run_section("open_interest", lambda: adapt_oi(evidence), errors) if full_scope else unavailable("open_interest")
+        walls = _run_section("wall_migration", lambda: adapt_wall_migration(evidence), errors) if order_book_scope else unavailable("wall_migration")
+        path = _run_section("path_absorption", lambda: adapt_path_absorption(evidence), errors) if order_book_scope else unavailable("path_absorption")
+        demand = _run_section("demand", lambda: adapt_demand(evidence), errors) if full_scope else unavailable("demand")
+        regime = _run_section("regime", lambda: adapt_regime(evidence, calculations), errors) if full_scope else unavailable("regime")
+        stage = _run_section("stage", lambda: adapt_stage(evidence), errors) if full_scope else unavailable("stage")
+        macro = _run_section("macro", lambda: adapt_macro(evidence), errors) if full_scope else unavailable("macro")
 
         status = calc_latest.status
         if errors:
             status = "invalid" if status == "invalid" else "degraded"
+        elif requested_scope != "all" and status == "healthy":
+            status = "degraded"
 
         return {
             "status": status,
@@ -423,7 +438,7 @@ async def main() -> int:
     stop = asyncio.Event()
     install_signal_handlers(stop)
     try:
-        if not await redis.ping():
+        if not await redis.ping_with_retry():
             log.error("redis ping failed; aborting analysis")
             return 1
         handler = await make_handler(settings, redis)

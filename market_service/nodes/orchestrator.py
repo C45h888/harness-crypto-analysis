@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from market_service.config import Settings
-from market_service.runtime.contracts import RefreshCommand, RuntimeRunState
+from market_service.runtime.contracts import HarnessRunRequest, RefreshCommand, RuntimeRunState
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 from ._base import install_signal_handlers, setup_logging
@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 
 DOMAIN_ORDER = ("data-access", "calculations", "analysis")
 DEFAULT_STEP_TIMEOUT_S = 60.0
+_SYMBOL_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _utc_iso() -> str:
@@ -113,8 +114,23 @@ async def run_collator_subprocess(symbol: str, run_id: str) -> dict[str, Any]:
     return {"ok": True, "result": parsed}
 
 
-async def run_cycle(redis: RedisRuntimeStore, symbol: str, settings: Settings) -> dict[str, Any]:
-    run_id = str(uuid.uuid4())
+async def run_cycle(
+    redis: RedisRuntimeStore, symbol: str, settings: Settings,
+    run_id: str | None = None,
+    scope: str = "all",
+) -> dict[str, Any]:
+    symbol = symbol.upper()
+    lock = _SYMBOL_LOCKS.setdefault(symbol, asyncio.Lock())
+    async with lock:
+        return await _run_cycle(redis, symbol, settings, run_id, scope)
+
+
+async def _run_cycle(
+    redis: RedisRuntimeStore, symbol: str, settings: Settings,
+    run_id: str | None = None,
+    scope: str = "all",
+) -> dict[str, Any]:
+    run_id = run_id or str(uuid.uuid4())
     started = _utc_iso()
     domains = {domain: "pending" for domain in DOMAIN_ORDER}
     await redis.write_runtime_run(RuntimeRunState(
@@ -134,7 +150,11 @@ async def run_cycle(redis: RedisRuntimeStore, symbol: str, settings: Settings) -
             domain=domain,
             symbol=symbol,
             run_id=run_id,
-            parameters={"depth_levels": settings.depth_levels, "flow_window_seconds": settings.flow_window_seconds},
+            parameters={
+                "depth_levels": settings.depth_levels,
+                "flow_window_seconds": settings.flow_window_seconds,
+                "scope": scope,
+            },
         )
         result = await redis.wait_for_result(
             run_id=run_id,
@@ -175,6 +195,29 @@ async def run_cycle(redis: RedisRuntimeStore, symbol: str, settings: Settings) -
     }
 
 
+async def run_harness_request_loop(
+    redis: RedisRuntimeStore, settings: Settings, stop: asyncio.Event,
+) -> None:
+    """Serve full-cycle requests emitted by the typed harness surface."""
+    active: set[str] = set()
+    async for _entry_id, request in redis.consume_harness_requests():
+        if stop.is_set():
+            break
+        symbol = request.symbol.upper()
+        if not symbol or symbol in active:
+            log.warning("ignoring invalid or overlapping harness request symbol=%s", symbol)
+            continue
+        active.add(symbol)
+        try:
+            params = request.parameters or {}
+            scope = str(params.get("scope", "all"))
+            await run_cycle(redis, symbol, settings, run_id=request.request_id, scope=scope)
+        except Exception:
+            log.exception("harness-request cycle failed for %s", symbol)
+        finally:
+            active.remove(symbol)
+
+
 async def main() -> int:
     setup_logging()
     settings = Settings.from_env()
@@ -184,16 +227,17 @@ async def main() -> int:
     poll_seconds = settings.poll_seconds
     log.info("orchestrator starting (symbols=%s poll=%ss)", settings.symbols, poll_seconds)
     try:
-        if not await redis.ping():
+        if not await redis.ping_with_retry():
             log.error("redis ping failed; aborting orchestrator")
             return 1
+        request_task = asyncio.create_task(run_harness_request_loop(redis, settings, stop))
         while not stop.is_set():
             cycle_started = time.monotonic()
             for symbol in settings.symbols:
                 if stop.is_set():
                     break
                 try:
-                    await run_cycle(redis, symbol, settings)
+                    await run_cycle(redis, symbol, settings, scope="all")
                 except Exception:
                     log.exception("orchestrator cycle failed for %s", symbol)
             elapsed = time.monotonic() - cycle_started
@@ -202,6 +246,7 @@ async def main() -> int:
             except asyncio.TimeoutError:
                 pass
     finally:
+        request_task.cancel() if "request_task" in locals() else None
         await redis.close()
     return 0
 

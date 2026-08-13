@@ -24,8 +24,12 @@ import asyncio
 import json
 import sys
 import time
+import uuid
 
 from market_service.analysis.market import analyze, render
+from market_service.config import Settings
+from market_service.runtime.contracts import HarnessRunRequest, RefreshCommand, RuntimeRunState
+from market_service.runtime.redis_store import RedisRuntimeStore
 
 
 async def build(symbol: str, trades: int, depth: int, window: int) -> dict:
@@ -48,6 +52,71 @@ async def build(symbol: str, trades: int, depth: int, window: int) -> dict:
     }
 
 
+async def trigger_domain(symbol: str, domain: str, scope: str, timeout_s: float) -> dict:
+    """Trigger one bounded domain refresh and return its completion event."""
+    settings = Settings.from_env()
+    redis = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+    command_id = str(uuid.uuid4())
+    try:
+        stream_id = await redis.request_refresh(RefreshCommand(
+            domain=domain,
+            symbol=symbol,
+            requested_by="harness",
+            command_id=command_id,
+            parameters={"run_id": command_id, "scope": scope},
+        ))
+        event = await redis.wait_for_result(command_id, domain, timeout_s=timeout_s)
+        return {
+            "request_id": command_id, "command_stream_id": stream_id,
+            "domain": domain, "symbol": symbol.upper(),
+            "completed": event is not None,
+            "result": event.payload if event else None,
+        }
+    finally:
+        await redis.close()
+
+
+async def trigger_full_cycle(symbol: str, timeout_s: float, scope: str = "all") -> dict:
+    """Ask the autonomous orchestrator to run one complete cycle."""
+    settings = Settings.from_env()
+    redis = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+    request_id = str(uuid.uuid4())
+    try:
+        requested_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        await redis.write_runtime_run(RuntimeRunState(
+            run_id=request_id,
+            symbol=symbol,
+            phase="REQUESTED",
+            started_at=requested_at,
+            updated_at=requested_at,
+            domains={"data-access": "pending", "calculations": "pending", "analysis": "pending"},
+        ))
+        await redis.request_harness_run(HarnessRunRequest(
+            symbol=symbol,
+            request_id=request_id,
+            parameters={"scope": scope},
+        ))
+        deadline = time.monotonic() + timeout_s
+        state = None
+        while time.monotonic() < deadline:
+            # The orchestrator's runtime key is the authoritative completion
+            # record. The request ID is carried through as the run ID.
+            state = await redis.read_runtime_run(request_id)
+            if state and state.get("phase") in ("PUBLISHED", "FAILED", "INVALID", "DEGRADED"):
+                break
+            await asyncio.sleep(0.25)
+        envelope = await redis.read_run(request_id)
+        return {
+            "request_id": request_id,
+            "scope": scope,
+            "completed": bool(state and state.get("phase") == "PUBLISHED"),
+            "runtime": state,
+            "envelope": envelope.to_dict() if envelope else None,
+        }
+    finally:
+        await redis.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Clean aggregated market-data harness for the model")
     p.add_argument("symbol", nargs="?", default="SOLUSDT")
@@ -55,10 +124,35 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--depth", type=int, default=50)
     p.add_argument("--window", type=int, default=60)
     p.add_argument("--json", action="store_true", help="emit the full JSON contract")
+    p.add_argument("--trigger", action="store_true", help="request one autonomous orchestrator cycle")
+    p.add_argument("--domain", choices=("data-access", "calculations", "analysis"),
+                   help="trigger one domain instead of a full cycle")
+    p.add_argument("--scope", choices=("all", "order_book", "trades", "funding", "open_interest", "tickers"),
+                   default="all", help="requested data scope for a domain trigger")
+    p.add_argument("--timeout", type=float, default=120.0)
+    p.add_argument("--latest", action="store_true", help="read the latest persisted collated envelope")
+    p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
     args = p.parse_args(argv)
 
-    result = asyncio.run(build(args.symbol, args.trades, args.depth, args.window))
+    if args.domain:
+        result = asyncio.run(trigger_domain(args.symbol, args.domain, args.scope, args.timeout))
+    elif args.trigger:
+        result = asyncio.run(trigger_full_cycle(args.symbol, args.timeout, args.scope))
+    elif args.latest or args.run_id:
+        settings = Settings.from_env()
+        async def _read():
+            store = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+            try:
+                value = await (store.read_run(args.run_id) if args.run_id else store.read_latest_run(args.symbol))
+                return value.to_dict() if value else None
+            finally:
+                await store.close()
+        result = asyncio.run(_read())
+    else:
+        result = asyncio.run(build(args.symbol, args.trades, args.depth, args.window))
     if args.json:
+        print(json.dumps(result, indent=2, default=str))
+    elif args.domain or args.trigger or args.latest or args.run_id:
         print(json.dumps(result, indent=2, default=str))
     else:
         print(render(result["core"]))

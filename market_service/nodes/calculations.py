@@ -256,6 +256,11 @@ async def make_handler(settings: Settings, redis: RedisRuntimeStore):
             }
 
         evidence = latest.data.get("evidence") or latest.data
+        requested_scope = str(
+            latest.data.get("requested_scope")
+            or evidence.get("requested_scope")
+            or "all"
+        )
         errors: list[dict[str, Any]] = []
 
         spot_evidence = evidence.get("spot") or {}
@@ -270,32 +275,62 @@ async def make_handler(settings: Settings, redis: RedisRuntimeStore):
                 },
             })
 
-        flow = _run_section("flow", lambda: adapt_flow_section(evidence, depth), errors) or {}
-        bucketed = _run_section("bucketed_cvd", lambda: adapt_bucketed_section(evidence, window), errors) or {}
-        correlation = _run_section("correlation", lambda: adapt_correlation(evidence, window), errors)
-        signal_inputs = _run_section("signal_inputs", lambda: adapt_signal_inputs(flow, evidence), errors) or {}
-        orderbook = _run_section("orderbook", lambda: adapt_orderbook_section(evidence, depth), errors) or {}
-        volume_profile = _run_section("volume_profile", lambda: adapt_volume_profile(evidence), errors) or {}
+        spot_trades_available = spot_evidence.get("trades_raw") is not None
+        fut_trades_available = fut_evidence.get("trades_raw") is not None
+        trades_available = requested_scope in ("all", "trades") and spot_trades_available and fut_trades_available
+        books_available = requested_scope in ("all", "order_book")
+
+        if trades_available:
+            flow = _run_section("flow", lambda: adapt_flow_section(evidence, depth), errors) or {}
+            bucketed = _run_section("bucketed_cvd", lambda: adapt_bucketed_section(evidence, window), errors) or {}
+            correlation = _run_section("correlation", lambda: adapt_correlation(evidence, window), errors)
+            signal_inputs = _run_section("signal_inputs", lambda: adapt_signal_inputs(flow, evidence), errors) or {}
+            volume_profile = _run_section("volume_profile", lambda: adapt_volume_profile(evidence), errors) or {}
+            turnover = _run_section("turnover", lambda: adapt_turnover(flow), errors) or {}
+        else:
+            unavailable = {
+                "status": "unavailable",
+                "reason": f"trade evidence not available for requested scope '{requested_scope}'",
+            }
+            flow = {"status": "unavailable", "spot_flow": None, "futures_flow": None, "reason": unavailable["reason"]}
+            bucketed = {"status": "unavailable", "spot_bucketed_cvd": None, "futures_bucketed_cvd": None, "reason": unavailable["reason"]}
+            correlation = unavailable
+            signal_inputs = {"status": "unavailable", "reason": unavailable["reason"]}
+            volume_profile = unavailable
+            turnover = unavailable
+
+        if books_available:
+            orderbook = _run_section("orderbook", lambda: adapt_orderbook_section(evidence, depth), errors) or {}
+        else:
+            orderbook = {
+                "status": "unavailable",
+                "reason": f"order-book evidence not available for requested scope '{requested_scope}'",
+            }
         technical = _run_section("technical", lambda: adapt_technical(evidence), errors) or {}
-        turnover = _run_section("turnover", lambda: adapt_turnover(flow), errors) or {}
 
         # signals need the shape built by adapt_signal_inputs; run only when it succeeded.
         signals: list[dict[str, Any]] = []
-        if signal_inputs:
+        if trades_available and signal_inputs:
             try:
                 signals = list(strict(C, "deterministic_signals", deterministic_signals, signal_inputs, None))
             except C.ContractViolation as violation:
                 errors.append(C.contract_error_entry(violation))
 
         # Status: healthy if no errors AND upstream data-access was healthy.
-        status = "healthy" if not errors and latest.status == "healthy" else (
-            "degraded" if latest.status in ("healthy", "degraded") and errors else "invalid"
-        )
+        if latest.status == "invalid":
+            status = "invalid"
+        elif errors:
+            status = "degraded"
+        elif requested_scope != "all":
+            status = "degraded"
+        else:
+            status = "healthy"
 
         return {
             "status": status,
             "errors": errors,
             "data_access_observed_at": latest.observed_at,
+            "requested_scope": requested_scope,
             "evidence_ref": {"source": "data-access", "observed_at": latest.observed_at},
             "calculations": {
                 "flow": flow,
@@ -321,7 +356,7 @@ async def main() -> int:
     stop = asyncio.Event()
     install_signal_handlers(stop)
     try:
-        if not await redis.ping():
+        if not await redis.ping_with_retry():
             log.error("redis ping failed; aborting calculations")
             return 1
         handler = await make_handler(settings, redis)

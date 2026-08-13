@@ -1,0 +1,20 @@
+{
+  "px": 76.25,
+  "spread_bps": 1.3115614138638751,
+  "obi_top20": -0.07372443745925363,
+  "required_buy_vol_sol": 0.0,
+  "available_bid_fuel_sol": 891572.6299999998,
+  "fuel_ratio": 999,
+  "verdict": "BUYERS HAVE AMPLE FUEL",
+  "confidence": "HIGH",
+  "fall_short_at": null,
+  "wall_qty_74_30_to_74_44": 0,
+  "wall_levels_74_30_to_74_44": 0,
+  "large_buy_qty": 908.1199999999999,
+  "large_sell_qty": 720.1399999999999,
+  "large_net": 187.98000000000002,
+  "tbr_trend": "SELL PRESSURE BUILDING",
+  "oi_trend": "OI FALLING (positions closing)",
+  "combo": ">>> LIQUIDATION CASCADE",
+  "smart_dir": "CROWD STABLE (69.2% long)"
+}

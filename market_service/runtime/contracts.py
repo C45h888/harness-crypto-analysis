@@ -16,7 +16,7 @@ MARKET_STATE_SCHEMA_VERSION = 1
 MARKET_RUN_SCHEMA_VERSION = 1
 StateStatus = Literal["healthy", "degraded", "invalid"]
 RuntimePhase = Literal[
-    "INITIALIZING", "COLLECTING", "CALCULATING", "ANALYZING",
+    "REQUESTED", "INITIALIZING", "COLLECTING", "CALCULATING", "ANALYZING",
     "COLLATING", "PUBLISHED", "DEGRADED", "INVALID", "STALE", "FAILED",
 ]
 
@@ -148,6 +148,38 @@ class RefreshCommand:
             symbol=str(fields.get("symbol", "")).upper(),
             requested_by=str(fields.get("requested_by", "runtime")),
             command_id=cmd_id,
+            parameters=parameters or None,
+        )
+
+
+@dataclass(frozen=True)
+class HarnessRunRequest:
+    """A bounded request for the orchestrator to run one complete symbol cycle."""
+
+    symbol: str
+    requested_by: str = "harness"
+    request_id: str | None = None
+    parameters: dict[str, Any] | None = None
+
+    def to_fields(self) -> dict[str, str]:
+        return {
+            "request_id": self.request_id or str(uuid.uuid4()),
+            "symbol": self.symbol.upper(),
+            "requested_by": self.requested_by,
+            "parameters": json.dumps(self.parameters or {}, separators=(",", ":")),
+        }
+
+    @classmethod
+    def from_fields(cls, fields: dict[str, str]) -> "HarnessRunRequest":
+        raw = fields.get("parameters", "{}")
+        try:
+            parameters = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parameters = {}
+        return cls(
+            symbol=str(fields.get("symbol", "")).upper(),
+            requested_by=str(fields.get("requested_by", "harness")),
+            request_id=fields.get("request_id") or None,
             parameters=parameters or None,
         )
 

@@ -33,6 +33,28 @@ services:
       timeout: 3s
       retries: 12
 
+  # One-shot schema bootstrap via Alembic. Applies all pending migrations up
+  # to head against the Postgres service on every `up` (idempotent baseline
+  # means it is safe on both fresh volumes and pre-existing databases), so the
+  # schema never depends on the initdb-first-boot-only behavior that skips
+  # scripts on existing volumes. Alembic is the single source of truth for
+  # schema evolution going forward.
+  db-init:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+    volumes:
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   # Domain service: data-access.
   # ONLY this service receives external API credentials (Binance, CoinGecko,
   # CryptoQuant). It publishes MarketStateEnvelope(source="data-access") to
@@ -63,6 +85,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import market_service.nodes.data_access; import market_service.runtime.redis_store as r; print(\"ok\")'"]
@@ -95,6 +119,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
       data-access:
         condition: service_healthy
     restart: unless-stopped
@@ -129,6 +155,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
       calculations:
         condition: service_healthy
     restart: unless-stopped
@@ -165,6 +193,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
       data-access:
         condition: service_healthy
       calculations:
@@ -202,6 +232,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # Legacy collator: one-shot per invocation. Stable entrypoint.
@@ -223,6 +255,38 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # Read-only harness client. This is intentionally a one-shot tool rather
+  # than another autonomous worker. It submits typed requests to the
+  # orchestrator and reads the exact run envelope back from Redis.
+  # The image contains the package at /app; no host bind mount and no Docker
+  # socket are required.
+  harness:
+    build: .
+    user: "marketflow"
+    entrypoint: ["python", "-m", "market_service.commands.harness"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      orchestrator:
+        condition: service_healthy
+    profiles: ["tools"]
     restart: "no"
 
 volumes:

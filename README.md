@@ -40,6 +40,20 @@ exploratory scripts have been fully migrated into it (`market_service/manifest.p
 # liquidation + macro). The model reads THIS, not scattered scripts.
 .venv/bin/python -m market_service.commands.harness SOLUSDT --json
 
+# Ask the running canonical orchestrator for one exact, scoped live run.
+.venv/bin/python -m market_service.commands.harness SOLUSDT --trigger --scope all --json
+
+# Ask one data node for a targeted refresh.
+.venv/bin/python -m market_service.commands.harness SOLUSDT --domain data-access --scope order_book --json
+
+# Read the exact run returned by a prior trigger; this does not depend on the
+# moving latest projection.
+.venv/bin/python -m market_service.commands.harness --run-id <RUN_ID> --json
+
+# The same harness surface from Docker. The image work directory is /app;
+# no host repository mount or Docker socket is used.
+docker compose --profile tools run --rm harness SOLUSDT --trigger --scope all --json
+
 # Verify every canonical runtime module imports cleanly
 .venv/bin/python -m market_service.commands.run_all
 .venv/bin/python -m market_service.commands.run_all --domain calculation

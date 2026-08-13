@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS signal_event (
 CREATE INDEX IF NOT EXISTS signal_event_symbol_observed_at_idx
     ON signal_event (symbol, observed_at DESC);
 
-CREATE VIEW latest_market_state AS
+CREATE OR REPLACE VIEW latest_market_state AS
 SELECT DISTINCT ON (symbol) *
 FROM market_snapshot
 ORDER BY symbol, observed_at DESC;
