@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS signal_event (
 CREATE INDEX IF NOT EXISTS signal_event_symbol_observed_at_idx
     ON signal_event (symbol, observed_at DESC);
 
-CREATE OR REPLACE VIEW latest_market_state AS
+CREATE VIEW latest_market_state AS
 SELECT DISTINCT ON (symbol) *
 FROM market_snapshot
 ORDER BY symbol, observed_at DESC;
@@ -70,3 +70,31 @@ CREATE INDEX IF NOT EXISTS market_run_status_idx
 
 CREATE INDEX IF NOT EXISTS market_run_data_source_idx
     ON market_run (data_source);
+
+-- Durable wall-history seam. Each row is one cycle's wall snapshot;
+-- mirrors the discipline of market_run (postgres-first, exact-run,
+-- schema-versioned). Layer C surfaces this through
+-- PostgresRuntimeStore.record_wall_snapshot / read_last_wall_snapshot.
+CREATE TABLE IF NOT EXISTS wall_snapshot (
+    symbol TEXT NOT NULL,
+    cycle_ts TIMESTAMPTZ NOT NULL,
+    run_id UUID NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    asks JSONB NOT NULL DEFAULT '[]'::jsonb,
+    bids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    fuel_ratio DOUBLE PRECISION NOT NULL,
+    bid_pool DOUBLE PRECISION NOT NULL,
+    ask_pool DOUBLE PRECISION NOT NULL,
+    bid_floor DOUBLE PRECISION NOT NULL,
+    ask_target DOUBLE PRECISION NOT NULL,
+    ask_walls_built INTEGER NOT NULL DEFAULT 0,
+    ask_walls_eroded INTEGER NOT NULL DEFAULT 0,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, cycle_ts)
+);
+
+CREATE INDEX IF NOT EXISTS wall_snapshot_run_id_idx
+    ON wall_snapshot (run_id);
+
+CREATE INDEX IF NOT EXISTS wall_symbol_completed_at_idx
+    ON wall_snapshot (symbol, cycle_ts DESC);

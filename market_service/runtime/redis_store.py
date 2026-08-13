@@ -19,10 +19,23 @@ from .contracts import (
 class RedisRuntimeStore:
     """Small typed adapter; callers never need to know Redis key names."""
 
-    def __init__(self, url: str, prefix: str = "marketflow", stream_maxlen: int = 10_000):
+    def __init__(self, url: str, prefix: str = "marketflow", stream_maxlen: int = 10_000,
+                 postgres_store: Any | None = None,
+                 collated_stream_maxlen: int = 5_000):
         self.redis: Redis = Redis.from_url(url, decode_responses=True)
         self.prefix = prefix.strip(":")
         self.stream_maxlen = stream_maxlen
+        # Doctrine §4 leaves the collated stream "intentionally
+        # unbounded by default so downstream replay and auditing have
+        # the full history". In practice this lets the AOF rewrite
+        # chain grow without bound; the cap here bounds the
+        # in-memory cost while keeping a generous replay window
+        # (5_000 entries ≈ 5 hours at the 30s orchestrator cycle).
+        self.collated_stream_maxlen = collated_stream_maxlen
+        # Layer C: optional PostgresRuntimeStore companion for
+        # durable wall-history reads/writes. When present, the
+        # analysis adapter uses postgres in preference to Redis.
+        self._postgres_store = postgres_store
 
     @staticmethod
     def _prefixed(prefix: str, key: str) -> str:
@@ -58,6 +71,16 @@ class RedisRuntimeStore:
 
     def run_domain_state_key(self, run_id: str, source: str) -> str:
         return f"{self.prefix}:runtime-run:{run_id}:domain:{source.lower()}"
+
+    def wall_history_stream(self, symbol: str) -> str:
+        """Bounded stream of wall_snapshot payloads for one symbol.
+
+        Schema is per-entry:
+          schema_version, cycle_ts, run_id, symbol, payload (JSON)
+        Bounded by ``stream_maxlen`` (configurable per-store). This is
+        the prior-cycle seam for ``adapt_wall_migration``.
+        """
+        return f"{self.prefix}:history:{symbol.upper()}:walls"
 
     @property
     def command_stream(self) -> str:
@@ -128,11 +151,15 @@ class RedisRuntimeStore:
         payload = envelope.to_json()
         dedupe_key = f"{self.prefix}:run:{envelope.run_id}"
         # One Redis-side transaction makes the latest projection, stream entry,
-        # and idempotency marker succeed or fail together.
-        script = """
+        # and idempotency marker succeed or fail together. The XADD
+        # uses MAXLEN ~ to bound the collated stream (telemetry hygiene
+        # spec — prevents the AOF rewrite chain from growing
+        # unbounded while preserving a generous replay window).
+        maxlen = int(self.collated_stream_maxlen)
+        script = f"""
         if redis.call('EXISTS', KEYS[1]) == 1 then return 'duplicate' end
         redis.call('SET', KEYS[2], ARGV[1])
-        local id = redis.call('XADD', KEYS[3], '*',
+        local id = redis.call('XADD', KEYS[3], 'MAXLEN', '~', {maxlen}, '*',
             'event_type', 'market_run', 'run_id', ARGV[2],
             'symbol', ARGV[3], 'schema_version', ARGV[4], 'payload', ARGV[1])
         redis.call('SET', KEYS[1], ARGV[1])
@@ -209,6 +236,56 @@ class RedisRuntimeStore:
             return state if state.run_id == run_id else None
         except (ValueError, json.JSONDecodeError):
             return None
+
+    async def record_wall_snapshot(self, symbol: str, run_id: str,
+                                   payload: dict[str, Any]) -> str:
+        """Append a wall snapshot to the bounded history stream.
+
+        ``payload`` is the wall_migration input set: asks, bids,
+        fuel_ratio, bid_pool, ask_pool, bid_floor, ask_target,
+        ask_walls_built, ask_walls_eroded, cycle_ts. The payload
+        is JSON-encoded into the stream entry so callers can decode
+        the full picture without the run envelope.
+        """
+        stream = self.wall_history_stream(symbol)
+        cycle_ts = payload.get("cycle_ts") or ""
+        body = json.dumps(payload, separators=(",", ":"), default=str)
+        return await self.redis.xadd(
+            stream,
+            {
+                "event_type": "wall_snapshot",
+                "symbol": symbol.upper(),
+                "run_id": run_id,
+                "schema_version": "1",
+                "cycle_ts": cycle_ts,
+                "payload": body,
+            },
+            maxlen=self.stream_maxlen,
+            approximate=True,
+        )
+
+    async def read_last_wall_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        """Read the most recent wall snapshot for ``symbol``.
+
+        Returns None when the stream is empty (legitimate "no history
+        yet" state — not a fabricated zero).
+        """
+        rows = await self.redis.xrevrange(self.wall_history_stream(symbol), count=1)
+        if not rows:
+            return None
+        _entry_id, fields = rows[0]
+        raw = fields.get("payload")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def read_wall_history_count(self, symbol: str) -> int:
+        """Return XLEN of the wall history stream for diagnostics."""
+        return int(await self.redis.xlen(self.wall_history_stream(symbol)))
 
     async def write_runtime_run(self, state: RuntimeRunState) -> None:
         await self.redis.set(

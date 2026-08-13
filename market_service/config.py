@@ -22,6 +22,7 @@ class Settings:
     flow_window_seconds: int
     depth_levels: int
     max_domain_state_age_seconds: int = 90
+    wall_history_maxlen: int = 200
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,6 +38,7 @@ class Settings:
             redis_url=redis_url,
             redis_key_prefix=os.getenv("REDIS_KEY_PREFIX", "marketflow"),
             redis_stream_maxlen=_positive_int("REDIS_STREAM_MAXLEN", 10000),
+            wall_history_maxlen=_positive_int("WALL_HISTORY_MAXLEN", 200),
             symbols=symbols,
             poll_seconds=_positive_int("POLL_SECONDS", 30),
             flow_window_seconds=_positive_int("FLOW_WINDOW_SECONDS", 300),

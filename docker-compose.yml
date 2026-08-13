@@ -3,9 +3,21 @@
 # collector path working unchanged and adds four new domain services that
 # communicate exclusively through Redis streams.
 services:
+  # Telemetry hygiene spec — Option C: a custom redis image that
+  # runs redis-server AND a tiny Python cleaner (PID 2) inside the
+  # same container, sharing /data and a local unix socket. No
+  # socket mount, no sidecar, no shell-out.
   redis:
-    image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    build:
+      context: ./docker-redis
+    image: crypto-ai-anal-redis:latest
+    user: "redis"
+    command: ["/usr/local/bin/redis-entrypoint.sh"]
+    environment:
+      TELEMETRY_HYGIENE_INTERVAL_S: "300"
+      TELEMETRY_HYGIENE_MIN_AGE_S: "3600"
+      REDIS_HYGIENE_URL: "unix:///tmp/redis.sock"
+      TELEMETRY_HYGIENE_DRY_RUN: "false"
     ports:
       - "127.0.0.1:6379:6379"
     volumes:

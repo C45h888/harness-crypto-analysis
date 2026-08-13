@@ -58,6 +58,7 @@ from market_service.analysis.wall_migration import (
 )
 from market_service.config import Settings
 from market_service.runtime.contracts import RefreshCommand
+from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 from . import contracts as C
@@ -176,13 +177,80 @@ def adapt_oi(evidence: dict[str, Any]) -> dict[str, Any]:
             "implied_value": implied, "raw_open_interest": oi_float}
 
 
-def adapt_wall_migration(evidence: dict[str, Any]) -> dict[str, Any]:
+def _bid_floors_from_significant_levels(bid_levels: list[list[float]],
+                                       calc_significant_levels: list[dict] | None,
+                                       price: float) -> list[float]:
+    """Drive ``densest_clusters`` floors from the populated bid side.
+
+    Uses the bid half of the calculations ``significant_levels`` list
+    when available; falls back to a single price-anchor floor when
+    not. This keeps the windows anchored over real dense bid clusters
+    rather than synthetic price-percentile anchors.
+    """
+    floors: list[float] = []
+    if calc_significant_levels:
+        for sl in calc_significant_levels:
+            raw = sl.get("price") if isinstance(sl, dict) else None
+            if raw is None:
+                continue
+            try:
+                p = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if p <= 0:
+                continue
+            floors.append(p)
+            if len(floors) >= 5:
+                break
+    if not floors and price > 0:
+        floors = [price]
+    return floors
+
+
+def _single_cycle_wall_counts(asks: list[list[float]],
+                              direction_threshold: float = 1.15) -> tuple[int, int]:
+    """Best-effort single-cycle BUILT UP / ERODED counts from the live ask ladder.
+
+    Walks the ask list in price order; consecutive steps whose qty grows
+    by >= direction_threshold are BUILT UP, those that shrink by >=
+    1/direction_threshold are ERODED. Used to feed
+    ``wall_trap_assessment`` until Layer B's prior-cycle history is in
+    place.
+    """
+    if not asks:
+        return 0, 0
+    built = 0
+    eroded = 0
+    prev_qty: float | None = None
+    for _, qty in asks:
+        try:
+            q = float(qty)
+        except (TypeError, ValueError):
+            continue
+        if prev_qty is not None and prev_qty > 0:
+            if q >= prev_qty * direction_threshold:
+                built += 1
+            elif q <= prev_qty / direction_threshold:
+                eroded += 1
+        prev_qty = q
+    return built, eroded
+
+
+def adapt_wall_migration(evidence: dict[str, Any],
+                         calc_significant_levels: list[dict] | None = None,
+                         prior_walls: dict[float, float] | None = None,
+                         prior_cycle_ts: str | None = None) -> dict[str, Any]:
     """Build inputs matching the documented signatures of the wall_migration functions.
 
     ``wall_delta(prior_walls, ask_levels, bid_levels, window, direction_threshold)``
     ``fuel_ratio(bids, asks, price, bid_floor, ask_target)``
     ``densest_clusters(bids, floors, window)``
     ``wall_trap_assessment(fuel_ratio_value, ask_walls_built, ask_walls_eroded=0)``
+
+    Layer B passes ``prior_walls`` from the previous cycle's wall
+    snapshot; the trap assessment + densest clusters also use live
+    inputs so wall_migration stops returning structurally-zero
+    values.
     """
     fut_book = _fut_book(evidence)
     bids, asks = _levels(fut_book, 50, function="wall_migration.*")
@@ -190,13 +258,21 @@ def adapt_wall_migration(evidence: dict[str, Any]) -> dict[str, Any]:
     bid_floor = price * 0.97 if price else 0.0
     ask_target = price * 1.03 if price else 0.0
 
-    delta = strict(C, "wall_delta", wall_delta, {}, asks, 0.02, 1.15)
+    delta = strict(C, "wall_delta", wall_delta, prior_walls or {}, asks, 0.02, 1.15)
     fuel = strict(C, "fuel_ratio", wall_fuel_ratio, bids, asks, price, bid_floor, ask_target)
-    clusters = strict(C, "densest_clusters", densest_clusters, bids, [bid_floor, price, ask_target], 0.10)
-    trap = strict(C, "wall_trap_assessment", wall_trap_assessment, 0.0, 0, 0)
+    floors = _bid_floors_from_significant_levels(bids, calc_significant_levels, price)
+    clusters = strict(C, "densest_clusters", densest_clusters, bids, floors, 0.10)
+    built, eroded = _single_cycle_wall_counts(asks)
+    trap = strict(C, "wall_trap_assessment", wall_trap_assessment,
+                  float(fuel.get("ratio") or 0.0), built, eroded)
 
     return {"wall_delta": delta, "fuel_ratio": fuel, "densest_clusters": clusters,
-            "trap_assessment": trap}
+            "trap_assessment": trap,
+            "prior_cycle_ts": prior_cycle_ts,
+            "prior_wall_count": len(prior_walls or {}),
+            "inputs_used": {"floors_count": len(floors), "ask_walls_built": built,
+                            "ask_walls_eroded": eroded,
+                            "fuel_ratio_value": float(fuel.get("ratio") or 0.0)}}
 
 
 def adapt_path_absorption(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -391,16 +467,94 @@ async def make_handler(settings: Settings, redis: RedisRuntimeStore):
                 "reason": f"{name} inputs not requested in scope '{requested_scope}'",
             }
 
+        orderbook_calc = calculations.get("orderbook") or {}
+        bid_significant_levels = orderbook_calc.get("fut_significant_levels") or []
+
+        # Layer C seam: prefer durable postgres-backed wall history
+        # over the redis stream so we survive Redis restarts. Falls
+        # back to the Redis stream for environments without
+        # PostgresRuntimeStore available (test fixtures etc.).
+        prior_snapshot = None
+        prior_pg = None
+        if hasattr(redis, "_postgres_store") and redis._postgres_store is not None:  # type: ignore[attr-defined]
+            try:
+                prior_pg = await redis._postgres_store.read_last_wall_snapshot(symbol)  # type: ignore[attr-defined]
+                if prior_pg:
+                    prior_snapshot = prior_pg
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[analysis] postgres wall snapshot read failed: %s", exc)
+        if prior_snapshot is None:
+            prior_snapshot = await redis.read_last_wall_snapshot(symbol)
+        prior_walls: dict[float, float] = {}
+        prior_cycle_ts: str | None = None
+        if prior_snapshot and isinstance(prior_snapshot.get("asks"), list):
+            prior_cycle_ts = prior_snapshot.get("cycle_ts")
+            for row in prior_snapshot["asks"]:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                try:
+                    prior_walls[float(row[0])] = float(row[1])
+                except (TypeError, ValueError):
+                    continue
+
         order_book_scope = requested_scope in ("all", "order_book")
         full_scope = requested_scope == "all"
         auction = _run_section("auction", lambda: adapt_auction(evidence), errors) if order_book_scope else unavailable("auction")
         oi = _run_section("open_interest", lambda: adapt_oi(evidence), errors) if full_scope else unavailable("open_interest")
-        walls = _run_section("wall_migration", lambda: adapt_wall_migration(evidence), errors) if order_book_scope else unavailable("wall_migration")
+        walls = _run_section("wall_migration",
+                             lambda: adapt_wall_migration(evidence, bid_significant_levels,
+                                                          prior_walls=prior_walls,
+                                                          prior_cycle_ts=prior_cycle_ts),
+                             errors) if order_book_scope else unavailable("wall_migration")
         path = _run_section("path_absorption", lambda: adapt_path_absorption(evidence), errors) if order_book_scope else unavailable("path_absorption")
         demand = _run_section("demand", lambda: adapt_demand(evidence), errors) if full_scope else unavailable("demand")
         regime = _run_section("regime", lambda: adapt_regime(evidence, calculations), errors) if full_scope else unavailable("regime")
         stage = _run_section("stage", lambda: adapt_stage(evidence), errors) if full_scope else unavailable("stage")
         macro = _run_section("macro", lambda: adapt_macro(evidence), errors) if full_scope else unavailable("macro")
+
+        # Layer B + C write: persist the current cycle's wall snapshot. C
+        # (postgres) is attempted FIRST so the durable record exists
+        # before any redis publication, mirroring doctrine §5
+        # (postgres-before-redis ordering). Errors are tolerated —
+        # analysis publication must not fail because of history
+        # logging.
+        if (order_book_scope and run_id and isinstance(walls, dict)
+                and walls.get("status") not in ("degraded", "invalid")
+                and isinstance(walls.get("fuel_ratio"), dict)
+                and isinstance(walls.get("trap_assessment"), dict)):
+            try:
+                fut_book_now = _fut_book(evidence)
+                _bids_now, asks_now = _levels(fut_book_now, 50, function="wall_migration.record")
+                cycle_ts = (
+                    data_latest.observed_at if data_latest and getattr(data_latest, "observed_at", None)
+                    else None
+                ) or calc_latest.observed_at or ""
+                fr = walls["fuel_ratio"]  # type: ignore[assignment]
+                tr = walls["trap_assessment"]  # type: ignore[assignment]
+                payload = {
+                    "schema_version": 1,
+                    "cycle_ts": cycle_ts,
+                    "run_id": run_id,
+                    "asks": [[float(p), float(q)] for p, q in asks_now],
+                    "bids": [[float(p), float(q)] for p, q in _bids_now],
+                    "fuel_ratio": float(fr.get("ratio") or 0.0),
+                    "bid_pool": float(fr.get("bid_pool") or 0.0),
+                    "ask_pool": float(fr.get("ask_pool") or 0.0),
+                    "bid_floor": float(fr.get("bid_floor") or 0.0),
+                    "ask_target": float(fr.get("ask_target") or 0.0),
+                    "ask_walls_built": int(tr.get("ask_walls_built") or 0),
+                    "ask_walls_eroded": int(tr.get("ask_walls_eroded") or 0),
+                }
+                # Layer C: postgres first.
+                if hasattr(redis, "_postgres_store") and redis._postgres_store is not None:  # type: ignore[attr-defined]
+                    try:
+                        await redis._postgres_store.record_wall_snapshot(symbol, run_id, payload)  # type: ignore[attr-defined]
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("[analysis] postgres wall snapshot record failed: %s", exc)
+                # Layer B: redis next.
+                await redis.record_wall_snapshot(symbol, run_id, payload)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[analysis] wall snapshot record failed: %s", exc)
 
         status = calc_latest.status
         if errors:
@@ -434,7 +588,11 @@ async def make_handler(settings: Settings, redis: RedisRuntimeStore):
 async def main() -> int:
     setup_logging()
     settings = Settings.from_env()
-    redis = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+    postgres = PostgresRuntimeStore(settings.database_url)
+    await postgres.connect()
+    redis = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix,
+                              settings.redis_stream_maxlen,
+                              postgres_store=postgres)
     stop = asyncio.Event()
     install_signal_handlers(stop)
     try:
@@ -452,6 +610,7 @@ async def main() -> int:
         )
     finally:
         await redis.close()
+        await postgres.close()
     return 0
 
 

@@ -11,10 +11,12 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY market_service ./market_service
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
 
 # The canonical client modules may arrive from a source checkout with private
 # mode bits. The runtime user must be able to import the complete package.
-RUN chmod -R a+rX /app/market_service
+RUN chmod -R a+rX /app/market_service /app/alembic /app/alembic.ini
 
 USER marketflow
 

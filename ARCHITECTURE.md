@@ -6,6 +6,9 @@ The implementation contract for the next containerization task is
 [`docs/CONTAINERIZATION_CONTRACT.md`](docs/CONTAINERIZATION_CONTRACT.md).
 The Docker acceptance procedure is defined in
 [`docs/DOCKER_RUNTIME_VERIFICATION_DOCTRINE.md`](docs/DOCKER_RUNTIME_VERIFICATION_DOCTRINE.md).
+The NOOA integration boundary is defined in
+[`docs/NOOA_HARNESS_ARCHITECTURE.md`](docs/NOOA_HARNESS_ARCHITECTURE.md), with
+the isolated package boundary in `market_service/nooa_harness/`.
 This document describes the current Phase 1 implementation beneath that
 doctrine.
 
