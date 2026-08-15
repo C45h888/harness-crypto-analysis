@@ -9,7 +9,7 @@ from typing import Any
 
 import asyncpg
 
-from .contracts import MarketRunEnvelope
+from .contracts import AnalystBriefing, MarketRunEnvelope
 
 
 class PostgresRuntimeStore:
@@ -74,6 +74,96 @@ class PostgresRuntimeStore:
         if raw is None:
             return None
         return MarketRunEnvelope.from_mapping(json.loads(raw) if isinstance(raw, str) else raw)
+
+    async def insert_analyst_briefing(self, briefing: AnalystBriefing) -> bool:
+        """Durable, idempotent write of one ``AnalystBriefing``.
+
+        Primary key is ``(session_id, run_id)``: a re-run of the same
+        session over the same canonical run_id updates the row instead of
+        producing a duplicate. The briefing always carries the run_id of
+        the canonical envelope it was produced from, so the durable record
+        is linked back to ``market_run`` by ``run_id`` even though there is
+        no FK (the agent layer must not be able to corrupt canonical state
+        by deleting a briefing).
+        """
+        briefing.validate()
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        try:
+            generated_at = datetime.fromisoformat(
+                briefing.generated_at.replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            generated_at = datetime.now()
+        row = await self.pool.fetchrow(
+            """INSERT INTO analyst_briefing
+               (session_id, run_id, schema_version, model_provider, model_name,
+                generated_at, briefing, parse_errors, envelope_summary)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+               ON CONFLICT (session_id, run_id) DO UPDATE
+               SET schema_version = EXCLUDED.schema_version,
+                   model_provider = EXCLUDED.model_provider,
+                   model_name = EXCLUDED.model_name,
+                   generated_at = EXCLUDED.generated_at,
+                   briefing = EXCLUDED.briefing,
+                   parse_errors = EXCLUDED.parse_errors,
+                   envelope_summary = EXCLUDED.envelope_summary
+               RETURNING session_id, run_id""",
+            uuid.UUID(briefing.session_id),
+            uuid.UUID(briefing.run_id),
+            briefing.schema_version,
+            briefing.model_provider,
+            briefing.model_name,
+            generated_at,
+            json.dumps(briefing.to_dict(), default=str),
+            json.dumps(list(briefing.parse_errors), default=str),
+            json.dumps(briefing.envelope_summary, default=str),
+        )
+        return row is not None
+
+    async def read_analyst_briefing(
+        self, session_id: str, run_id: str
+    ) -> AnalystBriefing | None:
+        """Read one durable briefing by its (session_id, run_id) key."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        raw = await self.pool.fetchval(
+            "SELECT briefing FROM analyst_briefing "
+            "WHERE session_id = $1 AND run_id = $2",
+            uuid.UUID(session_id), uuid.UUID(run_id),
+        )
+        if raw is None:
+            return None
+        return AnalystBriefing.from_mapping(
+            json.loads(raw) if isinstance(raw, str) else raw
+        )
+
+    async def read_briefings_for_run(
+        self, run_id: str, limit: int = 32,
+    ) -> list[AnalystBriefing]:
+        """All briefings produced for one canonical run_id (any session)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            "SELECT briefing FROM analyst_briefing "
+            "WHERE run_id = $1 ORDER BY generated_at DESC LIMIT $2",
+            uuid.UUID(run_id), limit,
+        )
+        out: list[AnalystBriefing] = []
+        for row in rows:
+            raw = row["briefing"]
+            if raw is None:
+                continue
+            try:
+                out.append(AnalystBriefing.from_mapping(
+                    json.loads(raw) if isinstance(raw, str) else raw
+                ))
+            except (ValueError, json.JSONDecodeError):
+                continue
+        return out
 
     async def latest_run(self, symbol: str) -> MarketRunEnvelope | None:
         if self.pool is None:

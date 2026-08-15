@@ -98,3 +98,30 @@ CREATE INDEX IF NOT EXISTS wall_snapshot_run_id_idx
 
 CREATE INDEX IF NOT EXISTS wall_symbol_completed_at_idx
     ON wall_snapshot (symbol, cycle_ts DESC);
+
+-- Durable record for validated AnalystBriefing artifacts produced by the
+-- NOOA analyst suite. Primary key is (session_id, run_id) so the same
+-- analyst session over the same canonical envelope updates in place;
+-- the run_id field links the briefing back to the immutable market_run
+-- envelope it was produced from. Mirrors the discipline of market_run:
+-- schema-versioned, postgres-first, no FK to market_run (the agent layer
+-- must not be able to corrupt canonical state by deleting a briefing).
+CREATE TABLE IF NOT EXISTS analyst_briefing (
+    session_id UUID NOT NULL,
+    run_id UUID NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    model_provider TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    briefing JSONB NOT NULL,
+    parse_errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    envelope_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (session_id, run_id)
+);
+
+CREATE INDEX IF NOT EXISTS analyst_briefing_run_id_idx
+    ON analyst_briefing (run_id);
+
+CREATE INDEX IF NOT EXISTS analyst_briefing_generated_at_idx
+    ON analyst_briefing (generated_at DESC);

@@ -1,7 +1,7 @@
 # NOOA Harness Boundary
 
-This directory is the future integration boundary for NVIDIA NOOA. It is not
-the market runtime and it is not an execution engine.
+This directory is the NOOA analyst boundary. It is not the market runtime and
+it is not an execution engine.
 
 The canonical runtime remains authoritative for:
 
@@ -13,34 +13,45 @@ The canonical runtime remains authoritative for:
 - Redis canonical state;
 - run identity and replayability.
 
-The NOOA harness will be responsible for reasoning over that state. It may
-inspect complete market envelopes, compare runs, request approved refreshes,
+The NOOA harness is responsible for reasoning over that state. It receives a
+complete canonical envelope from `market_service/commands/harness.py` and may
 form hypotheses, explain uncertainty, and prepare a human-review briefing.
 
-## Intended package shape
+## Package shape
 
 ```text
 market_service/nooa_harness/
 ├── __init__.py
-├── state.py          # typed views of canonical Redis state
-├── capabilities.py   # narrow typed bindings to approved runtime actions
-├── analyst.py        # future NOOA Agent class
-├── prompts.py        # reasoning doctrine and response structure
-├── backends.py       # OpenAI-compatible, Ollama, vLLM configuration
-└── tracing.py        # agent/session/run observability
+├── agents.py         # controller and specialist NOOA Agent classes
+├── suite.py          # one controller plus specialist composition
+├── runner.py         # long-running loop mounted by harness.py
+└── backends.py       # OpenAI-compatible, Ollama, vLLM configuration
 ```
 
-The package starts as a contract boundary. NOOA should be added only after the
-state types and tests are stable.
+Start the long-running suite through the existing harness mount point:
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT \
+  --analyst-loop --interval 60
+
+# Docker uses the same harness mount point and keeps the process running:
+docker compose --profile tools run --rm harness SOLUSDT \
+  --analyst-loop --interval 60
+```
+
+Set `NOOA_MODEL_PROVIDER`, `NOOA_MODEL_NAME`, and any provider credentials
+before starting it. `--cycles N` can be used for a bounded development run;
+the default `--cycles 0` runs until interrupted.
 
 ## Direct Redis principle
 
-The future agent may read the local Redis canonical state directly through a
-read-scoped Redis client. This is intentionally not a second orchestration
-plane. Typed classes describe the state; they do not force the model through a
-rigid chain of reasoning.
+The agent suite receives the complete state through the existing harness
+mount. This avoids another Redis translation layer and does not force the
+model through a rigid chain of reasoning. The canonical runtime remains the
+source of truth for data freshness, calculations, and persistence.
 
-The agent must read complete run envelopes when possible:
+The complete run envelope remains the unit of analysis and is retained with:
 
 ```text
 marketflow:run:<RUN_ID>

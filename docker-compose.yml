@@ -83,6 +83,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      WALL_HISTORY_MAXLEN: ${WALL_HISTORY_MAXLEN:-200}
       SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
       POLL_SECONDS: ${POLL_SECONDS:-30}
       FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
@@ -271,24 +272,31 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
-  # Read-only harness client. This is intentionally a one-shot tool rather
-  # than another autonomous worker. It submits typed requests to the
-  # orchestrator and reads the exact run envelope back from Redis.
+  # Harness client and optional long-running NOOA analyst runner. The
+  # analyst loop is still mounted through the canonical harness command; it
+  # does not create a second data-access or orchestration service.
   # The image contains the package at /app; no host bind mount and no Docker
   # socket are required.
   harness:
     build: .
     user: "marketflow"
     entrypoint: ["python", "-m", "market_service.commands.harness"]
-    env_file:
-      - path: .env
-        required: false
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
+      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
+      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
+      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
+      NOOA_API_KEY: ${NOOA_API_KEY:-}
+      # Legacy fallback aliases (deprecated; canonical is NOOA_* above).
+      PROVIDER: ${PROVIDER:-}
+      PROVIDER_API_KEY: ${PROVIDER_API_KEY:-}
+      PROVIDER_BASE_URL: ${PROVIDER_BASE_URL:-}
+      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
     depends_on:
       redis:
         condition: service_healthy

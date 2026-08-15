@@ -11,8 +11,8 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from .contracts import (
-    HarnessRunRequest, MarketEvent, MarketRunEnvelope, MarketStateEnvelope,
-    RefreshCommand, RuntimeRunState,
+    AnalystBriefing, HarnessRunRequest, MarketEvent, MarketRunEnvelope,
+    MarketStateEnvelope, RefreshCommand, RuntimeRunState,
 )
 
 
@@ -68,6 +68,9 @@ class RedisRuntimeStore:
 
     def run_state_key(self, run_id: str) -> str:
         return f"{self.prefix}:runtime-run:{run_id}"
+
+    def agent_stream(self, session_id: str, artifact_type: str) -> str:
+        return f"{self.prefix}:agent:{session_id}:{artifact_type}"
 
     def run_domain_state_key(self, run_id: str, source: str) -> str:
         return f"{self.prefix}:runtime-run:{run_id}:domain:{source.lower()}"
@@ -185,6 +188,59 @@ class RedisRuntimeStore:
 
     async def has_run(self, run_id: str) -> bool:
         return bool(await self.redis.exists(f"{self.prefix}:run:{run_id}"))
+
+    async def publish_agent_artifact(
+        self, session_id: str, artifact_type: str, payload: str,
+        *, run_id: str | None = None,
+    ) -> str:
+        """Publish advisory output into the agent-owned namespace only."""
+        if artifact_type not in {"observations", "hypotheses", "briefings"}:
+            raise ValueError(f"unsupported agent artifact type: {artifact_type}")
+        fields = {
+            "schema_version": "1",
+            "session_id": session_id,
+            "artifact_type": artifact_type,
+            "payload": payload,
+        }
+        if run_id is not None:
+            fields["run_id"] = run_id
+        return await self.redis.xadd(
+            self.agent_stream(session_id, artifact_type),
+            fields,
+            maxlen=self.stream_maxlen,
+            approximate=True,
+        )
+
+    async def publish_briefing(self, briefing: AnalystBriefing) -> str:
+        """Publish one validated ``AnalystBriefing`` to the agent namespace.
+
+        The stream entry carries the briefing's ``run_id`` as a top-level
+        field so downstream consumers can correlate advisory output with
+        the canonical envelope without parsing the payload. The full
+        briefing is JSON-encoded as the payload.
+        """
+        briefing.validate()
+        return await self.publish_agent_artifact(
+            briefing.session_id, "briefings", briefing.to_json(), run_id=briefing.run_id,
+        )
+
+    async def read_recent_briefings(
+        self, session_id: str, count: int = 16,
+    ) -> list[AnalystBriefing]:
+        """Read the most recent briefings for one session (highest first)."""
+        rows = await self.redis.xrevrange(
+            self.agent_stream(session_id, "briefings"), count=count
+        )
+        out: list[AnalystBriefing] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                out.append(AnalystBriefing.from_mapping(json.loads(raw)))
+            except (ValueError, json.JSONDecodeError):
+                continue
+        return out
 
     async def publish_domain_state(self, state: MarketStateEnvelope) -> str:
         """Publish a domain service envelope to its latest projection + stream."""

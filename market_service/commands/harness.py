@@ -132,8 +132,48 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--latest", action="store_true", help="read the latest persisted collated envelope")
     p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
+    p.add_argument("--analyst-loop", action="store_true",
+                   help="read canonical state and run the NOOA analyst suite")
+    p.add_argument("--interval", type=float, default=60.0,
+                   help="seconds between NOOA analyst cycles")
+    p.add_argument("--cycles", type=int, default=0,
+                   help="number of NOOA analyst cycles; 0 means run forever")
+    p.add_argument("--session-id", default=None,
+                   help="stable UUID analyst session id; default env NOOA_SESSION_ID or generated UUID")
+    p.add_argument("--briefing", action="store_true",
+                   help="read one persisted NOOA briefing by session and canonical run ID")
     args = p.parse_args(argv)
 
+    if args.briefing:
+        if args.analyst_loop or not args.session_id or not args.run_id:
+            print(json.dumps({
+                "error": "--briefing requires --session-id and --run-id and cannot combine with --analyst-loop"
+            }))
+            return 2
+        settings = Settings.from_env()
+        from market_service.nooa_harness.runner import read_briefing
+        briefing = asyncio.run(read_briefing(settings, args.session_id, args.run_id))
+        result = briefing.to_dict() if briefing else None
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if args.analyst_loop:
+        from market_service.nooa_harness.runner import run_analyst_loop
+        # The analyst path is read-only. --run-id takes precedence for one
+        # exact analysis; --latest polls persisted canonical state. Canonical
+        # refresh remains available only through the explicit --trigger path.
+        if args.run_id and args.latest:
+            print(json.dumps({"error": "--run-id and --latest are mutually exclusive"}))
+            return 2
+        asyncio.run(run_analyst_loop(
+            args.symbol,
+            interval_s=args.interval,
+            timeout_s=args.timeout,
+            cycles=args.cycles,
+            run_id=args.run_id,
+            use_latest=args.latest,
+            session_id=args.session_id,
+        ))
+        return 0
     if args.domain:
         result = asyncio.run(trigger_domain(args.symbol, args.domain, args.scope, args.timeout))
     elif args.trigger:

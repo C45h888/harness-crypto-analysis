@@ -3,3 +3,7 @@ asyncpg==0.30.0
 redis[hiredis]==6.4.0
 alembic==1.13.3
 psycopg2-binary==2.9.12
+# NOOA base runtime and CLI. The analyst suite is mounted through harness.py;
+# canonical collection, calculation, persistence, and execution stay outside it.
+nooa @ git+https://github.com/NVIDIA-NeMo/labs-OO-Agents.git@v0.0.6
+nooa-cli @ git+https://github.com/NVIDIA-NeMo/labs-OO-Agents.git@v0.0.6#subdirectory=packages/nooa-cli
