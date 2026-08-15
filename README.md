@@ -28,38 +28,71 @@ exploratory scripts have been fully migrated into it (`market_service/manifest.p
 
 ## Entrypoints
 
+## Runtime paths
+
+Docker Compose is the canonical runtime. The root `.env` is loaded by Compose;
+`.env.example` is only a template and is never used directly at runtime.
+
+For local Python-only development, use Python 3.12 through `uv`; the host
+macOS Python 3.9 is unsupported:
+
 ```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --json
+```
+
+The following Docker command is the canonical analyst entrypoint:
+
+```bash
+docker compose --profile tools run --rm harness SOLUSDT \
+  --analyst-loop --latest --cycles 1
+```
+
+The harness reads an existing immutable canonical envelope. It does not start
+another market cycle. Canonical refresh remains an explicit harness command
+using `--trigger`, outside the analyst path.
+
+```bash
+# Start the canonical runtime
+docker compose up -d
+
 # Live harness snapshot (JSON contract with raw evidence + derived metrics)
-.venv/bin/python -m market_service.commands.snapshot SOLUSDT --json
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.snapshot SOLUSDT --json
 
 # Same data, pretty text
-.venv/bin/python -m market_service.analysis.market SOLUSDT
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.analysis.market SOLUSDT
 
 # CLEAN AGGREGATED MARKET DATA for the model — the single harness surface.
 # All clean data for a symbol in one contract (core snapshot + signals + OI +
 # liquidation + macro). The model reads THIS, not scattered scripts.
-.venv/bin/python -m market_service.commands.harness SOLUSDT --json
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --json
 
 # Ask the running canonical orchestrator for one exact, scoped live run.
-.venv/bin/python -m market_service.commands.harness SOLUSDT --trigger --scope all --json
+docker compose --profile tools run --rm harness SOLUSDT --trigger --scope all --json
 
 # Ask one data node for a targeted refresh.
-.venv/bin/python -m market_service.commands.harness SOLUSDT --domain data-access --scope order_book --json
+docker compose --profile tools run --rm harness SOLUSDT --domain data-access --scope order_book --json
 
 # Read the exact run returned by a prior trigger; this does not depend on the
 # moving latest projection.
-.venv/bin/python -m market_service.commands.harness --run-id <RUN_ID> --json
+docker compose --profile tools run --rm harness --run-id <RUN_ID> --json
 
 # The same harness surface from Docker. The image work directory is /app;
 # no host repository mount or Docker socket is used.
 docker compose --profile tools run --rm harness SOLUSDT --trigger --scope all --json
 
 # Verify every canonical runtime module imports cleanly
-.venv/bin/python -m market_service.commands.run_all
-.venv/bin/python -m market_service.commands.run_all --domain calculation
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.run_all
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.run_all --domain calculation
 
 # Persistent collector (needs DATABASE_URL; see docker-compose.yml)
-.venv/bin/python -m market_service.collector
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.collector
 ```
 
 ## Shared-domain map (container-split prep)
@@ -98,7 +131,7 @@ zero. Use `--trades N` / `--depth N` to cap raw payload size.
 - **CoinGecko** public — global/market-cap/dominance overlay
 - **CryptoQuant** via MCP bridge — on-chain metric descriptions (basic plan:
   numerics locked, descriptions/interpretations still flow)
-- **Python 3.12**, `.venv/`, deps in `requirements.txt`
+- **Python 3.12**, deps in `requirements.txt` (run via `uv run` or Docker)
 - **PostgreSQL** via Docker for the persistent collector
 - **Redis 7** via Docker for latest state, telemetry streams, and bounded refresh commands
 
@@ -135,7 +168,7 @@ remains the durable ledger.
 The one-shot canonical collation seam is:
 
 ```bash
-.venv/bin/python -m market_service.commands.collate SOLUSDT --json
+docker compose --profile tools run --rm collator SOLUSDT --json
 ```
 
 It writes one immutable `market_run` envelope to PostgreSQL first, then writes
@@ -145,7 +178,8 @@ same SOLUSDT path once for live validation. The collated stream is intentionally
 untrimmed; apply retention manually when required.
 
 ```bash
-.venv/bin/python -m market_service.commands.health
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.health
 ```
 
 ```bash
@@ -156,7 +190,8 @@ docker compose exec postgres psql -U marketflow -d marketflow \
 ## Testing
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -q
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m unittest discover -s tests -q
 ```
 
 ## Docs
