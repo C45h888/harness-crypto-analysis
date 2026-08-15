@@ -287,7 +287,7 @@ services:
     environment:
       # Compose-constructed URLs override whatever .env carries for these
       # so the container talks to the right host inside the Docker network.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
