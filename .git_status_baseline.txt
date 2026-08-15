@@ -1,0 +1,24 @@
+ M .env.example
+ M .gitignore
+ M db/init/001_schema.sql
+ M docker-compose.yml
+ M market_service/commands/harness.py
+ M market_service/nooa_harness/README.md
+ M market_service/nooa_harness/__init__.py
+ M market_service/runtime/contracts.py
+ M market_service/runtime/postgres_store.py
+ M market_service/runtime/redis_store.py
+ D path_absorption_log.json
+ M requirements.txt
+?? .python-version
+?? alembic/versions/0003_analyst_briefing.py
+?? docs/NOOA_KNOWLEDGE_BASE_DESIGN.md
+?? docs/nooa-kb/
+?? docs/superpowers/
+?? market_service/nooa_harness/agents.py
+?? market_service/nooa_harness/backends.py
+?? market_service/nooa_harness/runner.py
+?? market_service/nooa_harness/suite.py
+?? tests/_nooa_fixtures.py
+?? tests/test_nooa_contracts.py
+?? tests/test_nooa_harness.py
