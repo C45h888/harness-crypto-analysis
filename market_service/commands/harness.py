@@ -12,7 +12,7 @@ scripts were fully migrated into `market_service` and deleted.)
 Usage:
     .venv/bin/python -m market_service.commands.harness SOLUSDT --json
     .venv/bin/python -m market_service.commands.harness SOLUSDT
-    .venv/bin/python -m market_service.commands.harness \
+    .venv/bin/python -m market_service.commands.harness \\
         --nooa market envelope SOLUSDT --latest
 
 The NOOA CLI is mounted at the canonical harness mount point: the repo-root
@@ -35,13 +35,14 @@ import uuid
 
 from market_service.analysis.market import analyze, render
 from market_service.config import Settings
+from market_service.nooa_harness.pipeline import WINDOW_MINUTES_MAP
 from market_service.runtime.contracts import HarnessRunRequest, RefreshCommand, RuntimeRunState
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 
-async def build(symbol: str, trades: int, depth: int, window: int) -> dict:
+async def build(symbol: str, trades: int, depth: int, bucket_window_s: int) -> dict:
     started = int(time.time() * 1000)
-    core = await analyze(symbol, trade_limit=trades, depth_limit=depth, bucket_window_s=window)
+    core = await analyze(symbol, trade_limit=trades, depth_limit=depth, bucket_window_s=bucket_window_s)
     return {
         "contract": {
             "name": "crypto-ai-market-harness",
@@ -50,7 +51,7 @@ async def build(symbol: str, trades: int, depth: int, window: int) -> dict:
             "clean_sources": ["market_service.clients", "market_service.calculations", "market_service.analysis"],
         },
         "symbol": symbol,
-        "requested": {"trade_limit": trades, "depth_limit": depth, "bucket_window_s": window},
+        "requested": {"trade_limit": trades, "depth_limit": depth, "bucket_window_s": bucket_window_s},
         "generated_at_ms": started,
         "core": core,
         "status": core.get("status", "degraded"),
@@ -106,8 +107,6 @@ async def trigger_full_cycle(symbol: str, timeout_s: float, scope: str = "all") 
         deadline = time.monotonic() + timeout_s
         state = None
         while time.monotonic() < deadline:
-            # The orchestrator's runtime key is the authoritative completion
-            # record. The request ID is carried through as the run ID.
             state = await redis.read_runtime_run(request_id)
             if state and state.get("phase") in ("PUBLISHED", "FAILED", "INVALID", "DEGRADED"):
                 break
@@ -129,7 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol", nargs="?", default="SOLUSDT")
     p.add_argument("--trades", type=int, default=500)
     p.add_argument("--depth", type=int, default=50)
-    p.add_argument("--window", type=int, default=60)
+    p.add_argument("--bucket-window", type=int, default=60,
+                   help="legacy bucket window in seconds for build() path")
     p.add_argument("--json", action="store_true", help="emit the full JSON contract")
     p.add_argument("--trigger", action="store_true", help="request one autonomous orchestrator cycle")
     p.add_argument("--domain", choices=("data-access", "calculations", "analysis"),
@@ -145,6 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds between NOOA analyst cycles")
     p.add_argument("--cycles", type=int, default=0,
                    help="number of NOOA analyst cycles; 0 means run forever")
+    p.add_argument("--window", choices=("15m", "1h", "4h"), default="15m",
+                   help="raw evidence lookback window for --analyst-loop (default: 15m)")
     p.add_argument("--with-memory", action="store_true",
                    help="NOOA analyst loop: recall prior session memory before each "
                         "cycle and remember each cycle's outputs (durable ledger + "
@@ -165,11 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.nooa is not None:
-        # NOOA CLI mounted at the canonical harness mount point: forward the
-        # remaining argv verbatim to the repo-root-mounted CLI (import-time
-        # mount, no writes into the installed nooa-cli package).
         from market_service.commands.nooa_cli import main as nooa_main
-
         passthrough = list(args.nooa)
         if passthrough and passthrough[0] == "--":
             passthrough = passthrough[1:]
@@ -189,12 +187,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.analyst_loop:
         from market_service.nooa_harness.runner import run_analyst_loop
-        # The analyst path is read-only. --run-id takes precedence for one
-        # exact analysis; --latest polls persisted canonical state. Canonical
-        # refresh remains available only through the explicit --trigger path.
         if args.run_id and args.latest:
             print(json.dumps({"error": "--run-id and --latest are mutually exclusive"}))
             return 2
+        window_minutes = WINDOW_MINUTES_MAP.get(args.window, 15)
         asyncio.run(run_analyst_loop(
             args.symbol,
             interval_s=args.interval,
@@ -204,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             use_latest=args.latest,
             session_id=args.session_id,
             with_memory=args.with_memory,
+            window_minutes=window_minutes,
         ))
         return 0
     if args.domain:
@@ -221,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 await store.close()
         result = asyncio.run(_read())
     else:
-        result = asyncio.run(build(args.symbol, args.trades, args.depth, args.window))
+        result = asyncio.run(build(args.symbol, args.trades, args.depth, args.bucket_window))
     if args.json:
         print(json.dumps(result, indent=2, default=str))
     elif args.domain or args.trigger or args.latest or args.run_id:

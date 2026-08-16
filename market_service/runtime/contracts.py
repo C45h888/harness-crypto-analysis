@@ -14,8 +14,8 @@ from typing import Any, Literal
 
 MARKET_STATE_SCHEMA_VERSION = 1
 MARKET_RUN_SCHEMA_VERSION = 1
-ANALYST_BRIEFING_SCHEMA_VERSION = 1
-SPECIALIST_REPORT_SCHEMA_VERSION = 1
+ANALYST_BRIEFING_SCHEMA_VERSION = 2
+SPECIALIST_REPORT_SCHEMA_VERSION = 2
 AGENT_MEMORY_SCHEMA_VERSION = 1
 # Agent-artifact kinds the memory node can persist. Mirrors the agent-owned
 # write surfaces from NOOA_HARNESS_ARCHITECTURE.md: observations, hypotheses,
@@ -31,6 +31,230 @@ RuntimePhase = Literal[
 ConfidenceLevel = Literal["low", "medium", "high"]
 AnalystStatus = Literal["healthy", "degraded", "failed"]
 ValidConfidence: tuple[str, ...] = ("low", "medium", "high")
+
+# ---------------------------------------------------------------------------
+# Typed sub-contracts for analyst-layer evidence, consensus, and disagreements.
+#
+# These are frozen dataclasses with to_dict / from_mapping round-trips so they
+# compose cleanly inside SpecialistReport and AnalystBriefing. The LLM-produced
+# JSON is still parsed through the existing from_llm_text / from_controller_text
+# boundaries; these types tighten what the parser validates and what downstream
+# consumers (Hermes, memory node) can rely on.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EvidenceEntry:
+    """One piece of evidence cited by a specialist or controller.
+
+    Required fields are ``path`` and ``interpretation`` — the envelope path
+    the claim is sourced from and what the analyst concluded from it. ``value``
+    is the raw value at that path (may be any JSON type). ``metric_name`` is an
+    optional human-readable label for the metric (e.g. ``funding_rate``).
+    """
+
+    path: str
+    interpretation: str
+    value: Any | None = None
+    metric_name: str | None = None
+
+    def validate(self) -> None:
+        if not self.path or not self.path.strip():
+            raise ValueError("EvidenceEntry requires a non-empty path")
+        if not self.interpretation or not self.interpretation.strip():
+            raise ValueError("EvidenceEntry requires a non-empty interpretation")
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "path": self.path,
+            "interpretation": self.interpretation,
+        }
+        if self.value is not None:
+            out["value"] = self.value
+        if self.metric_name is not None:
+            out["metric_name"] = self.metric_name
+        return out
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "EvidenceEntry":
+        entry = cls(
+            path=str(value.get("path", "")),
+            interpretation=str(value.get("interpretation", "")),
+            value=value.get("value"),
+            metric_name=(
+                str(value["metric_name"])
+                if value.get("metric_name") is not None else None
+            ),
+        )
+        entry.validate()
+        return entry
+
+
+@dataclass(frozen=True)
+class Consensus:
+    """Structured consensus from the controller.
+
+    ``direction`` and ``confidence`` are the categorical baseline (same as v1).
+    ``confidence_score`` is a numeric 0.0-1.0 the LLM produces directly —
+    richer signal for downstream adaptive reasoning. ``timeframe`` is the
+    implied horizon (e.g. ``intraday``, ``session``, ``swing``). ``magnitude``
+    is the expected move intensity (e.g. ``marginal``, ``moderate``, ``strong``).
+    """
+
+    direction: str
+    confidence: ConfidenceLevel
+    confidence_score: float | None = None
+    timeframe: str | None = None
+    magnitude: str | None = None
+
+    def validate(self) -> None:
+        if self.confidence not in ValidConfidence:
+            raise ValueError(f"invalid confidence: {self.confidence!r}")
+        if self.confidence_score is not None and not 0.0 <= self.confidence_score <= 1.0:
+            raise ValueError(
+                f"confidence_score must be in [0.0, 1.0], got {self.confidence_score!r}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "direction": self.direction,
+            "confidence": self.confidence,
+        }
+        if self.confidence_score is not None:
+            out["confidence_score"] = self.confidence_score
+        if self.timeframe is not None:
+            out["timeframe"] = self.timeframe
+        if self.magnitude is not None:
+            out["magnitude"] = self.magnitude
+        return out
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "Consensus":
+        confidence = str(value.get("confidence", "low"))
+        if confidence not in ValidConfidence:
+            confidence = "low"
+        score = value.get("confidence_score")
+        try:
+            score = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score = None
+        consensus = cls(
+            direction=str(value.get("direction", "unknown")),
+            confidence=confidence,  # type: ignore[arg-type]
+            confidence_score=score,
+            timeframe=(
+                str(value["timeframe"])
+                if value.get("timeframe") is not None else None
+            ),
+            magnitude=(
+                str(value["magnitude"])
+                if value.get("magnitude") is not None else None
+            ),
+        )
+        consensus.validate()
+        return consensus
+
+
+@dataclass(frozen=True)
+class KeyEvidence:
+    """One piece of cross-referenced evidence in the controller briefing.
+
+    ``path`` is the canonical envelope path. ``claim`` is the human-readable
+    assertion the controller makes about it. ``specialist`` names the source
+    specialist if the evidence originated from a specialist report.
+    """
+
+    path: str
+    claim: str
+    value: Any | None = None
+    run_id: str | None = None
+    specialist: str | None = None
+
+    def validate(self) -> None:
+        if not self.path or not self.path.strip():
+            raise ValueError("KeyEvidence requires a non-empty path")
+        if not self.claim or not self.claim.strip():
+            raise ValueError("KeyEvidence requires a non-empty claim")
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "path": self.path,
+            "claim": self.claim,
+        }
+        if self.value is not None:
+            out["value"] = self.value
+        if self.run_id is not None:
+            out["run_id"] = self.run_id
+        if self.specialist is not None:
+            out["specialist"] = self.specialist
+        return out
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "KeyEvidence":
+        entry = cls(
+            path=str(value.get("path", "")),
+            claim=str(value.get("claim", "")),
+            value=value.get("value"),
+            run_id=(
+                str(value["run_id"])
+                if value.get("run_id") is not None else None
+            ),
+            specialist=(
+                str(value["specialist"])
+                if value.get("specialist") is not None else None
+            ),
+        )
+        entry.validate()
+        return entry
+
+
+@dataclass(frozen=True)
+class Disagreement:
+    """One structured disagreement between specialists.
+
+    ``topic`` is the subject of disagreement. ``specialist_a`` and
+    ``specialist_b`` name the disagreeing specialists. ``resolution`` is the
+    controller's reconciliation (or ``unresolved``).
+    """
+
+    topic: str
+    specialist_a: str | None = None
+    specialist_b: str | None = None
+    resolution: str | None = None
+
+    def validate(self) -> None:
+        if not self.topic or not self.topic.strip():
+            raise ValueError("Disagreement requires a non-empty topic")
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"topic": self.topic}
+        if self.specialist_a is not None:
+            out["specialist_a"] = self.specialist_a
+        if self.specialist_b is not None:
+            out["specialist_b"] = self.specialist_b
+        if self.resolution is not None:
+            out["resolution"] = self.resolution
+        return out
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "Disagreement":
+        entry = cls(
+            topic=str(value.get("topic", "")),
+            specialist_a=(
+                str(value["specialist_a"])
+                if value.get("specialist_a") is not None else None
+            ),
+            specialist_b=(
+                str(value["specialist_b"])
+                if value.get("specialist_b") is not None else None
+            ),
+            resolution=(
+                str(value["resolution"])
+                if value.get("resolution") is not None else None
+            ),
+        )
+        entry.validate()
+        return entry
 
 
 def _utc_iso(value: datetime | None = None) -> str:
@@ -371,17 +595,29 @@ def _require_confidence(payload: dict[str, Any], key: str = "confidence") -> str
     return str(value)
 
 
-def _coerce_evidence_list(payload: dict[str, Any], key: str) -> tuple[dict[str, Any], ...]:
+def _coerce_evidence_list(payload: dict[str, Any], key: str) -> tuple[EvidenceEntry, ...]:
+    """Parse evidence list into typed EvidenceEntry objects.
+
+    Each item must be an object with at least ``path`` and ``interpretation``.
+    For backward compatibility with v1 evidence that only carried ``path``,
+    a missing ``interpretation`` is substituted with an empty string —
+    but the EvidenceEntry validator will reject it, so the suite's parse-error
+    path surfaces this as a structured error rather than silently accepting
+    incomplete evidence.
+    """
     raw = payload.get(key, [])
     if not isinstance(raw, list):
         raise ValueError(f"{key} must be a list")
-    out: list[dict[str, Any]] = []
+    out: list[EvidenceEntry] = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             raise ValueError(f"{key}[{i}] must be an object")
         if "path" not in item:
             raise ValueError(f"{key}[{i}] missing required field: path")
-        out.append(dict(item))
+        try:
+            out.append(EvidenceEntry.from_mapping(item))
+        except ValueError as exc:
+            raise ValueError(f"{key}[{i}]: {exc}") from exc
     return tuple(out)
 
 
@@ -412,16 +648,57 @@ def _coerce_list_of_objects(payload: dict[str, Any], key: str) -> tuple[dict[str
 def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
     """Compact, bounded projection of the canonical envelope for the briefing.
 
-    Stored on the briefing so the human reviewer can see what evidence
-    boundary the briefing was produced against, without re-fetching the
-    full envelope. ``null`` values are preserved (not zero-substituted) per
-    the canonical null discipline.
+    Stored on the briefing so downstream consumers (Hermes, human reviewers)
+    can see what evidence boundary the briefing was produced against, without
+    re-fetching the full envelope. Preserves key market metrics so the briefing
+    is self-contained for adaptive reasoning. ``null`` values are preserved
+    (not zero-substituted) per the canonical null discipline.
     """
     coverage = envelope.get("coverage") or {}
     domain_status = (
         coverage.get("domain_status")
         if isinstance(coverage, dict) else None
     ) or {}
+    canonical = envelope.get("canonical_state") or {}
+    if not isinstance(canonical, dict):
+        canonical = {}
+
+    # Safe traversal helpers for nested envelope paths.
+    def _path(d: Any, *keys: str) -> Any:
+        for k in keys:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(k)
+        return d
+
+    data_access = canonical.get("data-access") or {}
+    calculations = canonical.get("calculations") or {}
+    analysis = canonical.get("analysis") or {}
+
+    # Key market metrics — null-preserving, never zero-substituted.
+    ticker = _path(data_access, "evidence", "futures", "ticker_24h") or {}
+    funding = _path(data_access, "evidence", "futures", "funding") or {}
+    oi = _path(data_access, "evidence", "futures", "open_interest") or {}
+    flow = _path(calculations, "calculations", "flow") or {}
+    orderbook = _path(calculations, "calculations", "orderbook") or {}
+    demand = _path(analysis, "analysis", "demand", "decomposition") or {}
+
+    # CVD = buy_volume - sell_volume (deterministic, null-safe).
+    spot_flow = _path(flow, "spot") or {}
+    fut_flow = _path(flow, "futures") or {}
+    spot_cvd: float | None = None
+    futures_cvd: float | None = None
+    try:
+        if isinstance(spot_flow, dict) and "buy_volume" in spot_flow and "sell_volume" in spot_flow:
+            spot_cvd = float(spot_flow["buy_volume"]) - float(spot_flow["sell_volume"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if isinstance(fut_flow, dict) and "buy_volume" in fut_flow and "sell_volume" in fut_flow:
+            futures_cvd = float(fut_flow["buy_volume"]) - float(fut_flow["sell_volume"])
+    except (TypeError, ValueError):
+        pass
+
     return {
         "schema_version": envelope.get("schema_version"),
         "symbol": envelope.get("symbol"),
@@ -431,6 +708,21 @@ def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
         "data_source": envelope.get("data_source"),
         "domain_status": domain_status,
         "error_count": len(envelope.get("errors") or []),
+        # Key market metrics for downstream reasoning.
+        "last_price": ticker.get("lastPrice") if isinstance(ticker, dict) else None,
+        "volume_24h": ticker.get("volume") if isinstance(ticker, dict) else None,
+        "high_24h": ticker.get("highPrice") if isinstance(ticker, dict) else None,
+        "low_24h": ticker.get("lowPrice") if isinstance(ticker, dict) else None,
+        "funding_rate": funding.get("fundingRate") if isinstance(funding, dict) else None,
+        "mark_price": funding.get("markPrice") if isinstance(funding, dict) else None,
+        "open_interest": oi.get("openInterest") if isinstance(oi, dict) else None,
+        "spot_cvd": spot_cvd,
+        "futures_cvd": futures_cvd,
+        "spot_obi": _path(demand, "spot", "obi"),
+        "futures_obi": _path(demand, "futures", "obi"),
+        "fut_keystone_bid": _path(orderbook, "fut_keystone", "bid"),
+        "fut_keystone_ask": _path(orderbook, "fut_keystone", "ask"),
+        "fut_microprice_skew_bps": _path(orderbook, "fut_microprice_skew_bps"),
     }
 
 
@@ -442,6 +734,28 @@ def _raw_preview(raw: str, limit: int = 240) -> str:
     if len(cleaned) > limit:
         cleaned = cleaned[:limit] + "..."
     return cleaned
+
+
+def _extract_json_object(raw: str) -> dict | None:
+    """Extract one JSON object embedded in model prose (best-effort).
+
+    Reasoning-model gateways prefix answers with a ``thinking`` preamble and
+    often fence the JSON in ```json ... ``` blocks. This finds the first ``{``
+    and the final ``}`` and validates the slice. Returns ``None`` when no
+    object parses — callers must then raise the structured parse error
+    (never silently substitute).
+    """
+    start = raw.find("{")
+    if start == -1:
+        return None
+    end = raw.rfind("}")
+    if end <= start:
+        return None
+    try:
+        value = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 @dataclass(frozen=True)
@@ -456,7 +770,7 @@ class SpecialistReport:
     name: str
     run_id: str
     summary: str
-    evidence: tuple[dict[str, Any], ...]
+    evidence: tuple[EvidenceEntry, ...]
     confidence: ConfidenceLevel
     limitations: tuple[str, ...]
     extra: dict[str, Any]
@@ -478,22 +792,30 @@ class SpecialistReport:
     ) -> "SpecialistReport":
         """Parse and validate one specialist's JSON output.
 
-        Raises ``SpecialistReportParseError`` on malformed JSON or missing
-        required fields. Callers MUST catch this and persist the structured
-        error on the briefing — there is no silent fallback to neutral
-        values.
+        Strict JSON is preferred. When the raw text does not parse as JSON
+        (reasoning models prefix answers with prose / ```json fences), the
+        first embedded JSON object is extracted and marked on ``extra`` as
+        ``extracted: True`` — never a silent substitution. Raises
+        ``SpecialistReportParseError`` when no JSON object exists or required
+        fields are missing. Callers MUST catch this and persist the
+        structured error on the briefing — there is no silent fallback to
+        neutral values.
         """
         preview = _raw_preview(raw)
         if not isinstance(raw, str) or not raw.strip():
             raise SpecialistReportParseError(
                 name, run_id, "empty or non-string raw output", preview
             )
+        extracted = False
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SpecialistReportParseError(
-                name, run_id, f"invalid JSON: {exc.msg}", preview
-            ) from exc
+            payload = _extract_json_object(raw)
+            if payload is None:
+                raise SpecialistReportParseError(
+                    name, run_id, f"invalid JSON: {exc.msg}", preview
+                ) from exc
+            extracted = True
         if not isinstance(payload, dict):
             raise SpecialistReportParseError(
                 name, run_id, "top-level JSON must be an object", preview
@@ -515,6 +837,8 @@ class SpecialistReport:
         # dropped.
         reserved = {"summary", "evidence", "confidence", "limitations"}
         extra = {k: v for k, v in payload.items() if k not in reserved}
+        if extracted:
+            extra["extracted"] = True
         report = cls(
             name=name,
             run_id=run_id,
@@ -533,7 +857,7 @@ class SpecialistReport:
             "name": self.name,
             "run_id": self.run_id,
             "summary": self.summary,
-            "evidence": list(self.evidence),
+            "evidence": [e.to_dict() for e in self.evidence],
             "confidence": self.confidence,
             "limitations": list(self.limitations),
         }
@@ -562,9 +886,9 @@ class AnalystBriefing:
     model_name: str
     generated_at: str
     narrative: str
-    consensus: dict[str, Any]
-    disagreements: tuple[dict[str, Any], ...]
-    key_evidence: tuple[dict[str, Any], ...]
+    consensus: Consensus
+    disagreements: tuple[Disagreement, ...]
+    key_evidence: tuple[KeyEvidence, ...]
     limitations: tuple[str, ...]
     uncertainty_sources: tuple[str, ...]
     parse_errors: tuple[dict[str, Any], ...]
@@ -588,16 +912,19 @@ class AnalystBriefing:
             raise ValueError("AnalystBriefing requires prompt_version")
         if self.status not in ("healthy", "degraded", "failed"):
             raise ValueError(f"invalid analyst status: {self.status}")
-        if not isinstance(self.consensus, dict):
-            raise ValueError("consensus must be an object")
-        if "direction" not in self.consensus:
-            raise ValueError("consensus.direction is required")
+        if not isinstance(self.consensus, Consensus):
+            raise ValueError("consensus must be a Consensus instance")
         if not isinstance(self.specialist_reports, dict):
             raise ValueError("specialist_reports must be an object")
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "AnalystBriefing":
-        """Round-trip from a dict payload (e.g. read back from Redis or Postgres)."""
+        """Round-trip from a dict payload (e.g. read back from Redis or Postgres).
+
+        Handles both v1 (plain dict consensus/evidence) and v2 (typed) payloads:
+        consensus/evidence/disagreements are run through their respective
+        ``from_mapping`` constructors which accept plain dicts.
+        """
         pinned = {
             "schema_version", "session_id", "run_id", "model_provider",
             "model_name", "generated_at", "narrative", "consensus",
@@ -607,16 +934,26 @@ class AnalystBriefing:
         }
         extra = {k: v for k, v in value.items() if k not in pinned}
         briefing = cls(
-            schema_version=int(value.get("schema_version", ANALYST_BRIEFING_SCHEMA_VERSION)),
+            schema_version=ANALYST_BRIEFING_SCHEMA_VERSION,
             session_id=str(value["session_id"]),
             run_id=str(value["run_id"]),
             model_provider=str(value["model_provider"]),
             model_name=str(value["model_name"]),
             generated_at=str(value["generated_at"]),
             narrative=str(value.get("narrative") or ""),
-            consensus=dict(value.get("consensus") or {}),
-            disagreements=tuple(dict(d) for d in (value.get("disagreements") or ())),
-            key_evidence=tuple(dict(d) for d in (value.get("key_evidence") or ())),
+            consensus=Consensus.from_mapping(
+                dict(value.get("consensus") or {"direction": "unknown", "confidence": "low"})
+            ),
+            disagreements=tuple(
+                Disagreement.from_mapping(d)
+                for d in (value.get("disagreements") or ())
+                if isinstance(d, dict)
+            ),
+            key_evidence=tuple(
+                KeyEvidence.from_mapping(d)
+                for d in (value.get("key_evidence") or ())
+                if isinstance(d, dict) and d.get("path")
+            ),
             limitations=tuple(str(s) for s in (value.get("limitations") or ())),
             uncertainty_sources=tuple(str(s) for s in (value.get("uncertainty_sources") or ())),
             parse_errors=tuple(dict(d) for d in (value.get("parse_errors") or ())),
@@ -662,10 +999,10 @@ class AnalystBriefing:
         """
         envelope_summary = _envelope_summary(envelope)
         preview = _raw_preview(raw)
-        consensus: dict[str, Any] = {"direction": "unknown", "confidence": "low"}
+        consensus = Consensus(direction="unknown", confidence="low")
         narrative = ""
-        disagreements: tuple[dict[str, Any], ...] = ()
-        key_evidence: tuple[dict[str, Any], ...] = ()
+        disagreements: tuple[Disagreement, ...] = ()
+        key_evidence: tuple[KeyEvidence, ...] = ()
         limitations: tuple[str, ...] = ()
         uncertainty_sources: tuple[str, ...] = ()
         extra: dict[str, Any] = {}
@@ -684,15 +1021,27 @@ class AnalystBriefing:
                 narrative = str(payload.get("narrative") or "")
                 cs = payload.get("consensus")
                 if isinstance(cs, dict):
-                    consensus = {
-                        "direction": str(cs.get("direction", "unknown")),
-                        "confidence": str(cs.get("confidence", "low")),
-                    }
-                    if consensus["confidence"] not in ValidConfidence:
-                        consensus["confidence"] = "low"
+                    try:
+                        consensus = Consensus.from_mapping(cs)
+                    except ValueError:
+                        consensus = Consensus(direction="unknown", confidence="low")
                 try:
-                    disagreements = _coerce_list_of_objects(payload, "disagreements")
-                    key_evidence = _coerce_list_of_objects(payload, "key_evidence")
+                    raw_disagreements = payload.get("disagreements") or []
+                    if not isinstance(raw_disagreements, list):
+                        raise ValueError("disagreements must be a list")
+                    disagreements = tuple(
+                        Disagreement.from_mapping(d)
+                        for d in raw_disagreements
+                        if isinstance(d, dict) and d.get("topic")
+                    )
+                    raw_key_evidence = payload.get("key_evidence") or []
+                    if not isinstance(raw_key_evidence, list):
+                        raise ValueError("key_evidence must be a list")
+                    key_evidence = tuple(
+                        KeyEvidence.from_mapping(d)
+                        for d in raw_key_evidence
+                        if isinstance(d, dict) and d.get("path")
+                    )
                     limitations = _coerce_string_list(payload, "limitations")
                     uncertainty_sources = _coerce_string_list(payload, "uncertainty_sources")
                 except ValueError as exc:
@@ -752,9 +1101,9 @@ class AnalystBriefing:
             "model_name": self.model_name,
             "generated_at": self.generated_at,
             "narrative": self.narrative,
-            "consensus": self.consensus,
-            "disagreements": list(self.disagreements),
-            "key_evidence": list(self.key_evidence),
+            "consensus": self.consensus.to_dict(),
+            "disagreements": [d.to_dict() for d in self.disagreements],
+            "key_evidence": [e.to_dict() for e in self.key_evidence],
             "limitations": list(self.limitations),
             "uncertainty_sources": list(self.uncertainty_sources),
             "parse_errors": list(self.parse_errors),

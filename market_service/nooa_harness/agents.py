@@ -1,17 +1,20 @@
-"""NOOA analyst agents with LLM-generation strategies.
+"""NOOA analyst agents — the model interface loaded inside the harness.
 
-These classes are the first agentic layer above the canonical harness.  They
-do not pull exchange data, calculate indicators, write Redis, or place trades.
-The existing harness supplies one complete canonical envelope to the suite;
-NOOA supplies the reasoning over that envelope.
+These classes are the first agentic layer above the canonical harness. They
+do not pull exchange data, calculate indicators, write Redis, or place
+trades. The existing harness supplies one complete canonical envelope to the
+suite; NOOA supplies the reasoning over that envelope.
 
-Each specialist's ``assess()`` method uses ``@strategy(PredictStrategy())`` so
-the LLM generates the assessment text directly from the envelope.  The
-controller's ``synthesize()`` uses ``CodeActStrategy`` so it can
-programmatically reconcile specialist reports.
+Specialists build their own prompt and call the model exactly once
+(``self._llm.acall``) — no framework-level validation-retry loop. The raw
+text is returned and parsed by ``SpecialistReport.from_llm_text``, which
+tolerates the ``thinking`` preamble and ```json``` fences used by
+reasoning-model gateways. The controller keeps ``CodeActStrategy`` so it can
+programmatically reconcile the four specialist reports.
 
-The ``...`` (ellipsis) body is the NOOA contract — the framework detects it
-via ``has_ellipsis_body()`` and wraps the method into an LLM generation call.
+The envelope handed to the model is always the bounded LLM view
+(``bounded_envelope_view``); the complete canonical envelope stays immutable
+inside the runtime stores.
 """
 
 from __future__ import annotations
@@ -19,10 +22,10 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any
 
-from nooa import Agent, Context, spec, strategy
+from nooa import Agent, spec, strategy
 from nooa.agentdoc import hidden
 from nooa.context_blocks import DynamicContext
-from nooa.strategies import CodeActStrategy, PredictStrategy
+from nooa.strategies import CodeActStrategy
 
 # ---------------------------------------------------------------------------
 # Envelope schema — injected into agent context so the LLM knows the shape
@@ -92,6 +95,76 @@ _ENVELOPE_SCHEMA = json.dumps(
 
 
 # ---------------------------------------------------------------------------
+# Bounded LLM view + response text helpers (shared by agents and the CLI)
+# ---------------------------------------------------------------------------
+
+
+def bounded_envelope_view(
+    payload: dict[str, Any] | None,
+    roof: int = 180_000,
+    list_cap: int = 60,
+) -> str:
+    """Serialized envelope sized for the LLM param limit (never silent).
+
+    Returns the full envelope when it already fits. Otherwise large lists
+    are capped with an explicit ``__truncated__`` marker that records the
+    original count, and only as a last resort is the payload reduced to run
+    identity + coverage + errors with the trimmed top-level keys listed. The
+    complete canonical envelope is never mutated — this is only the LLM-bound
+    projection.
+    """
+    if not payload:
+        return "{}"
+    rendered = json.dumps(payload, default=str)
+    if len(rendered) <= roof:
+        return rendered
+
+    def _cap(value: Any, max_items: int) -> Any:
+        if isinstance(value, dict):
+            return {k: _cap(v, max_items) for k, v in value.items()}
+        if isinstance(value, list):
+            if len(value) > max_items:
+                return {
+                    "__truncated__": True,
+                    "count": len(value),
+                    "items": [_cap(item, max_items) for item in value[:max_items]],
+                }
+            return [_cap(item, max_items) for item in value]
+        return value
+
+    rendered = json.dumps(_cap(payload, list_cap), default=str)
+    if len(rendered) <= roof:
+        return rendered
+
+    kept = {
+        k: payload.get(k)
+        for k in ("run_id", "symbol", "status", "schema_version",
+                  "generated_at", "completed_at", "data_source")
+    }
+    kept["coverage"] = payload.get("coverage")
+    kept["errors"] = payload.get("errors")
+    kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
+    return json.dumps(kept, default=str)
+
+
+def response_text(resp: Any) -> str:
+    """Extract the text content from a NOOA unified-LLM response."""
+    raw = getattr(resp, "raw_response", resp)
+    choices = getattr(raw, "choices", None)
+    if choices:
+        content = getattr(getattr(choices[0], "message", None), "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+            if parts:
+                return "".join(parts)
+    if isinstance(resp, str):
+        return resp
+    return str(raw)
+
+
+# ---------------------------------------------------------------------------
 # Base analyst agent
 # ---------------------------------------------------------------------------
 
@@ -109,64 +182,32 @@ class MarketAnalyst(Agent):
         spec(description="What this agent is responsible for analyzing"),
     ] = "Reason over the complete canonical market envelope."
 
-    # Internal state — hidden from the LLM, set before each generation call
+    # Internal state — hidden from the LLM
     _current_envelope: Annotated[dict[str, Any] | None, hidden] = None
     _specialist_reports: Annotated[dict[str, str] | None, hidden] = None
 
-    # NOOA's PredictStrategy enforces max_param_chars (default 200k) on every
-    # strategy parameter. The live envelope carries raw evidence arrays that
-    # routinely exceed that, so the LLM-bound view is trimmed deterministically
-    # with explicit markers — the internal `_current_envelope` stays complete.
+    # Bounded LLM view limits (live envelopes exceed NOOA's param caps on raw
+    # evidence arrays alone; the deterministic summary stays complete).
     _MAX_LLM_ENVELOPE_CHARS = 180_000
     _LIST_CAP = 60
+    # Generation budget: reasoning-model gateways consume tokens on a
+    # `thinking` preface, then emit the JSON report — give it headroom so the
+    # report is not truncated mid-evidence.
+    _MAX_TOKENS = 4000
 
     def __init__(self, symbol: str, *, llm: Any):
         super().__init__(llm=llm)
         self.symbol = symbol.upper()
 
     def _bounded_envelope(self, max_chars: int | None = None) -> str:
-        """Serialized envelope sized for the LLM param limit (never silent).
-
-        Returns the full envelope when it already fits. Otherwise large lists
-        are capped with an explicit ``__truncated__`` marker that records the
-        original count, and only as a last resort is the payload reduced to
-        run identity + coverage + errors with the trimmed top-level keys
-        listed. The agent's internal ``_current_envelope`` is never mutated.
-        """
+        """Deprecated-style convenience: bounded LLM view of the current envelope."""
         if self._current_envelope is None:
             return "{}"
-        roof = max_chars or self._MAX_LLM_ENVELOPE_CHARS
-        payload = self._current_envelope
-        rendered = json.dumps(payload, default=str)
-        if len(rendered) <= roof:
-            return rendered
-
-        def _cap(value: Any, max_items: int) -> Any:
-            if isinstance(value, dict):
-                return {k: _cap(v, max_items) for k, v in value.items()}
-            if isinstance(value, list):
-                if len(value) > max_items:
-                    return {
-                        "__truncated__": True,
-                        "count": len(value),
-                        "items": [_cap(item, max_items) for item in value[:max_items]],
-                    }
-                return [_cap(item, max_items) for item in value]
-            return value
-
-        rendered = json.dumps(_cap(payload, self._LIST_CAP), default=str)
-        if len(rendered) <= roof:
-            return rendered
-
-        kept = {
-            k: payload.get(k)
-            for k in ("run_id", "symbol", "status", "schema_version",
-                      "generated_at", "completed_at", "data_source")
-        }
-        kept["coverage"] = payload.get("coverage")
-        kept["errors"] = payload.get("errors")
-        kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
-        return json.dumps(kept, default=str)
+        return bounded_envelope_view(
+            self._current_envelope,
+            roof=max_chars or self._MAX_LLM_ENVELOPE_CHARS,
+            list_cap=self._LIST_CAP,
+        )
 
     def _envelope_schema(self) -> str:
         """Return the envelope schema as a context block for the LLM."""
@@ -191,9 +232,46 @@ class MarketAnalyst(Agent):
             indent=2,
         )
 
+    async def _call_model_once(
+        self,
+        envelope_payload: dict[str, Any] | None,
+        *,
+        max_tokens: int | None = None,
+    ) -> str:
+        """One deterministic LLM call (no validation-retry loop).
+
+        Builds the system (remit + task) and user (format + schema + bounded
+        envelope) prompts and calls the configured model client once. The raw
+        text is returned as-is; parsing happens in
+        ``SpecialistReport.from_llm_text`` which extracts JSON from prose.
+        """
+        llm = getattr(self, "_llm", None)
+        if llm is None:
+            raise RuntimeError(f"{type(self).__name__}: no NOOA model client configured")
+        payload = envelope_payload if envelope_payload is not None else self._current_envelope
+        user = (
+            f"{self.output_format_prompt}\n\n"
+            "Envelope schema (shape reference):\n"
+            f"{self._envelope_schema()}\n\n"
+            "Canonical envelope for this run (raw arrays bounded):\n"
+            f"{bounded_envelope_view(payload, self._MAX_LLM_ENVELOPE_CHARS, self._LIST_CAP)}"
+            "\n\nIMPORTANT: Output ONLY one valid JSON object matching the format. "
+            "Allowed a brief reasoning line, but the JSON object must be present "
+            "and complete. No markdown fences around it. Do not end early."
+        )
+        system = f"{self.remit}\n\n{self.task_prompt}"
+        resp = await llm.acall(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens or self._MAX_TOKENS,
+        )
+        return response_text(resp)
+
 
 # ---------------------------------------------------------------------------
-# Specialist agents
+# Specialist agents — one-shot raw-text assessment, parsed by the suite
 # ---------------------------------------------------------------------------
 
 
@@ -201,27 +279,20 @@ class DeltaOrderflowAgent(MarketAnalyst):
     """Reason about delta, trades, CVD, OBI, VWAP, and book pressure."""
 
     remit = "Interpret orderflow and delta evidence without inventing missing values."
-
-    @strategy(
-        PredictStrategy(),
-        context={
-            "task": (
-                "You are a delta/orderflow analyst. Extract directional evidence "
-                "from the canonical envelope. Never invent values. State 'null' "
-                "when data is unavailable. Cite exact envelope paths for every claim."
-            ),
-            "output_format": (
-                "Return a JSON object with:\n"
-                "  summary: 2-3 sentence directional assessment\n"
-                "  evidence: [{\"path\": \"envelope path\", \"value\": ..., \"interpretation\": \"...\"}]\n"
-                "  confidence: low|medium|high\n"
-                "  limitations: [\"...\"]\n"
-                "  null_fields: [\"envelope paths that were null\"]"
-            ),
-            "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("self._bounded_envelope()"),
-        },
+    task_prompt = (
+        "You are a delta/orderflow analyst. Extract directional evidence "
+        "from the canonical envelope. Never invent values. State 'null' "
+        "when data is unavailable. Cite exact envelope paths for every claim."
     )
+    output_format_prompt = (
+        "Return a JSON object with:\n"
+        "  summary: 2-3 sentence directional assessment\n"
+        "  evidence: [{\"path\": \"envelope path\", \"value\": ..., \"interpretation\": \"what this means\", \"metric_name\": \"label\"}]\n"
+        "  confidence: low|medium|high\n"
+        "  limitations: [\"...\"]\n"
+        "  null_fields: [\"envelope paths that were null\"]"
+    )
+
     async def assess(
         self,
         envelope: Annotated[
@@ -241,34 +312,31 @@ class DeltaOrderflowAgent(MarketAnalyst):
             ),
         ],
     ) -> str:
-        """Assess directional orderflow, delta, and order-book evidence in the envelope."""
-        ...
+        """Assess directional orderflow, delta, and order-book evidence.
+
+        Returns raw model text; the suite parses it via
+        ``SpecialistReport.from_llm_text``.
+        """
+        return await self._call_model_once(envelope)
 
 
 class MacroAgent(MarketAnalyst):
     """Reason about funding, broader market context, and macro conditions."""
 
     remit = "Connect market context to the observed symbol while separating evidence from inference."
-
-    @strategy(
-        PredictStrategy(),
-        context={
-            "task": (
-                "You are a macro/context analyst. Assess funding conditions, "
-                "broader market context, and regime signals. Separate evidence "
-                "from inference. Cite exact envelope paths."
-            ),
-            "output_format": (
-                "Return a JSON object with:\n"
-                "  summary: 2-3 sentence macro assessment\n"
-                "  evidence: [{\"path\": \"...\", \"value\": ..., \"interpretation\": \"...\"}]\n"
-                "  confidence: low|medium|high\n"
-                "  limitations: [\"...\"]"
-            ),
-            "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("self._bounded_envelope()"),
-        },
+    task_prompt = (
+        "You are a macro/context analyst. Assess funding conditions, "
+        "broader market context, and regime signals. Separate evidence "
+        "from inference. Cite exact envelope paths."
     )
+    output_format_prompt = (
+        "Return a JSON object with:\n"
+        "  summary: 2-3 sentence macro assessment\n"
+        "  evidence: [{\"path\": \"...\", \"value\": ..., \"interpretation\": \"what this means\", \"metric_name\": \"label\"}]\n"
+        "  confidence: low|medium|high\n"
+        "  limitations: [\"...\"]"
+    )
+
     async def assess(
         self,
         envelope: Annotated[
@@ -287,34 +355,27 @@ class MacroAgent(MarketAnalyst):
         ],
     ) -> str:
         """Assess funding, context, and macro evidence present in the envelope."""
-        ...
+        return await self._call_model_once(envelope)
 
 
 class OpenInterestAgent(MarketAnalyst):
     """Reason about open interest, positioning, and changes in participation."""
 
     remit = "Interpret open-interest evidence and state what it cannot establish."
-
-    @strategy(
-        PredictStrategy(),
-        context={
-            "task": (
-                "You are an open-interest analyst. Assess OI state, change, and "
-                "positioning evidence. State what you cannot establish from the "
-                "available data. Cite exact envelope paths."
-            ),
-            "output_format": (
-                "Return a JSON object with:\n"
-                "  summary: 2-3 sentence OI assessment\n"
-                "  evidence: [{\"path\": \"...\", \"value\": ..., \"interpretation\": \"...\"}]\n"
-                "  confidence: low|medium|high\n"
-                "  limitations: [\"...\"]\n"
-                "  cannot_establish: [\"what the data cannot tell us\"]"
-            ),
-            "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("self._bounded_envelope()"),
-        },
+    task_prompt = (
+        "You are an open-interest analyst. Assess OI state, change, and "
+        "positioning evidence. State what you cannot establish from the "
+        "available data. Cite exact envelope paths."
     )
+    output_format_prompt = (
+        "Return a JSON object with:\n"
+        "  summary: 2-3 sentence OI assessment\n"
+        "  evidence: [{\"path\": \"...\", \"value\": ..., \"interpretation\": \"what this means\", \"metric_name\": \"label\"}]\n"
+        "  confidence: low|medium|high\n"
+        "  limitations: [\"...\"]\n"
+        "  cannot_establish: [\"what the data cannot tell us\"]"
+    )
+
     async def assess(
         self,
         envelope: Annotated[
@@ -325,41 +386,34 @@ class OpenInterestAgent(MarketAnalyst):
                     "  canonical_state.data-access.evidence.futures.open_interest\n"
                     "  canonical_state.data-access.evidence.futures.ticker_24h\n"
                     "  canonical_state.calculations.calculations.flow\n"
-                    "  canonical_state.analysis.analysis.demand.decomposition"
+                    "  canonical_state.analysis.analysis.demand.decomposition"                    "  canonical_state.analysis.analysis.demand.decomposition"
                 )
             ),
         ],
     ) -> str:
         """Assess open-interest state and positioning evidence in the envelope."""
-        ...
+        return await self._call_model_once(envelope)
 
 
 class LiquidationAgent(MarketAnalyst):
     """Reason about liquidation pressure and forced-flow evidence."""
 
     remit = "Interpret liquidation evidence and preserve explicit data limitations."
-
-    @strategy(
-        PredictStrategy(),
-        context={
-            "task": (
-                "You are a liquidation analyst. Assess liquidation-pressure "
-                "evidence from the available data. Note that liquidation data "
-                "is often incomplete — state what is missing clearly. "
-                "Cite exact envelope paths."
-            ),
-            "output_format": (
-                "Return a JSON object with:\n"
-                "  summary: 2-3 sentence liquidation assessment\n"
-                "  evidence: [{\"path\": \"...\", \"value\": ..., \"interpretation\": \"...\"}]\n"
-                "  confidence: low|medium|high\n"
-                "  limitations: [\"...\"]\n"
-                "  missing_data: [\"what liquidation data is absent\"]"
-            ),
-            "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("self._bounded_envelope()"),
-        },
+    task_prompt = (
+        "You are a liquidation analyst. Assess liquidation-pressure "
+        "evidence from the available data. Note that liquidation data "
+        "is often incomplete — state what is missing clearly. "
+        "Cite exact envelope paths."
     )
+    output_format_prompt = (
+        "Return a JSON object with:\n"
+        "  summary: 2-3 sentence liquidation assessment\n"
+        "  evidence: [{\"path\": \"...\", \"value\": ..., \"interpretation\": \"what this means\", \"metric_name\": \"label\"}]\n"
+        "  confidence: low|medium|high\n"
+        "  limitations: [\"...\"]\n"
+        "  missing_data: [\"what liquidation data is absent\"]"
+    )
+
     async def assess(
         self,
         envelope: Annotated[
@@ -378,7 +432,7 @@ class LiquidationAgent(MarketAnalyst):
         ],
     ) -> str:
         """Assess liquidation pressure and related evidence in the envelope."""
-        ...
+        return await self._call_model_once(envelope)
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +470,15 @@ class ControllerAgent(MarketAnalyst):
             "output_format": (
                 "Return a JSON object with:\n"
                 "  narrative: string (2-3 paragraphs synthesizing all views)\n"
-                "  consensus: {direction: string, confidence: low|medium|high}\n"
+                "  consensus: {\n"
+                "    direction: string (e.g. bullish, bearish, neutral)\n"
+                "    confidence: low|medium|high\n"
+                "    confidence_score: number 0.0-1.0 (your numeric confidence)\n"
+                "    timeframe: string (e.g. intraday, session, swing)\n"
+                "    magnitude: string (e.g. marginal, moderate, strong)\n"
+                "  }\n"
                 "  disagreements: [{topic, specialist_a, specialist_b, resolution}]\n"
-                "  key_evidence: [{run_id, path, claim}]\n"
+                "  key_evidence: [{path, claim, value, specialist}]\n"
                 "  limitations: [string]\n"
                 "  uncertainty_sources: [string]\n"
                 "The code you generate should read the envelope and specialist "

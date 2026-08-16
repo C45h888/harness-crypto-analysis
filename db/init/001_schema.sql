@@ -109,7 +109,7 @@ CREATE INDEX IF NOT EXISTS wall_symbol_completed_at_idx
 CREATE TABLE IF NOT EXISTS analyst_briefing (
     session_id UUID NOT NULL,
     run_id UUID NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version IN (1, 2)),
     model_provider TEXT NOT NULL,
     model_name TEXT NOT NULL,
     generated_at TIMESTAMPTZ NOT NULL,
@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS agent_memory (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ,
     forgotten BOOLEAN NOT NULL DEFAULT FALSE,
-    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version IN (1, 2)),
     payload JSONB NOT NULL,
     inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (memory_id)

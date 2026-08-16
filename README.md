@@ -129,6 +129,52 @@ MemoryNode. The CLI stays read-only against canonical state; only the
 `refresh`/`analyst` commands request bounded cycles or produce advisory
 briefings, exactly as the harness does.
 
+## Analyst contract objects (schema v2)
+
+The NOOA analyst suite produces validated, schema-versioned contract objects
+that cross the boundary to downstream consumers (Hermes, human reviewers,
+the memory node). All objects are frozen dataclasses with `to_dict()` /
+`from_mapping()` round-trips, persisted Postgres-first with Redis live
+projections. See `docs/NOOA_HARNESS_ARCHITECTURE.md` for the full contract
+surface.
+
+Key objects crossing the boundary:
+
+| Object | Purpose | Key fields |
+|---|---|---|
+| `SpecialistReport` | One specialist's output (delta/macro/OI/liquidation) | `summary`, `evidence: [EvidenceEntry]`, `confidence`, `limitations` |
+| `EvidenceEntry` | One piece of cited evidence | `path`, `interpretation`, `value`, `metric_name` |
+| `AnalystBriefing` | Controller's synthesis of all specialists | `narrative`, `consensus: Consensus`, `key_evidence: [KeyEvidence]`, `disagreements: [Disagreement]`, `specialist_reports` |
+| `Consensus` | Structured market verdict | `direction`, `confidence`, `confidence_score`, `timeframe`, `magnitude` |
+| `KeyEvidence` | Cross-referenced evidence claim | `path`, `claim`, `value`, `specialist` |
+| `Disagreement` | Specialist disagreement | `topic`, `specialist_a`, `specialist_b`, `resolution` |
+| `AgentMemory` | Durable analyst memory | `kind`, `content`, `importance`, `evidence_refs` |
+
+The `envelope_summary` on each briefing is enriched with key market metrics
+(last_price, open_interest, funding_rate, spot_cvd, futures_cvd, spot_obi,
+futures_obi, keystone levels) so downstream consumers can reason over the
+briefing without re-fetching the full envelope.
+
+## Architecture: two-layer reasoning
+
+The system operates as two layers:
+
+1. **NOOA analyst suite** (inner layer) — domain-focused specialists
+   (delta_orderflow, macro, open_interest, liquidations) + controller,
+   running on any OpenAI-compatible backend (Minimax, vLLM, Ollama).
+   Produces structured `AnalystBriefing` objects from canonical market
+   envelopes.
+
+2. **Hermes** (outer layer) — model-agnostic adaptive reasoning. Queries
+   the harness via CLI (`--analyst-loop`, `--latest`, `--briefing`, `--trigger`)
+   and reasons over the structured contract objects. Reads the latest
+   briefing or triggers a fresh analysis cycle as needed.
+
+The harness CLI (`market_service/commands/harness.py`) is the single mount
+point both layers use. The contract objects are the quality gate — the
+Hermes layer's reasoning is bounded by the quality of what crosses the
+contract boundary.
+
 ## Shared-domain map (container-split prep)
 
 `market_service/manifest.py` classifies every canonical module into one shared

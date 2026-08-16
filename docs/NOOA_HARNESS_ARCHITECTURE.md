@@ -67,10 +67,13 @@ Agent outputs are advisory artifacts. The trader retains final authority.
 
 ## State model
 
-The first implementation should use typed definitions for comprehension and
-validation, not a restrictive capability framework:
+The implementation uses typed, validated, schema-versioned frozen dataclasses
+for all analyst-contract objects. Schema version 2 (2026-08-16) tightens
+evidence entries, consensus, and key_evidence from loose dicts to typed
+sub-objects with required fields and validation:
 
 ```python
+# Canonical runtime envelope (unchanged v1)
 class MarketRunEnvelope:
     run_id: str
     symbol: str
@@ -83,23 +86,81 @@ class MarketRunEnvelope:
     errors: list[dict]
     source_metadata: dict
 
-class AnalystObservation:
-    run_id: str
-    claim: str
-    evidence_refs: list[str]
-    confidence: str
+# Typed sub-contracts (v2 — from contracts.py)
+class EvidenceEntry:
+    path: str              # required — envelope path
+    interpretation: str    # required — what the analyst concluded
+    value: Any | None      # optional — raw value at path
+    metric_name: str | None  # optional — human-readable label
 
-class AnalystHypothesis:
+class Consensus:
+    direction: str                    # required — up|down|flat|unknown
+    confidence: ConfidenceLevel       # required — low|medium|high
+    confidence_score: float | None    # optional — 0.0-1.0 numeric
+    timeframe: str | None             # optional — intraday|session|swing
+    magnitude: str | None             # optional — marginal|moderate|strong
+
+class KeyEvidence:
+    path: str              # required — envelope path
+    claim: str             # required — what the evidence shows
+    value: Any | None      # optional — raw value
+    run_id: str | None     # optional — source run
+    specialist: str | None # optional — sourcing specialist
+
+class Disagreement:
+    topic: str             # required — subject of disagreement
+    specialist_a: str | None
+    specialist_b: str | None
+    resolution: str | None
+
+# Specialist output (v2 — validated from LLM text)
+class SpecialistReport:
+    name: str
     run_id: str
-    thesis: str
-    supporting_evidence: list[str]
-    disconfirming_evidence: list[str]
-    invalidation_conditions: list[str]
-    uncertainty: list[str]
+    summary: str
+    evidence: tuple[EvidenceEntry, ...]
+    confidence: ConfidenceLevel
+    limitations: tuple[str, ...]
+    extra: dict[str, Any]  # specialist-specific fields
+
+# Controller briefing (v2 — validated from LLM text)
+class AnalystBriefing:
+    session_id: str
+    run_id: str
+    schema_version: int
+    model_provider: str
+    model_name: str
+    generated_at: str
+    narrative: str
+    consensus: Consensus
+    disagreements: tuple[Disagreement, ...]
+    key_evidence: tuple[KeyEvidence, ...]
+    limitations: tuple[str, ...]
+    uncertainty_sources: tuple[str, ...]
+    parse_errors: tuple[dict[str, Any], ...]
+    envelope_summary: dict[str, Any]  # enriched with market metrics
+    extra: dict[str, Any]
+    specialist_reports: dict[str, dict | None]
+
+# Durable memory (v1 — unchanged)
+class AgentMemory:
+    session_id: str
+    kind: str
+    content: str
+    memory_id: str
+    run_id: str | None
+    title: str | None
+    importance: float
+    tags: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    forgotten: bool
 ```
 
-The canonical envelope remains read-only. Observations and hypotheses are
-separate agent artifacts and must include the source `run_id`.
+The canonical envelope remains read-only. All analyst artifacts are
+schema-versioned, validated on construction, and persisted Postgres-first
+with Redis live projections. The `AnalystBriefing` and `SpecialistReport`
+are the ONLY sanctioned boundaries that turn LLM text into typed state —
+nothing reaches the durable stores without crossing them.
 
 ## Redis integration
 

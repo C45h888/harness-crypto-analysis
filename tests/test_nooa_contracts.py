@@ -162,6 +162,35 @@ class SpecialistReportContractTests(unittest.TestCase):
             SpecialistReport.from_llm_text("delta", "r-1", raw)
         self.assertIn("path", ctx.exception.error)
 
+    def test_reasoning_prose_with_embedded_json_extracts(self):
+        # MiniMax reasoning gateways prefix answers with a thinking preamble
+        # and fence the JSON in ```json ... ``` blocks. The parser must
+        # extract the object and mark it explicitly — never silently.
+        raw = (
+            " thinking\nLet me analyze the envelope for SOLUSDT...\n\n"
+            "```json\n"
+            + json.dumps({
+                "summary": "Spot demand bullish",
+                "evidence": [{"path": "a.b", "value": 1, "interpretation": "ok"}],
+                "confidence": "medium",
+                "limitations": ["analysis domain degraded"],
+                "null_fields": ["c.d"],
+            })
+            + "\n```\n"
+        )
+        report = SpecialistReport.from_llm_text("delta_orderflow", "r-1", raw)
+        self.assertEqual(report.summary, "Spot demand bullish")
+        self.assertTrue(report.extra.get("extracted") is True)
+
+    def test_prose_without_json_still_raises(self):
+        raw = (
+            " thinking\nI reviewed the envelope. Coverage is incomplete and "
+            "I cannot produce a directional assessment from the available"
+            " data without inventing values."
+        )
+        with self.assertRaises(SpecialistReportParseError):
+            SpecialistReport.from_llm_text("delta", "r-1", raw)
+
 
 # ---------------------------------------------------------------------------
 # AnalystBriefingContractTests
@@ -192,8 +221,8 @@ class AnalystBriefingContractTests(unittest.TestCase):
         self.assertEqual(briefing.run_id, "test-run-002")
         self.assertEqual(briefing.session_id, "sess-1")
         self.assertEqual(briefing.model_provider, "openai")
-        self.assertEqual(briefing.consensus["direction"], "up")
-        self.assertEqual(briefing.consensus["confidence"], "medium")
+        self.assertEqual(briefing.consensus.direction, "up")
+        self.assertEqual(briefing.consensus.confidence, "medium")
         self.assertEqual(len(briefing.key_evidence), 1)
         self.assertEqual(len(briefing.disagreements), 1)
         self.assertEqual(briefing.schema_version, ANALYST_BRIEFING_SCHEMA_VERSION)
@@ -210,8 +239,8 @@ class AnalystBriefingContractTests(unittest.TestCase):
         self.assertEqual(briefing.run_id, "test-run-002")
         self.assertIn("raw_narrative", briefing.extra)
         self.assertEqual(briefing.parse_errors[0]["stage"], "controller")
-        self.assertEqual(briefing.consensus["direction"], "unknown")
-        self.assertEqual(briefing.consensus["confidence"], "low")
+        self.assertEqual(briefing.consensus.direction, "unknown")
+        self.assertEqual(briefing.consensus.confidence, "low")
 
     def test_invalid_confidence_in_consensus_is_clamped(self):
         raw = json.dumps({
@@ -221,7 +250,7 @@ class AnalystBriefingContractTests(unittest.TestCase):
             session_id="sess-1", run_id="r", model_provider="o", model_name="m",
             generated_at="t", raw=raw, envelope=_SAMPLE_ENVELOPE_BRIEFING,
         )
-        self.assertEqual(briefing.consensus["confidence"], "low")
+        self.assertEqual(briefing.consensus.confidence, "low")
 
     def test_from_mapping_roundtrip(self):
         b1 = AnalystBriefing.from_controller_text(
@@ -277,7 +306,7 @@ class RunnerModeTests(unittest.IsolatedAsyncioTestCase):
         from market_service.nooa_harness import runner
 
         envelope_obj = MarketRunEnvelope.from_mapping(dict(_SAMPLE_ENVELOPE))
-        fake_read = AsyncMock(return_value=envelope_obj)
+        fake_pipeline = AsyncMock(return_value=envelope_obj)
         fake_persist = AsyncMock(return_value={"postgres_inserted": True, "redis_stream_id": "1-1"})
         fake_suite_analyze = AsyncMock(return_value={
             "briefing": self._briefing_payload(envelope_obj), "parse_errors": [],
@@ -285,70 +314,70 @@ class RunnerModeTests(unittest.IsolatedAsyncioTestCase):
             "schema_version": 1, "briefing_json": json.dumps(self._briefing_payload(envelope_obj)),
         })
         patchers = [
-            patch.object(runner, "_read_envelope", fake_read),
+            patch.object(runner, "pipeline_run_cycle", fake_pipeline),
+            patch.object(runner, "_read_envelope", AsyncMock(return_value=envelope_obj)),
             patch.object(runner, "_persist_briefing", fake_persist),
             patch.object(runner, "build_suite", return_value=MagicMock(analyze=fake_suite_analyze)),
-            # build_suite(symbol, backend.build_llm()) is mocked but the llm
-            # argument is still evaluated — stub build_llm so it never imports
-            # nooa/litellm.
             patch.object(runner.ModelBackendConfig, "build_llm", return_value=MagicMock()),
         ]
         for p in patchers:
             p.start()
             self.addCleanup(p.stop)
-        return runner, fake_read, fake_persist, fake_suite_analyze, envelope_obj
+        return runner, fake_pipeline, fake_persist, fake_suite_analyze, envelope_obj
 
     async def test_run_id_mode_does_not_trigger_new_cycle(self):
-        runner, fake_read, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
+        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
         await runner.run_analyst_loop(
             "SOLUSDT", interval_s=0, timeout_s=10, cycles=1,
             run_id=envelope_obj.run_id,
             session_id="11111111-1111-1111-1111-111111111111",
         )
-        fake_read.assert_awaited_once()
+        # run_id mode uses _read_envelope, not pipeline
+        fake_pipeline.assert_not_awaited()
         fake_persist.assert_awaited_once()
         persist_arg = fake_persist.await_args.args[1]
         self.assertEqual(persist_arg.run_id, envelope_obj.run_id)
 
     async def test_latest_mode_does_not_trigger_new_cycle(self):
-        runner, fake_read, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
+        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
         await runner.run_analyst_loop(
             "SOLUSDT", interval_s=0, timeout_s=10, cycles=1, use_latest=True,
             session_id="11111111-1111-1111-1111-111111111111",
         )
-        fake_read.assert_awaited_once()
+        fake_pipeline.assert_awaited_once()
         fake_persist.assert_awaited_once()
 
     async def test_default_mode_reads_latest_without_triggering(self):
-        runner, fake_read, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
+        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
         await runner.run_analyst_loop(
             "SOLUSDT", interval_s=0, timeout_s=10, cycles=1,
             session_id="11111111-1111-1111-1111-111111111111",
         )
-        fake_read.assert_awaited_once()
+        fake_pipeline.assert_awaited_once()
         fake_persist.assert_awaited_once()
 
     async def test_exact_run_defaults_to_one_shot(self):
-        runner, fake_read, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
+        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
         await runner.run_analyst_loop(
             "SOLUSDT", interval_s=0, run_id=envelope_obj.run_id,
             session_id="11111111-1111-1111-1111-111111111111",
         )
-        fake_read.assert_awaited_once()
+        # run_id mode uses _read_envelope, not pipeline
+        fake_pipeline.assert_not_awaited()
         fake_persist.assert_awaited_once()
 
     async def test_latest_mode_deduplicates_unchanged_run(self):
         from market_service.nooa_harness import runner
 
         envelope_obj = MarketRunEnvelope.from_mapping(dict(_SAMPLE_ENVELOPE))
-        fake_read = AsyncMock(side_effect=[envelope_obj, envelope_obj])
+        fake_pipeline = AsyncMock(side_effect=[envelope_obj, envelope_obj])
         fake_persist = AsyncMock(return_value={"postgres_inserted": True, "redis_stream_id": "1-1"})
         fake_suite_analyze = AsyncMock(return_value={
             "briefing": self._briefing_payload(envelope_obj), "parse_errors": [],
             "specialist_reports": {}, "symbol": "SOLUSDT", "run_id": envelope_obj.run_id,
             "schema_version": 1, "briefing_json": "{}",
         })
-        with patch.object(runner, "_read_envelope", fake_read), \
+        with patch.object(runner, "pipeline_run_cycle", fake_pipeline), \
              patch.object(runner, "_persist_briefing", fake_persist), \
              patch.object(runner, "build_suite", return_value=MagicMock(analyze=fake_suite_analyze)), \
              patch.object(runner.ModelBackendConfig, "build_llm", return_value=MagicMock()):
@@ -356,7 +385,7 @@ class RunnerModeTests(unittest.IsolatedAsyncioTestCase):
                 "SOLUSDT", interval_s=0, cycles=2, use_latest=True,
                 session_id="11111111-1111-1111-1111-111111111111",
             )
-        self.assertEqual(fake_read.await_count, 2)
+        self.assertEqual(fake_pipeline.await_count, 2)
         fake_suite_analyze.assert_awaited_once()
         fake_persist.assert_awaited_once()
 

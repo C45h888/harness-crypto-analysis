@@ -35,6 +35,8 @@ from market_service.runtime.redis_store import RedisRuntimeStore
 
 from .backends import ModelBackendConfig
 from .memory import MemoryNode
+from .pipeline import run_cycle as pipeline_run_cycle
+from .pipeline import WINDOW_MINUTES_MAP
 from .suite import build_suite
 
 log = logging.getLogger(__name__)
@@ -148,8 +150,8 @@ async def _remember_cycle_outputs(
     on the result dict, never raised into the analyst loop.
     """
     evidence_refs = tuple(
-        str(e.get("path", ""))
-        for e in briefing.key_evidence if e.get("path")
+        str(e.path)
+        for e in briefing.key_evidence if e.path
     )
     run_id = briefing.run_id
     remembered: list[dict[str, Any]] = []
@@ -184,8 +186,8 @@ async def _remember_cycle_outputs(
         session_id=str(session_id),
         kind="observation",
         content=(
-            f"Consensus: {briefing.consensus.get('direction', 'unknown')} "
-            f"(confidence {briefing.consensus.get('confidence', 'low')})"
+            f"Consensus: {briefing.consensus.direction} "
+            f"(confidence {briefing.consensus.confidence})"
         ),
         run_id=run_id,
         title=f"observation:{run_id[:8]}",
@@ -194,8 +196,8 @@ async def _remember_cycle_outputs(
         evidence_refs=evidence_refs,
     ), "memory.observation")
     for i, d in enumerate(briefing.disagreements):
-        topic = str(d.get("topic") or f"disagreement-{i + 1}")
-        resolution = str(d.get("resolution") or "unresolved")
+        topic = d.topic or f"disagreement-{i + 1}"
+        resolution = d.resolution or "unresolved"
         await _try(AgentMemory(
             session_id=str(session_id),
             kind="hypothesis",
@@ -225,17 +227,18 @@ async def run_analyst_loop(
     use_latest: bool = False,
     session_id: str | None = None,
     with_memory: bool = False,
+    window_minutes: int = 15,
 ) -> None:
-    """Continuously read canonical envelopes and analyze each one.
+    """Continuously run the pipeline and analyze each produced envelope.
 
     Mode resolution (in order):
 
-    1. ``run_id`` set → read that exact envelope once.
-    2. ``use_latest`` set, or no selector set → poll the latest persisted envelope.
-    3. no mode can trigger a canonical refresh; refresh remains a separate
-       explicit harness command.
+    1. ``run_id`` set → read that exact envelope once (legacy, no pipeline).
+    2. ``use_latest`` set, or no selector set → run the pipeline every cycle
+       to produce a fresh envelope, then analyze it.
 
     ``cycles=0`` means run until interrupted.
+    ``window_minutes`` controls how far back the pipeline reads raw evidence.
     """
     if interval_s < 0:
         raise ValueError("interval_s must be non-negative")
@@ -272,6 +275,7 @@ async def run_analyst_loop(
             use_latest=use_latest,
             resolved_session_id=resolved_session_id,
             memory=memory,
+            window_minutes=window_minutes,
         )
     finally:
         if memory is not None:
@@ -291,21 +295,22 @@ async def _run_analyst_loop_body(
     use_latest: bool,
     resolved_session_id: str,
     memory: MemoryNode | None,
+    window_minutes: int = 15,
 ) -> None:
-    """The actual poll/analyze/remember loop (split out so the memory
+    """The actual pipeline/analyze/remember loop (split out so the memory
     node's store lifecycle is owned by ``run_analyst_loop``)."""
     completed = 0
     last_processed_run_id: str | None = None
     while cycles == 0 or completed < cycles:
         envelope: MarketRunEnvelope | None = None
-        cycle_meta: dict[str, Any] = {"mode": "read", "scope": "latest"}
+        cycle_meta: dict[str, Any] = {"mode": "pipeline", "window_minutes": window_minutes}
 
         if run_id is not None:
             cycle_meta = {"mode": "read", "run_id": run_id}
             envelope = await _read_envelope(settings, symbol, run_id)
         else:
-            cycle_meta = {"mode": "read", "scope": "latest", "symbol": symbol.upper()}
-            envelope = await _read_envelope(settings, symbol, None)
+            cycle_meta = {"mode": "pipeline", "symbol": symbol.upper(), "window_minutes": window_minutes}
+            envelope = await pipeline_run_cycle(settings, symbol, window_minutes)
 
         if envelope is None:
             result: dict[str, Any] = {

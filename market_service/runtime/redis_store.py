@@ -476,6 +476,66 @@ class RedisRuntimeStore:
                 break
         return out
 
+    # ------------------------------------------------------------------
+    # Raw evidence stream — poller writes, harness reads
+    # ------------------------------------------------------------------
+
+    def raw_stream(self, symbol: str) -> str:
+        return f"{self.prefix}:stream:raw:{symbol.upper()}"
+
+    def raw_latest_key(self, symbol: str) -> str:
+        return f"{self.prefix}:latest:{symbol.upper()}:raw"
+
+    async def append_raw_evidence(self, symbol: str, payload: dict[str, Any]) -> str:
+        """Append one raw evidence snapshot to the rolling window stream."""
+        return await self.redis.xadd(
+            self.raw_stream(symbol),
+            {
+                "ts": str(payload.get("observed_at_ms", "")),
+                "payload": json.dumps(payload, default=str, separators=(",", ":")),
+            },
+            maxlen=5000,
+            approximate=True,
+        )
+
+    async def set_raw_latest(self, symbol: str, payload: dict[str, Any]) -> None:
+        """Set the latest raw evidence snapshot."""
+        await self.redis.set(
+            self.raw_latest_key(symbol),
+            json.dumps(payload, default=str, separators=(",", ":")),
+        )
+
+    async def read_raw_window(
+        self, symbol: str, since_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Read all raw evidence entries since ``since_ms`` (inclusive)."""
+        rows = await self.redis.xrange(
+            self.raw_stream(symbol), min=str(since_ms), max="+",
+        )
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    async def read_raw_latest(self, symbol: str) -> dict[str, Any] | None:
+        """Read the latest raw evidence snapshot."""
+        raw = await self.redis.get(self.raw_latest_key(symbol))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else None
+        except (ValueError, json.JSONDecodeError):
+            return None
+
     async def wait_for_result(
         self,
         run_id: str,

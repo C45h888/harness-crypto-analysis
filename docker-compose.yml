@@ -1,12 +1,7 @@
-# Canonical runtime topology (data-access -> calculations -> analysis -> collator)
-# plus the existing collector. The containerization contract keeps the unified
-# collector path working unchanged and adds four new domain services that
-# communicate exclusively through Redis streams.
+# Canonical runtime topology — poller feeds raw evidence into Redis every 5s;
+# the harness runs the pipeline (calc + analysis + collate) on its own schedule
+# and then passes the envelope to the NOOA analyst suite.
 services:
-  # Telemetry hygiene spec — Option C: a custom redis image that
-  # runs redis-server AND a tiny Python cleaner (PID 2) inside the
-  # same container, sharing /data and a local unix socket. No
-  # socket mount, no sidecar, no shell-out.
   redis:
     build:
       context: ./docker-redis
@@ -45,12 +40,7 @@ services:
       timeout: 3s
       retries: 12
 
-  # One-shot schema bootstrap via Alembic. Applies all pending migrations up
-  # to head against the Postgres service on every `up` (idempotent baseline
-  # means it is safe on both fresh volumes and pre-existing databases), so the
-  # schema never depends on the initdb-first-boot-only behavior that skips
-  # scripts on existing volumes. Alembic is the single source of truth for
-  # schema evolution going forward.
+  # One-shot schema bootstrap via Alembic.
   db-init:
     build: .
     command: ["alembic", "upgrade", "head"]
@@ -58,7 +48,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
     volumes:
       - ./alembic:/app/alembic:ro
       - ./alembic.ini:/app/alembic.ini:ro
@@ -67,29 +57,26 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # Domain service: data-access.
-  # ONLY this service receives external API credentials (Binance, CoinGecko,
-  # CryptoQuant). It publishes MarketStateEnvelope(source="data-access") to
-  # <prefix>:latest:<SYM>:data-access and <prefix>:stream:domain:data-access:<SYM>.
-  data-access:
+  # 5-second raw-evidence firehose. Replaces the old data-access node.
+  # Fetches Binance spot + futures data and appends to Redis raw stream.
+  # No math, no analysis, no collation — just Binance → Redis.
+  poller:
     build: .
     user: "marketflow"
-    command: ["python", "-m", "market_service.nodes.data_access"]
+    command: ["python", "-m", "market_service.poller"]
     env_file:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
-      WALL_HISTORY_MAXLEN: ${WALL_HISTORY_MAXLEN:-200}
       SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
-      POLL_SECONDS: ${POLL_SECONDS:-30}
+      POLL_SECONDS: ${POLL_SECONDS:-5}
       FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
       DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # External API creds (only here; not propagated to other services).
       BINANCE_BASE_URL: ${BINANCE_BASE_URL:-}
       CRYPTOQUANT_API_KEY: ${CRYPTOQUANT_API_KEY:-}
       COINGECKO_BASE_URL: ${COINGECKO_BASE_URL:-}
@@ -102,181 +89,17 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import market_service.nodes.data_access; import market_service.runtime.redis_store as r; print(\"ok\")'"]
+      test: ["CMD-SHELL", "python -c 'import market_service.poller; print(\"ok\")'"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 20s
 
-  # Domain service: calculations. Reads latest data-access payload and runs
-  # pure math. NO network I/O. NO creds.
-  calculations:
-    build: .
-    user: "marketflow"
-    command: ["python", "-m", "market_service.nodes.calculations"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
-      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
-      POLL_SECONDS: ${POLL_SECONDS:-30}
-      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
-      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-      data-access:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import market_service.nodes.calculations; print(\"ok\")'"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  # Domain service: analysis. Reads latest calculations + data-access and
-  # produces interpretation. NO trading, no threshold overrides.
-  analysis:
-    build: .
-    user: "marketflow"
-    command: ["python", "-m", "market_service.nodes.analysis"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
-      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
-      POLL_SECONDS: ${POLL_SECONDS:-30}
-      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
-      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-      calculations:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import market_service.nodes.analysis; print(\"ok\")'"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  # Orchestrator: the ONLY timer-driven application service. Each
-  # POLL_SECONDS it sequences data-access -> calculations -> analysis -> collate
-  # via <prefix>:stream:commands.
-  orchestrator:
-    build: .
-    user: "marketflow"
-    command: ["python", "-m", "market_service.nodes.orchestrator"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
-      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
-      POLL_SECONDS: ${POLL_SECONDS:-30}
-      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
-      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
-      MAX_DOMAIN_STATE_AGE_SECONDS: ${MAX_DOMAIN_STATE_AGE_SECONDS:-90}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-      data-access:
-        condition: service_healthy
-      calculations:
-        condition: service_healthy
-      analysis:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import market_service.nodes.orchestrator; print(\"ok\")'"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  # Legacy collector: writes market_snapshot + signal_event. Unchanged path.
-  collector:
-    build: .
-    user: "marketflow"
-    command: ["python", "-m", "market_service.collector"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
-      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
-      POLL_SECONDS: ${POLL_SECONDS:-30}
-      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
-      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-    restart: unless-stopped
-
-  # Legacy collator: one-shot per invocation. Stable entrypoint.
-  collator:
-    build: .
-    user: "marketflow"
-    command: ["python", "-m", "market_service.commands.collate", "SOLUSDT", "--json"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-    restart: "no"
-
-  # Harness client and optional long-running NOOA analyst runner. The
-  # analyst loop is still mounted through the canonical harness command; it
-  # does not create a second data-access or orchestration service.
-  # The image contains the package at /app; no host bind mount and no Docker
-  # socket are required.
+  # Harness client and long-running NOOA analyst runner. The analyst loop
+  # reads raw evidence from Redis, runs the pipeline (calc + analysis +
+  # collate) inline, then invokes the NOOA specialist agents over the
+  # resulting envelope. No exchange credentials needed — the poller owns
+  # that responsibility.
   harness:
     build: .
     user: "marketflow"
@@ -285,9 +108,7 @@ services:
       - path: .env
         required: false
     environment:
-      # Compose-constructed URLs override whatever .env carries for these
-      # so the container talks to the right host inside the Docker network.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
@@ -297,7 +118,6 @@ services:
       NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
       NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
       NOOA_API_KEY: ${NOOA_API_KEY:-}
-      # Legacy fallback aliases (deprecated; canonical is NOOA_* above).
       PROVIDER: ${PROVIDER:-}
       PROVIDER_API_KEY: ${PROVIDER_API_KEY:-}
       PROVIDER_BASE_URL: ${PROVIDER_BASE_URL:-}
@@ -309,17 +129,10 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
-      orchestrator:
-        condition: service_healthy
     profiles: ["tools"]
     restart: "no"
 
-  # Mounted NOOA CLI on the canonical runtime. Same image and env as the
-  # harness; the `market` harness group is mounted at import time
-  # (market_service/commands/nooa_cli.py) — no writes into the installed
-  # nooa-cli package. Interactive/one-shot use:
-  #   docker compose --profile tools run --rm nooa market envelope SOLUSDT --latest
-  #   docker compose --profile tools run --rm nooa market analyst SOLUSDT --cycles 1
+  # Mounted NOOA CLI on the canonical runtime.
   nooa:
     build: .
     user: "marketflow"
@@ -328,7 +141,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
