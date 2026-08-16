@@ -125,3 +125,44 @@ CREATE INDEX IF NOT EXISTS analyst_briefing_run_id_idx
 
 CREATE INDEX IF NOT EXISTS analyst_briefing_generated_at_idx
     ON analyst_briefing (generated_at DESC);
+
+-- Durable ledger for the MemoryNode — the analyst's own curated knowledge
+-- (observations, hypotheses, requests, briefings, facts/notes) so later
+-- analyst cycles can recall what the model concluded on earlier runs.
+-- Discipline mirrors analyst_briefing: schema-versioned, durable-ledger-first
+-- write order, immutable-by-id (re-writing the same memory_id updates fields
+-- in place — forget() tombstones with forgotten = TRUE), forgotten rows
+-- survive for audit but are excluded from recall, no FK to market_run
+-- (the agent layer must not corrupt canonical state by deleting a memory).
+-- The payload JSONB carries the full validated AgentMemory.to_dict() so
+-- recall/seeding reads one column (same shape as analyst_briefing).
+CREATE TABLE IF NOT EXISTS agent_memory (
+    memory_id UUID NOT NULL,
+    session_id UUID NOT NULL,
+    run_id UUID,
+    kind TEXT NOT NULL
+        CHECK (kind IN ('observation', 'hypothesis', 'request',
+                        'briefing', 'fact', 'note')),
+    title TEXT,
+    content TEXT NOT NULL,
+    importance DOUBLE PRECISION NOT NULL DEFAULT 5.0
+        CHECK (importance >= 0 AND importance <= 10),
+    tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+    evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ,
+    forgotten BOOLEAN NOT NULL DEFAULT FALSE,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    payload JSONB NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS agent_memory_session_created_idx
+    ON agent_memory (session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS agent_memory_run_id_idx
+    ON agent_memory (run_id);
+
+CREATE INDEX IF NOT EXISTS agent_memory_kind_idx
+    ON agent_memory (session_id, kind, created_at DESC);

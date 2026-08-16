@@ -7,6 +7,8 @@ WORKDIR /app
 
 RUN addgroup --system marketflow && adduser --system --ingroup marketflow marketflow
 
+# nooa / nooa-cli come from PyPI wheels (pinned in requirements.txt), so no
+# git or build toolchain is needed in the image.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 

@@ -9,7 +9,7 @@ from typing import Any
 
 import asyncpg
 
-from .contracts import AnalystBriefing, MarketRunEnvelope
+from .contracts import AgentMemory, AnalystBriefing, MarketRunEnvelope
 
 
 class PostgresRuntimeStore:
@@ -176,6 +176,153 @@ class PostgresRuntimeStore:
         if raw is None:
             return None
         return MarketRunEnvelope.from_mapping(json.loads(raw) if isinstance(raw, str) else raw)
+
+    async def insert_agent_memory(self, memory: AgentMemory) -> bool:
+        """Durable, idempotent write of one ``AgentMemory``.
+
+        Postgres is the durable ledger for agent memory; Redis is only the
+        live projection. The row is schema-versioned and immutable-by-id:
+        re-writing the same ``memory_id`` updates fields (used by
+        ``forget`` to tombstone) instead of duplicating. ``forgotten``
+        rows survive for audit but are excluded from recall.
+        """
+        memory.validate()
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        try:
+            created_at = datetime.fromisoformat(
+                memory.created_at.replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            created_at = datetime.now()
+        updated_at_raw = memory.updated_at
+        updated_at: datetime | None = None
+        if updated_at_raw:
+            try:
+                updated_at = datetime.fromisoformat(
+                    updated_at_raw.replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                updated_at = None
+        row = await self.pool.fetchrow(
+            """INSERT INTO agent_memory
+               (memory_id, session_id, run_id, kind, title, content,
+                importance, tags, evidence_refs, created_at, updated_at,
+                forgotten, schema_version, payload)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+               ON CONFLICT (memory_id) DO UPDATE
+               SET run_id = EXCLUDED.run_id,
+                   kind = EXCLUDED.kind,
+                   title = EXCLUDED.title,
+                   content = EXCLUDED.content,
+                   importance = EXCLUDED.importance,
+                   tags = EXCLUDED.tags,
+                   evidence_refs = EXCLUDED.evidence_refs,
+                   updated_at = EXCLUDED.updated_at,
+                   forgotten = EXCLUDED.forgotten,
+                   payload = EXCLUDED.payload
+               RETURNING memory_id""",
+            uuid.UUID(memory.memory_id),
+            uuid.UUID(memory.session_id),
+            uuid.UUID(memory.run_id) if memory.run_id else None,
+            memory.kind,
+            memory.title,
+            memory.content,
+            memory.importance,
+            json.dumps(list(memory.tags), default=str),
+            json.dumps(list(memory.evidence_refs), default=str),
+            created_at,
+            updated_at,
+            memory.forgotten,
+            memory.schema_version,
+            memory.to_json(),
+        )
+        return row is not None
+
+    async def read_recent_memories(
+        self, session_id: str, kind: str | None = None, limit: int = 32,
+    ) -> list[AgentMemory]:
+        """Most recent non-forgotten memories for one session.
+
+        Durable authority is Postgres; Redis is the fallen-back live
+        projection. Optional ``kind`` filter mirrors the recall surface
+        of the memory node.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        sql = (
+            "SELECT payload FROM agent_memory "
+            "WHERE session_id = $1 AND NOT forgotten "
+            "ORDER BY created_at DESC LIMIT $3"
+        )
+        params: list[Any] = [uuid.UUID(session_id), limit]
+        if kind is not None:
+            sql = (
+                "SELECT payload FROM agent_memory "
+                "WHERE session_id = $1 AND kind = $2 AND NOT forgotten "
+                "ORDER BY created_at DESC LIMIT $3"
+            )
+            params = [uuid.UUID(session_id), kind, limit]
+        rows = await self.pool.fetch(sql, *params)
+        out: list[AgentMemory] = []
+        for row in rows:
+            raw = row["payload"]
+            if raw is None:
+                continue
+            try:
+                out.append(AgentMemory.from_mapping(
+                    json.loads(raw) if isinstance(raw, str) else raw
+                ))
+            except (ValueError, json.JSONDecodeError):
+                continue
+        return out
+
+    async def read_memory(self, memory_id: str) -> AgentMemory | None:
+        """Read one durable memory by id (including forgotten rows)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        raw = await self.pool.fetchval(
+            "SELECT payload FROM agent_memory WHERE memory_id = $1",
+            uuid.UUID(memory_id),
+        )
+        if raw is None:
+            return None
+        try:
+            return AgentMemory.from_mapping(
+                json.loads(raw) if isinstance(raw, str) else raw
+            )
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    async def forget_memory(self, memory_id: str) -> bool:
+        """Tombstone one agent memory (audit row survives)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """UPDATE agent_memory
+               SET forgotten = TRUE, updated_at = now()
+               WHERE memory_id = $1
+               RETURNING memory_id""",
+            uuid.UUID(memory_id),
+        )
+        return row is not None
+
+    async def count_memories(self, session_id: str) -> dict[str, int]:
+        """Per-kind counts for one session's durable memories."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            "SELECT kind, COUNT(*) AS n FROM agent_memory "
+            "WHERE session_id = $1 AND NOT forgotten "
+            "GROUP BY kind ORDER BY kind",
+            uuid.UUID(session_id),
+        )
+        return {str(row["kind"]): int(row["n"]) for row in rows}
 
     async def has_run(self, run_id: str) -> bool:
         if self.pool is None:

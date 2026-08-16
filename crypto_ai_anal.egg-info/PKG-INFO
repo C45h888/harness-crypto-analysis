@@ -1,3 +1,14 @@
+Metadata-Version: 2.4
+Name: crypto-ai-anal
+Version: 2.0.0
+Summary: Containerized, human-in-the-loop crypto market data harness with NOOA analyst integration
+License: Proprietary
+Project-URL: Repository, https://github.com/kamii/crypto-ai-anal
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: nooa[viewer]>=0.0.8
+Requires-Dist: nooa-cli>=0.0.8
+
 # Crypto AI Analytics
 
 Live crypto market-data system for a discretionary SOL/ETH/BTC perp trader. It

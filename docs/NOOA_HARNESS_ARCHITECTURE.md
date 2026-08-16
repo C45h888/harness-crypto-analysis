@@ -143,6 +143,28 @@ session_id: agent session identifier
 The request enters the existing harness/orchestrator path. NOOA does not call
 exchange clients directly and does not create a second collection pipeline.
 
+## CLI mount (current integration state)
+
+The NOOA CLI is mounted at the canonical harness mount point without
+mutating the installed `nooa-cli` package:
+
+- `market_service/commands/nooa_cli_ext.py` — the `market` harness group
+  (`envelope`, `briefing`, `memory`, `analyst`, `refresh`), backed by the
+  canonical runtime stores.
+- `market_service/commands/nooa_cli.py` — repo-root mount: attaches the
+  `market` group to the framework root `oo` group at import time and
+  delegates to the normal CLI entry. One mount covers the VSCode-shell
+  wrapper (`./nooa`), the `nooa-market` console script, the Docker `nooa`
+  compose service, and the harness passthrough (`harness --nooa market ...`).
+- `market_service/commands/harness.py` — the canonical harness command; the
+  `--nooa` option forwards into the same mounted CLI, so the Docker harness
+  container can run the model-facing CLI during a run.
+
+`nooa`/`nooa-cli` are pinned at `0.0.8` from PyPI in `requirements.txt`.
+The agent classes (`agents.py`) are validated against the 0.0.8 API
+surface (`Agent`, `Context`, `spec`, `strategy`, `DynamicContext`,
+`CodeActStrategy`, `PredictStrategy`, `agentdoc.hidden`).
+
 ## Model backend seam
 
 Model configuration belongs inside the NOOA package, not inside market data

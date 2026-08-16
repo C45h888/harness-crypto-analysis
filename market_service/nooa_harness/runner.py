@@ -26,6 +26,7 @@ from typing import Any
 
 from market_service.config import Settings
 from market_service.runtime.contracts import (
+    AgentMemory,
     AnalystBriefing,
     MarketRunEnvelope,
 )
@@ -33,6 +34,7 @@ from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 from .backends import ModelBackendConfig
+from .memory import MemoryNode
 from .suite import build_suite
 
 log = logging.getLogger(__name__)
@@ -129,6 +131,90 @@ async def read_briefing(
         await postgres.close()
 
 
+async def _remember_cycle_outputs(
+    node: MemoryNode,
+    session_id: str,
+    envelope: MarketRunEnvelope | None,
+    briefing: AnalystBriefing,
+) -> dict[str, Any]:
+    """Auto-remember one cycle's advisory outputs as typed AgentMemory.
+
+    Deterministic extraction from the validated briefing (no LLM re-read):
+    - ``briefing`` — the narrative itself (highest importance);
+    - ``observation`` — the consensus direction/confidence;
+    - ``hypothesis`` — one per disagreement topic.
+
+    Everything is best-effort and non-fatal: a memory failure is recorded
+    on the result dict, never raised into the analyst loop.
+    """
+    evidence_refs = tuple(
+        str(e.get("path", ""))
+        for e in briefing.key_evidence if e.get("path")
+    )
+    run_id = briefing.run_id
+    remembered: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    async def _try(memory: AgentMemory, label: str) -> None:
+        try:
+            stored = await node.remember(
+                session_id=str(session_id),
+                kind=memory.kind,
+                content=memory.content,
+                run_id=memory.run_id,
+                title=memory.title,
+                importance=memory.importance,
+                evidence_refs=memory.evidence_refs,
+            )
+            remembered.append({"kind": memory.kind, "memory_id": stored.memory_id})
+        except Exception as exc:
+            errors.append({"stage": label, "error": f"{type(exc).__name__}: {exc}"})
+
+    await _try(AgentMemory(
+        session_id=str(session_id),
+        kind="briefing",
+        content=briefing.narrative or "",
+        run_id=run_id,
+        title=f"briefing:{run_id[:8]}",
+        importance=6.0,
+        tags=("briefing", briefing.status),
+        evidence_refs=evidence_refs,
+    ), "memory.briefing")
+    await _try(AgentMemory(
+        session_id=str(session_id),
+        kind="observation",
+        content=(
+            f"Consensus: {briefing.consensus.get('direction', 'unknown')} "
+            f"(confidence {briefing.consensus.get('confidence', 'low')})"
+        ),
+        run_id=run_id,
+        title=f"observation:{run_id[:8]}",
+        importance=5.0,
+        tags=("consensus",),
+        evidence_refs=evidence_refs,
+    ), "memory.observation")
+    for i, d in enumerate(briefing.disagreements):
+        topic = str(d.get("topic") or f"disagreement-{i + 1}")
+        resolution = str(d.get("resolution") or "unresolved")
+        await _try(AgentMemory(
+            session_id=str(session_id),
+            kind="hypothesis",
+            content=f"{topic}: {resolution}",
+            run_id=run_id,
+            title=f"disagreement:{topic[:40]}",
+            importance=4.0,
+            tags=("disagreement",),
+            evidence_refs=evidence_refs,
+        ), "memory.hypothesis")
+
+    return {
+        "remembered": remembered,
+        "errors": errors,
+        "count": len(remembered),
+        "error_count": len(errors),
+    }
+
+
 async def run_analyst_loop(
     symbol: str,
     *,
@@ -138,6 +224,7 @@ async def run_analyst_loop(
     run_id: str | None = None,
     use_latest: bool = False,
     session_id: str | None = None,
+    with_memory: bool = False,
 ) -> None:
     """Continuously read canonical envelopes and analyze each one.
 
@@ -166,6 +253,47 @@ async def run_analyst_loop(
     settings = Settings.from_env()
     backend = ModelBackendConfig.from_env()
     resolved_session_id = _resolve_session_id(session_id)
+
+    memory: MemoryNode | None = None
+    if with_memory:
+        memory = MemoryNode.from_settings(settings)
+
+    completed = 0
+    last_processed_run_id: str | None = None
+    try:
+        await _run_analyst_loop_body(
+            settings=settings,
+            backend=backend,
+            symbol=symbol,
+            interval_s=interval_s,
+            timeout_s=timeout_s,
+            cycles=cycles,
+            run_id=run_id,
+            use_latest=use_latest,
+            resolved_session_id=resolved_session_id,
+            memory=memory,
+        )
+    finally:
+        if memory is not None:
+            await memory.postgres.close()
+            await memory.redis.close()
+
+
+async def _run_analyst_loop_body(
+    *,
+    settings: Settings,
+    backend: ModelBackendConfig,
+    symbol: str,
+    interval_s: float,
+    timeout_s: float,
+    cycles: int,
+    run_id: str | None,
+    use_latest: bool,
+    resolved_session_id: str,
+    memory: MemoryNode | None,
+) -> None:
+    """The actual poll/analyze/remember loop (split out so the memory
+    node's store lifecycle is owned by ``run_analyst_loop``)."""
     completed = 0
     last_processed_run_id: str | None = None
     while cycles == 0 or completed < cycles:
@@ -199,6 +327,26 @@ async def run_analyst_loop(
             # to be analyzed. This keeps the run's read path (no-envelope /
             # unchanged-run) free of the nooa/litellm import cost: on the live
             # loop, retries for an unchanged run_id never build the agent stack.
+            #
+            # Memory inside the loop: recall the session's prior conclusions
+            # (Redis-first live read) and seed them into the suite as a
+            # context block; after the briefing is persisted, auto-remember
+            # this cycle's outputs back into the ledger. Best-effort only.
+            memory_meta: dict[str, Any] = {"enabled": memory is not None}
+            prior_memories: list[AgentMemory] = []
+            if memory is not None:
+                try:
+                    prior_memories = await memory.recall(
+                        resolved_session_id, limit=8,
+                    )
+                    memory_meta["recalled"] = [
+                        {"kind": m.kind, "memory_id": m.memory_id}
+                        for m in prior_memories
+                    ]
+                except Exception as exc:
+                    log.exception("memory recall failed for session=%s", resolved_session_id)
+                    memory_meta["recall_error"] = f"{type(exc).__name__}: {exc}"
+
             suite = build_suite(symbol, backend.build_llm())
             envelope_dict = envelope.to_dict()
             analysis = await suite.analyze(
@@ -206,6 +354,13 @@ async def run_analyst_loop(
                 session_id=resolved_session_id,
                 model_provider=backend.provider,
                 model_name=backend.model,
+                prior_memories=prior_memories or None,
+                specialist_timeout_s=float(
+                    os.getenv("NOOA_SPECIALIST_TIMEOUT_S", "120")
+                ),
+                controller_timeout_s=float(
+                    os.getenv("NOOA_CONTROLLER_TIMEOUT_S", "180")
+                ),
             )
             last_processed_run_id = envelope.run_id
             briefing = AnalystBriefing.from_mapping(analysis["briefing"])
@@ -215,6 +370,14 @@ async def run_analyst_loop(
             except Exception as exc:
                 log.exception("briefing persistence failed for run_id=%s", briefing.run_id)
                 persistence = {"error": f"{type(exc).__name__}: {exc}"}
+            if memory is not None:
+                try:
+                    memory_meta["remembered"] = await _remember_cycle_outputs(
+                        memory, resolved_session_id, envelope, briefing,
+                    )
+                except Exception as exc:
+                    log.exception("memory remember failed for run_id=%s", briefing.run_id)
+                    memory_meta["remember_error"] = f"{type(exc).__name__}: {exc}"
             result = {
                 "session_id": resolved_session_id,
                 "symbol": symbol.upper(),
@@ -223,6 +386,7 @@ async def run_analyst_loop(
                 "briefing": analysis["briefing"],
                 "parse_errors": analysis["parse_errors"],
                 "persistence": persistence,
+                "memory": memory_meta,
                 "model": {
                     "provider": backend.provider,
                     "name": backend.model,
@@ -235,4 +399,11 @@ async def run_analyst_loop(
             await asyncio.sleep(interval_s)
 
 
-__all__ = ["run_analyst_loop", "read_briefing", "_read_envelope", "_persist_briefing"]
+__all__ = [
+    "run_analyst_loop",
+    "read_briefing",
+    "_read_envelope",
+    "_persist_briefing",
+    "_remember_cycle_outputs",
+    "_run_analyst_loop_body",
+]

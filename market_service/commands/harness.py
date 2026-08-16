@@ -12,6 +12,13 @@ scripts were fully migrated into `market_service` and deleted.)
 Usage:
     .venv/bin/python -m market_service.commands.harness SOLUSDT --json
     .venv/bin/python -m market_service.commands.harness SOLUSDT
+    .venv/bin/python -m market_service.commands.harness \
+        --nooa market envelope SOLUSDT --latest
+
+The NOOA CLI is mounted at the canonical harness mount point: the repo-root
+`nooa` CLI (and the Docker `nooa` service) run the same `market` harness
+group through `market_service/commands/nooa_cli.py`, and `--nooa` forwards
+into it from this harness command.
 
 Follows the repo null discipline: `null` means a source did not provide a
 value — it is not a substitute for zero.
@@ -117,7 +124,7 @@ async def trigger_full_cycle(symbol: str, timeout_s: float, scope: str = "all") 
         await redis.close()
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Clean aggregated market-data harness for the model")
     p.add_argument("symbol", nargs="?", default="SOLUSDT")
     p.add_argument("--trades", type=int, default=500)
@@ -138,11 +145,35 @@ def main(argv: list[str] | None = None) -> int:
                    help="seconds between NOOA analyst cycles")
     p.add_argument("--cycles", type=int, default=0,
                    help="number of NOOA analyst cycles; 0 means run forever")
+    p.add_argument("--with-memory", action="store_true",
+                   help="NOOA analyst loop: recall prior session memory before each "
+                        "cycle and remember each cycle's outputs (durable ledger + "
+                        "Redis live projection)")
     p.add_argument("--session-id", default=None,
                    help="stable UUID analyst session id; default env NOOA_SESSION_ID or generated UUID")
     p.add_argument("--briefing", action="store_true",
                    help="read one persisted NOOA briefing by session and canonical run ID")
+    p.add_argument("--nooa", nargs=argparse.REMAINDER, metavar="ARGS",
+                   help="delegate to the mounted NOOA CLI through harness.py "
+                        "(e.g. --nooa market envelope SOLUSDT --latest; "
+                        "a leading -- is allowed but optional)")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
     args = p.parse_args(argv)
+
+    if args.nooa is not None:
+        # NOOA CLI mounted at the canonical harness mount point: forward the
+        # remaining argv verbatim to the repo-root-mounted CLI (import-time
+        # mount, no writes into the installed nooa-cli package).
+        from market_service.commands.nooa_cli import main as nooa_main
+
+        passthrough = list(args.nooa)
+        if passthrough and passthrough[0] == "--":
+            passthrough = passthrough[1:]
+        return nooa_main(passthrough)
 
     if args.briefing:
         if args.analyst_loop or not args.session_id or not args.run_id:
@@ -172,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run_id,
             use_latest=args.latest,
             session_id=args.session_id,
+            with_memory=args.with_memory,
         ))
         return 0
     if args.domain:

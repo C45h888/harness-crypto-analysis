@@ -314,6 +314,41 @@ services:
     profiles: ["tools"]
     restart: "no"
 
+  # Mounted NOOA CLI on the canonical runtime. Same image and env as the
+  # harness; the `market` harness group is mounted at import time
+  # (market_service/commands/nooa_cli.py) — no writes into the installed
+  # nooa-cli package. Interactive/one-shot use:
+  #   docker compose --profile tools run --rm nooa market envelope SOLUSDT --latest
+  #   docker compose --profile tools run --rm nooa market analyst SOLUSDT --cycles 1
+  nooa:
+    build: .
+    user: "marketflow"
+    entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-marketflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
+      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
+      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
+      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
+      NOOA_API_KEY: ${NOOA_API_KEY:-}
+      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    profiles: ["tools"]
+    restart: "no"
+
 volumes:
   postgres_data:
   redis_data:

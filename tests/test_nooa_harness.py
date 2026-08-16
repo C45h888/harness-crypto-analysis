@@ -119,6 +119,29 @@ class NooaHarnessIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.llm = _make_mock_llm()
 
+    def test_bounded_envelope_stays_under_param_limit(self):
+        # NOOA v0.0.8 PredictStrategy caps params at 200k chars; a live
+        # envelope can exceed that on raw evidence alone. The LLM-bound view
+        # must be trimmed with explicit markers and never mutate the agent's
+        # complete internal envelope.
+        suite = build_suite("SOLUSDT", llm=self.llm)
+        agent = suite.delta_orderflow
+        env = dict(_SAMPLE_ENVELOPE)
+        env["canonical_state"]["data-access"]["evidence"]["spot"]["trades_raw"] = [
+            {"price": i, "qty": i, "side": "buy", "time": i} for i in range(2000)
+        ]
+        agent._current_envelope = env
+        rendered = agent._bounded_envelope(max_chars=8_000)
+        self.assertLessEqual(len(rendered), 8_000)
+        parsed = json.loads(rendered)
+        self.assertEqual(parsed["run_id"], env["run_id"])
+        # Large raw arrays are truncated with an explicit marker, never dropped.
+        spot = parsed["canonical_state"]["data-access"]["evidence"]["spot"]
+        self.assertIn("__truncated__", spot["trades_raw"])
+        self.assertEqual(spot["trades_raw"]["count"], 2000)
+        # The agent's internal envelope remains complete after the bounded view.
+        self.assertEqual(len(agent._current_envelope["canonical_state"]["data-access"]["evidence"]["spot"]["trades_raw"]), 2000)
+
     def test_build_suite_creates_all_agents(self):
         suite = build_suite("SOLUSDT", llm=self.llm)
         self.assertIsInstance(suite, AnalystSuite)
@@ -312,7 +335,10 @@ class SuiteParseErrorTests(unittest.IsolatedAsyncioTestCase):
                 envelope,
                 session_id="sess-1", model_provider="openai", model_name="gpt-x",
             )
-        self.assertEqual(received, [id(envelope)] * 4)
+        # All specialists must receive ONE identical envelope view (the shared
+        # bounded LLM projection), never four different copies.
+        self.assertEqual(len(received), 4)
+        self.assertEqual(len(set(received)), 1)
         self.assertEqual(result["briefing"]["status"], "healthy")
 
 

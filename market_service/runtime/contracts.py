@@ -16,6 +16,13 @@ MARKET_STATE_SCHEMA_VERSION = 1
 MARKET_RUN_SCHEMA_VERSION = 1
 ANALYST_BRIEFING_SCHEMA_VERSION = 1
 SPECIALIST_REPORT_SCHEMA_VERSION = 1
+AGENT_MEMORY_SCHEMA_VERSION = 1
+# Agent-artifact kinds the memory node can persist. Mirrors the agent-owned
+# write surfaces from NOOA_HARNESS_ARCHITECTURE.md: observations, hypotheses,
+# requests, briefings — plus 'fact'/'note' for durable analyst notes.
+ValidMemoryKinds: tuple[str, ...] = (
+    "observation", "hypothesis", "request", "briefing", "fact", "note",
+)
 StateStatus = Literal["healthy", "degraded", "invalid"]
 RuntimePhase = Literal[
     "REQUESTED", "INITIALIZING", "COLLECTING", "CALCULATING", "ANALYZING",
@@ -760,6 +767,108 @@ class AnalystBriefing:
         if self.extra:
             out.update(self.extra)
         return out
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class AgentMemory:
+    """A durable, auditable analyst memory tied to one session (and run).
+
+    The memory node's unit of state. Every memory is advisory — it is the
+    analyst's own curated knowledge, never canonical market state. It may
+    optionally reference the canonical ``run_id`` (or exact envelope paths in
+    ``evidence_refs``) it was derived from, so recall stays auditable.
+
+    Persistence mirrors ``AnalystBriefing``: Postgres is the durable ledger
+    (``agent_memory`` table, schema-versioned), Redis is the live projection
+    (``marketflow:agent:<SESSION_ID>:memory`` stream). ``forgotten=True`` is a
+    tombstone — the row survives for audit but is excluded from recall.
+    """
+
+    session_id: str
+    kind: str
+    content: str
+    memory_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    run_id: str | None = None
+    title: str | None = None
+    importance: float = 5.0
+    tags: tuple[str, ...] = field(default_factory=tuple)
+    evidence_refs: tuple[str, ...] = field(default_factory=tuple)
+    created_at: str = field(default_factory=lambda: _utc_iso())
+    updated_at: str | None = None
+    forgotten: bool = False
+    schema_version: int = AGENT_MEMORY_SCHEMA_VERSION
+
+    def validate(self) -> None:
+        if self.schema_version != AGENT_MEMORY_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported agent memory schema version: {self.schema_version}"
+            )
+        if not self.session_id:
+            raise ValueError("AgentMemory requires session_id")
+        if self.kind not in ValidMemoryKinds:
+            raise ValueError(
+                f"invalid memory kind {self.kind!r}; expected one of {ValidMemoryKinds!r}"
+            )
+        if not self.content or not self.content.strip():
+            raise ValueError("AgentMemory requires non-empty content")
+        if not 0 <= self.importance <= 10:
+            raise ValueError(f"importance must be in [0, 10], got {self.importance!r}")
+        if self.run_id is not None and not str(self.run_id).strip():
+            raise ValueError("run_id must be non-empty when given")
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "AgentMemory":
+        """Round-trip from a dict payload (Redis or Postgres read-back)."""
+        memory = cls(
+            schema_version=int(
+                value.get("schema_version", AGENT_MEMORY_SCHEMA_VERSION)
+            ),
+            session_id=str(value["session_id"]),
+            kind=str(value["kind"]),
+            content=str(value["content"]),
+            memory_id=str(value.get("memory_id") or uuid.uuid4()),
+            run_id=(
+                str(value["run_id"])
+                if value.get("run_id") is not None else None
+            ),
+            title=(
+                str(value["title"])
+                if value.get("title") is not None else None
+            ),
+            importance=float(value.get("importance", 5.0)),
+            tags=tuple(str(t) for t in (value.get("tags") or ())),
+            evidence_refs=tuple(
+                str(e) for e in (value.get("evidence_refs") or ())
+            ),
+            created_at=str(value.get("created_at") or _utc_iso()),
+            updated_at=(
+                str(value["updated_at"])
+                if value.get("updated_at") is not None else None
+            ),
+            forgotten=bool(value.get("forgotten", False)),
+        )
+        memory.validate()
+        return memory
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "session_id": self.session_id,
+            "kind": self.kind,
+            "content": self.content,
+            "memory_id": self.memory_id,
+            "run_id": self.run_id,
+            "title": self.title,
+            "importance": self.importance,
+            "tags": list(self.tags),
+            "evidence_refs": list(self.evidence_refs),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "forgotten": self.forgotten,
+        }
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), default=str, separators=(",", ":"))

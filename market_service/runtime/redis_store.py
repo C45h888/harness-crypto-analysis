@@ -11,8 +11,8 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from .contracts import (
-    AnalystBriefing, HarnessRunRequest, MarketEvent, MarketRunEnvelope,
-    MarketStateEnvelope, RefreshCommand, RuntimeRunState,
+    AgentMemory, AnalystBriefing, HarnessRunRequest, MarketEvent,
+    MarketRunEnvelope, MarketStateEnvelope, RefreshCommand, RuntimeRunState,
 )
 
 
@@ -194,7 +194,7 @@ class RedisRuntimeStore:
         *, run_id: str | None = None,
     ) -> str:
         """Publish advisory output into the agent-owned namespace only."""
-        if artifact_type not in {"observations", "hypotheses", "briefings"}:
+        if artifact_type not in {"observations", "hypotheses", "briefings", "memory"}:
             raise ValueError(f"unsupported agent artifact type: {artifact_type}")
         fields = {
             "schema_version": "1",
@@ -241,6 +241,36 @@ class RedisRuntimeStore:
             except (ValueError, json.JSONDecodeError):
                 continue
         return out
+
+    async def read_recent_memories(
+        self, session_id: str, count: int = 32,
+    ) -> list[AgentMemory]:
+        """Read the most recent agent memories for one session (highest first).
+
+        Redis is the live projection; Postgres remains the durable authority
+        for history. Forgotten memories are skipped so the live projection
+        never resurrects a tombstoned row on a Postgres-empty fallback.
+        """
+        rows = await self.redis.xrevrange(
+            self.agent_stream(session_id, "memory"), count=count
+        )
+        out: list[AgentMemory] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                memory = AgentMemory.from_mapping(json.loads(raw))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            out.append(memory)
+        # Dedupe by memory_id keeping the NEWEST version (xrevrange is
+        # highest-first), then drop tombstoned versions: a forget() append
+        # must exclude the original entry from the live read plan too.
+        newest: dict[str, AgentMemory] = {}
+        for m in out:
+            newest.setdefault(m.memory_id, m)
+        return [m for m in newest.values() if not m.forgotten]
 
     async def publish_domain_state(self, state: MarketStateEnvelope) -> str:
         """Publish a domain service envelope to its latest projection + stream."""

@@ -113,9 +113,60 @@ class MarketAnalyst(Agent):
     _current_envelope: Annotated[dict[str, Any] | None, hidden] = None
     _specialist_reports: Annotated[dict[str, str] | None, hidden] = None
 
+    # NOOA's PredictStrategy enforces max_param_chars (default 200k) on every
+    # strategy parameter. The live envelope carries raw evidence arrays that
+    # routinely exceed that, so the LLM-bound view is trimmed deterministically
+    # with explicit markers — the internal `_current_envelope` stays complete.
+    _MAX_LLM_ENVELOPE_CHARS = 180_000
+    _LIST_CAP = 60
+
     def __init__(self, symbol: str, *, llm: Any):
         super().__init__(llm=llm)
         self.symbol = symbol.upper()
+
+    def _bounded_envelope(self, max_chars: int | None = None) -> str:
+        """Serialized envelope sized for the LLM param limit (never silent).
+
+        Returns the full envelope when it already fits. Otherwise large lists
+        are capped with an explicit ``__truncated__`` marker that records the
+        original count, and only as a last resort is the payload reduced to
+        run identity + coverage + errors with the trimmed top-level keys
+        listed. The agent's internal ``_current_envelope`` is never mutated.
+        """
+        if self._current_envelope is None:
+            return "{}"
+        roof = max_chars or self._MAX_LLM_ENVELOPE_CHARS
+        payload = self._current_envelope
+        rendered = json.dumps(payload, default=str)
+        if len(rendered) <= roof:
+            return rendered
+
+        def _cap(value: Any, max_items: int) -> Any:
+            if isinstance(value, dict):
+                return {k: _cap(v, max_items) for k, v in value.items()}
+            if isinstance(value, list):
+                if len(value) > max_items:
+                    return {
+                        "__truncated__": True,
+                        "count": len(value),
+                        "items": [_cap(item, max_items) for item in value[:max_items]],
+                    }
+                return [_cap(item, max_items) for item in value]
+            return value
+
+        rendered = json.dumps(_cap(payload, self._LIST_CAP), default=str)
+        if len(rendered) <= roof:
+            return rendered
+
+        kept = {
+            k: payload.get(k)
+            for k in ("run_id", "symbol", "status", "schema_version",
+                      "generated_at", "completed_at", "data_source")
+        }
+        kept["coverage"] = payload.get("coverage")
+        kept["errors"] = payload.get("errors")
+        kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
+        return json.dumps(kept, default=str)
 
     def _envelope_schema(self) -> str:
         """Return the envelope schema as a context block for the LLM."""
@@ -168,7 +219,7 @@ class DeltaOrderflowAgent(MarketAnalyst):
                 "  null_fields: [\"envelope paths that were null\"]"
             ),
             "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("json.dumps(self._current_envelope, default=str)"),
+            "envelope": DynamicContext("self._bounded_envelope()"),
         },
     )
     async def assess(
@@ -215,7 +266,7 @@ class MacroAgent(MarketAnalyst):
                 "  limitations: [\"...\"]"
             ),
             "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("json.dumps(self._current_envelope, default=str)"),
+            "envelope": DynamicContext("self._bounded_envelope()"),
         },
     )
     async def assess(
@@ -261,7 +312,7 @@ class OpenInterestAgent(MarketAnalyst):
                 "  cannot_establish: [\"what the data cannot tell us\"]"
             ),
             "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("json.dumps(self._current_envelope, default=str)"),
+            "envelope": DynamicContext("self._bounded_envelope()"),
         },
     )
     async def assess(
@@ -306,7 +357,7 @@ class LiquidationAgent(MarketAnalyst):
                 "  missing_data: [\"what liquidation data is absent\"]"
             ),
             "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "envelope": DynamicContext("json.dumps(self._current_envelope, default=str)"),
+            "envelope": DynamicContext("self._bounded_envelope()"),
         },
     )
     async def assess(
