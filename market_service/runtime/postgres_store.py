@@ -13,9 +13,20 @@ from .contracts import AgentMemory, AnalystBriefing, MarketRunEnvelope
 
 
 class PostgresRuntimeStore:
-    """Connection-pool boundary for the durable ledger."""
+    """Connection-pool boundary for the durable ledger.
 
-    def __init__(self, database_url: str):
+    ``DATABASE_URL`` is only required here — at the Postgres boundary — and
+    nowhere else. Redis-only surfaces (``Settings.from_redis_env``) never
+    construct this store, so Redis ops run without Postgres config.
+    """
+
+    def __init__(self, database_url: str | None):
+        if not database_url:
+            raise ValueError(
+                "DATABASE_URL is required to construct a PostgresRuntimeStore. "
+                "Postgres is only consulted when persistence is explicitly "
+                "required; Redis-only surfaces should run Redis alone."
+            )
         self.database_url = database_url
         self.pool: asyncpg.Pool | None = None
 

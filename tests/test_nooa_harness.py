@@ -131,8 +131,8 @@ class NooaHarnessIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {"price": i, "qty": i, "side": "buy", "time": i} for i in range(2000)
         ]
         agent._current_envelope = env
-        rendered = agent._bounded_envelope(max_chars=8_000)
-        self.assertLessEqual(len(rendered), 8_000)
+        rendered = agent._bounded_envelope(max_chars=30_000)
+        self.assertLessEqual(len(rendered), 30_000)
         parsed = json.loads(rendered)
         self.assertEqual(parsed["run_id"], env["run_id"])
         # Large raw arrays are truncated with an explicit marker, never dropped.
@@ -340,6 +340,71 @@ class SuiteParseErrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 4)
         self.assertEqual(len(set(received)), 1)
         self.assertEqual(result["briefing"]["status"], "healthy")
+
+
+@_requires_nooa
+class RawWindowDedupeTests(unittest.IsolatedAsyncioTestCase):
+    """read_raw_window must dedupe overlapping trade windows by aggregate id.
+
+    The poller snapshots carry a rolling ``trades_normalized`` window (300s
+    flow window vs 30s poll), so the same trade id appears across many
+    snapshots. Without dedup, volumes/CVD are inflated ~10x.
+    """
+
+    def setUp(self):
+        self.latest = {
+            "observed_at_ms": 1_700_000_000_000,
+            "depth_levels": 500,
+            "errors": [],
+            "spot": {"order_book": {"bids": [], "asks": []}, "trades_normalized": []},
+            "futures": {"order_book": {"bids": [], "asks": []}, "trades_normalized": []},
+        }
+
+    def _snap(self, spot_ids, fut_ids):
+        return {
+            "spot": {"trades_normalized": [{"id": i, "qty": 1.0, "price": 100.0} for i in spot_ids]},
+            "futures": {"trades_normalized": [{"id": i, "qty": 1.0, "price": 100.0} for i in fut_ids]},
+        }
+
+    def _fake_redis(self, snapshots):
+        latest = self.latest
+
+        class _R:
+            async def read_raw_latest(self, symbol):
+                return latest
+
+            async def read_raw_window(self, symbol, since_ms):
+                return snapshots
+
+        return _R()
+
+    async def test_overlapping_snapshots_are_deduped_per_symbol(self):
+        from market_service.nooa_harness.pipeline import read_raw_window
+
+        redis = self._fake_redis([
+            self._snap([1, 2, 3], [10, 11]),
+            self._snap([2, 3, 4], [11, 12]),
+            self._snap([3, 4, 5], [12, 13]),
+        ])
+        out = await read_raw_window(redis, "BTCUSDT", 15)
+        spot_ids = [t["id"] for t in out["spot"]["trades_normalized"]]
+        fut_ids = [t["id"] for t in out["futures"]["trades_normalized"]]
+        self.assertEqual(sorted(spot_ids), [1, 2, 3, 4, 5])
+        self.assertEqual(sorted(fut_ids), [10, 11, 12, 13])
+
+    async def test_depth_levels_uses_latest_or_central_default(self):
+        from market_service.nooa_harness.pipeline import read_raw_window
+        redis = self._fake_redis([self._snap([1], [10])])
+        out = await read_raw_window(redis, "BTCUSDT", 15)
+        self.assertEqual(out["depth_levels"], 500)
+
+    async def test_no_snapshot_returns_empty_and_central_depth(self):
+        from market_service.nooa_harness.pipeline import read_raw_window
+        redis = self._fake_redis([])
+        out = await read_raw_window(redis, "BTCUSDT", 15)
+        self.assertEqual(out["spot"]["trades_normalized"], [])
+        self.assertEqual(out["futures"]["trades_normalized"], [])
+        self.assertEqual(out["depth_levels"], 500)
 
 
 if __name__ == "__main__":

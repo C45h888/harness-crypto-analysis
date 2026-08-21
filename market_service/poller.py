@@ -43,10 +43,17 @@ async def fetch_binance_evidence(
     depth_levels: int,
     flow_window_seconds: int,
 ) -> dict[str, Any]:
-    """Pull the eight canonical Binance endpoints in parallel.
+    """Pull the canonical Binance endpoints in parallel.
 
     Same shape as the data-access node produced — the harness pipeline
     consumes this dict unchanged.
+
+    Eight spot/futures endpoints form the canonical minimum. Four
+    derivative-stats endpoints (taker_buy_sell, top_long_short,
+    global_long_short, open_interest_history) are now part of the
+    canonical surface so analysis adapters can compute TBR series,
+    top-trader drift, OI 1/3/6-bar deltas without re-fetching the
+    live API.
     """
     now_ms = _now_ms()
     start = now_ms - flow_window_seconds * 1000
@@ -60,15 +67,25 @@ async def fetch_binance_evidence(
         _safe(client.fut_open_interest(symbol), "fut_open_interest"),
         _safe(client.spot_agg_trades(symbol, limit=1000, start_time=start), "spot_trades"),
         _safe(client.fut_agg_trades(symbol, limit=1000, start_time=start), "fut_trades"),
+        _safe(client.fut_taker_buy_sell(symbol, period="5m", limit=12), "fut_taker_buy_sell"),
+        _safe(client.fut_top_long_short_accounts(symbol, period="5m", limit=12), "fut_top_long_short"),
+        _safe(client.fut_long_short_ratio(symbol, period="5m", limit=12), "fut_global_long_short"),
+        _safe(client.fut_open_interest_history(symbol, period="5m", limit=12), "fut_open_interest_history"),
     )
     (spot_book, e_book), (fut_book, e_fbook), (spot_24h, e24), (fut_24h, ef24), \
-    (fut_fund, efund), (fut_oi, eoi), (spot_raw, est), (fut_raw, eft) = results
+    (fut_fund, efund), (fut_oi, eoi), (spot_raw, est), (fut_raw, eft), \
+    (fut_tbs, etbs), (fut_top, etop), (fut_glb, eglb), (fut_oih, eoih) = results
 
     endpoint_names = (
         "spot_book", "fut_book", "spot_24h", "fut_24h",
         "fut_funding", "fut_open_interest", "spot_trades", "fut_trades",
+        "fut_taker_buy_sell", "fut_top_long_short", "fut_global_long_short",
+        "fut_open_interest_history",
     )
-    endpoint_errs = (e_book, e_fbook, e24, ef24, efund, eoi, est, eft)
+    endpoint_errs = (
+        e_book, e_fbook, e24, ef24, efund, eoi, est, eft,
+        etbs, etop, eglb, eoih,
+    )
     errors = [
         {"endpoint": name, "error": err}
         for name, err in zip(endpoint_names, endpoint_errs) if err
@@ -104,6 +121,13 @@ async def fetch_binance_evidence(
             "trades_normalized": fut_trades,
             "funding": fut_fund,
             "open_interest": fut_oi,
+            # Legacy-analysis surfaces — optional fallback for legacy
+            # TBR / top-trader / OI-drift signals. Each is a list of bars
+            # (newest last), or None on endpoint failure.
+            "taker_buy_sell": fut_tbs,
+            "top_ls": fut_top,
+            "global_ls": fut_glb,
+            "oi_history": fut_oih,
         },
     }
 
@@ -145,7 +169,7 @@ async def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    settings = Settings.from_env()
+    settings = Settings.from_redis_env()
     redis = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )

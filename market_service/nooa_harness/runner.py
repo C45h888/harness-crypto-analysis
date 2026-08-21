@@ -1,17 +1,36 @@
-"""One-shot NOOA analyst — pipeline + LLM, mounted through the harness CLI.
+"""One-shot NOOA analyst — pipeline + LLM, subordinate runtime module.
 
-The poller continuously feeds raw evidence into Redis. The harness runs
-on demand: reads the raw window, runs the pipeline (calc + analysis +
-collate), invokes the NOOA specialist agents, and persists the briefing.
+The poller continuously feeds raw evidence into Redis. This module is the
+subordinate runtime authority on top of the canonical pipeline: it reads the
+raw window, runs the pipeline (calc + analysis + collate), invokes the NOOA
+specialist agents, and persists the briefing.
 
-CLI shape (mounted by ``market_service.commands.harness --analyze``):
+> ***Note (repurposing):*** the NOOA specialist/controller agent classes loaded
+> through this module are being repurposed into deterministic
+> calculation/analysis objects that PULL from the poller-fed Redis stream.
+> They are stream-fed, never directly called by ``harness.py``, and never
+> open a live Binance session for core market data.
 
-  --analyze                run pipeline + NOOA agents once
-  --window 15m|1h|4h      raw evidence lookback window (default: 15m)
-  --run-id <UUID>          analyze a specific existing envelope (skip pipeline)
-  --latest                 read the latest persisted envelope (skip pipeline)
-  --session-id <UUID>      optional stable UUID (default: env NOOA_SESSION_ID or generated)
-  --with-memory            recall prior session memory and remember this cycle
+Runtime authority:
+
+  harness.py                  outer CLI       clean market-data contract only
+       └─► --nooa ─► nooa_cli.py / nooa_cli_ext.py   inner CLI (sole direct
+                                                      caller of THIS module)
+
+This module is never imported by ``market_service/commands/harness.py``.
+The outer harness routes every analyst / briefing / memory / agent
+operation through ``--nooa`` so the inner NOOA CLI remains the single
+direct caller of this subordinate runtime.
+
+CLI shape (mounted by ``nooa_cli_ext.market analyst …``, reached from
+harness.py via ``--nooa market analyst …``):
+
+  SOLUSDT --cycles 1              run pipeline + NOOA agents once
+  --run-id <UUID>                 analyze a specific existing envelope (skip pipeline)
+  --latest                        read the latest persisted envelope (skip pipeline)
+  --window 15m|1h|4h             raw evidence lookback window (default: 15m)
+  --session-id <UUID>             optional stable UUID (default: env NOOA_SESSION_ID or generated)
+  --with-memory                   recall prior session memory and remember this cycle
 """
 
 from __future__ import annotations
@@ -203,6 +222,10 @@ async def run_analyze_once(
     use_latest: bool = False,
     session_id: str | None = None,
     with_memory: bool = False,
+    deriv_ttl_s: int = 300,
+    include_cross_asset: bool = False,
+    include_derivatives: bool = True,
+    force_refresh_derivatives: bool = False,
 ) -> dict[str, Any]:
     """Run the pipeline + NOOA agents once and return the result.
 
@@ -235,7 +258,13 @@ async def run_analyze_once(
             envelope = await _read_envelope(settings, symbol, None)
         else:
             cycle_meta = {"mode": "pipeline", "symbol": symbol.upper(), "window_minutes": window_minutes}
-            envelope = await pipeline_run_cycle(settings, symbol, window_minutes)
+            envelope = await pipeline_run_cycle(
+                settings, symbol, window_minutes,
+                deriv_ttl_s=deriv_ttl_s,
+                include_cross_asset=include_cross_asset,
+                include_derivatives=include_derivatives,
+                force_refresh_derivatives=force_refresh_derivatives,
+            )
 
         if envelope is None:
             return {

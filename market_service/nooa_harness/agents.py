@@ -5,6 +5,13 @@ do not pull exchange data, calculate indicators, write Redis, or place
 trades. The existing harness supplies one complete canonical envelope to the
 suite; NOOA supplies the reasoning over that envelope.
 
+> ***Note (repurposing):*** these agent classes are being repurposed into
+> deterministic calculation/analysis objects that pull from the poller-fed
+> Redis stream. They remain python objects inside ``market_service/nooa_harness/``
+> and are never the CLI mount surface — terminal-based agents (pi, hermes,
+> claude code) reach the system through ``harness.py``, never these classes
+> directly.
+
 Specialists build their own prompt and call the model exactly once
 (``self._llm.acall``) — no framework-level validation-retry loop. The raw
 text is returned and parsed by ``SpecialistReport.from_llm_text``, which
@@ -185,10 +192,14 @@ class MarketAnalyst(Agent):
     _current_envelope: Annotated[dict[str, Any] | None, hidden] = None
     _specialist_reports: Annotated[dict[str, str] | None, hidden] = None
 
-    # Bounded LLM view limits (live envelopes exceed NOOA's param caps on raw
-    # evidence arrays alone; the deterministic summary stays complete).
-    _MAX_LLM_ENVELOPE_CHARS = 180_000
-    _LIST_CAP = 60
+    # Bounded LLM view limits. NOOA's PredictStrategy caps each strategy
+    # parameter at ``max_param_chars=200_000``; we keep the envelope roof just
+    # under that but materially higher than the old 60-item / 180k-chars view so
+    # the analyst can see a richer, deduped window of the deeper order book and
+    # trades and still leave headroom for the JSON report. Large arrays are still
+    # explicitly marked ``__truncated__`` (never silently dropped).
+    _MAX_LLM_ENVELOPE_CHARS = 190_000
+    _LIST_CAP = 200
     # Generation budget: reasoning-model gateways consume tokens on a
     # `thinking` preface, then emit the JSON report — give it headroom so the
     # report is not truncated mid-evidence.

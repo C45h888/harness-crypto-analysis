@@ -238,7 +238,13 @@ def memory_forget(session_id, memory_id) -> None:
 @click.option("--session-id", default=None, help="stable analyst session UUID")
 def analyst_cmd(symbol, run_id, use_latest, cycles, interval,
                 with_memory, session_id) -> None:
-    """Run the NOOA analyst suite (ControllerAgent + 4 specialists)."""
+    """Run the NOOA analyst suite (ControllerAgent + 4 specialists).
+
+    Calculation flags (derivative fetch, cross-asset, TTL, raw-only) live
+    on the outer harness CLI — see ``market_service.commands.harness``
+    ``--analyze`` and ``--refresh-derivatives``. This command reuses
+    whatever derivatives are already cached in Redis by those flags.
+    """
     from market_service.nooa_harness.runner import run_analyze_once
 
     async def _loop() -> None:

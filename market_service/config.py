@@ -22,15 +22,15 @@ def default_depth_levels() -> int:
     """Resolve the canonical order-book depth from env (no DB required).
 
     CLI/standalone analysis paths that fetch their own Binance book (and may
-    run without a database) use this instead of ``Settings.from_env()`` so the
-    order-book depth stays centralized on ``DEPTH_LEVELS`` everywhere.
+    run without a database) use this instead of ``Settings.from_redis_env()``
+    so the order-book depth stays centralized on ``DEPTH_LEVELS`` everywhere.
     """
     return _positive_int("DEPTH_LEVELS", DEFAULT_DEPTH_LEVELS)
 
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str
+    database_url: str | None
     redis_url: str
     redis_key_prefix: str
     redis_stream_maxlen: int
@@ -43,9 +43,39 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        """Full runtime settings requiring ``DATABASE_URL`` for the durable Postgres ledger.
+
+        Use this for any surface that actually reads/writes Postgres (envelope
+        persistence, analyst briefing, MemoryNode). Redis-only surfaces that
+        never touch Postgres should use :meth:`from_redis_env` instead.
+        """
+        return cls._resolve(require_db=True)
+
+    @classmethod
+    def from_redis_env(cls) -> "Settings":
+        """Redis-only runtime settings; ``DATABASE_URL`` is NOT required.
+
+        This is the correct resolver for a mature runtime state where Redis
+        is the operational source of truth and Postgres is the durable ledger
+        only contacted when explicitly required. Redis-only surfaces
+        (``--latest`` / ``--run-id`` / ``--refresh-derivatives`` / the poller)
+        use this and run with Redis alone.
+
+        ``database_url`` is ``None`` when unset. Any Postgres construction
+        against it raises a clear bound-to-boundary error (see
+        ``PostgresRuntimeStore``), so ``DATABASE_URL`` is only ever required
+        by the Postgres system.
+        """
+        return cls._resolve(require_db=False)
+
+    @classmethod
+    def _resolve(cls, *, require_db: bool) -> "Settings":
         url = os.getenv("DATABASE_URL")
-        if not url:
-            raise ValueError("DATABASE_URL is required")
+        if require_db and not url:
+            raise ValueError(
+                "DATABASE_URL is required for the Postgres ledger. "
+                "Use Settings.from_redis_env() for Redis-only paths."
+            )
         redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
         symbols = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip())
         if not symbols:

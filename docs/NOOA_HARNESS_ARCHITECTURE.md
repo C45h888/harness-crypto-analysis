@@ -175,6 +175,12 @@ marketflow:run:<RUN_ID>
 marketflow:latest:<SYMBOL>:collated
 marketflow:stream:collated:<SYMBOL>
 marketflow:runtime-run:<RUN_ID>
+marketflow:latest:<SYMBOL>:raw              # poller firehose (point-in-time)
+marketflow:stream:raw:<SYMBOL>              # bounded
+marketflow:latest:<SYMBOL>:derivatives      # on-demand batch (TTL 300s)
+marketflow:stream:domain:derivatives:<SYMBOL>
+marketflow:latest:<SYMBOL>:{data-access|calculations|analysis}
+marketflow:stream:domain:{data-access|calculations|analysis}:<SYMBOL>
 ```
 
 Agent-owned write surfaces:
@@ -185,6 +191,21 @@ marketflow:agent:<SESSION_ID>:hypotheses
 marketflow:agent:<SESSION_ID>:requests
 marketflow:agent:<SESSION_ID>:briefings
 ```
+
+The split between poller (point-in-time) and run-cycle (historical) data is
+documented in `docs/RUNTIME_DATA_AUTHORITY.md`. The analyst never calls
+Binance itself; the on-demand derivative fetch is owned by the runtime and
+exposed to the analyst via the outer `harness.py --refresh-derivatives`
+command and implicit fetching inside the `harness.py --analyze` cycle.
+
+The NOOA inner CLI is **calculation-agnostic**: its `analyst` command runs
+the agent suite and reads the canonical ledger that `harness.py --analyze`
+populates. Calculation flags (`--deriv-ttl`, `--with-cross-asset`,
+`--no-derivatives`, `--force-refresh-derivatives`) live on `harness.py`,
+not on `nooa market analyst`. NOOA itself will be reworked in a future
+pass to be driven by mathematical / statistical derivations defined in a
+later specification; the calculation pipeline remains the single source of
+truth for canonical numbers.
 
 The model should prefer exact run reads. The `latest` key is useful for live
 orientation but can advance while the autonomous runner continues producing
@@ -207,24 +228,44 @@ exchange clients directly and does not create a second collection pipeline.
 ## CLI mount (current integration state)
 
 The NOOA CLI is mounted at the canonical harness mount point without
-mutating the installed `nooa-cli` package:
+mutating the installed `nooa-cli` package. The runtime authority split is:
+
+```text
+harness.py                          OUTER CLI
+├── clean market-data contract      (no direct nooa_harness.* imports)
+└── --nooa ─► nooa_cli.py           INNER CLI (mounted into the framework
+            │                       ``oo`` group at import time)
+            └─► nooa_cli_ext.py     the ``market`` click group
+                                    (envelope, briefing, memory, analyst)
+                                    ─── sole direct caller of
+                                        market_service/nooa_harness/*
+```
+
+Concretely:
 
 - `market_service/commands/nooa_cli_ext.py` — the `market` harness group
-  (`envelope`, `briefing`, `memory`, `analyst`, `refresh`), backed by the
-  canonical runtime stores.
+  (`envelope`, `briefing`, `memory`, `analyst`), backed by the canonical
+  runtime stores. **Sole direct importer of `market_service/nooa_harness/*`.**
 - `market_service/commands/nooa_cli.py` — repo-root mount: attaches the
   `market` group to the framework root `oo` group at import time and
   delegates to the normal CLI entry. One mount covers the VSCode-shell
   wrapper (`./nooa`), the `nooa-market` console script, the Docker `nooa`
   compose service, and the harness passthrough (`harness --nooa market ...`).
-- `market_service/commands/harness.py` — the canonical harness command; the
-  `--nooa` option forwards into the same mounted CLI, so the Docker harness
-  container can run the model-facing CLI during a run.
+- `market_service/commands/harness.py` — the OUTER canonical harness CLI.
+  Emits the clean aggregated market-data contract and routes every analyst
+  / briefing / memory / agent operation through `--nooa` into the inner
+  NOOA CLI. **No direct `nooa_harness.*` imports.**
 
 `nooa`/`nooa-cli` are pinned at `0.0.8` from PyPI in `requirements.txt`.
 The agent classes (`agents.py`) are validated against the 0.0.8 API
 surface (`Agent`, `Context`, `spec`, `strategy`, `DynamicContext`,
 `CodeActStrategy`, `PredictStrategy`, `agentdoc.hidden`).
+
+Terminal-based coding agents (pi, hermes, claude code) shell out to the
+outer `harness.py` for clean market data, and to
+`harness.py --nooa market …` for any analyst / briefing / memory / agent
+operation. They never reach the subordinate `nooa_harness` runtime module
+directly — that path is reserved for the inner NOOA CLI.
 
 ## Model backend seam
 

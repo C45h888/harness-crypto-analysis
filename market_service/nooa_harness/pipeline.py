@@ -10,6 +10,7 @@ the harness already reads from — the harness agents see zero difference.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -31,6 +32,9 @@ from market_service.calculations.orderbook import (
 )
 from market_service.calculations.signals import deterministic_signals
 from market_service.calculations.technical import ema_series
+from market_service.calculations.delta import delta_variable, delta_state as _delta_state_fn
+
+from market_service.clients.binance import Binance
 from market_service.calculations.volume_profile import build_volume_profile, volume_profile_summary
 from market_service.analysis.auction import (
     auction_verdict,
@@ -52,8 +56,12 @@ from market_service.analysis.path_absorption import (
 )
 from market_service.analysis.regime import regime_verdict
 from market_service.analysis.wall_migration import (
+    bid_tier_balance,
+    compute_bid_tiers,
+    compute_round_anchors,
     densest_clusters,
     fuel_ratio as wall_fuel_ratio,
+    mega_at_keystone,
     wall_delta,
     wall_trap_assessment,
 )
@@ -93,17 +101,22 @@ async def read_raw_window(
 ) -> dict[str, Any]:
     """Read the latest raw evidence snapshot and accumulate trades within the window.
 
-    The poller writes a full snapshot every 5s. We read the latest snapshot
-    for order book / funding / OI / tickers (point-in-time), and use the
-    stream to accumulate trades across the window.
+    The poller writes a full snapshot every ``poll_seconds``. We read the latest
+    snapshot for order book / funding / OI / tickers (point-in-time), and use the
+    stream to accumulate trades across the window. Because each snapshot's
+    ``trades_normalized`` is a rolling window (``flow_window_seconds`` ≫ poll
+    interval), overlapping snapshots repeat the same trade ids; we **dedupe by
+    trade ``id``** (stable Binance aggregate id) so volumes/CVD are not inflated
+    by redeclaring each trade once per snapshot it appears in.
     """
     latest = await redis.read_raw_latest(symbol)
     if latest is None:
+        from market_service.config import default_depth_levels
         return {
             "observed_at": _utc_iso(),
             "observed_at_ms": int(time.time() * 1000),
             "fetch_window_ms": window_minutes * 60_000,
-            "depth_levels": 20,
+            "depth_levels": default_depth_levels(),
             "errors": [{"endpoint": "all", "error": "no raw evidence in Redis"}],
             "spot": {"ticker_24h": None, "order_book": {}, "trades_raw": [], "trades_normalized": []},
             "futures": {"ticker_24h": None, "order_book": {}, "trades_raw": [], "trades_normalized": [],
@@ -113,18 +126,39 @@ async def read_raw_window(
     since_ms = int(time.time() * 1000) - window_minutes * 60_000
     snapshots = await redis.read_raw_window(symbol, since_ms)
 
-    # Merge trades across all snapshots in the window.
-    spot_trades: list[dict[str, Any]] = []
-    fut_trades: list[dict[str, Any]] = []
+    def _dedupe(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[int] = set()
+        out: list[dict[str, Any]] = []
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("id")
+            if tid is not None:
+                try:
+                    key = int(tid)
+                except (TypeError, ValueError):
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+            out.append(t)
+        return out
+
+    # Accumulate trades across all snapshots in the window (already oldest-first).
+    spot_raw: list[dict[str, Any]] = []
+    fut_raw: list[dict[str, Any]] = []
     for snap in snapshots:
-        spot_trades.extend(snap.get("spot", {}).get("trades_normalized", []))
-        fut_trades.extend(snap.get("futures", {}).get("trades_normalized", []))
+        spot_raw.extend(snap.get("spot", {}).get("trades_normalized", []))
+        fut_raw.extend(snap.get("futures", {}).get("trades_normalized", []))
+
+    spot_trades = _dedupe(spot_raw)
+    fut_trades = _dedupe(fut_raw)
 
     return {
         "observed_at": _utc_iso(),
         "observed_at_ms": int(time.time() * 1000),
         "fetch_window_ms": window_minutes * 60_000,
-        "depth_levels": latest.get("depth_levels", 20),
+        "depth_levels": latest.get("depth_levels") or default_depth_levels(),
         "errors": latest.get("errors", []),
         "spot": {
             "ticker_24h": latest.get("spot", {}).get("ticker_24h"),
@@ -186,6 +220,52 @@ def _safe_last_price(bids: list[list[float]], asks: list[list[float]]) -> float 
     return None
 
 
+def _enrich_fut_keystone(keystone: dict[str, Any], asks: list[list[float]]) -> dict[str, Any]:
+    """Augment a find_keystone result with ``bid`` and ``ask`` aliases.
+
+    ``find_keystone`` historically returned ``{keystone, window_qty, tight, wide}``
+    where ``keystone`` is the densest bid-window center. Downstream readers
+    (notably ``_envelope_summary`` in ``runtime/contracts.py``) expect explicit
+    ``bid`` and ``ask`` keys. The ``bid`` is just an alias for the keystone
+    price (the bid side is where keystone lives). The ``ask`` is the nearest
+    ask at-or-above the keystone price — the first price sellers defend,
+    which is what the briefing wants to compare against buyer defence.
+
+    Round-number anchors + mega-tier percentage are computed elsewhere
+    (``_adapt_wall_migration``) — this helper only fixes the keystone
+    naming mismatch.
+    """
+    if not isinstance(keystone, dict):
+        return keystone
+    if "bid" not in keystone:
+        bid = keystone.get("keystone")
+        if bid is not None:
+            keystone["bid"] = bid
+    if "ask" not in keystone:
+        bid = keystone.get("bid") or keystone.get("keystone")
+        keystone["ask"] = None
+        if bid is not None:
+            try:
+                bid_f = float(bid)
+            except (TypeError, ValueError):
+                bid_f = None
+            if bid_f is not None and asks:
+                # nearest ask at-or-above keystone price
+                best = None
+                for p, q in asks:
+                    try:
+                        pf = float(p)
+                        qf = float(q)
+                    except (TypeError, ValueError):
+                        continue
+                    if pf >= bid_f:
+                        if best is None or pf < best[0]:
+                            best = (pf, qf)
+                if best is not None:
+                    keystone["ask"] = best[0]
+    return keystone
+
+
 def run_calculations(
     evidence: dict[str, Any],
     depth: int,
@@ -225,7 +305,10 @@ def run_calculations(
     orderbook: dict[str, Any] = {}
     if last_price is not None:
         orderbook = _run_section("orderbook", lambda: {
-            "fut_keystone": _strict(find_keystone, fut_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
+            "fut_keystone": _enrich_fut_keystone(
+                _strict(find_keystone, fut_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
+                fut_asks,
+            ),
             "spot_keystone": _strict(find_keystone, spot_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
             "fut_top_density_bids": _strict(top_density_windows, fut_book, 0.5, "bids", 5, name="top_density_windows"),
             "fut_absorption_ladder": _strict(absorption_ladder, fut_bids, last_price, count=10, name="absorption_ladder"),
@@ -404,7 +487,8 @@ def run_analysis(
     # Wall migration
     pw = prior_walls or {}
     wall_migration = _run_section("wall_migration", lambda: _adapt_wall_migration(
-        evidence, orderbook_calc.get("fut_significant_levels"), pw, prior_cycle_ts, depth=depth,
+        evidence, orderbook_calc.get("fut_significant_levels"), pw, prior_cycle_ts,
+        orderbook=orderbook_calc, depth=depth,
     ), errors) or {}
 
     # Path absorption
@@ -419,6 +503,9 @@ def run_analysis(
     # Stage
     stage = _run_section("stage", lambda: _adapt_stage(evidence), errors) or {}
 
+    # Delta — signed -2..+2 combo of wall imbalance + taker buy alignment.
+    delta = _run_section("delta", lambda: _adapt_delta(evidence), errors) or {}
+
     return {
         "status": "degraded" if errors else "healthy",
         "errors": errors,
@@ -426,6 +513,7 @@ def run_analysis(
             "auction": auction,
             "open_interest": oi,
             "wall_migration": wall_migration,
+            "delta": delta,
             "path_absorption": path_absorption,
             "demand": demand,
             "regime": regime,
@@ -458,6 +546,47 @@ def _adapt_auction(evidence: dict[str, Any]) -> dict[str, Any]:
             "verdict": verdict, "reasons": reasons}
 
 
+def _adapt_delta(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Compute the signed DELTA (-2..+2) from + taker buy alignment.
+
+    The wall imbalance uses the futures order book (not spot — the legacy DELTA
+    was a futures-only variable). The flow alignment consumes the
+    ``taker_buy_sell`` series populated by the on-demand derivative fetch;
+    before that fetch landed in Redis it is None and the function returns 0
+    for the flow leg (the wall leg is still computable from the book).
+    """
+    fut = _fut_evidence(evidence)
+    fut_book = fut.get("order_book") or {}
+    tbr_series = fut.get("taker_buy_sell")
+    last_price = _last_price_e(
+        C.require_list_of_pairs(fut_book.get("bids"), function="delta.find_price",
+                                where="futures.order_book.bids", max_items=20),
+        C.require_list_of_pairs(fut_book.get("asks"), function="delta.find_price",
+                                where="futures.order_book.asks", max_items=20),
+    )
+    if last_price is None or last_price <= 0:
+        return {
+            "verdict": "INSUFFICIENT_DATA",
+            "delta": None, "wall_imbalance": None, "flow_alignment": None,
+            "tbr_last_pct": None, "tbr_3avg_pct": None,
+            "bands": [], "range": {"lo": None, "hi": None},
+        }
+    delta = _strict(delta_variable, fut_book, tbr_series, float(last_price),
+                    half_range=0.75, band_step=0.10, name="delta_variable")
+    return {
+        "delta": delta["delta"],
+        "delta_raw": delta["delta_raw"],
+        "wall_imbalance": delta["wall_imbalance"],
+        "flow_alignment": delta["flow_alignment"],
+        "tbr_last_pct": delta["tbr_last_pct"],
+        "tbr_3avg_pct": delta["tbr_3avg_pct"],
+        "n_bands": delta["n_bands"],
+        "bands": delta["bands"],
+        "range": delta["range"],
+        "verdict": _delta_state_fn(delta["delta"]),
+    }
+
+
 def _adapt_oi(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
     fut = _fut_evidence(evidence)
     fut_book = fut.get("order_book") or {}
@@ -468,11 +597,26 @@ def _adapt_oi(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
     oi_value = oi_raw.get("open_interest") if isinstance(oi_raw, dict) else None
     oi_float = float(oi_value) if isinstance(oi_value, (int, float)) else 0.0
     walls = _strict(find_walls, asks, last_price, 0.005, 0.05, name="find_walls")
-    weighted = _strict(oi_weighted_contracts, oi_float, None, None, name="oi_weighted_contracts")
-    inflow = _strict(oi_inflow_outflow, [], name="oi_inflow_outflow")
-    implied = _strict(oi_implied_value, [], name="oi_implied_value")
+
+    # OI history series — populated by the on-demand derivative fetch.
+    # We extract the per-bar oi_value (USD notional) + oi (contracts) and feed
+    # the deterministic layers that previously ran with [] (always empty).
+    oi_hist = fut.get("oi_history") or []
+    oi_series = _oi_series(oi_hist)
+    oi_value_series = _oi_value_series(oi_hist)
+    top_long_pct = _ls_last_pct(fut.get("top_ls"))
+    glb_long_pct = _ls_last_pct(fut.get("global_ls"))
+    weighted = _strict(oi_weighted_contracts, oi_float, top_long_pct, glb_long_pct,
+                       name="oi_weighted_contracts")
+    inflow = _strict(oi_inflow_outflow, oi_series, name="oi_inflow_outflow")
+    implied_rows = [
+        {"bucket": i * 300_000, "oi": v, "oi_value": nv}
+        for i, (v, nv) in enumerate(zip(oi_series, oi_value_series))
+    ]
+    implied = _strict(oi_implied_value, implied_rows, name="oi_implied_value")
     return {"walls": walls, "weighted_contracts": weighted, "inflow_outflow": inflow,
-            "implied_value": implied, "raw_open_interest": oi_float}
+            "implied_value": implied, "raw_open_interest": oi_float,
+            "bars_available": len(oi_series)}
 
 
 def _adapt_wall_migration(
@@ -480,7 +624,9 @@ def _adapt_wall_migration(
     calc_significant_levels: list[dict] | None,
     prior_walls: dict[float, float],
     prior_cycle_ts: str | None,
-    *, depth: int,
+    *,
+    orderbook: dict[str, Any] | None = None,
+    depth: int,
 ) -> dict[str, Any]:
     fut_book = _fut_book_e(evidence)
     bids, asks = _levels(fut_book, depth, function="wall_migration.*")
@@ -493,9 +639,26 @@ def _adapt_wall_migration(
     clusters = _strict(densest_clusters, bids, floors, 0.10, name="densest_clusters")
     built, eroded = _single_cycle_wall_counts(asks)
     trap = _strict(wall_trap_assessment, float(fuel.get("ratio") or 0.0), built, eroded, name="wall_trap_assessment")
+    # Tier counts + round-number anchors (legacy institutional_buyers.py work —
+    # surfaced as canonical fields so briefings can reason over institutional
+    # bid share without re-fetching the orderbook on every read).
+    tiers = compute_bid_tiers(bids)
+    round_anchors = compute_round_anchors(bids)
+    # Institutional bid vs ask balance + mega-at-keystone (the two missing
+    # legacy signals from institutional_buyers.py:129,167-171).
+    tier_balance = _strict(bid_tier_balance, bids, asks, 5000.0, 1.2, name="bid_tier_balance")
+    keystone_for_mega = (orderbook.get("fut_keystone") or {}).get("keystone") if isinstance(orderbook, dict) else None
+    mega_kz = (
+        _strict(mega_at_keystone, bids, float(keystone_for_mega), 5000.0, 0.10,
+                name="mega_at_keystone")
+        if keystone_for_mega is not None else {"keystone_price": None, "count": 0,
+                                              "qty": 0.0, "notional": 0.0, "levels": []}
+    )
     return {"wall_delta": delta, "fuel_ratio": fuel, "densest_clusters": clusters,
             "trap_assessment": trap, "prior_cycle_ts": prior_cycle_ts,
             "prior_wall_count": len(prior_walls or {}),
+            "tiers": tiers, "round_anchors": round_anchors,
+            "tier_balance": tier_balance, "mega_at_keystone": mega_kz,
             "inputs_used": {"floors_count": len(floors), "ask_walls_built": built,
                             "ask_walls_eroded": eroded, "fuel_ratio_value": float(fuel.get("ratio") or 0.0)}}
 
@@ -518,6 +681,46 @@ def _adapt_path_absorption(evidence: dict[str, Any], *, depth: int) -> dict[str,
 def _adapt_demand(evidence: dict[str, Any]) -> dict[str, Any]:
     fut = _fut_evidence(evidence)
     spot = _spot_evidence(evidence)
+    cross = evidence.get("cross_asset") or {}
+    # Pull BTC/ETH change_pct + funding from the cross-asset fetch the on-demand
+    # derivative step populated. Without it, macro_climate returns "data
+    # unavailable" so we treat this as best-effort.
+    tickers = {t.get("symbol"): t for t in (cross.get("tickers_24h") or []) if isinstance(t, dict)}
+    funding_rows = {row.get("symbol"): row.get("funding")
+                    for row in (cross.get("funding") or []) if isinstance(row, dict)}
+
+    def _funding_bps(sym: str) -> float | None:
+        f = funding_rows.get(sym)
+        if not isinstance(f, dict):
+            return None
+        try:
+            return float(f.get("lastFundingRate") or f.get("last_funding_rate") or 0) * 10000
+        except (TypeError, ValueError):
+            return None
+
+    def _change_pct(sym: str) -> float | None:
+        t = tickers.get(sym)
+        if not t:
+            return None
+        try:
+            return float(t.get("priceChangePercent") or t.get("price_change_percent"))
+        except (TypeError, ValueError):
+            return None
+
+    target_change_pct = None
+    fut_ticker = fut.get("ticker_24h") or {}
+    if isinstance(fut_ticker, dict):
+        for k in ("priceChangePercent", "price_change_percent"):
+            if k in fut_ticker and fut_ticker[k] is not None:
+                try:
+                    target_change_pct = float(fut_ticker[k]); break
+                except (TypeError, ValueError):
+                    pass
+
+    macro_in = {
+        "btc": {"change_pct": _change_pct("BTCUSDT"), "funding": _funding_bps("BTCUSDT")},
+        "eth": {"change_pct": _change_pct("ETHUSDT"), "funding": _funding_bps("ETHUSDT")},
+    }
     d = {
         "spot": {
             "trades": spot.get("trades_normalized") or [],
@@ -539,8 +742,11 @@ def _adapt_demand(evidence: dict[str, Any]) -> dict[str, Any]:
     }
     dx = _strict(decompose_demand, d, name="decompose_demand")
     verdict, reasons = _strict(demand_verdict, dx, name="demand_verdict")
-    climate = _strict(macro_climate, {"btc": {"change_pct": None}, "eth": {"change_pct": None}}, None, name="macro_climate")
-    return {"decomposition": dx, "verdict": verdict, "reasons": reasons, "macro_climate": climate}
+    climate = _strict(macro_climate, macro_in, target_change_pct, name="macro_climate")
+    return {"decomposition": dx, "verdict": verdict, "reasons": reasons,
+            "macro_climate": climate, "macro_inputs": macro_in,
+            "cross_asset": {"symbols_seen": sorted(tickers.keys()),
+                            "funding_symbols": sorted(funding_rows.keys())}}
 
 
 def _adapt_regime(evidence: dict[str, Any], calc_data: dict[str, Any]) -> dict[str, Any]:
@@ -562,7 +768,8 @@ def _adapt_regime(evidence: dict[str, Any], calc_data: dict[str, Any]) -> dict[s
 
 def _adapt_stage(evidence: dict[str, Any]) -> dict[str, Any]:
     from market_service.analysis.stage import infer_stage
-    klines = _fut_evidence(evidence).get("klines") or []
+    fut = _fut_evidence(evidence)
+    klines = fut.get("klines") or []
     closes = []
     for k in klines:
         if isinstance(k, (list, tuple)) and len(k) >= 5:
@@ -579,11 +786,28 @@ def _adapt_stage(evidence: dict[str, Any]) -> dict[str, Any]:
     px_chg_4h = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] else 0.0
     up_steps = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i - 1])
     down_steps = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i - 1])
+    # Wire the L/S and funding signals the on-demand derivative fetch populates.
+    funding_bps = None
+    funding = fut.get("funding") or {}
+    if isinstance(funding, dict):
+        try:
+            funding_bps = float(funding.get("lastFundingRate") or funding.get("last_funding_rate") or 0) * 10000
+        except (TypeError, ValueError):
+            funding_bps = None
+    top_long_pct = _ls_last_pct(fut.get("top_ls"))
+    glb_long_pct = _ls_last_pct(fut.get("global_ls"))
+    # OI 4h change approximated from the history series if available.
+    oi_series = _oi_series(fut.get("oi_history") or [])
+    if len(oi_series) >= 2 and oi_series[0] > 0:
+        oi_chg_4h = (oi_series[-1] - oi_series[0]) / oi_series[0] * 100
+    else:
+        oi_chg_4h = 0.0
     return {
         "stage": _strict(infer_stage,
-                         px_chg_4h=px_chg_4h, oi_chg_4h=0.0, up_pct_4h=50.0,
+                         px_chg_4h=px_chg_4h, oi_chg_4h=oi_chg_4h, up_pct_4h=50.0,
                          up_steps=up_steps, down_steps=down_steps,
-                         funding_bps=None, top_long_pct=None, global_long_pct=None,
+                         funding_bps=funding_bps,
+                         top_long_pct=top_long_pct, global_long_pct=glb_long_pct,
                          distribution_clusters=0.0, absorption_clusters=0.0,
                          name="infer_stage"),
         "kline_count": len(klines),
@@ -703,6 +927,175 @@ async def persist_envelope(
         await redis.close()
 
 
+def _oi_series(oi_hist: list[dict[str, Any]] | None) -> list[float]:
+    """Extract the per-bar OI contract count from a raw OI history list."""
+    out: list[float] = []
+    for row in oi_hist or []:
+        if not isinstance(row, dict):
+            continue
+        v = row.get("sumOpenInterest") or row.get("sum_open_interest") \
+            or row.get("openInterest") or row.get("open_interest")
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _oi_value_series(oi_hist: list[dict[str, Any]] | None) -> list[float]:
+    """Extract the per-bar OI USD-notional from a raw OI history list."""
+    out: list[float] = []
+    for row in oi_hist or []:
+        if not isinstance(row, dict):
+            continue
+        v = row.get("sumOpenInterestValue") or row.get("sum_open_interest_value")
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ls_last_pct(series: list[dict[str, Any]] | None) -> float | None:
+    """Extract the latest long-account proportion from a topL/S or globalL/S series."""
+    if not series:
+        return None
+    last = series[-1] if isinstance(series[-1], dict) else None
+    if not last:
+        return None
+    for k in ("longAccount", "long_account"):
+        if k in last and last[k] is not None:
+            try:
+                return float(last[k])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Derivative evidence — command-triggered fetch, merged into evidence
+# ---------------------------------------------------------------------------
+
+# Cross-asset universe used for macro climate + cross-asset funding rows.
+# Matches analysis/macro.py:DEFAULT_SYMBOLS so the two paths agree on the
+# reference set (BTC/ETH/SOL/BNB/XRP/DOGE/AVAX/LINK).
+MACRO_SYMBOLS: tuple[str, ...] = (
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+    "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT",
+)
+
+DERIV_TTL_S_DEFAULT = 300
+DERIV_FRESH_MS_DEFAULT = 300_000  # 5 min — back-to-back cycles within this skip the fetch
+
+
+def _unwrap(x: Any) -> Any:
+    """Treat BaseException as None so one failed Binance call doesn't kill the batch."""
+    if isinstance(x, BaseException):
+        log.warning("derivative fetch returned exception: %s", x)
+        return None
+    return x
+
+
+async def fetch_derivative_evidence(
+    client: Binance,
+    symbol: str,
+    *,
+    include_cross_asset: bool = True,
+    macro_symbols: tuple[str, ...] = MACRO_SYMBOLS,
+) -> dict[str, Any]:
+    """One-shot fetch of historical-derivative endpoints the poller doesn't carry.
+
+    Returns a dict the harness merges into the canonical evidence before
+    running calculations + analysis. Each field is independently None-safe
+    so a single Binance 5xx / timeout / rate-limit on one endpoint does not
+    drop the whole batch.
+
+    Endpoints:
+      own symbol: oi_history, taker_buy_sell, top_ls, global_ls, klines, funding
+      cross asset (optional): 8 x spot_24h + 8 x fut_funding
+    """
+    own = await asyncio.gather(
+        client.fut_open_interest_history(symbol, period="5m", limit=48),
+        client.fut_taker_buy_sell(symbol, period="5m", limit=48),
+        client.fut_top_long_short_accounts(symbol, period="5m", limit=12),
+        client.fut_long_short_ratio(symbol, period="5m", limit=12),
+        client.fut_klines(symbol, interval="5m", limit=48),
+        client.fut_funding(symbol),
+        return_exceptions=True,
+    )
+    oi_hist, tbr, top_ls, glb_ls, klines_5m, funding_self = (_unwrap(v) for v in own)
+
+    cross: dict[str, Any] = {"tickers_24h": [], "funding": []}
+    if include_cross_asset:
+        cross_batches = await asyncio.gather(
+            asyncio.gather(*(client.spot_24h(s) for s in macro_symbols),
+                           return_exceptions=True),
+            asyncio.gather(*(client.fut_funding(s) for s in macro_symbols),
+                           return_exceptions=True),
+            return_exceptions=True,
+        )
+        tickers_raw, funding_raw = (_unwrap(b) for b in cross_batches)
+        cross["tickers_24h"] = [t for t in (tickers_raw or []) if isinstance(t, dict)]
+        cross["funding"] = [
+            {"symbol": s, "funding": f}
+            for s, f in zip(macro_symbols, (funding_raw or []))
+            if isinstance(f, dict)
+        ]
+
+    return {
+        "observed_at_ms": int(time.time() * 1000),
+        "schema_version": 1,
+        "futures": {
+            "oi_history": oi_hist,
+            "taker_buy_sell": tbr,
+            "top_ls": top_ls,
+            "global_ls": glb_ls,
+            "klines": klines_5m,
+            "funding": funding_self,
+        },
+        "cross_asset": cross,
+    }
+
+
+def _is_deriv_fresh(deriv: dict[str, Any] | None, now_ms: int, fresh_ms: int) -> bool:
+    if not deriv or not isinstance(deriv, dict):
+        return False
+    ts = deriv.get("observed_at_ms")
+    if not isinstance(ts, (int, float)):
+        return False
+    age_ms = now_ms - int(ts)
+    # Reject future timestamps (clock skew / corrupted cache) and over-age.
+    if age_ms < 0:
+        return False
+    return age_ms <= fresh_ms
+
+
+def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -> dict[str, Any]:
+    """Merge one derivative evidence dict into the canonical evidence shape.
+
+    The merged fields are added to ``evidence.futures`` (so existing adapters
+    like ``_adapt_oi``, ``_adapt_demand``, ``_adapt_regime`` pick them up
+    without code changes) and to ``evidence.cross_asset`` (a new top-level
+    key consumed by the demand adapter's macro_climate call).
+    """
+    if not deriv or not isinstance(deriv, dict):
+        return evidence
+    out = dict(evidence)
+    out["futures"] = dict(evidence.get("futures") or {})
+    deriv_fut = deriv.get("futures") or {}
+    for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines"):
+        if key in deriv_fut and deriv_fut[key] is not None:
+            out["futures"][key] = deriv_fut[key]
+    if "cross_asset" in deriv and deriv["cross_asset"]:
+        out["cross_asset"] = deriv["cross_asset"]
+    out["derivative_observed_at_ms"] = deriv.get("observed_at_ms")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Full cycle — read → calc → analyze → collate → persist
 # ---------------------------------------------------------------------------
@@ -712,8 +1105,31 @@ async def run_cycle(
     symbol: str,
     window_minutes: int,
     depth: int | None = None,
+    *,
+    deriv_ttl_s: int = DERIV_TTL_S_DEFAULT,
+    deriv_fresh_ms: int = DERIV_FRESH_MS_DEFAULT,
+    include_cross_asset: bool = False,
+    include_derivatives: bool = True,
+    force_refresh_derivatives: bool = False,
+    persist: bool = True,
 ) -> MarketRunEnvelope:
-    """Run one complete pipeline cycle and return the persisted envelope."""
+    """Run one complete pipeline cycle and return the envelope.
+
+    New keyword args (all backward compatible — defaults preserve old behavior):
+      deriv_ttl_s           — TTL of derivative cache in Redis (default 300s)
+      deriv_fresh_ms        — how old the cache can be before re-fetching (default 300_000ms)
+      include_cross_asset   — when True, also fetch 16 cross-asset calls (off by default)
+      include_derivatives   — master switch; False = behave exactly like the pre-change pipeline
+      force_refresh_derivatives — bypass cache and always re-fetch
+      persist               — when False, skip Postgres + Redis persistence entirely
+                             (real dry-run; the envelope is computed but not written)
+
+    This module is a stream-fed calculation object: ``read_raw_window`` reads
+    the poller-written Redis stream (the single coherent Binance source) — it
+    never opens a live Binance session for core data. On-demand derivative
+    fetch (``fetch_derivative_evidence``) is the only Binance touch and is
+    cache-first.
+    """
     depth = depth or settings.depth_levels
     window_s = window_minutes * 60
 
@@ -722,6 +1138,29 @@ async def run_cycle(
     )
     try:
         evidence = await read_raw_window(redis, symbol, window_minutes)
+        deriv: dict[str, Any] | None = None
+        if include_derivatives:
+            now_ms = int(time.time() * 1000)
+            if not force_refresh_derivatives:
+                cached = await redis.read_derivative_evidence(symbol)
+                if _is_deriv_fresh(cached, now_ms, deriv_fresh_ms):
+                    deriv = cached
+                    log.debug("run_cycle %s: derivative cache hit (age=%dms)",
+                              symbol, now_ms - int(cached.get("observed_at_ms") or 0))
+            if deriv is None:
+                log.info("run_cycle %s: fetching derivative evidence (cross_asset=%s)",
+                         symbol, include_cross_asset)
+                async with Binance() as client:
+                    deriv = await fetch_derivative_evidence(
+                        client, symbol, include_cross_asset=include_cross_asset,
+                    )
+                try:
+                    await redis.publish_derivative_evidence(
+                        symbol, deriv, ttl_s=deriv_ttl_s,
+                    )
+                except Exception:
+                    log.exception("run_cycle %s: failed to publish derivative cache", symbol)
+        evidence = _merge_derivatives(evidence, deriv)
     finally:
         await redis.close()
 
@@ -756,10 +1195,14 @@ async def run_cycle(
 
     envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
 
-    try:
-        await persist_envelope(envelope, settings)
-    except Exception:
-        log.exception("failed to persist envelope for %s run_id=%s", symbol, envelope.run_id)
+    if persist:
+        try:
+            await persist_envelope(envelope, settings)
+        except Exception:
+            log.exception("failed to persist envelope for %s run_id=%s", symbol, envelope.run_id)
+    else:
+        log.info("run_cycle %s: dry-run (persist=False) — run_id=%s not written",
+                 symbol, envelope.run_id)
 
     return envelope
 
@@ -772,4 +1215,10 @@ __all__ = [
     "assemble_envelope",
     "persist_envelope",
     "run_cycle",
+    "fetch_derivative_evidence",
+    "_merge_derivatives",
+    "_is_deriv_fresh",
+    "MACRO_SYMBOLS",
+    "DERIV_TTL_S_DEFAULT",
+    "DERIV_FRESH_MS_DEFAULT",
 ]

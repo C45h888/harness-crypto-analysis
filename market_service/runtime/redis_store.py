@@ -4,13 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 from redis.asyncio import Redis
 
 from .contracts import (
+    AGENT_MEMORY_SCHEMA_VERSION, ANALYST_BRIEFING_SCHEMA_VERSION,
     AgentMemory, AnalystBriefing, MarketRunEnvelope, MarketStateEnvelope,
 )
+
+
+# Schema version for stream-entries on the agent-artifact namespaces.
+# Each artifact_type maps to the contract version its payload validates
+# against so downstream tooling can read version from the stream-field
+# instead of having to decode the JSON payload first.
+_AGENT_ARTIFACT_SCHEMA_VERSION: dict[str, int] = {
+    "observations": 1,
+    "hypotheses": 1,
+    "briefings": ANALYST_BRIEFING_SCHEMA_VERSION,
+    "memory": AGENT_MEMORY_SCHEMA_VERSION,
+}
+
+
+# Default TTL for per-run STRING keys (run:<run_id>, runtime-run:<run_id>:domain:*).
+# 24h bounds growth while keeping a generous re-run guard and replay window.
+_PER_RUN_KEY_TTL_S = 86_400
 
 
 class RedisRuntimeStore:
@@ -121,6 +140,8 @@ class RedisRuntimeStore:
         # uses MAXLEN ~ to bound the collated stream (telemetry hygiene
         # spec — prevents the AOF rewrite chain from growing
         # unbounded while preserving a generous replay window).
+        # The dedupe key (and the latest-by-symbol copy) carry EXPIRE so
+        # per-run_id STRING keys cannot accumulate forever.
         maxlen = int(self.collated_stream_maxlen)
         script = f"""
         if redis.call('EXISTS', KEYS[1]) == 1 then return 'duplicate' end
@@ -128,7 +149,7 @@ class RedisRuntimeStore:
         local id = redis.call('XADD', KEYS[3], 'MAXLEN', '~', {maxlen}, '*',
             'event_type', 'market_run', 'run_id', ARGV[2],
             'symbol', ARGV[3], 'schema_version', ARGV[4], 'payload', ARGV[1])
-        redis.call('SET', KEYS[1], ARGV[1])
+        redis.call('SET', KEYS[1], ARGV[1], 'EX', {int(_PER_RUN_KEY_TTL_S)})
         return id
         """
         return str(await self.redis.eval(
@@ -159,8 +180,13 @@ class RedisRuntimeStore:
         """Publish advisory output into the agent-owned namespace only."""
         if artifact_type not in {"observations", "hypotheses", "briefings", "memory"}:
             raise ValueError(f"unsupported agent artifact type: {artifact_type}")
+        # Resolve schema_version from the contract so the stream-field
+        # reflects the true payload version (briefings=2, memory=1).
+        # The contract is the source of truth — keeps Redis entries
+        # in sync if a future bump changes the constant.
+        schema_version = _AGENT_ARTIFACT_SCHEMA_VERSION.get(artifact_type, 1)
         fields = {
-            "schema_version": "1",
+            "schema_version": str(schema_version),
             "session_id": session_id,
             "artifact_type": artifact_type,
             "payload": payload,
@@ -246,7 +272,13 @@ class RedisRuntimeStore:
         async with self.redis.pipeline(transaction=True) as pipe:
             pipe.set(latest_key, payload)
             if state.run_id:
-                pipe.set(self.run_domain_state_key(state.run_id, state.source), payload)
+                # TTL bounds growth of per-run_id per-source STRING keys
+                # so a long-running harness does not accumulate them.
+                pipe.set(
+                    self.run_domain_state_key(state.run_id, state.source),
+                    payload,
+                    ex=int(_PER_RUN_KEY_TTL_S),
+                )
             pipe.xadd(
                 stream,
                 {
@@ -335,6 +367,71 @@ class RedisRuntimeStore:
     async def read_wall_history_count(self, symbol: str) -> int:
         """Return XLEN of the wall history stream for diagnostics."""
         return int(await self.redis.xlen(self.wall_history_stream(symbol)))
+
+    # ------------------------------------------------------------------
+    # Derivative evidence — command-triggered fetch writes, harness reads
+    # ------------------------------------------------------------------
+
+    def derivatives_key(self, symbol: str) -> str:
+        """Latest projection for command-fetched derivative evidence."""
+        return f"{self.prefix}:latest:{symbol.upper()}:derivatives"
+
+    def derivatives_stream(self, symbol: str) -> str:
+        """Append-only audit trail of every derivative evidence fetch."""
+        return f"{self.prefix}:stream:domain:derivatives:{symbol.upper()}"
+
+    async def publish_derivative_evidence(
+        self,
+        symbol: str,
+        payload: dict[str, Any],
+        ttl_s: int = 300,
+    ) -> str:
+        """Atomically SET latest + XADD stream for one derivative evidence fetch.
+
+        ``ttl_s`` bounds how long the latest projection stays cached so back-to-
+        back ``--analyze`` cycles within the TTL reuse the same data instead of
+        re-hitting Binance. The stream entry carries the full payload so an
+        audit reader can replay the fetch history.
+
+        Single Lua script closes the SET/XADD ordering hole: no reader sees a
+        ``latest`` snapshot whose stream entry is missing.
+        """
+        if ttl_s <= 0:
+            raise ValueError("ttl_s must be positive")
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        ts = str(int(time.time() * 1000))
+        maxlen = int(self.stream_maxlen)
+        script = f"""
+        redis.call('SET', KEYS[1], ARGV[1], 'EX', {int(ttl_s)})
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', {maxlen}, '*',
+            'event_type', 'derivative_evidence', 'symbol', ARGV[3],
+            'schema_version', '1', 'ts', ARGV[2], 'payload', ARGV[1])
+        """
+        return str(await self.redis.eval(
+            script, 2,
+            self.derivatives_key(symbol), self.derivatives_stream(symbol),
+            body, ts, symbol.upper(),
+        ))
+
+    async def read_derivative_evidence(self, symbol: str) -> dict[str, Any] | None:
+        """Read the latest derivative evidence snapshot.
+
+        Returns ``None`` when the key is missing OR the cache has expired
+        (Redis returned nil after EX). Preserves the observed_at_ms field so
+        callers can decide whether the snapshot is fresh enough.
+        """
+        raw = await self.redis.get(self.derivatives_key(symbol))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def derivative_cache_ttl(self, symbol: str) -> int:
+        """Diagnostic: remaining TTL on the derivative evidence key."""
+        return int(await self.redis.ttl(self.derivatives_key(symbol)))
 
     # ------------------------------------------------------------------
     # Raw evidence stream — poller writes, harness reads

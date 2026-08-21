@@ -1,4 +1,13 @@
-"""Composition of the long-running NOOA analyst suite."""
+"""Composition of the long-running NOOA analyst suite.
+
+> ***Note (repurposing):*** the analyst composition here is being repurposed
+> into a set of deterministic calculation/analysis objects that pull from the
+> poller-fed Redis stream. They are python objects inside
+> ``market_service/nooa_harness/`` and are never the CLI mount — terminal-based
+> agents reach the system through ``harness.py``.
+
+See ``market_service/nooa_harness/README.md`` for the runtime authority split.
+"""
 
 from __future__ import annotations
 

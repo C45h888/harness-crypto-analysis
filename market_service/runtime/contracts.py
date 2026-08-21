@@ -587,6 +587,9 @@ def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
         "futures_obi": _path(demand, "futures", "obi"),
         "fut_keystone_bid": _path(orderbook, "fut_keystone", "bid"),
         "fut_keystone_ask": _path(orderbook, "fut_keystone", "ask"),
+        # Round-number bid anchors surfaced from wall_migration analysis.
+        "bid_anchor_count": _path(analysis, "analysis", "wall_migration", "round_anchors", "count"),
+        "mega_tier_pct": _path(analysis, "analysis", "wall_migration", "tiers", "mega", "pct"),
         "fut_microprice_skew_bps": _path(orderbook, "fut_microprice_skew_bps"),
     }
 

@@ -225,6 +225,29 @@ The database health check must pass before `collector` or `collator` starts.
 ## Required environment
 
 Every service that uses infrastructure must receive the relevant values from
+the environment.
+
+### Data-fetch authority (split between poller and run-cycle)
+
+The data-access layer is split by endpoint:
+
+- **Poller** (every `POLL_SECONDS`, default 5s) — 8 point-in-time
+  endpoints: spot/fut L2 depth, spot/fut 24h ticker, futures mark/funding,
+  futures current OI, spot/fut aggTrades. Written atomically to
+  `marketflow:latest:<SYM>:raw` + `marketflow:stream:raw:<SYM>`.
+- **Run-cycle** (on demand, triggered by harness commands) — 5
+  historical endpoints (`fut_open_interest_history`,
+  `fut_taker_buy_sell`, `fut_top_long_short_accounts`,
+  `fut_long_short_ratio`, `fut_klines`) plus, opt-in, 16 cross-asset
+  calls (8 spot_24h + 8 fut_funding across the macro symbol set).
+  Cached in Redis with TTL (`marketflow:latest:<SYM>:derivatives`).
+  Triggered by `nooa market refresh-derivatives` or implicitly by
+  `nooa market analyst` when the cache is missing or stale.
+
+See `docs/RUNTIME_DATA_AUTHORITY.md` for the full contract — endpoint list,
+key names, cache TTL, command surface, and failure modes.
+
+Every service that uses infrastructure must receive the relevant values from
 the environment:
 
 ```text

@@ -1,7 +1,7 @@
-# NOOA Harness Boundary
+# NOOA Harness Boundary — subordinate runtime module
 
-This directory is the NOOA analyst boundary. It is not the market runtime and
-it is not an execution engine.
+This directory is the **subordinate** NOOA analyst runtime. It is not the
+market runtime and it is not an execution engine.
 
 The canonical runtime remains authoritative for:
 
@@ -13,9 +13,28 @@ The canonical runtime remains authoritative for:
 - Redis canonical state;
 - run identity and replayability.
 
-The NOOA harness is responsible for reasoning over that state. It receives a
-complete canonical envelope from `market_service/commands/harness.py` and may
-form hypotheses, explain uncertainty, and prepare a human-review briefing.
+The NOOA harness is responsible for reasoning over that state. It receives
+a complete canonical envelope from `market_service/commands/nooa_cli_ext.py`
+(the inner NOOA CLI), and may form hypotheses, explain uncertainty, and
+prepare a human-review briefing.
+
+## Runtime authority split
+
+```text
+harness.py                          outer CLI
+├── clean market-data contract (no agents)
+└── --nooa ─► nooa_cli.py           inner CLI (mounted into the framework
+            │                       ``oo`` group at import time)
+            └─► nooa_cli_ext.py     the ``market`` click group
+                                    (envelope, briefing, memory, analyst)
+                                    ─── sole direct caller of THIS directory
+```
+
+`market_service/commands/harness.py` does **not** import anything from
+`market_service/nooa_harness/`. Every analyst / briefing / memory / agent
+operation is reached from the outer harness via `--nooa`, which routes
+into the inner NOOA CLI, which is the sole direct caller of this
+subordinate runtime module.
 
 ## Package shape
 
@@ -24,32 +43,39 @@ market_service/nooa_harness/
 ├── __init__.py
 ├── agents.py         # controller and specialist NOOA Agent classes
 ├── suite.py          # one controller plus specialist composition
-├── runner.py         # long-running loop mounted by harness.py
+├── runner.py         # run_analyze_once orchestrator (sole caller: nooa_cli_ext)
+├── pipeline.py       # harness-owned read→calc→analyze→collate→persist
+├── memory.py         # MemoryNode over the agent-namespace stores
+├── contracts.py      # explicit contract validation for adapters
 └── backends.py       # OpenAI-compatible, Ollama, vLLM configuration
 ```
 
-Start the long-running suite through the existing harness mount point:
+Start the analyst suite through the inner NOOA CLI (reached from the
+outer harness via `--nooa`):
 
 ```bash
+# Outer harness → inner NOOA CLI → this module
 uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.commands.harness SOLUSDT \
-  --analyst-loop --interval 60
+  python -m market_service.commands.harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
 
-# Docker uses the same harness mount point and keeps the process running:
-docker compose --profile tools run --rm harness SOLUSDT \
-  --analyst-loop --interval 60
+# Or invoke the inner CLI directly:
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.nooa_cli market analyst SOLUSDT --cycles 1 --with-memory
+
+# Docker uses the same surface (tools profile, on-demand):
+docker compose --profile tools run --rm harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
+docker compose --profile tools run --rm nooa    market analyst SOLUSDT --cycles 1 --with-memory
 ```
 
 Set `NOOA_MODEL_PROVIDER`, `NOOA_MODEL_NAME`, and any provider credentials
-before starting it. `--cycles N` can be used for a bounded development run;
-the default `--cycles 0` runs until interrupted.
+before starting it. `--cycles N` can be used for a bounded development run.
 
 ## Direct Redis principle
 
-The agent suite receives the complete state through the existing harness
-mount. This avoids another Redis translation layer and does not force the
-model through a rigid chain of reasoning. The canonical runtime remains the
-source of truth for data freshness, calculations, and persistence.
+The agent suite receives the complete state through the existing inner NOOA
+CLI mount. This avoids another Redis translation layer and does not force
+the model through a rigid chain of reasoning. The canonical runtime remains
+the source of truth for data freshness, calculations, and persistence.
 
 The complete run envelope remains the unit of analysis and is retained with:
 
