@@ -379,12 +379,17 @@ def run_analysis(
     *,
     prior_walls: dict[float, float] | None = None,
     prior_cycle_ts: str | None = None,
+    depth: int | None = None,
 ) -> dict[str, Any]:
     """Run the same deterministic analysis as the old analysis node.
 
-    ``prior_walls`` and ``prior_cycle_ts`` are read from Redis by the caller
-    (async) and passed in — this function stays pure sync.
+    ``depth`` is the centralized canonical order-book depth (defaults to the
+    config resolver) and is threaded into every adapter so wall/OI/path
+    analyses scan the full configured book instead of a hard-coded slice.
     """
+    if depth is None:
+        from market_service.config import default_depth_levels
+        depth = default_depth_levels()
     errors: list[dict[str, Any]] = []
 
     calc_data = calculations.get("calculations") or {}
@@ -394,16 +399,16 @@ def run_analysis(
     auction = _run_section("auction", lambda: _adapt_auction(evidence), errors) or {}
 
     # Open interest
-    oi = _run_section("oi", lambda: _adapt_oi(evidence), errors) or {}
+    oi = _run_section("oi", lambda: _adapt_oi(evidence, depth=depth), errors) or {}
 
     # Wall migration
     pw = prior_walls or {}
     wall_migration = _run_section("wall_migration", lambda: _adapt_wall_migration(
-        evidence, orderbook_calc.get("fut_significant_levels"), pw, prior_cycle_ts,
+        evidence, orderbook_calc.get("fut_significant_levels"), pw, prior_cycle_ts, depth=depth,
     ), errors) or {}
 
     # Path absorption
-    path_absorption = _run_section("path_absorption", lambda: _adapt_path_absorption(evidence), errors) or {}
+    path_absorption = _run_section("path_absorption", lambda: _adapt_path_absorption(evidence, depth=depth), errors) or {}
 
     # Demand
     demand = _run_section("demand", lambda: _adapt_demand(evidence), errors) or {}
@@ -453,11 +458,11 @@ def _adapt_auction(evidence: dict[str, Any]) -> dict[str, Any]:
             "verdict": verdict, "reasons": reasons}
 
 
-def _adapt_oi(evidence: dict[str, Any]) -> dict[str, Any]:
+def _adapt_oi(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
     fut = _fut_evidence(evidence)
     fut_book = fut.get("order_book") or {}
-    asks = C.require_list_of_pairs(fut_book.get("asks"), function="oi.find_walls", where="futures.order_book.asks", max_items=20)
-    bids = C.require_list_of_pairs(fut_book.get("bids"), function="oi.find_walls", where="futures.order_book.bids", max_items=20)
+    asks = C.require_list_of_pairs(fut_book.get("asks"), function="oi.find_walls", where="futures.order_book.asks", max_items=depth)
+    bids = C.require_list_of_pairs(fut_book.get("bids"), function="oi.find_walls", where="futures.order_book.bids", max_items=depth)
     last_price = _last_price_e(bids, asks) or 0.0
     oi_raw = fut.get("open_interest") or {}
     oi_value = oi_raw.get("open_interest") if isinstance(oi_raw, dict) else None
@@ -475,9 +480,10 @@ def _adapt_wall_migration(
     calc_significant_levels: list[dict] | None,
     prior_walls: dict[float, float],
     prior_cycle_ts: str | None,
+    *, depth: int,
 ) -> dict[str, Any]:
     fut_book = _fut_book_e(evidence)
-    bids, asks = _levels(fut_book, 50, function="wall_migration.*")
+    bids, asks = _levels(fut_book, depth, function="wall_migration.*")
     price = _last_price_e(bids, asks) or 0.0
     bid_floor = price * 0.97 if price else 0.0
     ask_target = price * 1.03 if price else 0.0
@@ -494,9 +500,9 @@ def _adapt_wall_migration(
                             "ask_walls_eroded": eroded, "fuel_ratio_value": float(fuel.get("ratio") or 0.0)}}
 
 
-def _adapt_path_absorption(evidence: dict[str, Any]) -> dict[str, Any]:
+def _adapt_path_absorption(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
     fut_book = _fut_book_e(evidence)
-    bids, asks = _levels(fut_book, 50, function="path_absorption.*")
+    bids, asks = _levels(fut_book, depth, function="path_absorption.*")
     price = _last_price_e(bids, asks) or 0.0
     entry = price * 1.01 if price else 0.0
     bid_floor = price * 0.97 if price else 0.0
@@ -745,7 +751,8 @@ async def run_cycle(
 
     analysis_result = run_analysis(evidence, calc_result,
                                    prior_walls=prior_walls or None,
-                                   prior_cycle_ts=prior_cycle_ts)
+                                   prior_cycle_ts=prior_cycle_ts,
+                                   depth=depth)
 
     envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
 

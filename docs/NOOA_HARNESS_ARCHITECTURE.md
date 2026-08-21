@@ -296,6 +296,106 @@ canonical truth.
 - compare analyst outputs against the same immutable run;
 - preserve human review as the final step.
 
+## Known issues — analysis register (pre-fix-pass state)
+
+This section is the current analysis of issues observed in the runtime. It
+is tracked here so the next fix pass has one register to act against. It is
+**analysis only** — nothing here has been changed inside the system yet.
+
+### NOOA-SECURITY-1 — ControllerAgent runs code via `CodeActStrategy` (critical) **— FIXED**
+
+**Status: resolved.** `ControllerAgent.synthesize` previously ran model-emitted
+Python via `@strategy(CodeActStrategy(), ...)` inside the harness container
+(the only code-executing agent). It now follows the same non-code-executing,
+JSON-only path as the 4 specialists (`_call_model_once` → one `llm.acall`,
+output parsed by `AnalystBriefing.from_controller_text`). No model-supplied
+code is executed; the model only returns JSON text. Local behavior is
+unchanged — same inputs (bounded envelope + specialist reports) and the same
+JSON narrative output contract. The worked-out rationale (recorded below)
+remains as the analysis that drove the fix.
+
+`ControllerAgent.synthesize` (`market_service/nooa_harness/agents.py`, the
+`@strategy(CodeActStrategy(), ...)` decorator) is the **only** agent that lets
+the model emit raw Python that is executed inside the harness container. The
+worked-out rationale (verbatim TODO in the source):
+
+> `CodeActStrategy` lets the model emit Python that executes inside the
+> harness container. This is acceptable while the only envelope-side
+> capability is the read-only `MarketRunEnvelope`, but the doctrine
+> explicitly flags the container boundary as security-critical before live
+> credentials or broader capabilities are exposed. Replace with a
+> non-code-executing strategy (e.g. `PredictStrategy` + strict JSON-only
+> response contract) or sandbox generated code before any capability
+> expansion lands.
+
+**Surface:** the 4 specialists (`DeltaOrderflowAgent`, `MacroAgent`,
+`OpenInterestAgent`, `LiquidationAgent`) use the safe one-shot path
+(`_call_model_once` + JSON parse). The controller is the only code-executing
+path. Its prompt literally instructs the model to "read the envelope and
+specialist reports, then produce the JSON above".
+
+**Why this is a security boundary:** that code runs inside a container that
+holds exchange credentials (`BINANCE_BASE_URL`), `CRYPTOQUANT_API_KEY`,
+`NOOA_API_KEY`, plus Postgres + Redis network access and the in-memory
+envelope. Today the code only has read access to the envelope, so it is
+"acceptable"; the moment broader capabilities are exposed (Redis/Postgres
+writes, exchange/fetch access, env/secrets reads) this becomes **arbitrary
+code execution** inside that boundary.
+
+**Recommended path (primary):** switch the controller to `PredictStrategy`
++ strict JSON-only response contract — one-shot text completion like the
+specialists. The deterministic pipeline already did the math, so the model
+does not need to compute programmatically. Simpler and safer.
+
+**Alternate path:** keep `CodeActStrategy` but sandbox execution — a
+restricted runtime with no import / file / network / DB access, exposing only
+a read-only envelope view. Preserves model computation at the cost of a
+sandbox to maintain.
+
+**Deferred-until-fixed:** capability expansion, live credentials, or any
+non-read-only surface must not land while `CodeActStrategy` remains.
+
+### RUNTIME-1 — non-atomic poller latest/stream write (latent) **— FIXED**
+
+**Status: resolved.** `poller.poll_symbol` previously called `set_raw_latest`
+(SET) then `append_raw_evidence` (XADD) as two round-trips, leaving a ~1 RTT
+window where a reader could see a latest with no matching stream entry. These
+methods are replaced by a single atomic `RedisRuntimeStore.publish_raw_evidence`
+(Lua script that SETs latest + XADDs the stream in one step), so no reader can
+observe a latest snapshot whose stream entry is missing. Verified live against
+the running Redis.
+
+### RUNTIME-2 — dead orchestrator command surface (dead code) **— FIXED**
+
+**Status: resolved.** Removed the entire orphaned control surface from the
+pruned orchestrator architecture, which published into streams nothing read
+(`stream:harness:requests` held 24 orphaned entries):
+- `redis_store`: `request_refresh`, `request_harness_run`, `consume_commands`,
+  `consume_harness_requests`, `publish_result`, `read_results`, `wait_for_result`,
+  `write_runtime_run`, `read_runtime_run`, `run_state_key`, and the
+  `command_stream`/`result_stream`/`harness_request_stream` properties.
+- contracts: `RefreshCommand`, `HarnessRunRequest`, `RuntimeRunState`, `MarketEvent`
+  (and `RuntimePhase`); re-exported symbols removed from `runtime/__init__`.
+- `commands/harness.py`: dropped `--trigger`/`--domain`/`--scope`/`--timeout` and
+  `trigger_domain`/`trigger_full_cycle`; `commands/nooa_cli_ext.py`: dropped the
+  `refresh` subcommand; deleted the last orphan `market_service/nodes/`.
+The pipeline now runs directly via `--analyze` — no dead control plane remains.
+
+### RUNTIME-3 — always-on `nooa` compose service crash-loops **— FIXED**
+
+**Status: resolved.** The compose `nooa` service is now on-demand only
+(`profiles: ["tools"]`, `restart: "no"`) and invoked with explicit args
+(`docker compose --profile tools run --rm nooa market ...`), so it no longer
+runs `nooa_cli.main([])` with no subcommand (the source of the
+`NoArgsIsHelpError` crash-loop).
+
+### RUNTIME-4 — no idempotency on `append_raw_evidence` (moot today) **— FIXED**
+
+**Status: resolved.** The atomic `publish_raw_evidence` adds a per-snapshot
+idempotency guard (keyed on `observed_at_ms`, TTL) so a re-delivered snapshot
+from a concurrent poller is deduped (no duplicate XADD, no double-append).
+Verified live.
+
 ## Readiness condition
 
 NOOA is ready for live read-only analysis only when:

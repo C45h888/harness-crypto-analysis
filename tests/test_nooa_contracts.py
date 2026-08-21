@@ -277,7 +277,7 @@ class SettingsStub:
 
 
 class RunnerModeTests(unittest.IsolatedAsyncioTestCase):
-    """runner.run_analyst_loop: read-existing is default, refresh is explicit."""
+    """runner.run_analyze_once: one-shot pipeline + NOOA analysis."""
 
     def setUp(self):
         self._env = patch.dict(
@@ -325,68 +325,43 @@ class RunnerModeTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
         return runner, fake_pipeline, fake_persist, fake_suite_analyze, envelope_obj
 
-    async def test_run_id_mode_does_not_trigger_new_cycle(self):
+    async def test_run_id_mode_reads_existing_envelope(self):
         runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
-        await runner.run_analyst_loop(
-            "SOLUSDT", interval_s=0, timeout_s=10, cycles=1,
+        await runner.run_analyze_once(
+            "SOLUSDT",
             run_id=envelope_obj.run_id,
             session_id="11111111-1111-1111-1111-111111111111",
         )
-        # run_id mode uses _read_envelope, not pipeline
         fake_pipeline.assert_not_awaited()
         fake_persist.assert_awaited_once()
         persist_arg = fake_persist.await_args.args[1]
         self.assertEqual(persist_arg.run_id, envelope_obj.run_id)
 
-    async def test_latest_mode_does_not_trigger_new_cycle(self):
+    async def test_latest_mode_reads_persisted_envelope(self):
         runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
-        await runner.run_analyst_loop(
-            "SOLUSDT", interval_s=0, timeout_s=10, cycles=1, use_latest=True,
+        await runner.run_analyze_once(
+            "SOLUSDT", use_latest=True,
             session_id="11111111-1111-1111-1111-111111111111",
         )
-        fake_pipeline.assert_awaited_once()
-        fake_persist.assert_awaited_once()
-
-    async def test_default_mode_reads_latest_without_triggering(self):
-        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
-        await runner.run_analyst_loop(
-            "SOLUSDT", interval_s=0, timeout_s=10, cycles=1,
-            session_id="11111111-1111-1111-1111-111111111111",
-        )
-        fake_pipeline.assert_awaited_once()
-        fake_persist.assert_awaited_once()
-
-    async def test_exact_run_defaults_to_one_shot(self):
-        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
-        await runner.run_analyst_loop(
-            "SOLUSDT", interval_s=0, run_id=envelope_obj.run_id,
-            session_id="11111111-1111-1111-1111-111111111111",
-        )
-        # run_id mode uses _read_envelope, not pipeline
         fake_pipeline.assert_not_awaited()
         fake_persist.assert_awaited_once()
 
-    async def test_latest_mode_deduplicates_unchanged_run(self):
-        from market_service.nooa_harness import runner
+    async def test_default_mode_runs_pipeline(self):
+        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
+        await runner.run_analyze_once(
+            "SOLUSDT",
+            session_id="11111111-1111-1111-1111-111111111111",
+        )
+        fake_pipeline.assert_awaited_once()
+        fake_persist.assert_awaited_once()
 
-        envelope_obj = MarketRunEnvelope.from_mapping(dict(_SAMPLE_ENVELOPE))
-        fake_pipeline = AsyncMock(side_effect=[envelope_obj, envelope_obj])
-        fake_persist = AsyncMock(return_value={"postgres_inserted": True, "redis_stream_id": "1-1"})
-        fake_suite_analyze = AsyncMock(return_value={
-            "briefing": self._briefing_payload(envelope_obj), "parse_errors": [],
-            "specialist_reports": {}, "symbol": "SOLUSDT", "run_id": envelope_obj.run_id,
-            "schema_version": 1, "briefing_json": "{}",
-        })
-        with patch.object(runner, "pipeline_run_cycle", fake_pipeline), \
-             patch.object(runner, "_persist_briefing", fake_persist), \
-             patch.object(runner, "build_suite", return_value=MagicMock(analyze=fake_suite_analyze)), \
-             patch.object(runner.ModelBackendConfig, "build_llm", return_value=MagicMock()):
-            await runner.run_analyst_loop(
-                "SOLUSDT", interval_s=0, cycles=2, use_latest=True,
-                session_id="11111111-1111-1111-1111-111111111111",
-            )
-        self.assertEqual(fake_pipeline.await_count, 2)
-        fake_suite_analyze.assert_awaited_once()
+    async def test_run_id_mode_skips_pipeline(self):
+        runner, fake_pipeline, fake_persist, fake_suite, envelope_obj = self._build_loop(None)
+        await runner.run_analyze_once(
+            "SOLUSDT", run_id=envelope_obj.run_id,
+            session_id="11111111-1111-1111-1111-111111111111",
+        )
+        fake_pipeline.assert_not_awaited()
         fake_persist.assert_awaited_once()
 
     def test_session_ids_are_uuid_only(self):
@@ -396,15 +371,6 @@ class RunnerModeTests(unittest.IsolatedAsyncioTestCase):
         uuid.UUID(value)
         with self.assertRaises(ValueError):
             _resolve_session_id("auto-session")
-
-    async def test_mutually_exclusive_run_id_and_latest_raise(self):
-        from market_service.nooa_harness import runner
-
-        with self.assertRaises(ValueError):
-            await runner.run_analyst_loop(
-                "SOLUSDT", interval_s=0, timeout_s=10, cycles=0,
-                run_id="some-uuid", use_latest=True,
-            )
 
 
 # ---------------------------------------------------------------------------

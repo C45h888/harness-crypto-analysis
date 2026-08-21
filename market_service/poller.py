@@ -129,8 +129,10 @@ async def poll_symbol(
         depth_levels=settings.depth_levels,
         flow_window_seconds=settings.flow_window_seconds,
     )
-    await redis.set_raw_latest(symbol, evidence)
-    stream_id = await redis.append_raw_evidence(symbol, evidence)
+    stream_id = await redis.publish_raw_evidence(symbol, evidence)
+    if stream_id is None:
+        log.debug("poller %s: duplicate snapshot skipped", symbol)
+        return
     log.debug("poller %s: %d spot trades, %d fut trades, stream=%s",
               symbol,
               len(evidence["spot"]["trades_normalized"]),

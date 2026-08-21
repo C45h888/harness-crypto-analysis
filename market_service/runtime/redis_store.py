@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncIterator
+from typing import Any
 
 from redis.asyncio import Redis
-from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import ResponseError
 
 from .contracts import (
-    AgentMemory, AnalystBriefing, HarnessRunRequest, MarketEvent,
-    MarketRunEnvelope, MarketStateEnvelope, RefreshCommand, RuntimeRunState,
+    AgentMemory, AnalystBriefing, MarketRunEnvelope, MarketStateEnvelope,
 )
 
 
@@ -41,12 +38,6 @@ class RedisRuntimeStore:
     def _prefixed(prefix: str, key: str) -> str:
         return f"{prefix.strip(':')}:{key}"
 
-    def latest_key(self, symbol: str, source: str) -> str:
-        return f"{self.prefix}:latest:{symbol.upper()}:{source}"
-
-    def telemetry_stream(self, symbol: str) -> str:
-        return f"{self.prefix}:stream:market:{symbol.upper()}"
-
     def collated_latest_key(self, symbol: str) -> str:
         return f"{self.prefix}:latest:{symbol.upper()}:collated"
 
@@ -66,9 +57,6 @@ class RedisRuntimeStore:
     def domain_latest_key(self, symbol: str, source: str) -> str:
         return f"{self.prefix}:latest:{symbol.upper()}:{source.lower()}"
 
-    def run_state_key(self, run_id: str) -> str:
-        return f"{self.prefix}:runtime-run:{run_id}"
-
     def agent_stream(self, session_id: str, artifact_type: str) -> str:
         return f"{self.prefix}:agent:{session_id}:{artifact_type}"
 
@@ -84,18 +72,6 @@ class RedisRuntimeStore:
         the prior-cycle seam for ``adapt_wall_migration``.
         """
         return f"{self.prefix}:history:{symbol.upper()}:walls"
-
-    @property
-    def command_stream(self) -> str:
-        return f"{self.prefix}:stream:commands"
-
-    @property
-    def result_stream(self) -> str:
-        return f"{self.prefix}:stream:results"
-
-    @property
-    def harness_request_stream(self) -> str:
-        return f"{self.prefix}:stream:harness:requests"
 
     async def close(self) -> None:
         await self.redis.aclose()
@@ -115,39 +91,26 @@ class RedisRuntimeStore:
             await asyncio.sleep(delay_s)
         return False
 
-    async def publish_state(self, state: MarketStateEnvelope) -> str:
-        payload = state.to_json()
-        await self.redis.set(self.latest_key(state.symbol, state.source), payload)
-        return await self.redis.xadd(
-            self.telemetry_stream(state.symbol),
-            {"event_type": "market_state", "symbol": state.symbol, "payload": payload},
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
-
-    async def read_latest_state(self, symbol: str, source: str) -> MarketStateEnvelope | None:
-        raw = await self.redis.get(self.latest_key(symbol, source))
-        return MarketStateEnvelope.from_mapping(json.loads(raw)) if raw else None
-
     async def read_recent_events(self, symbol: str, count: int = 100) -> list[dict[str, Any]]:
-        rows = await self.redis.xrevrange(self.telemetry_stream(symbol), count=count)
-        return [{"id": event_id, **fields} for event_id, fields in rows]
+        """Read the most recent raw evidence snapshots for one symbol.
 
-    async def request_refresh(self, command: RefreshCommand) -> str:
-        return await self.redis.xadd(
-            self.command_stream,
-            command.to_fields(),
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
-
-    async def publish_result(self, event: MarketEvent) -> str:
-        return await self.redis.xadd(
-            self.result_stream,
-            event.to_fields(),
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
+        Reads the canonical raw evidence stream (written by the poller) —
+        the single source of truth for market telemetry. Each returned dict
+        is a decoded evidence snapshot decorated with its stream ``id`` and
+        ``ts``, newest first.
+        """
+        rows = await self.redis.xrevrange(self.raw_stream(symbol), count=count)
+        out: list[dict[str, Any]] = []
+        for entry_id, fields in rows:
+            raw = fields.get("payload")
+            try:
+                value = json.loads(raw) if raw else None
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            out.append({"id": entry_id, "ts": fields.get("ts", ""), **value})
+        return out
 
     async def publish_run(self, envelope: MarketRunEnvelope) -> str:
         envelope.validate()
@@ -373,109 +336,6 @@ class RedisRuntimeStore:
         """Return XLEN of the wall history stream for diagnostics."""
         return int(await self.redis.xlen(self.wall_history_stream(symbol)))
 
-    async def write_runtime_run(self, state: RuntimeRunState) -> None:
-        await self.redis.set(
-            self.run_state_key(state.run_id),
-            json.dumps(state.to_dict(), separators=(",", ":")),
-        )
-
-    async def read_runtime_run(self, run_id: str) -> dict[str, Any] | None:
-        raw = await self.redis.get(self.run_state_key(run_id))
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-            return value if isinstance(value, dict) else None
-        except json.JSONDecodeError:
-            return None
-
-    async def request_harness_run(self, request: HarnessRunRequest) -> str:
-        return await self.redis.xadd(
-            self.harness_request_stream,
-            request.to_fields(),
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
-
-    async def consume_harness_requests(
-        self, last_id: str = "$", block_ms: int = 2000, count: int = 8,
-    ) -> AsyncIterator[tuple[str, HarnessRunRequest]]:
-        current_id = last_id
-        while True:
-            try:
-                rows = await self.redis.xread(
-                    {self.harness_request_stream: current_id},
-                    block=block_ms,
-                    count=count,
-                )
-            except Exception:
-                await asyncio.sleep(1.0)
-                continue
-            if not rows:
-                continue
-            for _stream, entries in rows:
-                for entry_id, fields in entries:
-                    current_id = entry_id
-                    yield entry_id, HarnessRunRequest.from_fields(fields)
-
-    async def consume_commands(
-        self,
-        domain: str,
-        last_id: str = "$",
-        block_ms: int = 5_000,
-        count: int = 16,
-    ) -> AsyncIterator[tuple[str, RefreshCommand]]:
-        """Yield ``(stream_id, RefreshCommand)`` pairs from ``stream:commands``.
-
-        Filters by ``command.domain``. ``last_id`` starts at ``$`` so a freshly
-        started node does not replay history; pass an explicit id to resume.
-        """
-        current_id: str = last_id
-        while True:
-            try:
-                rows = await self.redis.xread(
-                    {self.command_stream: current_id},
-                    block=block_ms,
-                    count=count,
-                )
-            except (ResponseError, RedisConnectionError, OSError, ConnectionError):
-                # Docker DNS/network interruptions must not terminate a long-lived
-                # node. Reconnect is handled by redis-py's lazy connection path
-                # on the next read; this loop keeps the consumer alive.
-                rows = []
-                await asyncio.sleep(1.0)
-            if not rows:
-                continue
-            for _stream, entries in rows:
-                for entry_id, fields in entries:
-                    current_id = entry_id
-                    command = RefreshCommand.from_fields(fields)
-                    if command.domain == domain:
-                        yield entry_id, command
-
-    async def read_results(
-        self,
-        run_id: str | None = None,
-        count: int = 16,
-    ) -> list[tuple[str, MarketEvent]]:
-        """Read recent completion events from ``stream:results``.
-
-        If ``run_id`` is supplied, only events whose payload contains a matching
-        ``run_id`` are returned (used by the orchestrator to await pipeline
-        steps deterministically).
-        """
-        rows = await self.redis.xrevrange(self.result_stream, count=count * 4)
-        out: list[tuple[str, MarketEvent]] = []
-        for entry_id, fields in rows:
-            event = MarketEvent.from_fields(fields)
-            if run_id is None:
-                out.append((entry_id, event))
-            elif event.payload.get("run_id") == run_id:
-                out.append((entry_id, event))
-            if len(out) >= count:
-                break
-        return out
-
     # ------------------------------------------------------------------
     # Raw evidence stream — poller writes, harness reads
     # ------------------------------------------------------------------
@@ -486,24 +346,41 @@ class RedisRuntimeStore:
     def raw_latest_key(self, symbol: str) -> str:
         return f"{self.prefix}:latest:{symbol.upper()}:raw"
 
-    async def append_raw_evidence(self, symbol: str, payload: dict[str, Any]) -> str:
-        """Append one raw evidence snapshot to the rolling window stream."""
-        return await self.redis.xadd(
-            self.raw_stream(symbol),
-            {
-                "ts": str(payload.get("observed_at_ms", "")),
-                "payload": json.dumps(payload, default=str, separators=(",", ":")),
-            },
-            maxlen=5000,
-            approximate=True,
-        )
+    def raw_dedupe_key(self, symbol: str, observed_at_ms: str) -> str:
+        """Idempotency guard key for one raw evidence snapshot."""
+        return f"{self.prefix}:raw-dedupe:{symbol.upper()}:{observed_at_ms}"
 
-    async def set_raw_latest(self, symbol: str, payload: dict[str, Any]) -> None:
-        """Set the latest raw evidence snapshot."""
-        await self.redis.set(
-            self.raw_latest_key(symbol),
-            json.dumps(payload, default=str, separators=(",", ":")),
+    async def publish_raw_evidence(self, symbol: str, payload: dict[str, Any]) -> str | None:
+        """Atomically write one raw evidence snapshot to Redis.
+
+        A single Lua script SETs the ``latest`` projection AND XADDs the raw
+        stream in one step, so no reader can observe a latest snapshot whose
+        stream entry is missing (atomicity closes the SET/XADD ordering hole).
+        A per-snapshot idempotency guard (keyed on ``observed_at_ms``, with a
+        TTL) dedupes a re-delivered snapshot from a concurrent poller.
+
+        Returns the stream id, or ``None`` when the snapshot was a duplicate.
+        """
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        ts = str(payload.get("observed_at_ms", ""))
+        script = """
+        if ARGV[2] ~= '' then
+          local guard = redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[3])
+          if guard == false then return 'duplicate' end
+        end
+        redis.call('SET', KEYS[1], ARGV[1])
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', 5000, '*',
+            'ts', ARGV[2], 'payload', ARGV[1])
+        """
+        result = await self.redis.eval(
+            script, 3,
+            self.raw_latest_key(symbol), self.raw_stream(symbol),
+            self.raw_dedupe_key(symbol, ts),
+            body, ts, 600,
         )
+        if result == "duplicate":
+            return None
+        return str(result)
 
     async def read_raw_window(
         self, symbol: str, since_ms: int,
@@ -535,25 +412,3 @@ class RedisRuntimeStore:
             return value if isinstance(value, dict) else None
         except (ValueError, json.JSONDecodeError):
             return None
-
-    async def wait_for_result(
-        self,
-        run_id: str,
-        source: str,
-        timeout_s: float = 30.0,
-        poll_interval_s: float = 0.25,
-    ) -> MarketEvent | None:
-        """Block (poll) until a result event for ``(run_id, source)`` arrives.
-
-        Used by the orchestrator between pipeline steps. Returns ``None`` on
-        timeout so the caller can decide whether to fail or retry.
-        """
-        import asyncio
-        import time
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            for _entry_id, event in await self.read_results(run_id=run_id, count=32):
-                if event.payload.get("source") == source:
-                    return event
-            await asyncio.sleep(poll_interval_s)
-        return None

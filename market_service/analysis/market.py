@@ -115,11 +115,18 @@ async def _safe(coro_factory, name: str) -> tuple[Any, str | None]:
 async def analyze(
     symbol: str,
     trade_limit: int = 500,
-    depth_limit: int = 50,
+    depth_limit: int | None = None,
     bucket_window_s: int = 60,
     include_extended: bool = True,
 ) -> dict:
-    """One-shot combined snapshot with raw Binance evidence and derived metrics."""
+    """One-shot combined snapshot with raw Binance evidence and derived metrics.
+
+    ``depth_limit`` defaults to the centralized canonical order-book depth
+    (``DEPTH_LEVELS``) when not given, so every assert path uses one source.
+    """
+    if depth_limit is None:
+        from market_service.config import default_depth_levels
+        depth_limit = default_depth_levels()
     started_at_ms = int(time.time() * 1000)
     out: dict[str, Any] = {
         "contract": {
@@ -355,7 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Binance + CryptoQuant market analysis")
     p.add_argument("symbol", nargs="?", default="BTCUSDT", help="Binance symbol, e.g. BTCUSDT, ETHUSDT")
     p.add_argument("--trades", type=int, default=500, help="recent trades to pull per venue")
-    p.add_argument("--depth", type=int, default=50, help="order book depth (5|10|20|50|100|...)")
+    p.add_argument("--depth", type=int, default=None,
+                   help="order book depth (default: centralized DEPTH_LEVELS)")
     p.add_argument("--window", type=int, default=60, help="CVD bucket window in seconds")
     p.add_argument("--json", action="store_true", help="emit JSON instead of pretty text")
     p.add_argument("-v", "--verbose", action="store_true")

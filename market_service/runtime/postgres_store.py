@@ -255,13 +255,13 @@ class PostgresRuntimeStore:
         sql = (
             "SELECT payload FROM agent_memory "
             "WHERE session_id = $1 AND NOT forgotten "
-            "ORDER BY created_at DESC LIMIT $3"
+            "ORDER BY created_at DESC LIMIT $2"
         )
         params: list[Any] = [uuid.UUID(session_id), limit]
         if kind is not None:
             sql = (
                 "SELECT payload FROM agent_memory "
-                "WHERE session_id = $1 AND kind = $2 AND NOT forgotten "
+                "WHERE session_id = $1 AND kind = $2::text AND NOT forgotten "
                 "ORDER BY created_at DESC LIMIT $3"
             )
             params = [uuid.UUID(session_id), kind, limit]

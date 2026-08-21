@@ -1,6 +1,7 @@
-# Canonical runtime topology — poller feeds raw evidence into Redis every 5s;
-# the harness runs the pipeline (calc + analysis + collate) on its own schedule
-# and then passes the envelope to the NOOA analyst suite.
+# Canonical runtime topology — poller feeds raw evidence into Redis on the
+# cadence set by POLL_SECONDS (30s default); the harness runs the pipeline
+# (calc + analysis + collate) on demand and passes the envelope to the NOOA
+# analyst suite, which itself runs on demand under the `tools` profile.
 services:
   redis:
     build:
@@ -40,7 +41,7 @@ services:
       timeout: 3s
       retries: 12
 
-  # One-shot schema bootstrap via Alembic.
+  # One-shot schema bootstrap via Alembic. Runs once on `up`, exits.
   db-init:
     build: .
     command: ["alembic", "upgrade", "head"]
@@ -48,7 +49,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
     volumes:
       - ./alembic:/app/alembic:ro
       - ./alembic.ini:/app/alembic.ini:ro
@@ -57,9 +58,8 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # 5-second raw-evidence firehose. Replaces the old data-access node.
-  # Fetches Binance spot + futures data and appends to Redis raw stream.
-  # No math, no analysis, no collation — just Binance → Redis.
+  # 5-second raw-evidence firehose. Fetches Binance data and appends
+  # to the Redis raw stream. No math, no analysis — just Binance → Redis.
   poller:
     build: .
     user: "marketflow"
@@ -68,14 +68,14 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
       SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
       POLL_SECONDS: ${POLL_SECONDS:-5}
       FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
-      DEPTH_LEVELS: ${DEPTH_LEVELS:-20}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-500}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       BINANCE_BASE_URL: ${BINANCE_BASE_URL:-}
       CRYPTOQUANT_API_KEY: ${CRYPTOQUANT_API_KEY:-}
@@ -88,18 +88,10 @@ services:
       db-init:
         condition: service_completed_successfully
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import market_service.poller; print(\"ok\")'"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
 
-  # Harness client and long-running NOOA analyst runner. The analyst loop
-  # reads raw evidence from Redis, runs the pipeline (calc + analysis +
-  # collate) inline, then invokes the NOOA specialist agents over the
-  # resulting envelope. No exchange credentials needed — the poller owns
-  # that responsibility.
+  # One-shot harness. Reads raw evidence from Redis, runs the pipeline
+  # (calc + analysis + collate), then invokes NOOA agents. Use via:
+  #   docker compose --profile tools run --rm harness SOLUSDT --analyze --window 15m --json
   harness:
     build: .
     user: "marketflow"
@@ -108,7 +100,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
@@ -132,16 +124,22 @@ services:
     profiles: ["tools"]
     restart: "no"
 
-  # Mounted NOOA CLI on the canonical runtime.
+  # NOOA CLI host. On-demand only (profiles: ["tools"]) — running it
+  # always-on would burn LLM tokens every cycle for no reason. Invoke with:
+  #   docker compose --profile tools run --rm nooa \
+  #       market envelope SOLUSDT --latest
+  #   docker compose --profile tools run --rm nooa \
+  #       market analyst SOLUSDT --cycles 1 --with-memory
   nooa:
     build: .
     user: "marketflow"
+    profiles: ["tools"]
     entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
     env_file:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:***@postgres:5432/${POSTGRES_DB:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-10000}
@@ -159,7 +157,6 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
-    profiles: ["tools"]
     restart: "no"
 
 volumes:

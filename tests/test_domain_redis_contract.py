@@ -53,22 +53,8 @@ class DomainKeyContractTests(unittest.TestCase):
     def test_preexisting_keys_still_exist(self):
         # Per the contract, the existing keys must be preserved.
         self.assertEqual(
-            self.store.latest_key("SOLUSDT", "collector"),
-            "marketflow:latest:SOLUSDT:collector",
-        )
-        self.assertEqual(
-            self.store.telemetry_stream("SOLUSDT"),
-            "marketflow:stream:market:SOLUSDT",
-        )
-        self.assertEqual(
             self.store.collated_stream("SOLUSDT"),
             "marketflow:stream:collated:SOLUSDT",
-        )
-        self.assertEqual(
-            self.store.command_stream, "marketflow:stream:commands",
-        )
-        self.assertEqual(
-            self.store.result_stream, "marketflow:stream:results",
         )
 
     def test_publish_domain_state_rejects_unknown_source(self):

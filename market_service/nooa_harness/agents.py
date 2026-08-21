@@ -9,8 +9,9 @@ Specialists build their own prompt and call the model exactly once
 (``self._llm.acall``) — no framework-level validation-retry loop. The raw
 text is returned and parsed by ``SpecialistReport.from_llm_text``, which
 tolerates the ``thinking`` preamble and ```json``` fences used by
-reasoning-model gateways. The controller keeps ``CodeActStrategy`` so it can
-programmatically reconcile the four specialist reports.
+reasoning-model gateways. The controller uses the same non-code-executing
+path (``_call_model_once`` + strict JSON-only contract) so the model never
+emits executable Python inside the harness container.
 
 The envelope handed to the model is always the bounded LLM view
 (``bounded_envelope_view``); the complete canonical envelope stays immutable
@@ -22,10 +23,8 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any
 
-from nooa import Agent, spec, strategy
+from nooa import Agent, spec
 from nooa.agentdoc import hidden
-from nooa.context_blocks import DynamicContext
-from nooa.strategies import CodeActStrategy
 
 # ---------------------------------------------------------------------------
 # Envelope schema — injected into agent context so the LLM knows the shape
@@ -237,20 +236,23 @@ class MarketAnalyst(Agent):
         envelope_payload: dict[str, Any] | None,
         *,
         max_tokens: int | None = None,
+        extra_context: str | None = None,
     ) -> str:
         """One deterministic LLM call (no validation-retry loop).
 
-        Builds the system (remit + task) and user (format + schema + bounded
-        envelope) prompts and calls the configured model client once. The raw
-        text is returned as-is; parsing happens in
+        Builds the system (remit + task) and user (format + optional extra
+        context + schema + bounded envelope) prompts and calls the configured
+        model client once. The raw text is returned as-is; parsing happens in
         ``SpecialistReport.from_llm_text`` which extracts JSON from prose.
         """
         llm = getattr(self, "_llm", None)
         if llm is None:
             raise RuntimeError(f"{type(self).__name__}: no NOOA model client configured")
         payload = envelope_payload if envelope_payload is not None else self._current_envelope
+        extra = f"{extra_context}\n\n" if extra_context else ""
         user = (
             f"{self.output_format_prompt}\n\n"
+            f"{extra}"
             "Envelope schema (shape reference):\n"
             f"{self._envelope_schema()}\n\n"
             "Canonical envelope for this run (raw arrays bounded):\n"
@@ -445,50 +447,41 @@ class ControllerAgent(MarketAnalyst):
 
     remit = "Reconcile specialist views against the canonical envelope and state uncertainty clearly."
 
-    # TODO(nooa-security): CodeActStrategy lets the model emit Python that
-    # executes inside the harness container. This is acceptable while the
-    # only envelope-side capability is the read-only MarketRunEnvelope,
-    # but the doctrine explicitly flags the container boundary as
-    # security-critical before live credentials or broader capabilities
-    # are exposed. Replace with a non-code-executing strategy (e.g.
-    # PredictStrategy + strict JSON-only response contract) or sandbox
-    # generated code before any capability expansion lands.
-
-    @strategy(
-        CodeActStrategy(),
-        context={
-            "task": (
-                "You are the controller analyst. You receive 4 specialist reports "
-                "(delta_orderflow, macro, open_interest, liquidations) and the "
-                "canonical envelope. Your job:\n"
-                "1. Cross-reference each specialist claim against the envelope\n"
-                "2. Identify contradictions between specialists\n"
-                "3. Identify areas of consensus\n"
-                "4. Produce a narrative briefing that separates evidence from inference\n"
-                "5. State uncertainty explicitly — never pretend confidence"
-            ),
-            "output_format": (
-                "Return a JSON object with:\n"
-                "  narrative: string (2-3 paragraphs synthesizing all views)\n"
-                "  consensus: {\n"
-                "    direction: string (e.g. bullish, bearish, neutral)\n"
-                "    confidence: low|medium|high\n"
-                "    confidence_score: number 0.0-1.0 (your numeric confidence)\n"
-                "    timeframe: string (e.g. intraday, session, swing)\n"
-                "    magnitude: string (e.g. marginal, moderate, strong)\n"
-                "  }\n"
-                "  disagreements: [{topic, specialist_a, specialist_b, resolution}]\n"
-                "  key_evidence: [{path, claim, value, specialist}]\n"
-                "  limitations: [string]\n"
-                "  uncertainty_sources: [string]\n"
-                "The code you generate should read the envelope and specialist "
-                "reports, then produce the JSON above."
-            ),
-            "envelope_schema": DynamicContext("self._envelope_schema()"),
-            "specialist_reports": DynamicContext("json.dumps(self._specialist_reports, indent=2)"),
-            "envelope_summary": DynamicContext("self._envelope_summary()"),
-        },
+    # SECURITY (resolved): the controller previously used CodeActStrategy,
+    # which let the model emit Python that executed inside the harness
+    # container — an arbitrary code-execution surface inside a boundary that
+    # holds credentials and Postgres/Redis network access. It now follows the
+    # same non-code-executing, JSON-only path as the specialists: one
+    # deterministic LLM call returning raw JSON text, parsed by
+    # AnalystBriefing.from_controller_text. No model-supplied code is ever
+    # executed. Local behavior is unchanged — same inputs (bounded envelope +
+    # specialist reports) and the same JSON output contract.
+    task_prompt = (
+        "You are the controller analyst. You receive 4 specialist reports "
+        "(delta_orderflow, macro, open_interest, liquidations) and the "
+        "canonical envelope. Your job:\n"
+        "1. Cross-reference each specialist claim against the envelope\n"
+        "2. Identify contradictions between specialists\n"
+        "3. Identify areas of consensus\n"
+        "4. Produce a narrative briefing that separates evidence from inference\n"
+        "5. State uncertainty explicitly — never pretend confidence"
     )
+    output_format_prompt = (
+        "Return a JSON object with:\n"
+        "  narrative: string (2-3 paragraphs synthesizing all views)\n"
+        "  consensus: {\n"
+        "    direction: string (e.g. bullish, bearish, neutral)\n"
+        "    confidence: low|medium|high\n"
+        "    confidence_score: number 0.0-1.0 (your numeric confidence)\n"
+        "    timeframe: string (e.g. intraday, session, swing)\n"
+        "    magnitude: string (e.g. marginal, moderate, strong)\n"
+        "  }\n"
+        "  disagreements: [{topic, specialist_a, specialist_b, resolution}]\n"
+        "  key_evidence: [{path, claim, value, specialist}]\n"
+        "  limitations: [string]\n"
+        "  uncertainty_sources: [string]\n"
+    )
+
     async def synthesize(
         self,
         envelope: Annotated[
@@ -510,8 +503,20 @@ class ControllerAgent(MarketAnalyst):
             ),
         ],
     ) -> str:
-        """Produce a data-driven narrative from the envelope and specialist reports."""
-        ...
+        """Produce a data-driven narrative from the envelope and specialist reports.
+
+        Non-code-executing path (SECURITY): one deterministic LLM call with a
+        strict JSON-only response contract, exactly like the specialists.
+        Returns raw JSON text; the suite parses it via
+        ``AnalystBriefing.from_controller_text``.
+        """
+        reports_block = "Specialist reports:\n" + json.dumps(
+            specialist_reports or {}, default=str, indent=2,
+        )
+        return await self._call_model_once(
+            envelope,
+            extra_context=reports_block,
+        )
 
 
 __all__ = [

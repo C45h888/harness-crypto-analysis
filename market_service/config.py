@@ -4,11 +4,28 @@ import os
 from dataclasses import dataclass
 
 
+# Canonical order-book depth. Single source of truth for every poller, calcs,
+# analysis, and CLI path. Mirrors the legacy live scripts (which scanned the
+# full Binance depth book up to ``limit=1000``) while staying a rational,
+# centrally-configurable depth: ``DEPTH_LEVELS`` ovverrides at deploy time.
+DEFAULT_DEPTH_LEVELS = 500
+
+
 def _positive_int(name: str, default: int) -> int:
     value = int(os.getenv(name, str(default)))
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def default_depth_levels() -> int:
+    """Resolve the canonical order-book depth from env (no DB required).
+
+    CLI/standalone analysis paths that fetch their own Binance book (and may
+    run without a database) use this instead of ``Settings.from_env()`` so the
+    order-book depth stays centralized on ``DEPTH_LEVELS`` everywhere.
+    """
+    return _positive_int("DEPTH_LEVELS", DEFAULT_DEPTH_LEVELS)
 
 
 @dataclass(frozen=True)
@@ -42,6 +59,6 @@ class Settings:
             symbols=symbols,
             poll_seconds=_positive_int("POLL_SECONDS", 30),
             flow_window_seconds=_positive_int("FLOW_WINDOW_SECONDS", 300),
-            depth_levels=_positive_int("DEPTH_LEVELS", 20),
+            depth_levels=default_depth_levels(),
             max_domain_state_age_seconds=_positive_int("MAX_DOMAIN_STATE_AGE_SECONDS", 90),
         )

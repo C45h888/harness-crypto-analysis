@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from market_service.runtime.contracts import MarketEvent, MarketStateEnvelope, RefreshCommand
+from market_service.runtime.contracts import MarketStateEnvelope
 
 
 class RuntimeContractTests(unittest.TestCase):
@@ -18,12 +18,6 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(decoded["symbol"], "SOLUSDT")
         self.assertIsNone(decoded["data"]["obi"])
         self.assertEqual(decoded["schema_version"], 1)
-
-    def test_event_and_command_are_transport_safe(self):
-        event = MarketEvent("signal", "SOLUSDT", {"severity": 3})
-        command = RefreshCommand("order_book", "solusdt", parameters={"depth": 20})
-        self.assertEqual(event.to_fields()["symbol"], "SOLUSDT")
-        self.assertEqual(json.loads(command.to_fields()["parameters"])["depth"], 20)
 
 
 if __name__ == "__main__":

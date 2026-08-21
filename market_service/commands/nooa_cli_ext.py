@@ -17,7 +17,6 @@ nooa_cli_install.py`` drops a thin shim module there that re-exports the
     nooa market briefing --session-id <UUID> --run-id <UUID>
     nooa market memory recall --session-id <UUID>
     nooa market analyst SOLUSDT --cycles 1 --with-memory
-    nooa market refresh SOLUSDT --all
 
 Every handler reads/writes through the canonical runtime stores (Redis
 primary read, Postgres durable ledger) — no second pipeline.
@@ -240,40 +239,30 @@ def memory_forget(session_id, memory_id) -> None:
 def analyst_cmd(symbol, run_id, use_latest, cycles, interval,
                 with_memory, session_id) -> None:
     """Run the NOOA analyst suite (ControllerAgent + 4 specialists)."""
-    from market_service.nooa_harness.runner import run_analyst_loop
+    from market_service.nooa_harness.runner import run_analyze_once
 
-    asyncio.run(run_analyst_loop(
-        symbol,
-        interval_s=interval,
-        cycles=cycles,
-        run_id=run_id,
-        use_latest=use_latest,
-        session_id=session_id,
-        with_memory=with_memory,
-    ))
-
-
-# --------------------------------------------------------------------------
-# refresh — request a bounded canonical cycle (typed HarnessRunRequest)
-# --------------------------------------------------------------------------
-@command.command("refresh")
-@click.argument("symbol", default="SOLUSDT")
-@click.option("--scope", default="all",
-              type=click.Choice(("all", "order_book", "trades", "funding",
-                                 "open_interest", "tickers")))
-@click.option("--domain", default=None,
-              type=click.Choice(("data-access", "calculations", "analysis")),
-              help="trigger one domain instead of a full cycle")
-@click.option("--timeout", type=float, default=120.0)
-def refresh_cmd(symbol, scope, domain, timeout) -> None:
-    """Ask the orchestrator for one bounded canonical refresh run."""
-    from market_service.commands.harness import trigger_domain, trigger_full_cycle
-
-    if domain is not None:
-        result = asyncio.run(trigger_domain(symbol, domain, scope, timeout))
-    else:
-        result = asyncio.run(trigger_full_cycle(symbol, timeout, scope))
-    _emit(result)
+    async def _loop() -> None:
+        if cycles == 0:
+            while True:
+                await run_analyze_once(
+                    symbol,
+                    use_latest=use_latest or (run_id is None),
+                    run_id=run_id,
+                    session_id=session_id,
+                    with_memory=with_memory,
+                )
+                await asyncio.sleep(interval)
+        for _ in range(cycles):
+            await run_analyze_once(
+                symbol,
+                use_latest=use_latest or (run_id is None),
+                run_id=run_id,
+                session_id=session_id,
+                with_memory=with_memory,
+            )
+            if _ < cycles - 1:
+                await asyncio.sleep(interval)
+    asyncio.run(_loop())
 
 
 __all__ = ["command"]
