@@ -55,6 +55,60 @@ Usage:
 
 Follows the repo null discipline: ``null`` means a source did not provide a
 value — it is not a substitute for zero.
+
+The runtime authority split is:
+
+  harness.py              outer CLI       clean market-data contract
+                                            + calculation pipeline
+                                            + Redis derivative cache
+                                            + router to NOOA inner CLI
+       │
+       ├─► --analyze ─► pipeline.run_cycle (no agents, deterministic only)
+       │
+       ├─► --refresh-derivatives ─► fetch_derivative_evidence + Redis cache
+       │
+       └─► --nooa ─► nooa_cli.py         inner CLI (mounted into the framework
+                                          ``oo`` group at import time)
+                          │
+                          └─► nooa_cli_ext.py  the ``market`` click group
+                                              (envelope, briefing, memory,
+                                               analyst) — sole direct caller
+                                              of nooa_harness.*
+
+The envelope reads (``--latest`` / ``--run-id``) go directly to the
+``MarketRunEnvelope`` contract in ``runtime.contracts`` via
+``RedisRuntimeStore``. They are data reads, not agent reads — the
+nooa_harness boundary is never crossed on those paths.
+
+The NOOA inner CLI is **calculation-agnostic**: its ``analyst`` command
+calls ``run_analyze_once`` which in turn calls ``pipeline.run_cycle`` and
+reuses whatever derivatives are already in Redis (pre-populated by
+``harness.py --refresh-derivatives`` or implicitly by ``--analyze``). NOOA
+itself will be reworked in a future pass to be driven by mathematical /
+statistical derivations; the calculation pipeline remains the single
+source of truth for canonical numbers.
+
+Usage:
+    # clean data contract (no agents)
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --latest --json
+    .venv/bin/python -m market_service.commands.harness --run-id <UUID> --json
+
+    # calculation pipeline — populates the canonical ledger
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --window 15m --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --envelope-summary --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --with-cross-asset --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --no-derivatives --json
+
+    # any analyst / briefing / memory / agent operation — routed via --nooa
+    .venv/bin/python -m market_service.commands.harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
+    .venv/bin/python -m market_service.commands.harness --nooa market envelope SOLUSDT --latest
+    .venv/bin/python -m market_service.commands.harness --nooa market briefing --session-id <UUID> --run-id <UUID>
+    .venv/bin/python -m market_service.commands.harness --nooa market memory recall --session-id <UUID>
+
+Follows the repo null discipline: `null` means a source did not provide a
+value — it is not a substitute for zero.
 """
 
 from __future__ import annotations
