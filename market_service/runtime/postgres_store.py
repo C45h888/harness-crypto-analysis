@@ -9,7 +9,7 @@ from typing import Any
 
 import asyncpg
 
-from .contracts import AgentMemory, AnalystBriefing, MarketRunEnvelope
+from .contracts import AgentMemory, AnalystBriefing, MarketRunEnvelope, _json_safe
 
 
 class PostgresRuntimeStore:
@@ -70,9 +70,9 @@ class PostgresRuntimeStore:
             uuid.UUID(envelope.run_id), envelope.symbol,
             datetime.fromisoformat(envelope.generated_at),
             datetime.fromisoformat(envelope.completed_at), envelope.status, envelope.data_source,
-            envelope.schema_version, json.dumps(envelope.coverage),
-            json.dumps(envelope.canonical_state), json.dumps(envelope.domain_outputs),
-            json.dumps(list(envelope.errors)), json.dumps(envelope.source_metadata or {}),
+            envelope.schema_version, json.dumps(_json_safe(envelope.coverage)),
+            json.dumps(_json_safe(envelope.canonical_state)), json.dumps(_json_safe(envelope.domain_outputs)),
+            json.dumps(_json_safe(list(envelope.errors))), json.dumps(_json_safe(envelope.source_metadata or {})),
             envelope.to_json(),
         )
         return row is not None
@@ -417,6 +417,39 @@ class PostgresRuntimeStore:
             result["cycle_ts"] = result["cycle_ts"].isoformat()
         return result
 
+    async def read_wall_history(self, symbol: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """Layer C read: full wall_snapshot history for ``symbol``, newest first.
+
+        Mirrors ``RedisRuntimeStore.read_wall_history`` so the migration
+        analysis can probe every recorded wall level from the durable ledger.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            """SELECT symbol, cycle_ts, run_id, schema_version, asks, bids,
+                      fuel_ratio, bid_pool, ask_pool, bid_floor, ask_target,
+                      ask_walls_built, ask_walls_eroded
+               FROM wall_snapshot
+               WHERE symbol = $1
+               ORDER BY cycle_ts DESC LIMIT $2""",
+            symbol.upper(), limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            result = dict(row)
+            for col in ("asks", "bids"):
+                v = result.get(col)
+                if isinstance(v, str):
+                    try:
+                        result[col] = json.loads(v)
+                    except (ValueError, json.JSONDecodeError):
+                        result[col] = []
+            if "cycle_ts" in result and hasattr(result["cycle_ts"], "isoformat"):
+                result["cycle_ts"] = result["cycle_ts"].isoformat()
+            out.append(result)
+        return out
+
     async def wall_snapshot_count(self, symbol: str) -> int:
         """Diagnostic count for the wall_snapshot table for one symbol."""
         if self.pool is None:
@@ -424,3 +457,112 @@ class PostgresRuntimeStore:
         assert self.pool is not None
         return int(await self.pool.fetchval(
             "SELECT COUNT(*) FROM wall_snapshot WHERE symbol = $1", symbol.upper()))
+
+    # ------------------------------------------------------------------
+    # Keystone history — cross-cycle keystone-migration ledger
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _opt_float(value: Any) -> float | None:
+        """Null-discipline coercion: None stays None (no fabricated zero)."""
+        if value is None:
+            return None
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+    async def record_keystone_snapshot(self, symbol: str, run_id: str,
+                                       payload: dict[str, Any]) -> bool:
+        """Layer C write: insert a keystone_history row.
+
+        Mirrors the discipline of ``record_wall_snapshot``: idempotent on
+        (symbol, cycle_ts) so re-runs are safe; postgres-first ordering so
+        the row is durable before any redis publication. Metric columns are
+        nullable per the null discipline (None = source did not provide).
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        cycle_ts_raw = payload.get("cycle_ts") or ""
+        try:
+            cycle_ts_value = datetime.fromisoformat(cycle_ts_raw.replace("Z", "+00:00")) \
+                if cycle_ts_raw else datetime.now()
+        except (TypeError, ValueError):
+            cycle_ts_value = datetime.now()
+        row = await self.pool.fetchrow(
+            """INSERT INTO keystone_history
+               (symbol, cycle_ts, run_id, schema_version,
+                keystone_price, window_qty, tight_lo, tight_hi,
+                wide_lo, wide_hi, keystone_bid_qty, ask_ladder_notional)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+               ON CONFLICT (symbol, cycle_ts) DO NOTHING
+               RETURNING symbol, cycle_ts""",
+            symbol.upper(), cycle_ts_value, uuid.UUID(run_id),
+            int(payload.get("schema_version") or 1),
+            self._opt_float(payload.get("keystone_price")),
+            self._opt_float(payload.get("window_qty")),
+            self._opt_float(payload.get("tight_lo")),
+            self._opt_float(payload.get("tight_hi")),
+            self._opt_float(payload.get("wide_lo")),
+            self._opt_float(payload.get("wide_hi")),
+            self._opt_float(payload.get("keystone_bid_qty")),
+            self._opt_float(payload.get("ask_ladder_notional")),
+        )
+        return row is not None
+
+    def _decode_keystone_row(self, row: Any) -> dict[str, Any]:
+        result = dict(row)
+        if "cycle_ts" in result and hasattr(result["cycle_ts"], "isoformat"):
+            result["cycle_ts"] = result["cycle_ts"].isoformat()
+        return result
+
+    async def read_last_keystone_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        """Layer C read: most recent keystone_history row for ``symbol``.
+
+        Returns None when no snapshot exists yet — same semantics as the
+        Redis read, but durable across Redis restarts.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """SELECT symbol, cycle_ts, run_id, schema_version,
+                      keystone_price, window_qty, tight_lo, tight_hi,
+                      wide_lo, wide_hi, keystone_bid_qty, ask_ladder_notional
+               FROM keystone_history
+               WHERE symbol = $1
+               ORDER BY cycle_ts DESC LIMIT 1""",
+            symbol.upper(),
+        )
+        return self._decode_keystone_row(row) if row is not None else None
+
+    async def read_keystone_history(self, symbol: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """Layer C read: full keystone_history for ``symbol``, newest first.
+
+        Mirrors ``RedisRuntimeStore.read_keystone_history`` so the
+        cross-cycle migration verdict can probe every recorded keystone
+        from the durable ledger.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            """SELECT symbol, cycle_ts, run_id, schema_version,
+                      keystone_price, window_qty, tight_lo, tight_hi,
+                      wide_lo, wide_hi, keystone_bid_qty, ask_ladder_notional
+               FROM keystone_history
+               WHERE symbol = $1
+               ORDER BY cycle_ts DESC LIMIT $2""",
+            symbol.upper(), limit,
+        )
+        return [self._decode_keystone_row(r) for r in rows]
+
+    async def keystone_snapshot_count(self, symbol: str) -> int:
+        """Diagnostic count for the keystone_history table for one symbol."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        return int(await self.pool.fetchval(
+            "SELECT COUNT(*) FROM keystone_history WHERE symbol = $1", symbol.upper()))

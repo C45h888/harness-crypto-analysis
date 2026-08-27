@@ -26,12 +26,22 @@ from market_service.calculations.flow import (
 )
 from market_service.calculations.orderbook import (
     absorption_ladder,
+    ask_wall_ladder,
     find_keystone,
+    hourly_keystone_migration,
+    keystone_bid_stack,
+    keystone_trade_intensity,
     significant_levels,
     top_density_windows,
+    zone_buy_sell,
+    zone_ratio_grid,
 )
 from market_service.calculations.signals import deterministic_signals
-from market_service.calculations.technical import ema_series
+from market_service.calculations.technical import (
+    ema_series,
+    seller_aggression_classify,
+    tiered_large_flow,
+)
 from market_service.calculations.delta import delta_variable, delta_state as _delta_state_fn
 
 from market_service.clients.binance import Binance
@@ -48,6 +58,7 @@ from market_service.analysis.oi import (
     oi_implied_value,
     oi_inflow_outflow,
     oi_weighted_contracts,
+    wall_break_assessment,
 )
 from market_service.analysis.path_absorption import (
     fuel_ratio as path_fuel_ratio,
@@ -61,6 +72,9 @@ from market_service.analysis.wall_migration import (
     compute_round_anchors,
     densest_clusters,
     fuel_ratio as wall_fuel_ratio,
+    keystone_holds_scorecard,
+    keystone_wall_balance,
+    level_absorption,
     mega_at_keystone,
     wall_delta,
     wall_trap_assessment,
@@ -84,6 +98,115 @@ WINDOW_MINUTES_MAP: dict[str, int] = {
     "1h": 60,
     "4h": 240,
 }
+
+
+# ---------------------------------------------------------------------------
+# Calculation-model groups — segregated command surface (Pass 3 pivot)
+#
+# The monolithic run-cycle stays as the canonical persisted envelope path
+# (--analyze). The calculation-model commands (--wall / --flow /
+# --structure / --positioning) run ONLY the sections each analytical
+# domain needs — no envelope, no persistence, focused output.
+#
+# GROUP_MAP is the single source of truth for which calculation and
+# analysis sections belong to each domain group. The section names here
+# are exactly the keys produced by run_calculations / run_analysis.
+# ---------------------------------------------------------------------------
+
+GROUP_MAP: dict[str, dict[str, tuple[str, ...]]] = {
+    "wall": {
+        "calculations": ("orderbook",),
+        "analysis": ("wall_migration", "path_absorption", "oi"),
+    },
+    "flow": {
+        "calculations": ("flow", "bucketed_cvd", "correlation", "technical"),
+        "analysis": ("demand", "auction", "delta"),
+    },
+    "structure": {
+        "calculations": ("volume_profile", "technical"),
+        "analysis": ("regime", "stage"),
+    },
+    "positioning": {
+        "calculations": (),
+        "analysis": ("oi",),
+    },
+}
+
+# Calculation-section dependencies: a requested section pulls its
+# prerequisites in automatically (turnover reads flow output; signals
+# reads flow output + OI). Kept separate from GROUP_MAP so the group
+# definitions stay domain-pure while dependency resolution stays generic.
+_CALC_SECTION_DEPS: dict[str, tuple[str, ...]] = {
+    "turnover": ("flow",),
+    "signals": ("flow",),
+}
+
+# Analysis adapters that consume the calculations layer need the
+# corresponding calculation sections present (regime reads calc flow;
+# wall_migration reads calc orderbook). Auto-included on request.
+_ANALYSIS_CALC_DEPS: dict[str, tuple[str, ...]] = {
+    "regime": ("flow",),
+    "wall_migration": ("orderbook",),
+}
+
+
+def resolve_calc_sections(sections: frozenset[str] | None) -> frozenset[str] | None:
+    """Expand a requested calculation-section set with its prerequisites.
+
+    ``None`` means "all sections" (the canonical full-cycle behavior) and
+    passes through untouched. The expansion is transitive so a dependency
+    of a dependency is also pulled in.
+    """
+    if sections is None:
+        return None
+    resolved = set(sections)
+    frontier = list(resolved)
+    while frontier:
+        sec = frontier.pop()
+        for dep in _CALC_SECTION_DEPS.get(sec, ()):
+            if dep not in resolved:
+                resolved.add(dep)
+                frontier.append(dep)
+    return frozenset(resolved)
+
+
+def resolve_analysis_sections(
+    sections: frozenset[str] | None,
+    calc_sections: frozenset[str] | None,
+) -> tuple[frozenset[str] | None, frozenset[str] | None]:
+    """Expand analysis sections and merge their calculation prerequisites.
+
+    Returns (analysis_sections, calc_sections). An analysis adapter that
+    consumes the calculations layer auto-includes the calculation sections
+    it reads (regime→flow, wall_migration→orderbook). ``None`` analysis
+    sections means "all" and passes through.
+    """
+    if sections is None:
+        return None, calc_sections
+    calc = set(calc_sections) if calc_sections is not None else None
+    for sec in sections:
+        for dep in _ANALYSIS_CALC_DEPS.get(sec, ()):
+            if calc is None:
+                break  # all calculations already requested
+            calc.add(dep)
+    return sections, (frozenset(calc) if calc is not None else None)
+
+
+def sections_for_groups(groups: tuple[str, ...]) -> tuple[frozenset[str], frozenset[str]]:
+    """Flatten requested group names into (calc_sections, analysis_sections).
+
+    Unknown group names raise ValueError so the CLI surfaces a clean error
+    instead of silently returning empty output.
+    """
+    calc: set[str] = set()
+    anal: set[str] = set()
+    for g in groups:
+        spec = GROUP_MAP.get(g)
+        if spec is None:
+            raise ValueError(f"unknown calculation group: {g!r}")
+        calc.update(spec["calculations"])
+        anal.update(spec["analysis"])
+    return frozenset(calc), frozenset(anal)
 
 
 def _utc_iso() -> str:
@@ -270,28 +393,42 @@ def run_calculations(
     evidence: dict[str, Any],
     depth: int,
     window: int,
+    sections: frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    """Run the same deterministic calculations as the old calculations node."""
+    """Run the same deterministic calculations as the old calculations node.
+
+    ``sections`` (calculation-model groups, Pass 3): when ``None`` (default)
+    every section runs — the canonical full-cycle behavior. When a
+    frozenset of section names is given, only those sections (plus their
+    auto-resolved prerequisites) execute and only they appear in the output
+    ``calculations`` dict. This is what the segregated ``--wall`` /
+    ``--flow`` / ``--structure`` / ``--positioning`` commands use to skip
+    work they don't need.
+    """
     errors: list[dict[str, Any]] = []
+    resolved = resolve_calc_sections(sections)
+
+    def want(name: str) -> bool:
+        return resolved is None or name in resolved
 
     flow = _run_section("flow", lambda: {
         "spot_flow": _strict(summarize, _spot_trades(evidence), _spot_book(evidence),
                              depth_levels=depth, name="summarize"),
         "futures_flow": _strict(summarize, _fut_trades(evidence), _fut_book(evidence),
                                depth_levels=depth, name="summarize"),
-    }, errors) or {}
+    }, errors) or {} if want("flow") else {}
 
     bucketed = _run_section("bucketed_cvd", lambda: {
         "spot_bucketed_cvd": _strict(bucketed_cvd, _spot_trades(evidence), window_s=window, name="bucketed_cvd"),
         "futures_bucketed_cvd": _strict(bucketed_cvd, _fut_trades(evidence), window_s=window, name="bucketed_cvd"),
-    }, errors) or {}
+    }, errors) or {} if want("bucketed_cvd") else {}
 
     correlation = _run_section("correlation", lambda: (
         _strict(cvd_series_corr,
                 _strict(bucketed_cvd, _spot_trades(evidence), window_s=window, name="bucketed_cvd"),
                 _strict(bucketed_cvd, _fut_trades(evidence), window_s=window, name="bucketed_cvd"),
                 window_s=window, name="cvd_series_corr")
-    ), errors)
+    ), errors) if want("correlation") else None
 
     # Orderbook
     fut_book = _fut_book(evidence)
@@ -303,18 +440,51 @@ def run_calculations(
     last_price = _safe_last_price(fut_bids, fut_asks)
 
     orderbook: dict[str, Any] = {}
-    if last_price is not None:
-        orderbook = _run_section("orderbook", lambda: {
-            "fut_keystone": _enrich_fut_keystone(
+    if want("orderbook") and last_price is not None:
+        def _orderbook_builder() -> dict[str, Any]:
+            fut_keystone = _enrich_fut_keystone(
                 _strict(find_keystone, fut_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
                 fut_asks,
-            ),
-            "spot_keystone": _strict(find_keystone, spot_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
-            "fut_top_density_bids": _strict(top_density_windows, fut_book, 0.5, "bids", 5, name="top_density_windows"),
-            "fut_absorption_ladder": _strict(absorption_ladder, fut_bids, last_price, count=10, name="absorption_ladder"),
-            "fut_significant_levels": _strict(significant_levels, fut_bids + fut_asks, 0.0, name="significant_levels"),
-            "fut_microprice_skew_bps": _strict(microprice_skew_bps, spot_bids, spot_asks, name="microprice_skew_bps"),
-        }, errors) or {}
+            )
+            kz_price = fut_keystone.get("keystone") if isinstance(fut_keystone, dict) else None
+            kz_tight = (fut_keystone.get("tight") or {}) if isinstance(fut_keystone, dict) else {}
+            kz_wide = (fut_keystone.get("wide") or {}) if isinstance(fut_keystone, dict) else {}
+            return {
+                "fut_keystone": fut_keystone,
+                "spot_keystone": _strict(find_keystone, spot_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
+                "fut_top_density_bids": _strict(top_density_windows, fut_book, 0.5, "bids", 5, name="top_density_windows"),
+                "fut_absorption_ladder": _strict(absorption_ladder, fut_bids, last_price, count=10, name="absorption_ladder"),
+                "fut_significant_levels": _strict(significant_levels, fut_bids + fut_asks, 0.0, name="significant_levels"),
+                "fut_microprice_skew_bps": _strict(microprice_skew_bps, spot_bids, spot_asks, name="microprice_skew_bps"),
+                # Legacy port (deep_keystone.py:104-200): cumulative bid stack
+                # around the keystone — below / at / above decomposition.
+                "keystone_bid_stack": (
+                    _strict(keystone_bid_stack, fut_bids, kz_price, name="keystone_bid_stack")
+                    if kz_price is not None else None
+                ),
+                # Legacy port (deep_keystone.py:74-101 + keystone_scan.py:130-165):
+                # trade-flow intensity at the keystone defence zone.
+                "keystone_trade_intensity": (
+                    _strict(keystone_trade_intensity, _fut_trades(evidence),
+                            kz_tight.get("lo"), kz_tight.get("hi"),
+                            kz_wide.get("lo"), kz_wide.get("hi"),
+                            name="keystone_trade_intensity")
+                    if kz_price is not None and kz_tight.get("lo") is not None
+                       and kz_wide.get("hi") is not None else None
+                ),
+                # Legacy port (wall_analysis.py:83-112): 0.05-bucket ask ladder
+                # above price with cumulative notional (default 3.00 reach).
+                "ask_wall_ladder": _strict(ask_wall_ladder, fut_asks, last_price,
+                                           None, 0.05, 60, name="ask_wall_ladder"),
+                # Legacy port (long_term_flow.py hourly keystone): intra-window
+                # keystone migration over the current trade window. At the default
+                # 15m window this yields a single bucket (verdict FLAT — valid);
+                # meaningful at --window 1h/4h.
+                "hourly_keystone_migration": _strict(
+                    hourly_keystone_migration, _fut_trades(evidence), 0.05, 0.20,
+                    name="hourly_keystone_migration"),
+            }
+        orderbook = _run_section("orderbook", _orderbook_builder, errors) or {}
 
     # Volume profile
     volume_profile = _run_section("volume_profile", lambda: {
@@ -322,7 +492,7 @@ def run_calculations(
         "summary": _strict(volume_profile_summary,
                           _strict(build_volume_profile, _fut_trades(evidence), 0.05, name="build_volume_profile"),
                           name="volume_profile_summary"),
-    }, errors) or {}
+    }, errors) or {} if want("volume_profile") else {}
 
     # Technical
     technical = _run_section("technical", lambda: {
@@ -330,7 +500,15 @@ def run_calculations(
                        [float(row[4]) for row in ((evidence.get("futures") or {}).get("klines") or [])
                         if isinstance(row, (list, tuple)) and len(row) >= 5],
                        name="ema_series"),
-    }, errors) or {}
+        # Legacy port (sol_deep_monitor.py:191-247): tiered large-print flow
+        # (large/huge/whale) over trailing 5m/15m windows.
+        "tiered_large_flow": _strict(tiered_large_flow, _fut_trades(evidence),
+                                     name="tiered_large_flow"),
+        # Legacy port (seller_wall_check.py:162-240): seller aggression
+        # classification from big prints >= 100 SOL in the last 5 min.
+        "seller_aggression": _strict(seller_aggression_classify, _fut_trades(evidence),
+                                     name="seller_aggression_classify"),
+    }, errors) or {} if want("technical") else {}
 
     # Turnover
     spot_flow = flow.get("spot_flow") or {}
@@ -339,7 +517,7 @@ def run_calculations(
     fut_notional = (fut_flow.get("buy_notional_usd") or 0.0) + (fut_flow.get("sell_notional_usd") or 0.0)
     turnover = _run_section("turnover", lambda: {
         "spot_turnover_share": _strict(spot_turnover_share, spot_notional, fut_notional, name="spot_turnover_share"),
-    }, errors) or {}
+    }, errors) or {} if want("turnover") else {}
 
     # Signals
     signal_inputs = {
@@ -349,25 +527,32 @@ def run_calculations(
         "open_interest": ((evidence.get("futures") or {}).get("open_interest") or {}).get("open_interest"),
     }
     signals: list[dict[str, Any]] = []
-    try:
-        signals = list(_strict(deterministic_signals, signal_inputs, None, name="deterministic_signals"))
-    except C.ContractViolation as violation:
-        errors.append(C.contract_error_entry(violation))
+    if want("signals"):
+        try:
+            signals = list(_strict(deterministic_signals, signal_inputs, None, name="deterministic_signals"))
+        except C.ContractViolation as violation:
+            errors.append(C.contract_error_entry(violation))
+
+    # Build the calculations dict with only the sections that were requested
+    # (or all of them when sections=None). Unrequested sections are omitted
+    # entirely — downstream readers see no trace of them.
+    all_calc: dict[str, Any] = {
+        "flow": flow,
+        "bucketed_cvd": bucketed,
+        "correlation": correlation,
+        "signal_inputs": signal_inputs,
+        "signals": signals,
+        "orderbook": orderbook,
+        "turnover": turnover,
+        "volume_profile": volume_profile,
+        "technical": technical,
+    }
+    calc_out = {k: v for k, v in all_calc.items() if want(k)} if resolved is not None else all_calc
 
     return {
         "status": "degraded" if errors else "healthy",
         "errors": errors,
-        "calculations": {
-            "flow": flow,
-            "bucketed_cvd": bucketed,
-            "correlation": correlation,
-            "signal_inputs": signal_inputs,
-            "signals": signals,
-            "orderbook": orderbook,
-            "turnover": turnover,
-            "volume_profile": volume_profile,
-            "technical": technical,
-        },
+        "calculations": calc_out,
         "coverage_seconds": window,
     }
 
@@ -463,62 +648,76 @@ def run_analysis(
     prior_walls: dict[float, float] | None = None,
     prior_cycle_ts: str | None = None,
     depth: int | None = None,
+    sections: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Run the same deterministic analysis as the old analysis node.
 
     ``depth`` is the centralized canonical order-book depth (defaults to the
     config resolver) and is threaded into every adapter so wall/OI/path
     analyses scan the full configured book instead of a hard-coded slice.
+
+    ``sections`` (calculation-model groups, Pass 3): when ``None`` (default)
+    every analysis adapter runs. When a frozenset of section names is given,
+    only those adapters execute and only they appear in the output
+    ``analysis`` dict. This is what the segregated ``--wall`` / ``--flow`` /
+    ``--structure`` / ``--positioning`` commands use.
     """
     if depth is None:
         from market_service.config import default_depth_levels
         depth = default_depth_levels()
     errors: list[dict[str, Any]] = []
 
+    def want(name: str) -> bool:
+        return sections is None or name in sections
+
     calc_data = calculations.get("calculations") or {}
     orderbook_calc = calc_data.get("orderbook") or {}
 
     # Auction
-    auction = _run_section("auction", lambda: _adapt_auction(evidence), errors) or {}
+    auction = _run_section("auction", lambda: _adapt_auction(evidence), errors) or {} if want("auction") else {}
 
     # Open interest
-    oi = _run_section("oi", lambda: _adapt_oi(evidence, depth=depth), errors) or {}
+    oi = _run_section("oi", lambda: _adapt_oi(evidence, depth=depth), errors) or {} if want("oi") else {}
 
     # Wall migration
     pw = prior_walls or {}
     wall_migration = _run_section("wall_migration", lambda: _adapt_wall_migration(
         evidence, orderbook_calc.get("fut_significant_levels"), pw, prior_cycle_ts,
         orderbook=orderbook_calc, depth=depth,
-    ), errors) or {}
+    ), errors) or {} if want("wall_migration") else {}
 
     # Path absorption
-    path_absorption = _run_section("path_absorption", lambda: _adapt_path_absorption(evidence, depth=depth), errors) or {}
+    path_absorption = _run_section("path_absorption", lambda: _adapt_path_absorption(evidence, depth=depth), errors) or {} if want("path_absorption") else {}
 
     # Demand
-    demand = _run_section("demand", lambda: _adapt_demand(evidence), errors) or {}
+    demand = _run_section("demand", lambda: _adapt_demand(evidence), errors) or {} if want("demand") else {}
 
     # Regime
-    regime = _run_section("regime", lambda: _adapt_regime(evidence, calc_data), errors) or {}
+    regime = _run_section("regime", lambda: _adapt_regime(evidence, calc_data), errors) or {} if want("regime") else {}
 
     # Stage
-    stage = _run_section("stage", lambda: _adapt_stage(evidence), errors) or {}
+    stage = _run_section("stage", lambda: _adapt_stage(evidence), errors) or {} if want("stage") else {}
 
     # Delta — signed -2..+2 combo of wall imbalance + taker buy alignment.
-    delta = _run_section("delta", lambda: _adapt_delta(evidence), errors) or {}
+    delta = _run_section("delta", lambda: _adapt_delta(evidence), errors) or {} if want("delta") else {}
+
+    all_analysis: dict[str, Any] = {
+        "auction": auction,
+        "open_interest": oi,
+        "wall_migration": wall_migration,
+        "delta": delta,
+        "path_absorption": path_absorption,
+        "demand": demand,
+        "regime": regime,
+        "stage": stage,
+    }
+    analysis_out = {k: v for k, v in all_analysis.items() if want(k if k != "open_interest" else "oi")} \
+        if sections is not None else all_analysis
 
     return {
         "status": "degraded" if errors else "healthy",
         "errors": errors,
-        "analysis": {
-            "auction": auction,
-            "open_interest": oi,
-            "wall_migration": wall_migration,
-            "delta": delta,
-            "path_absorption": path_absorption,
-            "demand": demand,
-            "regime": regime,
-            "stage": stage,
-        },
+        "analysis": analysis_out,
     }
 
 
@@ -629,6 +828,7 @@ def _adapt_wall_migration(
     depth: int,
 ) -> dict[str, Any]:
     fut_book = _fut_book_e(evidence)
+    fut = _fut_evidence(evidence)
     bids, asks = _levels(fut_book, depth, function="wall_migration.*")
     price = _last_price_e(bids, asks) or 0.0
     bid_floor = price * 0.97 if price else 0.0
@@ -659,8 +859,189 @@ def _adapt_wall_migration(
             "prior_wall_count": len(prior_walls or {}),
             "tiers": tiers, "round_anchors": round_anchors,
             "tier_balance": tier_balance, "mega_at_keystone": mega_kz,
+            "keystone_wall_balance": _wall_keystone_balance(
+                bids, asks, keystone_for_mega, price),
+            "keystone_holds_scorecard": _wall_keystone_holds(
+                fut, bids, asks, keystone_for_mega, price),
+            "level_absorption": _wall_level_absorption(bids, floors, price),
+            "wall_break": _wall_break(fut, asks),
+            "zone_ratio_grid": _wall_zone_grid(fut, keystone_for_mega, price),
+            "zone_buy_sell": _wall_zone_intensity(fut, keystone_for_mega, price),
             "inputs_used": {"floors_count": len(floors), "ask_walls_built": built,
                             "ask_walls_eroded": eroded, "fuel_ratio_value": float(fuel.get("ratio") or 0.0)}}
+
+
+# ---------------------------------------------------------------------------
+# Legacy-parity wall/keystone signal helpers (Issue 2 wiring).
+#
+# These wrap the migrated-but-dead pure functions so their outputs are emitted
+# into ``analysis.wall_migration`` and persisted to Redis/Postgres via the
+# run-cycle envelope. All inputs come from the already-merged evidence
+# (order book + trades + derivative fetch), so no new data acquisition is
+# needed. Test the pure functions directly (tests/test_analysis_m3.py,
+# tests/test_calculations_m1.py) — these adapters only marshal evidence into
+# the right argument shape.
+# ---------------------------------------------------------------------------
+
+
+def _wall_zone_band(keystone_for_mega: Any, price: float) -> tuple[float, float, float, float]:
+    """Derive keystone + seller-wall bands around the current price.
+
+    Keystone band: [kz-0.20, kz] (bid-side defense, legacy convention).
+    Seller-wall band: [sw, sw+0.20] anchored at the densest ask cluster above
+    price. Falls back to price-centric bands when the keystone is unavailable.
+    """
+    kf = float(keystone_for_mega) if keystone_for_mega is not None else price
+    kz_lo, kz_hi = kf - 0.20, kf
+    sw_lo, sw_hi = kf + 0.10, kf + 0.30
+    return kz_lo, kz_hi, sw_lo, sw_hi
+
+
+def _wall_keystone_balance(bids, asks, keystone_for_mega: Any, price: float) -> dict:
+    """Keystone vs seller-wall qty/notional balance (keystone_wall_balance)."""
+    kz_lo, kz_hi, sw_lo, sw_hi = _wall_zone_band(keystone_for_mega, price)
+    return _strict(keystone_wall_balance, bids, asks, kz_lo, kz_hi, sw_lo, sw_hi,
+                   name="keystone_wall_balance")
+
+
+def _wall_keystone_holds(fut, bids, asks, keystone_for_mega: Any, price: float) -> dict:
+    """Keystone-holds 0-10 scorecard fed by the balance + on-chain/flow inputs.
+
+    Inputs are derived from evidence that is already present:
+      bid_ask_qty_ratio — from keystone_wall_balance
+      latest_tbr        — latest taker buy share from taker_buy_sell
+      oi_chg_5m         — OI % change over the last two bars
+      top_long_pct      — top-trader long account proportion
+      net_buy_ratio     — latest trades buy share
+    Each is None-safe; if a source is absent the scorecard still runs with
+    zero where the deterministic function tolerates it.
+    """
+    balance = _wall_keystone_balance(bids, asks, keystone_for_mega, price)
+    bid_ask_qty_ratio = float(balance.get("bid_ask_qty_ratio") or 0.0)
+    latest_tbr = _taker_buy_share(fut.get("taker_buy_sell"))
+    oi_chg_5m = _oi_pct_change(fut.get("oi_history"))
+    top_long_pct = _ls_last_pct(fut.get("top_ls"))
+    if top_long_pct is not None:
+        try:
+            top_long_pct = float(top_long_pct)
+        except (TypeError, ValueError):
+            top_long_pct = None
+    net_buy_ratio = _net_buy_share(fut.get("trades_normalized"))
+    return _strict(
+        keystone_holds_scorecard, bid_ask_qty_ratio, latest_tbr, oi_chg_5m,
+        top_long_pct or 0.0, net_buy_ratio, name="keystone_holds_scorecard",
+    )
+
+
+def _wall_level_absorption(bids, floors, price: float) -> list[dict]:
+    """Absorption capacity (zero-bid vacuum detection) at key bid levels."""
+    levels = list(floors) if floors else [price]
+    return _strict(level_absorption, bids, levels, 0.01,
+                   (1000.0, 5000.0, 10000.0), name="level_absorption")
+
+
+def _wall_break(fut, asks) -> dict:
+    """Can buyers clear the ask stack via buy-flow alone? (wall_break_assessment)."""
+    total_wall_sol = sum(float(q) for _, q in asks)
+    buy_per_min, peak_buy_per_min = _buy_rates(fut.get("trades_normalized") or [])
+    return _strict(wall_break_assessment, total_wall_sol, buy_per_min,
+                   peak_buy_per_min, 15, name="wall_break_assessment")
+
+
+def _wall_zone_grid(fut, keystone_for_mega: Any, price: float) -> list[dict]:
+    """Bid/ask ratio grid across the keystone corridor (zone_ratio_grid)."""
+    kf = float(keystone_for_mega) if keystone_for_mega is not None else price
+    return _strict(zone_ratio_grid, fut.get("order_book") or {}, kf - 0.40, kf + 0.70,
+                   0.05, name="zone_ratio_grid")
+
+
+def _wall_zone_intensity(fut, keystone_for_mega: Any, price: float) -> list[dict]:
+    """Taker buy/sell intensity per price zone near the keystone (zone_buy_sell)."""
+    kf = float(keystone_for_mega) if keystone_for_mega is not None else price
+    return _strict(zone_buy_sell, fut.get("trades_normalized") or [],
+                   kf - 0.40, kf + 0.70, 0.05, name="zone_buy_sell")
+
+
+def _taker_buy_share(taker_bs: list[dict[str, Any]] | None) -> float:
+    """Latest taker buy share (0..1) from the Binance taker_buy_sell series.
+
+    Uses buyVol/(buyVol+sellVol) of the most recent bar; 0.5 neutral fallback
+    when the series is missing/empty (mirrors summarize's buy_share default).
+    """
+    if not taker_bs:
+        return 0.5
+    last = taker_bs[-1] if isinstance(taker_bs[-1], dict) else None
+    if not last:
+        return 0.5
+    bv = float(last.get("buyVol") or last.get("buy_vol") or 0)
+    sv = float(last.get("sellVol") or last.get("sell_vol") or 0)
+    s = bv + sv
+    return bv / s if s > 0 else 0.5
+
+
+def _oi_pct_change(oi_hist: list[dict[str, Any]] | None) -> float:
+    """OI % change between the last two bars; 0.0 on insufficient data."""
+    series = _oi_series(oi_hist)
+    if len(series) >= 2 and series[-2]:
+        return (series[-1] - series[-2]) / series[-2] * 100
+    return 0.0
+
+
+def _net_buy_share(trades: list[dict[str, Any]] | None) -> float:
+    """Taker-buy share (0..1) over the recent trade window; 0.5 default."""
+    trades = trades or []
+    total = 0.0
+    buys = 0.0
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        try:
+            qty = float(t.get("qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        total += qty
+        is_maker = t.get("is_buyer_maker")
+        if is_maker is not None and not is_maker:
+            buys += qty
+        elif is_maker is None and str(t.get("side", "")).lower() == "buy":
+            buys += qty
+    return buys / total if total > 0 else 0.5
+
+
+def _buy_rates(trades: list[dict[str, Any]]) -> tuple[float, float]:
+    """Current + peak taker-buy rate (SOL/min) over the recent window.
+
+    Buckets trades into per-minute buy volume; current = last full minute,
+    peak = max of all minutes. Returns (0, 0) on empty input.
+    """
+    if not trades:
+        return 0.0, 0.0
+    per_min: dict[int, float] = {}
+    now_ms = max(
+        int(t.get("ts") or t.get("time") or 0) for t in trades if isinstance(t, dict)
+    )
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        is_maker = t.get("is_buyer_maker")
+        side = t.get("side")
+        if is_maker is not None and is_maker:
+            continue
+        if is_maker is None and str(side).lower() != "buy":
+            continue
+        ts = int(t.get("ts") or t.get("time") or 0)
+        bucket = ts // 60000 * 60000
+        per_min[bucket] = per_min.get(bucket, 0.0) + float(t.get("qty") or 0)
+    if not per_min:
+        return 0.0, 0.0
+    peak = max(per_min.values())
+    # current = most recent bucket (closest to now_ms)
+    current_bucket = max(per_min)
+    current = per_min[current_bucket]
+    # Only treat as current if the newest bucket is reasonably close to now.
+    if now_ms - current_bucket > 60000 * 2:
+        current = 0.0
+    return current, peak
 
 
 def _adapt_path_absorption(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
@@ -926,6 +1307,185 @@ async def persist_envelope(
         await postgres.close()
         await redis.close()
 
+# ---------------------------------------------------------------------------
+# Wall-snapshot seam — read the FULL recorded wall history into the migration
+# analysis, and WRITE the current cycle's wall state so the next cycle sees it.
+# ---------------------------------------------------------------------------
+
+
+def _wall_snapshot_payload(
+    symbol: str,
+    run_id: str,
+    evidence: dict[str, Any],
+    analysis_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble one wall-snapshot payload from this cycle's evidence + analysis.
+
+    The payload shape matches what ``record_wall_snapshot`` persists (both
+    Redis and Postgres): asks/bids plus the deterministic fuel/migration
+    metrics. ``cycle_ts`` is the envelope/run generation timestamp so a
+    re-run within the same cycle is an idempotent upsert, not a duplicate.
+    """
+    futures_book = (evidence.get("futures") or {}).get("order_book") or {}
+    asks_raw = futures_book.get("asks") or []
+    bids_raw = futures_book.get("bids") or []
+    wm = ((analysis_result.get("analysis") or {}).get("wall_migration")) or {}
+    fuel = wm.get("fuel_ratio") or {}
+    inputs = wm.get("inputs_used") or {}
+    return {
+        "cycle_ts": _utc_iso(),
+        "schema_version": 1,
+        "asks": asks_raw,
+        "bids": bids_raw,
+        "fuel_ratio": float(inputs.get("fuel_ratio_value") or 0.0),
+        "bid_pool": float(fuel.get("bid_pool") or 0.0),
+        "ask_pool": float(fuel.get("ask_pool") or 0.0),
+        "bid_floor": float(fuel.get("bid_floor") or 0.0),
+        "ask_target": float(fuel.get("ask_target") or 0.0),
+        "ask_walls_built": int(inputs.get("ask_walls_built") or 0),
+        "ask_walls_eroded": int(inputs.get("ask_walls_eroded") or 0),
+    }
+
+
+async def _record_wall_snapshot(
+    settings: Settings,
+    symbol: str,
+    run_id: str,
+    evidence: dict[str, Any],
+    analysis_result: dict[str, Any],
+) -> dict[str, Any]:
+    """WRITE the current cycle's wall snapshot (Postgres first, then Redis).
+
+    This closes the write seam: every cycle appends its wall state to the
+    durable ledger so subsequent cycles can call ALL recorded walls, not
+    just the one that happened to be written last.
+    """
+    payload = _wall_snapshot_payload(symbol, run_id, evidence, analysis_result)
+    postgres = PostgresRuntimeStore(settings.database_url)
+    redis = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    try:
+        await postgres.connect()
+        pg_ok = await postgres.record_wall_snapshot(symbol, run_id, payload)
+        redis_id = await redis.record_wall_snapshot(symbol, run_id, payload)
+        return {
+            "postgres_written": pg_ok,
+            "redis_stream_id": redis_id,
+            "cycle_ts": payload["cycle_ts"],
+            "wall_levels_recorded": len(payload.get("asks") or []),
+        }
+    finally:
+        await postgres.close()
+        await redis.close()
+
+
+def _keystone_snapshot_payload(
+    symbol: str,
+    run_id: str,
+    calc_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble one keystone-snapshot payload from this cycle's calculations.
+
+    Extracts the fut_keystone (price + tight/wide bands), the keystone bid
+    stack tight-zone total qty, and the ask-wall ladder total notional —
+    the scalar state needed to reconstruct cross-cycle keystone migration.
+    ``cycle_ts`` is the cycle generation timestamp so a re-run within the
+    same cycle is an idempotent upsert, not a duplicate.
+
+    Null discipline: a missing keystone (orderbook section degraded / no
+    last_price) yields keystone_price=None — never a fabricated price.
+    """
+    calculations = (calc_result.get("calculations") or {})
+    orderbook = calculations.get("orderbook") or {}
+    kz = orderbook.get("fut_keystone") or {}
+    kz_price = kz.get("keystone")
+    tight = kz.get("tight") or {}
+    wide = kz.get("wide") or {}
+    stack = orderbook.get("keystone_bid_stack") or {}
+    ladder = orderbook.get("ask_wall_ladder") or {}
+
+    def _f(v: Any) -> float | None:
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "cycle_ts": _utc_iso(),
+        "schema_version": 1,
+        "keystone_price": _f(kz_price),
+        "window_qty": _f(kz.get("window_qty")),
+        "tight_lo": _f(tight.get("lo")),
+        "tight_hi": _f(tight.get("hi")),
+        "wide_lo": _f(wide.get("lo")),
+        "wide_hi": _f(wide.get("hi")),
+        "keystone_bid_qty": _f((stack.get("tight") or {}).get("total_qty")),
+        "ask_ladder_notional": _f(ladder.get("total_notional")),
+    }
+
+
+async def _record_keystone_snapshot(
+    settings: Settings,
+    symbol: str,
+    run_id: str,
+    calc_result: dict[str, Any],
+) -> dict[str, Any]:
+    """WRITE the current cycle's keystone snapshot (Postgres first, then Redis).
+
+    Cross-cycle companion to ``_record_wall_snapshot``: every cycle appends
+    its keystone state to the durable ledger so the migration verdict can
+    probe ALL recorded keystones, not just the most recent pull.
+    """
+    payload = _keystone_snapshot_payload(symbol, run_id, calc_result)
+    postgres = PostgresRuntimeStore(settings.database_url)
+    redis = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    try:
+        await postgres.connect()
+        pg_ok = await postgres.record_keystone_snapshot(symbol, run_id, payload)
+        redis_id = await redis.record_keystone_snapshot(symbol, run_id, payload)
+        return {
+            "postgres_written": pg_ok,
+            "redis_stream_id": redis_id,
+            "cycle_ts": payload["cycle_ts"],
+            "keystone_price": payload.get("keystone_price"),
+        }
+    finally:
+        await postgres.close()
+        await redis.close()
+
+
+def _accumulate_prior_walls(
+    snapshots: list[dict[str, Any]],
+) -> tuple[dict[float, float], str | None]:
+    """Merge the FULL recorded wall history into one prior-walls map.
+
+    ``snapshots`` are newest-first (the order both stores return). We
+    iterate oldest-first so the newest known qty wins for a given level,
+    but every level ever recorded is retained - so wall_migration probes
+    ALL recorded wall levels, and a wall removed since an older pull is
+    still surfaced (as ERODED) rather than silently dropped.
+    """
+    prior_walls: dict[float, float] = {}
+    prior_cycle_ts: str | None = None
+    for snap in reversed(snapshots or []):
+        ts = snap.get("cycle_ts")
+        if ts and prior_cycle_ts is None:
+            prior_cycle_ts = ts
+        asks = snap.get("asks")
+        if not isinstance(asks, list):
+            continue
+        for row in asks:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            try:
+                prior_walls[float(row[0])] = float(row[1])
+            except (TypeError, ValueError):
+                continue
+    return prior_walls, prior_cycle_ts
+
 
 def _oi_series(oi_hist: list[dict[str, Any]] | None) -> list[float]:
     """Extract the per-bar OI contract count from a raw OI history list."""
@@ -1166,26 +1726,28 @@ async def run_cycle(
 
     calc_result = run_calculations(evidence, depth, window_s)
 
-    # Read prior wall snapshot for analysis (async, done here)
+    # Read the FULL recorded wall history for analysis (async, done here).
+    # Postgres is the durable authority; Redis is the live projection fallback.
     prior_walls: dict[float, float] = {}
     prior_cycle_ts: str | None = None
+    pg = PostgresRuntimeStore(settings.database_url)
     redis2 = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
     try:
-        prior_snapshot = await redis2.read_last_wall_snapshot(symbol)
-        if prior_snapshot and isinstance(prior_snapshot.get("asks"), list):
-            prior_cycle_ts = prior_snapshot.get("cycle_ts")
-            for row in prior_snapshot["asks"]:
-                if not isinstance(row, (list, tuple)) or len(row) < 2:
-                    continue
-                try:
-                    prior_walls[float(row[0])] = float(row[1])
-                except (TypeError, ValueError):
-                    continue
+        try:
+            await pg.connect()
+            history = await pg.read_wall_history(symbol)
+        except Exception:
+            log.warning("run_cycle %s: postgres wall-history read failed; falling back to redis", symbol)
+            history = []
+        if not history:
+            history = await redis2.read_wall_history(symbol)
+        prior_walls, prior_cycle_ts = _accumulate_prior_walls(history)
     except Exception:
-        pass
+        log.exception("run_cycle %s: failed to read wall history", symbol)
     finally:
+        await pg.close()
         await redis2.close()
 
     analysis_result = run_analysis(evidence, calc_result,
@@ -1196,6 +1758,18 @@ async def run_cycle(
     envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
 
     if persist:
+        # WRITE the current cycle's wall snapshot so the ledger records it and
+        # later cycles can call ALL recorded walls (not just the last pull).
+        try:
+            await _record_wall_snapshot(settings, symbol, envelope.run_id, evidence, analysis_result)
+        except Exception:
+            log.exception("run_cycle %s: failed to record wall snapshot", symbol)
+        # WRITE the current cycle's keystone snapshot (cross-cycle keystone
+        # migration ledger — clean separation from the wall ledger).
+        try:
+            await _record_keystone_snapshot(settings, symbol, envelope.run_id, calc_result)
+        except Exception:
+            log.exception("run_cycle %s: failed to record keystone snapshot", symbol)
         try:
             await persist_envelope(envelope, settings)
         except Exception:

@@ -232,11 +232,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-persist", action="store_true",
                    help="--analyze: skip Postgres + Redis persistence (dry run)")
 
+    # --- Calculation-model group commands (Pass 3 — segregated surface) ---
+    # These run ONLY the calculation + analysis sections each analytical
+    # domain needs. No envelope, no persistence, focused output. They are
+    # combinable (e.g. --wall --flow) and mutually exclusive with the
+    # monolithic --analyze and the envelope reads.
+    p.add_argument("--wall", action="store_true",
+                   help="wall & keystone analysis: orderbook calc + wall_migration / "
+                        "path_absorption / oi analysis. Focused, no envelope.")
+    p.add_argument("--flow", action="store_true",
+                   help="trade flow & aggression: flow / cvd / correlation / technical "
+                        "calc + demand / auction / delta analysis. Focused, no envelope.")
+    p.add_argument("--structure", action="store_true",
+                   help="market structure: volume_profile / technical calc + "
+                        "regime / stage analysis. Focused, no envelope.")
+    p.add_argument("--positioning", action="store_true",
+                   help="positioning & derivatives: oi analysis only (weighted "
+                        "contracts, inflow/outflow, implied value). Focused, no envelope.")
+
     # --- Envelope reads (canonical ledger) ---
     p.add_argument("--latest", action="store_true",
                    help="read the latest persisted collated MarketRunEnvelope "
                         "(direct runtime.contracts read, NOT a nooa_harness op)")
     p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
+    p.add_argument("--keystone-history", action="store_true",
+                   help="read the cross-cycle keystone ledger (Redis first, "
+                        "Postgres fallback) and derive the keystone migration "
+                        "verdict. Returns the recorded keystone series + "
+                        "UP/DOWN/FLAT per cycle + the aggregate verdict.")
+    p.add_argument("--history-limit", type=int, default=100,
+                   help="max keystone history entries to read for "
+                        "--keystone-history (default 100)")
 
     # --- NOOA routing ---
     p.add_argument("--nooa", nargs=argparse.REMAINDER, metavar="ARGS",
@@ -275,6 +301,20 @@ def main(argv: list[str] | None = None) -> int:
                               "with_cross_asset": result.get("with_cross_asset")},
                              indent=2, default=str))
         return 0 if result.get("stream_id") else 1
+
+    # --- Route 1.5: calculation-model group commands (Pass 3 segregated surface).
+    # Runs ONLY the calc + analysis sections for the requested domain groups.
+    # No envelope, no persistence. Redis-only (no DATABASE_URL) except --wall
+    # which reads wall history (Postgres fallback).
+    requested_groups = tuple(
+        g for g, flag in (("wall", args.wall), ("flow", args.flow),
+                          ("structure", args.structure), ("positioning", args.positioning))
+        if flag
+    )
+    if requested_groups:
+        result = asyncio.run(_run_groups(args, requested_groups))
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("status") in ("healthy", "degraded") else 1
 
     # --- Route 2: run the calculation pipeline end-to-end (canonical).
     if args.analyze:
@@ -319,6 +359,14 @@ def main(argv: list[str] | None = None) -> int:
         result = asyncio.run(_read())
         print(json.dumps(result, indent=2, default=str))
         return 0
+
+    # --- Route 3.5: cross-cycle keystone ledger read + migration verdict.
+    # Redis is the live projection (read first); Postgres is the durable
+    # fallback when the Redis stream is empty. No agents involved.
+    if args.keystone_history:
+        result = asyncio.run(_read_keystone_history(args))
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("history") or result.get("cycles") else 1
 
     # --- Route 4: legacy dev-only live waveform (explicit --live).
     if args.live:
@@ -465,15 +513,266 @@ async def _run_analyze(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+async def _run_groups(args: argparse.Namespace, groups: tuple[str, ...]) -> dict[str, Any]:
+    """Calculation-model group commands (Pass 3): focused, segregated analysis.
+
+    Runs ONLY the calculation + analysis sections each requested domain group
+    needs. No envelope assembly, no persistence. Redis-only (no DATABASE_URL)
+    except ``wall`` which reads the wall-history ledger (Postgres fallback).
+
+    The model gets exactly the data its question needs — not the 5.7MB
+    combined envelope. This is the new primary interface for targeted
+    analysis; ``--analyze`` remains for the canonical persisted record.
+    """
+    from market_service.nooa_harness.pipeline import (
+        GROUP_MAP, WINDOW_MINUTES_MAP, read_raw_window, resolve_analysis_sections,
+        resolve_calc_sections, run_analysis, run_calculations, sections_for_groups,
+        _merge_derivatives, fetch_derivative_evidence,
+    )
+    from market_service.clients.binance import Binance
+
+    settings = Settings.from_redis_env()
+    symbol = args.symbol.upper()
+    window_minutes = WINDOW_MINUTES_MAP.get(args.window, 15)
+    window_s = window_minutes * 60
+    depth = args.depth or settings.depth_levels
+
+    try:
+        calc_sections, anal_sections = sections_for_groups(groups)
+    except ValueError as e:
+        return {"status": "invalid", "symbol": symbol, "groups": list(groups), "error": str(e)}
+
+    # Auto-include calculation prerequisites for the requested analysis adapters.
+    anal_sections, calc_sections = resolve_analysis_sections(anal_sections, calc_sections)
+    calc_sections = resolve_calc_sections(calc_sections)
+
+    started = time.monotonic()
+    store = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    try:
+        evidence = await read_raw_window(store, symbol, window_minutes)
+
+        # Warm the derivative cache for groups that need it: oi (oi_history,
+        # L/S), demand (taker + cross_asset), regime (L/S), stage (klines).
+        # Cache-first; fetch on miss.
+        needs_deriv = bool({"oi", "demand", "regime", "stage"} & set(anal_sections or set()))
+        deriv = None
+        if needs_deriv and not args.no_derivatives:
+            cached = await store.read_derivative_evidence(symbol)
+            from market_service.nooa_harness.pipeline import DERIV_FRESH_MS_DEFAULT, _is_deriv_fresh
+            if cached and _is_deriv_fresh(cached, int(time.time() * 1000), DERIV_FRESH_MS_DEFAULT):
+                deriv = cached
+            else:
+                async with Binance() as client:
+                    deriv = await fetch_derivative_evidence(client, symbol, include_cross_asset=args.with_cross_asset)
+                try:
+                    await store.publish_derivative_evidence(symbol, deriv, ttl_s=args.deriv_ttl)
+                except Exception:
+                    log.exception("_run_groups %s: failed to publish derivative cache", symbol)
+        evidence = _merge_derivatives(evidence, deriv)
+    finally:
+        await store.close()
+
+    calc_result = run_calculations(evidence, depth, window_s, sections=calc_sections)
+
+    # Wall history for wall_migration (Postgres-first, Redis fallback) — only
+    # when the wall group is actually requested.
+    prior_walls: dict[float, float] = {}
+    prior_cycle_ts = None
+    if "wall_migration" in (anal_sections or set()):
+        prior_walls, prior_cycle_ts = await _load_prior_walls(settings, symbol)
+
+    analysis_result = run_analysis(
+        evidence, calc_result,
+        prior_walls=prior_walls or None,
+        prior_cycle_ts=prior_cycle_ts,
+        depth=depth,
+        sections=anal_sections,
+    )
+
+    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+    all_errors = list(calc_result.get("errors") or []) + list(analysis_result.get("errors") or [])
+    status = "degraded" if all_errors else "healthy"
+
+    # Assemble focused per-group output: only the sections each group owns.
+    out_groups: dict[str, Any] = {}
+    for g in groups:
+        spec = GROUP_MAP[g]
+        anal_out = analysis_result.get("analysis") or {}
+        out_groups[g] = {
+            "calculations": {
+                k: (calc_result.get("calculations") or {}).get(k)
+                for k in spec["calculations"]
+            },
+            "analysis": {
+                ("open_interest" if k == "oi" else k):
+                    anal_out.get("open_interest" if k == "oi" else k)
+                for k in spec["analysis"]
+            },
+        }
+
+    out: dict[str, Any] = {
+        "status": status,
+        "symbol": symbol,
+        "groups": list(groups),
+        "window_minutes": window_minutes,
+        "results": out_groups,
+        "elapsed_ms": elapsed_ms,
+        "errors": all_errors,
+    }
+    # Keystone-history verdict rides along with the wall group.
+    if "wall" in groups:
+        out["keystone_history"] = await _keystone_history_payload(settings, symbol, args.history_limit)
+    return out
+
+
+async def _load_prior_walls(settings: Settings, symbol: str) -> tuple[dict[float, float], str | None]:
+    """Load the wall-history ledger for wall_migration (Postgres-first, Redis fallback)."""
+    from market_service.nooa_harness.pipeline import _accumulate_prior_walls
+    from market_service.runtime.postgres_store import PostgresRuntimeStore
+    history: list[dict[str, Any]] = []
+    if settings.database_url:
+        pg = PostgresRuntimeStore(settings.database_url)
+        try:
+            await pg.connect()
+            history = await pg.read_wall_history(symbol)
+        except Exception:
+            log.warning("_load_prior_walls %s: postgres read failed; falling back to redis", symbol)
+            history = []
+        finally:
+            await pg.close()
+    if not history:
+        store = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+        try:
+            history = await store.read_wall_history(symbol)
+        finally:
+            await store.close()
+    return _accumulate_prior_walls(history)
+
+
+async def _keystone_history_payload(settings: Settings, symbol: str, limit: int) -> dict[str, Any]:
+    """Read the cross-cycle keystone ledger + migration verdict (for --wall)."""
+    from market_service.calculations.orderbook import keystone_cycle_migration
+    from market_service.runtime.postgres_store import PostgresRuntimeStore
+    store = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+    history: list[dict[str, Any]] = []
+    try:
+        history = await store.read_keystone_history(symbol, count=max(1, limit or 100))
+    finally:
+        await store.close()
+    if not history and settings.database_url:
+        pg = PostgresRuntimeStore(settings.database_url)
+        try:
+            await pg.connect()
+            history = await pg.read_keystone_history(symbol, limit=max(1, limit or 100))
+        finally:
+            await pg.close()
+    migration = keystone_cycle_migration(history) if history else {"cycles": [], "verdict": None, "net_buckets": 0}
+    return {
+        "history_count": len(history),
+        "cycles": migration.get("cycles"),
+        "verdict": migration.get("verdict"),
+        "net_buckets": migration.get("net_buckets"),
+    }
+
+
+async def _read_keystone_history(args: argparse.Namespace) -> dict[str, Any]:
+    """Read the cross-cycle keystone ledger and derive the migration verdict.
+
+    Redis is the live projection (read first); Postgres is the durable
+    fallback when the Redis stream is empty. The migration verdict is
+    derived read-side via ``keystone_cycle_migration`` (pure function) —
+    no agents, no re-fetch. Follows the null discipline: an empty ledger
+    returns ``history: []`` and ``verdict: None`` (no fabricated state).
+    """
+    from market_service.calculations.orderbook import keystone_cycle_migration
+    from market_service.runtime.postgres_store import PostgresRuntimeStore
+
+    settings = Settings.from_redis_env()
+    symbol = args.symbol.upper()
+    limit = max(1, int(args.history_limit or 100))
+
+    store = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    history: list[dict[str, Any]] = []
+    source = "redis"
+    try:
+        history = await store.read_keystone_history(symbol, count=limit)
+    finally:
+        await store.close()
+
+    if not history and settings.database_url:
+        # Durable fallback — the Redis stream is live/bounded, Postgres is
+        # the ledger that survives Redis restarts.
+        pg = PostgresRuntimeStore(settings.database_url)
+        try:
+            await pg.connect()
+            history = await pg.read_keystone_history(symbol, limit=limit)
+            source = "postgres"
+        finally:
+            await pg.close()
+
+    migration = keystone_cycle_migration(history) if history else {
+        "cycles": [], "verdict": None, "net_buckets": 0,
+    }
+    return {
+        "symbol": symbol,
+        "source": source if history else None,
+        "history_count": len(history),
+        "history": history,
+        "cycles": migration.get("cycles"),
+        "verdict": migration.get("verdict"),
+        "net_buckets": migration.get("net_buckets"),
+    }
+
+
 def _projection(envelope_dict: dict[str, Any]) -> dict[str, Any]:
-    """Compact projection of an envelope: status, key metrics, no raw evidence."""
+    """Signal-inventory projection of an envelope: keys per section + scalar
+    headlines, never raw arrays.
+
+    CLI convenience for ``--analyze --envelope-summary``. The canonical
+    read path for the model is the FULL envelope via ``--latest`` /
+    ``--run-id``; this projection only inventories what signal groups are
+    present and surfaces a handful of scalar headlines so a human can
+    verify the Pass 1/Pass 2 ports landed without dumping the whole
+    envelope. Null discipline: headlines pass through None untouched.
+    """
     out = {k: v for k, v in envelope_dict.items()
            if k in ("schema_version", "symbol", "status", "generated_at",
                     "completed_at", "coverage", "run_id")}
     cs = envelope_dict.get("canonical_state") or {}
     analysis = (cs.get("analysis") or {}).get("analysis") or {}
-    # Surface the most-used per-domain fields for quick review.
+    calculations = (cs.get("calculations") or {}).get("calculations") or {}
+    orderbook = calculations.get("orderbook") or {}
+    technical = calculations.get("technical") or {}
+
+    # Signal inventory: which groups are present per section.
     out["analysis_keys"] = sorted(analysis.keys()) if isinstance(analysis, dict) else []
+    out["calculations_keys"] = sorted(calculations.keys()) if isinstance(calculations, dict) else []
+    out["orderbook_keys"] = sorted(orderbook.keys()) if isinstance(orderbook, dict) else []
+    out["technical_keys"] = sorted(technical.keys()) if isinstance(technical, dict) else []
+
+    # Scalar headlines for the Pass 1/Pass 2 ports (bounded, no raw arrays).
+    def _path(d: Any, *keys: str) -> Any:
+        for k in keys:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(k)
+        return d
+
+    fz = orderbook.get("fut_keystone") or {}
+    out["headlines"] = {
+        "fut_keystone_bid": fz.get("bid") if isinstance(fz, dict) else None,
+        "fut_keystone_ask": fz.get("ask") if isinstance(fz, dict) else None,
+        "keystone_bid_qty": _path(orderbook, "keystone_bid_stack", "tight", "total_qty"),
+        "ask_ladder_notional": _path(orderbook, "ask_wall_ladder", "total_notional"),
+        "keystone_trade_buy_qty": _path(orderbook, "keystone_trade_intensity", "tight", "buy_qty"),
+        "keystone_trade_sell_qty": _path(orderbook, "keystone_trade_intensity", "tight", "sell_qty"),
+        "seller_aggression": _path(technical, "seller_aggression", "classification"),
+        "hourly_keystone_verdict": _path(orderbook, "hourly_keystone_migration", "verdict"),
+    }
     return out
 
 

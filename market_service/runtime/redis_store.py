@@ -92,6 +92,17 @@ class RedisRuntimeStore:
         """
         return f"{self.prefix}:history:{symbol.upper()}:walls"
 
+    def keystone_history_stream(self, symbol: str) -> str:
+        """Bounded stream of keystone snapshots for one symbol.
+
+        Schema is per-entry:
+          schema_version, cycle_ts, run_id, symbol, payload (JSON)
+        Bounded by ``stream_maxlen`` (configurable per-store). This is the
+        cross-cycle keystone-migration ledger (clean separation from the
+        wall-history stream: buyer defence vs seller walls).
+        """
+        return f"{self.prefix}:history:{symbol.upper()}:keystones"
+
     async def close(self) -> None:
         await self.redis.aclose()
 
@@ -345,6 +356,28 @@ class RedisRuntimeStore:
             approximate=True,
         )
 
+    async def read_wall_history(self, symbol: str, count: int = 1000) -> list[dict[str, Any]]:
+        """Read the recorded wall snapshots for ``symbol``, newest first.
+
+        Unlike ``read_last_wall_snapshot`` this surfaces the FULL recorded
+        wall history (bounded by the stream cap), so the wall-migration
+        analysis can probe every historically-recorded seller-wall level and
+        not just the most recent pull.
+        """
+        rows = await self.redis.xrevrange(self.wall_history_stream(symbol), count=count)
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
     async def read_last_wall_snapshot(self, symbol: str) -> dict[str, Any] | None:
         """Read the most recent wall snapshot for ``symbol``.
 
@@ -367,6 +400,80 @@ class RedisRuntimeStore:
     async def read_wall_history_count(self, symbol: str) -> int:
         """Return XLEN of the wall history stream for diagnostics."""
         return int(await self.redis.xlen(self.wall_history_stream(symbol)))
+
+    # ------------------------------------------------------------------
+    # Keystone history — cross-cycle keystone-migration ledger
+    # ------------------------------------------------------------------
+
+    async def record_keystone_snapshot(self, symbol: str, run_id: str,
+                                       payload: dict[str, Any]) -> str:
+        """Append one cycle's keystone snapshot to the bounded history stream.
+
+        ``payload`` is the keystone state set: cycle_ts, keystone_price,
+        window_qty, tight/wide bands, keystone_bid_qty, ask_ladder_notional.
+        JSON-encoded into the stream entry so callers can decode the full
+        picture without the run envelope. Mirrors ``record_wall_snapshot``.
+        """
+        stream = self.keystone_history_stream(symbol)
+        cycle_ts = payload.get("cycle_ts") or ""
+        body = json.dumps(payload, separators=(",", ":"), default=str)
+        return await self.redis.xadd(
+            stream,
+            {
+                "event_type": "keystone_snapshot",
+                "symbol": symbol.upper(),
+                "run_id": run_id,
+                "schema_version": "1",
+                "cycle_ts": cycle_ts,
+                "payload": body,
+            },
+            maxlen=self.stream_maxlen,
+            approximate=True,
+        )
+
+    async def read_keystone_history(self, symbol: str, count: int = 1000) -> list[dict[str, Any]]:
+        """Read the recorded keystone snapshots for ``symbol``, newest first.
+
+        Surfaces the FULL recorded keystone history (bounded by the stream
+        cap) so the cross-cycle migration verdict can probe every recorded
+        keystone, not just the most recent pull. Mirrors ``read_wall_history``.
+        """
+        rows = await self.redis.xrevrange(self.keystone_history_stream(symbol), count=count)
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    async def read_last_keystone_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        """Read the most recent keystone snapshot for ``symbol``.
+
+        Returns None when the stream is empty (legitimate "no history
+        yet" state — not a fabricated zero). Mirrors ``read_last_wall_snapshot``.
+        """
+        rows = await self.redis.xrevrange(self.keystone_history_stream(symbol), count=1)
+        if not rows:
+            return None
+        _entry_id, fields = rows[0]
+        raw = fields.get("payload")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def read_keystone_history_count(self, symbol: str) -> int:
+        """Return XLEN of the keystone history stream for diagnostics."""
+        return int(await self.redis.xlen(self.keystone_history_stream(symbol)))
 
     # ------------------------------------------------------------------
     # Derivative evidence — command-triggered fetch writes, harness reads

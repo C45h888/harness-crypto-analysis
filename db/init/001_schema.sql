@@ -99,6 +99,34 @@ CREATE INDEX IF NOT EXISTS wall_snapshot_run_id_idx
 CREATE INDEX IF NOT EXISTS wall_symbol_completed_at_idx
     ON wall_snapshot (symbol, cycle_ts DESC);
 
+-- Cross-cycle keystone ledger. Each row is one cycle's keystone state;
+-- clean separation from wall_snapshot (buyer defence vs seller walls).
+-- Mirrors the discipline of wall_snapshot (postgres-first, exact-run,
+-- schema-versioned). Nullable metric columns follow the null discipline:
+-- null means the cycle did not provide a value, never a fabricated zero.
+CREATE TABLE IF NOT EXISTS keystone_history (
+    symbol TEXT NOT NULL,
+    cycle_ts TIMESTAMPTZ NOT NULL,
+    run_id UUID NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    keystone_price DOUBLE PRECISION,
+    window_qty DOUBLE PRECISION,
+    tight_lo DOUBLE PRECISION,
+    tight_hi DOUBLE PRECISION,
+    wide_lo DOUBLE PRECISION,
+    wide_hi DOUBLE PRECISION,
+    keystone_bid_qty DOUBLE PRECISION,
+    ask_ladder_notional DOUBLE PRECISION,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, cycle_ts)
+);
+
+CREATE INDEX IF NOT EXISTS keystone_history_run_id_idx
+    ON keystone_history (run_id);
+
+CREATE INDEX IF NOT EXISTS keystone_history_symbol_cycle_idx
+    ON keystone_history (symbol, cycle_ts DESC);
+
 -- Durable record for validated AnalystBriefing artifacts produced by the
 -- NOOA analyst suite. Primary key is (session_id, run_id) so the same
 -- analyst session over the same canonical envelope updates in place;

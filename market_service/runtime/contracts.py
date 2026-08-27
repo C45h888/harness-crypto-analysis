@@ -7,6 +7,7 @@ stays in ``market_service`` and infrastructure details stay in the adapters.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -260,6 +261,28 @@ def _utc_iso(value: datetime | None = None) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _json_safe(value: Any) -> Any:
+    """Return a transport-safe copy with non-finite floats coerced to None.
+
+    Doctrine: contracts are "transport-safe JSON only". ``json.dumps`` writes
+    non-finite floats (NaN / Infinity) as literal ``NaN``/``Infinity`` tokens,
+    which are NOT valid JSON and are rejected by strict consumers (e.g. the
+    Postgres ``json``/``jsonb`` column). A non-finite float means a division
+    produced no computable value, so ``null`` ("source did not provide /
+    could not compute") is the correct transport representation - not an
+    invented zero.
+    """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 @dataclass(frozen=True)
 class MarketStateEnvelope:
     """A latest-state projection published by a domain data node."""
@@ -304,7 +327,7 @@ class MarketStateEnvelope:
             "produced_at": self.produced_at,
             "status": self.status,
             "coverage_seconds": self.coverage_seconds,
-            "data": self.data,
+            "data": _json_safe(self.data),
             "run_id": self.run_id,
             "errors": list(self.errors),
         }
@@ -398,11 +421,11 @@ class MarketRunEnvelope:
             "completed_at": self.completed_at,
             "status": self.status,
             "data_source": self.data_source,
-            "coverage": self.coverage,
-            "canonical_state": self.canonical_state,
-            "domain_outputs": self.domain_outputs,
+            "coverage": _json_safe(self.coverage),
+            "canonical_state": _json_safe(self.canonical_state),
+            "domain_outputs": _json_safe(self.domain_outputs),
             "errors": list(self.errors),
-            "source_metadata": self.source_metadata or {},
+            "source_metadata": _json_safe(self.source_metadata or {}),
         }
 
     def to_json(self) -> str:

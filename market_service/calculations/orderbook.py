@@ -14,7 +14,7 @@ asks (Binance depth shape). All functions are pure and deterministic.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 
 def rolling_density(levels: Iterable[Sequence[float]], width: float, side: str) -> list[dict]:
@@ -164,6 +164,164 @@ def zone_buy_sell(trades: Iterable[dict], lo: float, hi: float, step: float = 0.
     } for p, d in sorted(zones.items())]
 
 
+def keystone_trade_intensity(
+    trades: Iterable[dict],
+    tight_lo: float,
+    tight_hi: float,
+    wide_lo: float,
+    wide_hi: float,
+    min_wide_qty: float = 5.0,
+) -> dict[str, Any]:
+    """Trade-flow intensity at the keystone defence zone.
+
+    Splits trades inside the tight zone ``[tight_lo, tight_hi]`` into
+    aggressive buys (``is_buyer_maker`` False) and aggressive sells, and
+    counts aggressive buys with ``qty >= min_wide_qty`` in the wide zone
+    ``[wide_lo, wide_hi]``. Legacy source: deep_keystone.py:74-101 (large
+    trades at keystone + aggressive buys in wide zone), keystone_scan.py:130-165.
+
+    ``trades`` are normalized dicts with ``ts``, ``price``, ``qty``,
+    ``is_buyer_maker``. All functions are pure and deterministic.
+    """
+    tight_buys: list[dict] = []
+    tight_sells: list[dict] = []
+    wide_aggressive_buys: list[dict] = []
+    for t in trades:
+        try:
+            price = float(t["price"])
+            qty = float(t["qty"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        is_buy = not t.get("is_buyer_maker")
+        if tight_lo <= price <= tight_hi:
+            row = {"ts": int(t.get("ts") or 0), "price": price, "qty": qty,
+                   "notional": price * qty}
+            if is_buy:
+                tight_buys.append(row)
+            else:
+                tight_sells.append(row)
+        if wide_lo <= price <= wide_hi and is_buy and qty >= min_wide_qty:
+            wide_aggressive_buys.append({"ts": int(t.get("ts") or 0),
+                                         "price": price, "qty": qty,
+                                         "notional": price * qty})
+
+    return {
+        "tight": {
+            "lo": tight_lo, "hi": tight_hi,
+            "buy_count": len(tight_buys),
+            "buy_qty": sum(r["qty"] for r in tight_buys),
+            "buy_notional": sum(r["notional"] for r in tight_buys),
+            "sell_count": len(tight_sells),
+            "sell_qty": sum(r["qty"] for r in tight_sells),
+            "sell_notional": sum(r["notional"] for r in tight_sells),
+        },
+        "wide_aggressive_buys": {
+            "lo": wide_lo, "hi": wide_hi,
+            "min_qty": min_wide_qty,
+            "count": len(wide_aggressive_buys),
+            "notional": sum(r["notional"] for r in wide_aggressive_buys),
+        },
+    }
+
+
+def keystone_bid_stack(bids: Iterable[Sequence[float]], keystone: float,
+                       tol: float = 0.05) -> dict[str, Any]:
+    """Cumulative bid stack around the keystone price.
+
+    Returns per-level cumulative qty + notional inside the tight zone
+    ``[keystone - tol, keystone + tol]``, plus the below / at / above
+    keystone decomposition (floor area ``keystone - 6*tol`` up to the
+    keystone, exact match at the keystone, and the next defence band above
+    up to ``keystone + 3*tol``). Legacy source: deep_keystone.py:104-200.
+
+    Boards are lists of ``(price, qty)`` pairs.
+    """
+    bids = [(float(p), float(q)) for p, q in bids]
+    tight_lo, tight_hi = keystone - tol, keystone + tol
+    floor_lo = keystone - 6 * tol
+    above_hi = keystone + 3 * tol
+
+    tight_levels = sorted((p, q) for p, q in bids if tight_lo <= p <= tight_hi)
+    cum_qty = 0.0
+    cum_notional = 0.0
+    tight_rows: list[dict] = []
+    for p, q in tight_levels:
+        cum_qty += q
+        cum_notional += p * q
+        tight_rows.append({"price": p, "qty": q, "cum_qty": cum_qty,
+                           "cum_notional": cum_notional})
+
+    below = [{"price": p, "qty": q, "notional": p * q}
+             for p, q in sorted(bids) if floor_lo <= p < keystone]
+    k_round = round(keystone, 4)
+    exact = [{"price": p, "qty": q, "notional": p * q}
+             for p, q in sorted(bids) if round(p, 4) == k_round]
+    above = [{"price": p, "qty": q, "notional": p * q}
+             for p, q in sorted(bids) if keystone < p <= above_hi]
+
+    return {
+        "keystone": keystone,
+        "tol": tol,
+        "tight": {
+            "lo": tight_lo, "hi": tight_hi,
+            "levels": tight_rows,
+            "total_qty": cum_qty,
+            "total_notional": cum_notional,
+        },
+        "below": below,
+        "at": exact,
+        "above": above,
+    }
+
+
+def ask_wall_ladder(
+    asks: Iterable[Sequence[float]],
+    price: float,
+    hi_limit: float | None = None,
+    step: float = 0.05,
+    max_buckets: int = 60,
+) -> dict[str, Any]:
+    """Ask-wall ladder: per-bucket ask depth above price with cumulative notional.
+
+    Buckets of width ``step`` starting at ``price`` upward to ``hi_limit``
+    (default: ``price + max_buckets * step``). Each bucket reports level
+    count, qty, notional, and the running cumulative notional. Legacy
+    source: wall_analysis.py:83-112.
+
+    Boards are lists of ``(price, qty)`` pairs.
+    """
+    if step <= 0:
+        raise ValueError("step must be positive")
+    asks = [(float(p), float(q)) for p, q in asks]
+    if hi_limit is None:
+        hi_limit = price + max_buckets * step
+
+    zones: list[dict] = []
+    cum_notional = 0.0
+    total_qty = 0.0
+    z = price
+    while z < hi_limit + 1e-9:
+        z_hi = z + step
+        levels = [(p, q) for p, q in asks if z <= p < z_hi]
+        qty = sum(q for _, q in levels)
+        notional = sum(p * q for p, q in levels)
+        cum_notional += notional
+        total_qty += qty
+        zones.append({"lo": z, "hi": z_hi, "n_levels": len(levels),
+                      "qty": qty, "notional": notional,
+                      "cum_notional": cum_notional})
+        z += step
+
+    return {
+        "price": price,
+        "hi_limit": hi_limit,
+        "step": step,
+        "zones": zones,
+        "total_qty": total_qty,
+        "total_notional": cum_notional,
+    }
+
+
 def hourly_keystone_migration(trades: Iterable[dict], bucket_size: float = 0.05,
                               width: float = 0.20) -> dict:
     """Hourly buyer-keystone migration over the window spanned by ``trades``.
@@ -203,4 +361,60 @@ def hourly_keystone_migration(trades: Iterable[dict], bucket_size: float = 0.05,
     descending = sum(1 for r in rows if r["migration"] == "DOWN")
     verdict = "MIGRATING_UP" if ascending > descending else ("MIGRATING_DOWN" if descending > ascending else "FLAT")
     return {"hourly": rows, "verdict": verdict,
+            "net_buckets": ascending - descending}
+
+
+def keystone_cycle_migration(
+    snapshots: Iterable[dict],
+    width: float = 0.20,
+) -> dict[str, Any]:
+    """Cross-cycle keystone migration over the recorded keystone ledger.
+
+    ``snapshots`` are keystone_history rows (Redis stream payloads or
+    Postgres rows) in ANY order — they are sorted by ``cycle_ts``
+    internally, oldest first. Rows with a missing/None ``keystone_price``
+    are skipped (null discipline: no fabricated price). Consecutive
+    keystone prices are compared against ``width``:
+
+      delta > +width  → UP
+      delta < -width  → DOWN
+      otherwise       → FLAT
+
+    Returns ``{cycles, verdict, net_buckets}`` where ``verdict`` is
+    MIGRATING_UP / MIGRATING_DOWN / FLAT over the recorded runs. The first
+    cycle in the series carries ``migration: None`` (no prior to compare).
+    Pure and deterministic — the read-side companion to
+    ``hourly_keystone_migration`` (intra-window) and the durable seam to
+    ``keystone_history`` (cross-cycle).
+    """
+    rows: list[tuple[str, float]] = []
+    for s in snapshots:
+        if not isinstance(s, dict):
+            continue
+        ts = s.get("cycle_ts") or ""
+        kp = s.get("keystone_price")
+        try:
+            kp_f = float(kp) if kp is not None else None
+        except (TypeError, ValueError):
+            kp_f = None
+        if kp_f is None:
+            continue
+        rows.append((str(ts), kp_f))
+    rows.sort(key=lambda r: r[0])
+
+    cycles: list[dict] = []
+    prev: float | None = None
+    for ts, kp in rows:
+        direction: str | None = None
+        if prev is not None:
+            diff = kp - prev
+            direction = "UP" if diff > width else ("DOWN" if diff < -width else "FLAT")
+        cycles.append({"cycle_ts": ts, "keystone": kp, "migration": direction})
+        prev = kp
+
+    ascending = sum(1 for c in cycles if c["migration"] == "UP")
+    descending = sum(1 for c in cycles if c["migration"] == "DOWN")
+    verdict = ("MIGRATING_UP" if ascending > descending
+               else ("MIGRATING_DOWN" if descending > ascending else "FLAT"))
+    return {"cycles": cycles, "verdict": verdict,
             "net_buckets": ascending - descending}

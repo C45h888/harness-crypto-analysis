@@ -145,3 +145,40 @@ class MegaAtKeystoneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestPipelineWiring:
+    """Verify the wired legacy-parity signals are emitted by _adapt_wall_migration."""
+
+    def _evidence(self):
+        from market_service.nooa_harness.pipeline import _adapt_wall_migration
+        bids = [[float(p), f] for p, f in [(100.00, 50), (99.80, 40), (99.70, 30),
+                                           (99.85, 60), (99.60, 20)]]
+        asks = [[float(p), f] for p, f in [(100.20, 30), (100.30, 80), (100.40, 50),
+                                           (100.50, 70), (100.10, 25)]]
+        trades = [
+            {"ts": 1700000000000, "qty": 10.0, "is_buyer_maker": False, "price": 100.0},
+            {"ts": 1700000060000, "qty": 8.0, "is_buyer_maker": True, "price": 100.2},
+        ]
+        return {
+            "futures": {
+                "order_book": {"bids": bids, "asks": asks},
+                "trades_normalized": trades,
+                "taker_buy_sell": [{"buyVol": 100, "sellVol": 80}],
+                "oi_history": [{"sumOpenInterest": 1000}, {"sumOpenInterest": 1100}],
+                "top_ls": [{"longAccount": 0.70}],
+            }
+        }
+
+    def test_new_wall_keys_present(self):
+        from market_service.nooa_harness.pipeline import _adapt_wall_migration
+        evidence = self._evidence()
+        out = _adapt_wall_migration(evidence, [], {}, None,
+                                    orderbook={"fut_keystone": {"keystone": 99.80}},
+                                    depth=10)
+        for key in ("keystone_wall_balance", "keystone_holds_scorecard",
+                    "level_absorption", "wall_break", "zone_ratio_grid",
+                    "zone_buy_sell"):
+            assert key in out, f"missing {key}"
+        assert "keystone_holds_probability" in out["keystone_holds_scorecard"] or "score" in out["keystone_holds_scorecard"]
+        assert isinstance(out["zone_ratio_grid"], list)
+        assert isinstance(out["wall_break"], dict)
