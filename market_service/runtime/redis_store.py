@@ -563,24 +563,45 @@ class RedisRuntimeStore:
         A per-snapshot idempotency guard (keyed on ``observed_at_ms``, with a
         TTL) dedupes a re-delivered snapshot from a concurrent poller.
 
+        Memory discipline (5s cadence): the stream entry carries a *trimmed*
+        payload — ``trades_raw`` is stripped because every stream consumer
+        (``read_raw_window``) reads only ``trades_normalized``; the raw
+        Binance arrays are a byte-for-byte duplicate of the normalized
+        trades inside the same snapshot and account for ~half of the
+        per-entry size. The full untrimmed payload is kept in the
+        ``latest`` projection (the ``trades_raw`` fallback surface).
+        Stream length is bounded by ``self.stream_maxlen`` (the hardcoded
+        5000 ignored the configured cap). At the 5s cadence the cap is a
+        MEMORY budget, not just a history window: ~344 KB/trimmed entry
+        x 1200 entries x 3 symbols ~= 1.2 GB, sized to stay under the
+        1.5 GB maxmemory with room for collated/ledger keys (1200 x 5s
+        = 100 min of stream history; the 15m analysis window needs 180).
+
         Returns the stream id, or ``None`` when the snapshot was a duplicate.
         """
-        body = json.dumps(payload, default=str, separators=(",", ":"))
+        full_body = json.dumps(payload, default=str, separators=(",", ":"))
+        trimmed = {
+            **payload,
+            "spot": {k: v for k, v in payload.get("spot", {}).items() if k != "trades_raw"},
+            "futures": {k: v for k, v in payload.get("futures", {}).items() if k != "trades_raw"},
+        }
+        stream_body = json.dumps(trimmed, default=str, separators=(",", ":"))
         ts = str(payload.get("observed_at_ms", ""))
+        maxlen = str(int(self.stream_maxlen))
         script = """
         if ARGV[2] ~= '' then
           local guard = redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[3])
           if guard == false then return 'duplicate' end
         end
         redis.call('SET', KEYS[1], ARGV[1])
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', 5000, '*',
-            'ts', ARGV[2], 'payload', ARGV[1])
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'ts', ARGV[2], 'payload', ARGV[4])
         """
         result = await self.redis.eval(
             script, 3,
             self.raw_latest_key(symbol), self.raw_stream(symbol),
             self.raw_dedupe_key(symbol, ts),
-            body, ts, 600,
+            full_body, ts, "600", stream_body, maxlen,
         )
         if result == "duplicate":
             return None

@@ -55,6 +55,13 @@ class PostgresRuntimeStore:
         return dict(row) if row else None
 
     async def insert_run(self, envelope: MarketRunEnvelope) -> bool:
+        """Append one canonical run (deduped, 2026-08-27 pass).
+
+        The `envelope` jsonb column is left NULL: coverage /
+        canonical_state / domain_outputs / errors are stored as first-class
+        columns and the full envelope is reconstructed on read from them.
+        The old double-write made every row ~2x its necessary size.
+        """
         envelope.validate()
         if self.pool is None:
             await self.connect()
@@ -63,8 +70,8 @@ class PostgresRuntimeStore:
             """INSERT INTO market_run
                (run_id, symbol, generated_at, completed_at, status, data_source,
                 schema_version, coverage, canonical_state, domain_outputs, errors,
-                source_metadata, envelope)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                source_metadata)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                ON CONFLICT (run_id) DO NOTHING
                RETURNING run_id""",
             uuid.UUID(envelope.run_id), envelope.symbol,
@@ -73,18 +80,62 @@ class PostgresRuntimeStore:
             envelope.schema_version, json.dumps(_json_safe(envelope.coverage)),
             json.dumps(_json_safe(envelope.canonical_state)), json.dumps(_json_safe(envelope.domain_outputs)),
             json.dumps(_json_safe(list(envelope.errors))), json.dumps(_json_safe(envelope.source_metadata or {})),
-            envelope.to_json(),
         )
         return row is not None
+
+    @staticmethod
+    def _envelope_from_row(row: dict) -> MarketRunEnvelope:
+        """Reconstruct a MarketRunEnvelope from split columns.
+
+        Prefers the reconstructed mapping; falls back to the stored
+        `envelope` column for legacy rows (written before the dedupe pass)
+        so pre-existing envelopes keep round-tripping byte-identically.
+        """
+        stored = row.get("envelope")
+        if stored is not None:
+            return MarketRunEnvelope.from_mapping(
+                json.loads(stored) if isinstance(stored, str) else stored
+            )
+        def _as_dict(v):
+            if isinstance(v, str):
+                v = json.loads(v)
+            return dict(v or {})
+        generated_at = row["generated_at"]
+        completed_at = row["completed_at"]
+        errors = row.get("errors")
+        if isinstance(errors, str):
+            errors = json.loads(errors)
+        return MarketRunEnvelope.from_mapping({
+            "schema_version": row["schema_version"],
+            "run_id": str(row["run_id"]),
+            "symbol": row["symbol"],
+            "generated_at": generated_at.isoformat() if hasattr(generated_at, "isoformat") else str(generated_at),
+            "completed_at": completed_at.isoformat() if hasattr(completed_at, "isoformat") else str(completed_at),
+            "status": row["status"],
+            "data_source": row["data_source"],
+            "coverage": _as_dict(row.get("coverage")),
+            "canonical_state": _as_dict(row.get("canonical_state")),
+            "domain_outputs": _as_dict(row.get("domain_outputs")),
+            "errors": tuple(errors or ()),
+            "source_metadata": _as_dict(row.get("source_metadata")),
+        })
+
+    _RUN_COLUMNS = (
+        "run_id, symbol, generated_at, completed_at, status, data_source, "
+        "schema_version, coverage, canonical_state, domain_outputs, errors, "
+        "source_metadata, envelope"
+    )
 
     async def read_run(self, run_id: str) -> MarketRunEnvelope | None:
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
-        raw = await self.pool.fetchval("SELECT envelope FROM market_run WHERE run_id = $1", run_id)
-        if raw is None:
+        row = await self.pool.fetchrow(
+            f"SELECT {self._RUN_COLUMNS} FROM market_run WHERE run_id = $1", run_id
+        )
+        if row is None:
             return None
-        return MarketRunEnvelope.from_mapping(json.loads(raw) if isinstance(raw, str) else raw)
+        return self._envelope_from_row(dict(row))
 
     async def insert_analyst_briefing(self, briefing: AnalystBriefing) -> bool:
         """Durable, idempotent write of one ``AnalystBriefing``.
@@ -180,13 +231,14 @@ class PostgresRuntimeStore:
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
-        raw = await self.pool.fetchval(
-            "SELECT envelope FROM market_run WHERE symbol = $1 ORDER BY completed_at DESC LIMIT 1",
+        row = await self.pool.fetchrow(
+            f"SELECT {self._RUN_COLUMNS} FROM market_run "
+            "WHERE symbol = $1 ORDER BY completed_at DESC LIMIT 1",
             symbol.upper(),
         )
-        if raw is None:
+        if row is None:
             return None
-        return MarketRunEnvelope.from_mapping(json.loads(raw) if isinstance(raw, str) else raw)
+        return self._envelope_from_row(dict(row))
 
     async def insert_agent_memory(self, memory: AgentMemory) -> bool:
         """Durable, idempotent write of one ``AgentMemory``.

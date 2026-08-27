@@ -164,6 +164,19 @@ async def poll_symbol(
               stream_id)
 
 
+async def _safe_poll_symbol(
+    client: Binance,
+    redis: RedisRuntimeStore,
+    settings: Settings,
+    symbol: str,
+) -> None:
+    """Guarded wrapper so one symbol's failure never cancels the others."""
+    try:
+        await poll_symbol(client, redis, settings, symbol)
+    except Exception as exc:
+        log.warning("poller cycle failed for %s: %s", symbol, exc)
+
+
 async def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -182,12 +195,23 @@ async def main() -> int:
                      settings.symbols, settings.poll_seconds)
             while True:
                 started = time.monotonic()
-                for symbol in settings.symbols:
-                    try:
-                        await poll_symbol(client, redis, settings, symbol)
-                    except Exception:
-                        log.exception("poller cycle failed for %s", symbol)
+                # All symbols fetched concurrently — each symbol's 12
+                # endpoints already gather in parallel, so sequential
+                # iteration multiplied cycle time by len(symbols).
+                results = await asyncio.gather(
+                    *[
+                        _safe_poll_symbol(client, redis, settings, symbol)
+                        for symbol in settings.symbols
+                    ],
+                    return_exceptions=True,
+                )
+                for symbol, res in zip(settings.symbols, results):
+                    if isinstance(res, Exception):
+                        log.exception("poller cycle failed for %s", symbol, exc_info=res)
                 elapsed = time.monotonic() - started
+                if elapsed > settings.poll_seconds:
+                    log.warning("poller overrun: cycle took %.2fs > poll=%ss",
+                                elapsed, settings.poll_seconds)
                 sleep_s = max(0.0, settings.poll_seconds - elapsed)
                 await asyncio.sleep(sleep_s)
     finally:

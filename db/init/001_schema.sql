@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS market_run (
     domain_outputs JSONB NOT NULL DEFAULT '{}'::jsonb,
     errors JSONB NOT NULL DEFAULT '[]'::jsonb,
     source_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    envelope JSONB NOT NULL,
+    -- Dedupe pass (0007): new writes leave this NULL; the envelope is
+    -- reconstructed from the split columns on read. Legacy rows keep it.
+    envelope JSONB,
     inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
