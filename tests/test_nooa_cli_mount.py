@@ -38,7 +38,7 @@ class NooaCliMountTests(unittest.TestCase):
     def test_market_group_has_harness_subcommands(self):
         names = set(_MOUNTED.commands["market"].commands)
         self.assertEqual(
-            names, {"envelope", "briefing", "memory", "analyst"}
+            names, {"envelope", "briefing", "memory", "analyst", "microstructure"}
         )
 
     def test_mount_does_not_write_into_framework_package(self):

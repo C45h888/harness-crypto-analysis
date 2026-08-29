@@ -260,6 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "Postgres fallback) and derive the keystone migration "
                         "verdict. Returns the recorded keystone series + "
                         "UP/DOWN/FLAT per cycle + the aggregate verdict.")
+    p.add_argument("--microstructure-status", action="store_true",
+                   help="read the isolated Binance spot microstructure capture status from Redis; "
+                        "does not start capture, run calculations, or invoke NOOA")
     p.add_argument("--history-limit", type=int, default=100,
                    help="max keystone history entries to read for "
                         "--keystone-history (default 100)")
@@ -367,6 +370,12 @@ def main(argv: list[str] | None = None) -> int:
         result = asyncio.run(_read_keystone_history(args))
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("history") or result.get("cycles") else 1
+
+    # --- Route 3.6: isolated microstructure capture health only.
+    if args.microstructure_status:
+        result = asyncio.run(_read_microstructure_status(args))
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("status") is not None else 1
 
     # --- Route 4: legacy dev-only live waveform (explicit --live).
     if args.live:
@@ -726,6 +735,26 @@ async def _read_keystone_history(args: argparse.Namespace) -> dict[str, Any]:
         "verdict": migration.get("verdict"),
         "net_buckets": migration.get("net_buckets"),
     }
+
+
+async def _read_microstructure_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Read the separate spot-capture health projection, Redis-only."""
+    settings = Settings.from_redis_env()
+    symbol = args.symbol.upper()
+    store = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
+    try:
+        status = await store.read_microstructure_status("spot", symbol)
+        return {
+            "symbol": symbol,
+            "venue": "spot",
+            "status_key": store.microstructure_status_key("spot", symbol),
+            "raw_stream": store.microstructure_raw_stream("spot", symbol),
+            "event_stream": store.microstructure_event_stream("spot", symbol),
+            "ofi_stream": store.microstructure_ofi_stream("spot", symbol),
+            "status": status,
+        }
+    finally:
+        await store.close()
 
 
 def _projection(envelope_dict: dict[str, Any]) -> dict[str, Any]:

@@ -12,8 +12,10 @@ from market_service.manifest import CLEAN_MODULES
 def domain_for(key: str) -> str:
     if key == "clients":
         return "data-access"
-    if key in {"flow", "orderbook", "volume_profile", "technical", "signals"}:
+    if key in {"flow", "orderbook", "volume_profile", "technical", "signals", "microstructure"}:
         return "calculation"
+    if key == "microstructure_capture":
+        return "data-access"
     return "analysis"
 
 

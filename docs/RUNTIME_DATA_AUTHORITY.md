@@ -81,6 +81,36 @@ The poller never carries historical or cross-asset data. The run-cycle
 never re-fetches point-in-time book/ticker/funding/trades — those come from
 the poller's Redis raw stream.
 
+## Optional microstructure capture (Pass 1-2)
+
+The paper-derived OFI path is isolated from the five-second REST poller. The
+optional `microstructure-capture` Compose profile consumes Binance Spot
+`<symbol>@depth@100ms`, bootstraps a local book from a REST snapshot, validates
+the Binance depth-update sequence, and writes only the dedicated Redis ledger:
+
+```text
+marketflow:stream:microstructure:raw:spot:<SYMBOL>
+marketflow:stream:microstructure:events:spot:<SYMBOL>
+marketflow:stream:microstructure:ofi:spot:<SYMBOL>
+marketflow:latest:microstructure:spot:<SYMBOL>:book
+marketflow:latest:microstructure:spot:<SYMBOL>:status
+```
+
+Raw deltas are capture evidence; best-quote transition events contain the
+deterministic paper contribution `e_n`; completed 10-second (configurable)
+intervals contain `OFI_k` and event-average `AD_i`. Statistical fitting,
+`MicrostructureEvidence`, canonical-envelope integration, and NOOA
+interpretation are not part of this capture pass. A sequence gap resets the
+local book and is visible in the status object; it must never be bridged with
+inferred events.
+
+Run it separately from the existing poller:
+
+```bash
+docker compose --profile microstructure up microstructure-capture
+docker compose --profile tools run --rm harness BTCUSDT --microstructure-status
+```
+
 ## Endpoint split
 
 ### Poller (8 endpoints, every `POLL_SECONDS`, default 5s)

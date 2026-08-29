@@ -129,6 +129,39 @@ CREATE INDEX IF NOT EXISTS keystone_history_run_id_idx
 CREATE INDEX IF NOT EXISTS keystone_history_symbol_cycle_idx
     ON keystone_history (symbol, cycle_ts DESC);
 
+-- Durable ledger for immutable Pass-3 MicrostructureEvidence objects
+-- (paper-derived OFI price-impact fits). Postgres-first: the Redis
+-- latest-evidence key is only a projection of this table. The full
+-- evidence JSON is retained in ``evidence`` for exact replay; the
+-- scalar columns exist for querying and the null discipline applies
+-- (null coefficient = the fit was insufficient, never zero).
+CREATE TABLE IF NOT EXISTS microstructure_evidence (
+    symbol TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    generated_at_ms BIGINT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    interval_seconds INTEGER NOT NULL,
+    window_start_ms BIGINT NOT NULL,
+    window_end_ms BIGINT NOT NULL,
+    tick_size NUMERIC NOT NULL,
+    depth_estimator TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    price_impact_fit JSONB,
+    sensitivity_fit JSONB,
+    depth_scaling_fit JSONB,
+    block_average_depth NUMERIC,
+    coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL,
+    evidence JSONB NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, venue, evidence_id)
+);
+
+CREATE INDEX IF NOT EXISTS microstructure_evidence_symbol_window_idx
+    ON microstructure_evidence (symbol, venue, window_end_ms DESC);
+
 -- Durable record for validated AnalystBriefing artifacts produced by the
 -- NOOA analyst suite. Primary key is (session_id, run_id) so the same
 -- analyst session over the same canonical envelope updates in place;

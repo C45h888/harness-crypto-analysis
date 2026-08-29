@@ -37,6 +37,8 @@ CLEAN_MODULES: dict[str, str] = {
     "volume_profile": "market_service.calculations.volume_profile",
     "technical": "market_service.calculations.technical",
     "signals": "market_service.calculations.signals",
+    "microstructure": "market_service.microstructure",
+    "microstructure_capture": "market_service.microstructure.capture",
     "market": "market_service.analysis.market",
     "oi": "market_service.analysis.oi",
     "liquidations": "market_service.analysis.liquidations",

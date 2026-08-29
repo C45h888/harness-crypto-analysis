@@ -89,6 +89,31 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # Optional, isolated event-level source for the paper-derived OFI work.
+  # This is deliberately separate from `poller`: a depth-stream reconnect or
+  # sequence gap cannot delay the five-second REST evidence path.
+  microstructure-capture:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.microstructure.capture", "${MICROSTRUCTURE_SYMBOL:-BTCUSDT}"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      MICROSTRUCTURE_STREAM_MAXLEN: ${MICROSTRUCTURE_STREAM_MAXLEN:-100000}
+      MICROSTRUCTURE_SNAPSHOT_LEVELS: ${MICROSTRUCTURE_SNAPSHOT_LEVELS:-1000}
+      MICROSTRUCTURE_RECONNECT_SECONDS: ${MICROSTRUCTURE_RECONNECT_SECONDS:-2}
+      MICROSTRUCTURE_INTERVAL_SECONDS: ${MICROSTRUCTURE_INTERVAL_SECONDS:-10}
+      BINANCE_SPOT_WS_BASE: ${BINANCE_SPOT_WS_BASE:-wss://stream.binance.com:9443/ws}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["microstructure"]
+    restart: unless-stopped
+
   # One-shot harness. Reads raw evidence from Redis, runs the pipeline
   # (calc + analysis + collate), then invokes NOOA agents. Use via:
   #   docker compose --profile tools run --rm harness SOLUSDT --analyze --window 15m --json

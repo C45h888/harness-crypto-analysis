@@ -149,7 +149,7 @@ def bounded_envelope_view(
     }
     kept["coverage"] = payload.get("coverage")
     kept["errors"] = payload.get("errors")
-    kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
+    kept["_trimmed_keys"] = sorted(payload.get("canonical_state") or {})
     return json.dumps(kept, default=str)
 
 
@@ -446,6 +446,168 @@ class LiquidationAgent(MarketAnalyst):
     ) -> str:
         """Assess liquidation pressure and related evidence in the envelope."""
         return await self._call_model_once(envelope)
+
+
+# ---------------------------------------------------------------------------
+# Pass-3 microstructure interpretation agent (read-only over fitted evidence)
+# ---------------------------------------------------------------------------
+
+_MICROSTRUCTURE_EVIDENCE_SCHEMA = json.dumps(
+    {
+        "schema_version": 1,
+        "symbol": "BTCUSDT",
+        "venue": "spot",
+        "evidence_id": "ev-<hash-prefix>",
+        "input_hash": "<sha256>",
+        "model_version": "ofi-depth-v1",
+        "interval_seconds": 10,
+        "window_start_ms": "<int>",
+        "window_end_ms": "<int>",
+        "tick_size": "<decimal>",
+        "depth_estimator": "event_mean_best_bid_ask_v1",
+        "price_impact_fit": {
+            "fit_id": "beta-<hash>",
+            "alpha": "<decimal>",
+            "beta": "<decimal>",
+            "stderr_beta": "<decimal|null>",
+            "r2": "<decimal|null>",
+            "n_observations": "<int>",
+            "excluded_observations": "<int>",
+            "heteroskedasticity_flag": "<bool>",
+            "mean_ad": "<decimal|null>",
+            "price_unit": "ticks",
+            "status": "validated|provisional|insufficient",
+        },
+        "sensitivity_fit": "same shape as price_impact_fit, OFI recomputed without price-changing events, or null",
+        "depth_scaling_fit": {
+            "fit_id": "depth-<hash>",
+            "c": "<decimal|null>",
+            "lambda": "<decimal|null>",
+            "stderr_lambda": "<decimal|null>",
+            "n_blocks": "<int>",
+            "r2": "<decimal|null>",
+            "fit_ids": ["beta-<hash>", "..."],
+            "status": "validated|provisional|insufficient",
+        },
+        "coverage": "object: events/intervals captured, gaps, reconnects",
+        "status": "validated|provisional|insufficient",
+    },
+    indent=2,
+)
+
+
+class MicrostructureInterpretationAgent(MarketAnalyst):
+    """Read-only interpreter of immutable MicrostructureEvidence.
+
+    Receives BOTH fitted models — the empirical price-impact fit
+    (ΔP_k = α + β·OFI_k) and the depth-scaling fit (β = c·AD^-λ) — each with
+    independent diagnostics, and explains fit quality, sign, magnitude and
+    limitations. The two models are NEVER merged into a single point
+    prediction: the substituted combined expression
+    ΔP = α + c·OFI/AD^λ + (ν·OFI + ε) carries a heteroskedastic ν·OFI term,
+    so it is a derived diagnostic at most.
+
+    Authority: this agent never recomputes OFI, never refits β/c/λ, never
+    opens Binance, never reconstructs the book, and never overrides a
+    deterministic status. It cites evidence paths and states what the data
+    cannot establish.
+    """
+
+    remit = (
+        "Interpret fitted microstructure evidence without recomputing any "
+        "value. The deterministic fitter is the only producer of coefficients."
+    )
+    task_prompt = (
+        "You are a microstructure analyst. You receive one immutable "
+        "MicrostructureEvidence object containing two SEPARATE fitted models: "
+        "(1) price_impact_fit, an OLS of ΔP_k = alpha + beta*OFI_k over one "
+        "estimation block, and (2) depth_scaling_fit, a log-log fit of "
+        "beta_i = c * AD_i^-lambda across blocks. Interpret each model's sign, "
+        "magnitude, fit quality (r2, stderr, n_observations) and status "
+        "(validated/provisional/insufficient) independently. NEVER combine them "
+        "into a single price prediction — the combined expression carries a "
+        "heteroskedastic nu*OFI interaction term and is at most a derived "
+        "diagnostic. When sensitivity_fit is present, compare it to the primary "
+        "fit (it excludes price-changing events; divergence flags the paper's "
+        "tautology caveat). Respect the deterministic status: never treat a "
+        "provisional or insufficient fit as a trading signal. Never recompute "
+        "OFI, beta, c, or lambda. Cite exact evidence paths for every claim."
+    )
+    output_format_prompt = (
+        "Return a JSON object with:\n"
+        "  summary: 2-3 sentence interpretation of the fitted models\n"
+        "  evidence: [{\"path\": \"evidence path\", \"value\": ..., "
+        "\"interpretation\": \"what this means\", \"metric_name\": \"label\"}]\n"
+        "  confidence: low|medium|high\n"
+        "  limitations: [\"...\"]\n"
+        "  model_separation: one sentence on why the two fits are read separately"
+    )
+
+    def _envelope_schema(self) -> str:
+        """Shape reference for MicrostructureEvidence (not the market envelope)."""
+        return _MICROSTRUCTURE_EVIDENCE_SCHEMA
+
+    @staticmethod
+    def _evidence_from_envelope(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Locate microstructure evidence inside a canonical envelope view.
+
+        Pass-3 routes evidence directly today; once the envelope carries a
+        versioned ``microstructure`` domain this resolver finds it there.
+        """
+        if not isinstance(envelope, dict):
+            return None
+        for key in ("microstructure", "microstructure_evidence"):
+            candidate = envelope.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        canonical = envelope.get("canonical_state")
+        if isinstance(canonical, dict):
+            for key in ("microstructure", "microstructure_evidence"):
+                candidate = canonical.get(key)
+                if isinstance(candidate, dict):
+                    return candidate
+        return None
+
+    async def assess(
+        self,
+        evidence: Annotated[
+            dict[str, Any],
+            spec(
+                description=(
+                    "One immutable MicrostructureEvidence object (or a canonical "
+                    "envelope containing one under a microstructure key). Paths: "
+                    "price_impact_fit.{beta,alpha,r2,status}, "
+                    "sensitivity_fit.*, depth_scaling_fit.{c,lambda,status}, "
+                    "coverage.*, status"
+                )
+            ),
+        ],
+    ) -> str:
+        """Interpret one evidence object; deterministic unavailable when absent.
+
+        When no evidence is present this returns a parseable unavailable report
+        WITHOUT a model call (null discipline — no LLM call to state absence).
+        """
+        payload = evidence if isinstance(evidence, dict) else None
+        resolved = payload
+        if resolved is None or "evidence_id" not in resolved:
+            resolved = self._evidence_from_envelope(payload)
+        if resolved is None:
+            return json.dumps({
+                "summary": "Microstructure evidence unavailable for this run.",
+                "evidence": [],
+                "confidence": "low",
+                "limitations": ["no MicrostructureEvidence persisted or present in the envelope"],
+                "null_fields": ["microstructure"],
+            })
+        return await self._call_model_once(
+            resolved,
+            extra_context=(
+                "The payload below is ONE MicrostructureEvidence object, not the "
+                "market envelope. Both fitted models carry deterministic status "
+                "fields that you must respect."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

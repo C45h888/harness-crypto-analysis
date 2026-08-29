@@ -637,3 +637,135 @@ class RedisRuntimeStore:
             return value if isinstance(value, dict) else None
         except (ValueError, json.JSONDecodeError):
             return None
+
+    # ------------------------------------------------------------------
+    # Microstructure ledger — isolated from the five-second REST poller.
+    # ------------------------------------------------------------------
+
+    def microstructure_raw_stream(self, venue: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:microstructure:raw:{venue.lower()}:{symbol.upper()}"
+
+    def microstructure_event_stream(self, venue: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:microstructure:events:{venue.lower()}:{symbol.upper()}"
+
+    def microstructure_ofi_stream(self, venue: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:microstructure:ofi:{venue.lower()}:{symbol.upper()}"
+
+    def microstructure_book_key(self, venue: str, symbol: str) -> str:
+        return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:book"
+
+    def microstructure_status_key(self, venue: str, symbol: str) -> str:
+        return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:status"
+
+    def microstructure_evidence_key(self, venue: str, symbol: str) -> str:
+        return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:evidence"
+
+    async def publish_microstructure_delta(
+        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
+    ) -> str:
+        """Append raw depth evidence without sharing poller retention or keys."""
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        return str(await self.redis.xadd(
+            self.microstructure_raw_stream(venue, symbol),
+            {"payload": body, "ts": str(payload.get("received_ts_ms", ""))},
+            maxlen=max(1, int(maxlen)), approximate=True,
+        ))
+
+    async def publish_microstructure_event(
+        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
+    ) -> str:
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        return str(await self.redis.xadd(
+            self.microstructure_event_stream(venue, symbol),
+            {"payload": body, "ts": str((payload.get("current") or {}).get("exchange_ts_ms", ""))},
+            maxlen=max(1, int(maxlen)), approximate=True,
+        ))
+
+    async def publish_microstructure_interval(
+        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
+    ) -> str:
+        """Append one completed deterministic OFI/AD measurement interval."""
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        return str(await self.redis.xadd(
+            self.microstructure_ofi_stream(venue, symbol),
+            {"payload": body, "ts": str(payload.get("end_ts_ms", ""))},
+            maxlen=max(1, int(maxlen)), approximate=True,
+        ))
+
+    async def set_microstructure_book(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
+        await self.redis.set(
+            self.microstructure_book_key(venue, symbol),
+            json.dumps(payload, default=str, separators=(",", ":")),
+        )
+
+    async def set_microstructure_status(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
+        await self.redis.set(
+            self.microstructure_status_key(venue, symbol),
+            json.dumps(payload, default=str, separators=(",", ":")),
+        )
+
+    async def read_microstructure_status(self, venue: str, symbol: str) -> dict[str, Any] | None:
+        raw = await self.redis.get(self.microstructure_status_key(venue, symbol))
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    async def publish_microstructure_evidence(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
+        """Persist one immutable MicrostructureEvidence projection (latest)."""
+        await self.redis.set(
+            self.microstructure_evidence_key(venue, symbol),
+            json.dumps(payload, default=str, separators=(",", ":")),
+        )
+
+    async def read_microstructure_evidence(self, venue: str, symbol: str) -> dict[str, Any] | None:
+        raw = await self.redis.get(self.microstructure_evidence_key(venue, symbol))
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    async def read_microstructure_events(
+        self, venue: str, symbol: str, *, start: str = "-", end: str = "+", count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read best-quote transition events from the dedicated event stream.
+
+        Each entry's ``payload`` field carries one serialized OrderBookEvent;
+        entries whose payload does not decode are skipped (never fabricated).
+        """
+        return await self._read_microstructure_stream(
+            self.microstructure_event_stream(venue, symbol), start=start, end=end, count=count,
+        )
+
+    async def read_microstructure_intervals(
+        self, venue: str, symbol: str, *, start: str = "-", end: str = "+", count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read completed OFIInterval rows from the dedicated OFI stream."""
+        return await self._read_microstructure_stream(
+            self.microstructure_ofi_stream(venue, symbol), start=start, end=end, count=count,
+        )
+
+    async def _read_microstructure_stream(
+        self, key: str, *, start: str, end: str, count: int | None,
+    ) -> list[dict[str, Any]]:
+        rows = await self.redis.xrange(key, min=start, max=end, count=count)
+        payloads: list[dict[str, Any]] = []
+        for _entry_id, fields in rows or []:
+            raw = (fields or {}).get("payload")
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if not isinstance(raw, str):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(decoded, dict):
+                payloads.append(decoded)
+        return payloads

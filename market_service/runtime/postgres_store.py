@@ -618,3 +618,100 @@ class PostgresRuntimeStore:
         assert self.pool is not None
         return int(await self.pool.fetchval(
             "SELECT COUNT(*) FROM keystone_history WHERE symbol = $1", symbol.upper()))
+
+    # ------------------------------------------------------------------
+    # Pass-3 microstructure evidence ledger (postgres-first durable layer).
+    # Redis latest-evidence keys are projections of these rows only.
+    # ------------------------------------------------------------------
+
+    async def insert_microstructure_evidence(self, evidence: dict[str, Any]) -> bool:
+        """Persist one immutable MicrostructureEvidence row (idempotent on id)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO microstructure_evidence
+               (symbol, venue, evidence_id, generated_at_ms, schema_version,
+                interval_seconds, window_start_ms, window_end_ms, tick_size,
+                depth_estimator, input_hash, model_version,
+                price_impact_fit, sensitivity_fit, depth_scaling_fit,
+                block_average_depth, coverage, status, evidence)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+               ON CONFLICT (symbol, venue, evidence_id) DO NOTHING
+               RETURNING evidence_id""",
+            str(evidence["symbol"]).upper(),
+            str(evidence["venue"]),
+            str(evidence["evidence_id"]),
+            int(evidence["generated_at_ms"]),
+            int(evidence.get("schema_version") or 1),
+            int(evidence["interval_seconds"]),
+            int(evidence["window_start_ms"]),
+            int(evidence["window_end_ms"]),
+            evidence["tick_size"],
+            str(evidence["depth_estimator"]),
+            str(evidence["input_hash"]),
+            str(evidence["model_version"]),
+            json.dumps(evidence.get("price_impact_fit")),
+            json.dumps(evidence.get("sensitivity_fit")),
+            json.dumps(evidence.get("depth_scaling_fit")),
+            evidence.get("block_average_depth"),
+            json.dumps(evidence.get("coverage") or {}),
+            str(evidence["status"]),
+            json.dumps(evidence),
+        )
+        return row is not None
+
+    async def read_microstructure_evidence(
+        self, symbol: str, venue: str, evidence_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Durable read: latest evidence for (symbol, venue) or one exact id."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        if evidence_id:
+            row = await self.pool.fetchrow(
+                """SELECT evidence FROM microstructure_evidence
+                   WHERE symbol = $1 AND venue = $2 AND evidence_id = $3""",
+                symbol.upper(), venue, evidence_id,
+            )
+        else:
+            row = await self.pool.fetchrow(
+                """SELECT evidence FROM microstructure_evidence
+                   WHERE symbol = $1 AND venue = $2
+                   ORDER BY window_end_ms DESC LIMIT 1""",
+                symbol.upper(), venue,
+            )
+        if row is None:
+            return None
+        evidence = row["evidence"]
+        if isinstance(evidence, str):
+            try:
+                evidence = json.loads(evidence)
+            except (ValueError, json.JSONDecodeError):
+                return None
+        return evidence if isinstance(evidence, dict) else None
+
+    async def list_microstructure_evidence(
+        self, symbol: str, venue: str, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Durable read: the most recent evidence rows for (symbol, venue)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            """SELECT evidence FROM microstructure_evidence
+               WHERE symbol = $1 AND venue = $2
+               ORDER BY window_end_ms DESC LIMIT $3""",
+            symbol.upper(), venue, limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            evidence = row["evidence"]
+            if isinstance(evidence, str):
+                try:
+                    evidence = json.loads(evidence)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+            if isinstance(evidence, dict):
+                out.append(evidence)
+        return out
