@@ -86,6 +86,7 @@ from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 from . import contracts as C
+from .contracts import GroupEnvelope
 
 log = logging.getLogger(__name__)
 
@@ -1824,8 +1825,432 @@ def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -
 
 
 # ---------------------------------------------------------------------------
-# Full cycle — read → calc → analyze → collate → persist
+# Specialized group envelopes — the interpretation-plane read interface.
+#
+# The canonical MarketRunEnvelope is the persisted AUDIT record; these
+# GroupEnvelopes are what analysts actually READ. They are emitted either
+# (a) directly from the Redis raw stream via run_group_cycle (the harness
+# group commands: --wall/--flow/--structure/--positioning), or (b) as a
+# deterministic projection of a persisted canonical envelope so NOOA
+# specialists can be handed exactly the section surface their remit covers
+# — bounded by construction, with the canonical run_id preserved for audit.
 # ---------------------------------------------------------------------------
+
+# Per-specialist group assignment (nooa_harness.agents.SPECIALIST_GROUP_KINDS
+# mirrors this; kept here as the single source of truth for the projection).
+SPECIALIST_GROUP_KINDS: dict[str, str] = {
+    "delta_orderflow": "flow",
+    "macro": "structure",
+    "open_interest": "positioning",
+    "liquidations": "wall",
+}
+
+# Hard per-array cap at contract-emission level. The largest legitimate
+# arrays (volume-profile buckets over a 4h window, ask-wall ladders) fit
+# comfortably; anything larger is capped WITH an explicit __truncated__
+# marker — never silently dropped, and never left to break the LLM param
+# limit downstream.
+_GROUP_ARRAY_CAP = 128
+
+
+def _bound_arrays(value: Any, cap: int = _GROUP_ARRAY_CAP) -> Any:
+    """Deterministically cap any list/tuple at ``cap`` items, explicitly marked."""
+    if isinstance(value, dict):
+        return {k: _bound_arrays(v, cap) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = [_bound_arrays(v, cap) for v in value[:cap]]
+        if len(value) > cap:
+            return {"__truncated__": True, "count": len(value), "items": items}
+        return items
+    return value
+
+
+def _evidence_headlines(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Compact shared evidence context (snake_case scalars, null-preserving).
+
+    Every group envelope carries these so any specialist has the baseline
+    market state without raw arrays. Mirrors the fixed path discipline of
+    runtime.contracts._envelope_summary — pure path-reads, no arithmetic.
+    """
+    fut = (evidence or {}).get("futures") or {}
+    spot = (evidence or {}).get("spot") or {}
+
+    def _p(d: Any, *keys: str) -> Any:
+        for k in keys:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(k)
+        return d
+
+    ticker = _p(fut, "ticker_24h") or {}
+    spot_ticker = _p(spot, "ticker_24h") or {}
+    funding = _p(fut, "funding") or {}
+    oi = _p(fut, "open_interest") or {}
+    return {
+        "last_price": _p(fut, "ticker_24h", "last_price") or _p(fut, "ticker_24h", "lastPrice"),
+        "spot_last_price": _p(spot, "ticker_24h", "last_price") or _p(spot, "ticker_24h", "lastPrice"),
+        "funding_rate": _p(funding, "last_funding_rate") or _p(funding, "lastFundingRate"),
+        "mark_price": _p(funding, "mark_price") or _p(funding, "markPrice"),
+        "open_interest": _p(oi, "open_interest") or _p(oi, "openInterest"),
+        "high_24h": _p(ticker, "high_price") or _p(ticker, "highPrice"),
+        "low_24h": _p(ticker, "low_price") or _p(ticker, "lowPrice"),
+        "quote_volume_24h": _p(ticker, "quote_volume") or _p(ticker, "quoteVolume"),
+        "spot_quote_volume_24h": _p(spot_ticker, "quote_volume") or _p(spot_ticker, "quoteVolume"),
+    }
+
+
+def build_group_envelopes(
+    envelope_dict: dict[str, Any],
+    *,
+    bound_cap: int = _GROUP_ARRAY_CAP,
+) -> dict[str, GroupEnvelope]:
+    """Project one canonical MarketRunEnvelope dict into the four group envelopes.
+
+    Pure deterministic projection: each group envelope carries ONLY the
+    calculation/analysis sections GROUP_MAP assigns to it, the canonical
+    run_id, the shared coverage, the domain errors, and the compact evidence
+    headlines. Arrays are bounded at emission (explicit markers) so every
+    group envelope fits an LLM context BY CONSTRUCTION.
+    """
+    cs = envelope_dict.get("canonical_state") or {}
+    calc_all = (cs.get("calculations") or {}).get("calculations") or {}
+    anal_all = (cs.get("analysis") or {}).get("analysis") or {}
+    errors_all = envelope_dict.get("errors") or []
+    coverage = envelope_dict.get("coverage") or {}
+    run_id = str(envelope_dict.get("run_id") or "")
+    symbol = str(envelope_dict.get("symbol") or "").upper()
+    domain_status = coverage.get("domain_status") or {}
+
+    headlines = _evidence_headlines((cs.get("data-access") or {}).get("evidence") or {})
+    generated_at = str(envelope_dict.get("completed_at") or envelope_dict.get("generated_at") or "")
+
+    # Requested analysis window, if recorded (falls back to flow_window).
+    window_minutes = int((coverage.get("flow_window_seconds") or 900) // 60) or 15
+
+    out: dict[str, GroupEnvelope] = {}
+    for kind, spec in GROUP_MAP.items():
+        calculations = {
+            k: _bound_arrays(calc_all.get(k), bound_cap)
+            for k in spec["calculations"]
+        }
+        analysis = {}
+        for k in spec["analysis"]:
+            out_key = "open_interest" if k == "oi" else k
+            analysis[out_key] = _bound_arrays(anal_all.get(out_key), bound_cap)
+
+        # Projection carries the canonical error list verbatim — every
+        # group sees the full degradation picture of the run it came from.
+        group_errors = list(errors_all)
+        status = envelope_dict.get("status") or (
+            "degraded" if group_errors else "healthy"
+        )
+        out[kind] = GroupEnvelope(
+            kind=kind,
+            symbol=symbol,
+            status=str(status),
+            generated_at=generated_at,
+            run_id=run_id,
+            window_minutes=window_minutes,
+            coverage={
+                "domain_status": domain_status,
+                "evidence": coverage.get("evidence") or {},
+            },
+            calculations=calculations,
+            analysis=analysis,
+            evidence_headlines=headlines,
+            errors=tuple(group_errors),
+            source="canonical_projection",
+        )
+    return out
+
+
+def build_controller_view(
+    envelope_dict: dict[str, Any],
+    group_envelopes: dict[str, GroupEnvelope],
+) -> dict[str, Any]:
+    """Compact cross-group view for the controller agent.
+
+    Replaces feeding the controller the monolithic bounded envelope: the
+    controller sees one compact block per group (status + scalar headlines
+    extracted from the group's deterministic sections) plus shared coverage
+    and errors. Bounded by construction — no collapse path needed.
+    """
+    cs = envelope_dict.get("canonical_state") or {}
+    calc_all = (cs.get("calculations") or {}).get("calculations") or {}
+    anal_all = (cs.get("analysis") or {}).get("analysis") or {}
+
+    def _p(d: Any, *keys: str) -> Any:
+        for k in keys:
+            if not isinstance(d, dict):
+                return None
+            d = d.get(k)
+        return d
+
+    def _flow(kind: str) -> dict[str, Any]:
+        ge = group_envelopes.get(kind)
+        if ge is None:
+            return {}
+        return ge.to_dict()
+
+    flow_view = _flow("flow")
+    wall_view = _flow("wall")
+    structure_view = _flow("structure")
+    positioning_view = _flow("positioning")
+
+    flow_calc = (flow_view.get("calculations") or {}).get("flow") or {}
+    spot_flow = _p(flow_calc, "spot_flow") or {}
+    fut_flow = _p(flow_calc, "futures_flow") or {}
+    delta = _p(flow_view, "analysis", "delta") or {}
+    demand = _p(flow_view, "analysis", "demand", "decomposition") or {}
+    auction = _p(flow_view, "analysis", "auction") or {}
+    wm = _p(wall_view, "analysis", "wall_migration") or {}
+    pa = _p(wall_view, "analysis", "path_absorption") or {}
+    oi_out = _p(positioning_view, "analysis", "open_interest") or {}
+    regime = _p(structure_view, "analysis", "regime") or {}
+    stage = _p(structure_view, "analysis", "stage") or {}
+
+    orderbook_wall = (wall_view.get("calculations") or {}).get("orderbook") or {}
+    technical_wall = (wall_view.get("calculations") or {}).get("technical") or {}
+
+    return {
+        "schema_version": envelope_dict.get("schema_version"),
+        "run_id": envelope_dict.get("run_id"),
+        "symbol": envelope_dict.get("symbol"),
+        "status": envelope_dict.get("status"),
+        "generated_at": envelope_dict.get("generated_at"),
+        "completed_at": envelope_dict.get("completed_at"),
+        "coverage": {
+            "domain_status": (envelope_dict.get("coverage") or {}).get("domain_status"),
+            "evidence": (envelope_dict.get("coverage") or {}).get("evidence"),
+        },
+        "errors": list(envelope_dict.get("errors") or []),
+        "groups": {
+            "flow": {
+                "status": flow_view.get("status"),
+                "spot_flow": {k: spot_flow.get(k) for k in (
+                    "cvd", "buy_share", "obi", "vwap", "trade_count", "last_price")},
+                "futures_flow": {k: fut_flow.get(k) for k in (
+                    "cvd", "buy_share", "obi", "vwap", "trade_count", "last_price")},
+                "delta": {k: delta.get(k) for k in (
+                    "delta", "verdict", "wall_imbalance", "flow_alignment",
+                    "tbr_last_pct", "tbr_3avg_pct")},
+                "demand": {
+                    "spot": _p(demand, "spot"),
+                    "futures": _p(demand, "futures"),
+                    "verdict": _p(flow_view, "analysis", "demand", "verdict"),
+                },
+                "auction": {k: auction.get(k) for k in (
+                    "verdict", "reasons", "microprice")},
+            },
+            "wall": {
+                "status": wall_view.get("status"),
+                "fut_keystone": _p(orderbook_wall, "fut_keystone"),
+                "keystone_bid_stack": _p(orderbook_wall, "keystone_bid_stack"),
+                "keystone_trade_intensity": _p(orderbook_wall, "keystone_trade_intensity"),
+                "ask_wall_ladder": _p(orderbook_wall, "ask_wall_ladder"),
+                "seller_aggression": _p(technical_wall, "seller_aggression"),
+                "wall_migration": {
+                    "fuel_ratio": _p(wm, "fuel_ratio"),
+                    "wall_delta": _p(wm, "wall_delta"),
+                    "trap_assessment": _p(wm, "trap_assessment"),
+                    "densest_clusters": _p(wm, "densest_clusters"),
+                    "tiers": _p(wm, "tiers"),
+                    "round_anchors": _p(wm, "round_anchors"),
+                },
+                "path_absorption": {
+                    "fuel_ratio": _p(pa, "fuel_ratio"),
+                    "simulated_ascent": _p(pa, "simulated_ascent"),
+                    "simulated_descent": _p(pa, "simulated_descent"),
+                },
+            },
+            "structure": {
+                "status": structure_view.get("status"),
+                "regime": regime,
+                "stage": stage,
+            },
+            "positioning": {
+                "status": positioning_view.get("status"),
+                "open_interest": {
+                    "raw_open_interest": _p(oi_out, "raw_open_interest"),
+                    "weighted_contracts": _p(oi_out, "weighted_contracts"),
+                    "inflow_outflow": _p(oi_out, "inflow_outflow"),
+                    "implied_value": _p(oi_out, "implied_value"),
+                    "walls": _p(oi_out, "walls"),
+                },
+            },
+        },
+        "evidence_headlines": _evidence_headlines(
+            (cs.get("data-access") or {}).get("evidence") or {}),
+    }
+
+
+async def run_group_cycle(
+    settings: Settings,
+    symbol: str,
+    window_minutes: int,
+    groups: tuple[str, ...],
+    *,
+    deriv_ttl_s: int = DERIV_TTL_S_DEFAULT,
+    include_cross_asset: bool = False,
+    include_derivatives: bool = True,
+    force_refresh_derivatives: bool = False,
+    depth: int | None = None,
+) -> dict[str, GroupEnvelope]:
+    """Read raw evidence DIRECTLY from the Redis store and emit typed GroupEnvelopes.
+
+    This is the harness group-command plane: no MarketRunEnvelope, no
+    persistence. Each requested group gets its own GroupEnvelope containing
+    only its GROUP_MAP sections. Redis is the single data source (the 5s
+    poller feeds it); the on-demand derivative fetch is the only Binance
+    touch and is cache-first. Wall history is read from Postgres (Redis
+    fallback) only when the wall group needs it.
+    """
+    unknown = [g for g in groups if g not in GROUP_MAP]
+    if unknown:
+        raise ValueError(f"unknown calculation group(s): {unknown!r}")
+
+    depth = depth or settings.depth_levels
+    window_s = window_minutes * 60
+    store = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    try:
+        evidence = await read_raw_window(store, symbol, window_minutes)
+
+        # Warm the derivative cache for groups that need it: oi (oi_history,
+        # L/S), demand (taker + cross_asset), regime (L/S), stage (klines).
+        requested_analysis: set[str] = set()
+        for g in groups:
+            requested_analysis.update(GROUP_MAP[g]["analysis"])
+        needs_deriv = bool({"oi", "demand", "regime", "stage"} & requested_analysis)
+        deriv: dict[str, Any] | None = None
+        if needs_deriv and include_derivatives:
+            cached = await store.read_derivative_evidence(symbol)
+            if cached and _is_deriv_fresh(cached, int(time.time() * 1000), DERIV_FRESH_MS_DEFAULT):
+                deriv = cached
+            else:
+                async with Binance() as client:
+                    deriv = await fetch_derivative_evidence(
+                        client, symbol, include_cross_asset=include_cross_asset,
+                    )
+                try:
+                    await store.publish_derivative_evidence(symbol, deriv, ttl_s=deriv_ttl_s)
+                except Exception:
+                    log.exception("run_group_cycle %s: failed to publish derivative cache", symbol)
+        evidence = _merge_derivatives(evidence, deriv)
+    finally:
+        await store.close()
+
+    calc_sections, anal_sections = sections_for_groups(groups)
+    anal_sections, calc_sections = resolve_analysis_sections(anal_sections, calc_sections)
+    calc_sections = resolve_calc_sections(calc_sections)
+
+    calc_result = run_calculations(evidence, depth, window_s, sections=calc_sections)
+
+    # Wall history only when the wall group is requested.
+    prior_walls: dict[float, float] = {}
+    prior_cycle_ts: str | None = None
+    if "wall_migration" in (anal_sections or set()):
+        pg: PostgresRuntimeStore | None = (
+            PostgresRuntimeStore(settings.database_url) if settings.database_url else None
+        )
+        history: list[dict[str, Any]] = []
+        try:
+            if pg is not None:
+                try:
+                    history = await pg.read_wall_history(symbol)
+                except Exception:
+                    log.warning(
+                        "run_group_cycle %s: postgres wall-history read failed; falling back to redis",
+                        symbol)
+                    history = []
+            if not history:
+                history = await RedisRuntimeStore(
+                    settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+                ).read_wall_history(symbol)
+        except Exception:
+            log.exception("run_group_cycle %s: failed to read wall history", symbol)
+        finally:
+            if pg is not None:
+                await pg.close()
+        prior_walls, prior_cycle_ts = _accumulate_prior_walls(history)
+
+    analysis_result = run_analysis(
+        evidence, calc_result,
+        prior_walls=prior_walls or None,
+        prior_cycle_ts=prior_cycle_ts,
+        depth=depth,
+        sections=anal_sections,
+    )
+
+    all_errors = list(calc_result.get("errors") or []) + list(analysis_result.get("errors") or [])
+    status = "degraded" if all_errors else "healthy"
+    run_id = str(uuid.uuid4())
+    generated_at = _utc_iso()
+    calc_by_section = calc_result.get("calculations") or {}
+    anal_by_section = analysis_result.get("analysis") or {}
+
+    out: dict[str, GroupEnvelope] = {}
+    for kind in groups:
+        spec = GROUP_MAP[kind]
+        calc_payload = {
+            k: _bound_arrays(calc_by_section.get(k))
+            for k in spec["calculations"]
+        }
+        anal_payload = {}
+        for k in spec["analysis"]:
+            out_key = "open_interest" if k == "oi" else k
+            anal_payload[out_key] = _bound_arrays(anal_by_section.get(out_key))
+
+        group_errors = [
+            e for e in all_errors
+            if not isinstance(e, dict)
+            or (e.get("function") or "").split(".")[0] in _kind_function_prefixes(kind)
+        ]
+        out[kind] = GroupEnvelope(
+            kind=kind,
+            symbol=symbol.upper(),
+            status="degraded" if group_errors else status,
+            generated_at=generated_at,
+            run_id=run_id,
+            window_minutes=window_minutes,
+            coverage={
+                "requested_window_seconds": window_s,
+                "analysis_sections": sorted(anal_payload.keys()),
+                "calculation_sections": sorted(calc_payload.keys()),
+            },
+            calculations=calc_payload,
+            analysis=anal_payload,
+            evidence_headlines=_evidence_headlines(evidence),
+            errors=tuple(group_errors),
+            source="group_cycle",
+        )
+    return out
+
+
+def _kind_function_prefixes(kind: str) -> tuple[str, ...]:
+    """strict_call function-name prefixes that belong to a group's adapters."""
+    prefixes: dict[str, tuple[str, ...]] = {
+        "wall": ("orderbook", "find_keystone", "top_density", "absorption",
+                 "significant", "microprice_skew", "keystone", "ask_wall",
+                 "hourly", "wall_delta", "fuel_ratio", "densest", "wall_trap",
+                 "bid_tier", "mega_at", "level_absorption", "wall_break",
+                 "zone", "oi.find_walls", "oi_weighted", "oi_inflow",
+                 "oi_implied", "path_absorption", "simulated"),
+        "flow": ("summarize", "bucketed_cvd", "cvd_series_corr", "ema_series",
+                 "tiered_large", "seller_aggression", "spot_turnover",
+                 "decompose_demand", "demand_verdict", "macro_climate",
+                 "auction_verdict", "microprice", "initiated_flow",
+                 "flow_persistence", "delta_variable", "deterministic_signals"),
+        "structure": ("build_volume_profile", "volume_profile_summary",
+                      "ema_series", "tiered_large", "seller_aggression",
+                      "regime_verdict", "stage"),
+        "positioning": ("oi.find_walls", "oi_weighted", "oi_inflow", "oi_implied"),
+    }
+    return prefixes.get(kind, ())
+
+
+
 
 async def run_cycle(
     settings: Settings,
@@ -1964,6 +2389,10 @@ __all__ = [
     "assemble_envelope",
     "persist_envelope",
     "run_cycle",
+    "run_group_cycle",
+    "build_group_envelopes",
+    "build_controller_view",
+    "SPECIALIST_GROUP_KINDS",
     "fetch_derivative_evidence",
     "_merge_derivatives",
     "_is_deriv_fresh",

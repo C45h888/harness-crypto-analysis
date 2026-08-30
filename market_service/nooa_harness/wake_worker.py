@@ -270,6 +270,7 @@ class WakeSupervisor:
         status_stream_maxlen: int = STATUS_STREAM_MAXLEN,
         dispatcher: Callable[[WakeEnvelope], Awaitable[dict[str, Any]]] | None = None,
         wake_config: WakeConfig | None = None,
+        on_stop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         self.symbol = symbol.upper()
@@ -280,6 +281,7 @@ class WakeSupervisor:
         self.status_stream_maxlen = status_stream_maxlen
         self.dispatcher = dispatcher
         self.config = wake_config or WakeConfig()
+        self._on_stop = on_stop
 
         self._stream = self.store.microstructure_event_stream(self.venue, self.symbol)
         self._group = f"inference-wake:{self.venue}:{self.symbol}"
@@ -727,11 +729,14 @@ class WakeSupervisor:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        if self._status_stream_key is not None:
+        # The worker NEVER owns the status-transition stream or the event
+        # stream — capture writes them and they are the durable event surface
+        # for recovery wakes. Nothing is deleted here.
+        if self._on_stop is not None:
             try:
-                await self.store.redis.delete(self._status_stream_key)
+                await self._on_stop()
             except Exception:
-                pass
+                log.exception("wake on_stop callback failed")
 
     @property
     def liveness(self) -> bool:
@@ -810,8 +815,10 @@ async def _build_supervisor(
     # ``run_cycle`` — the Slice-2 closed loop. The engine path is lazy
     # (nooa is imported only when actually dispatching), so the worker
     # module stays nooa-free at import.
+    engine_close: Callable[[], Awaitable[None]] | None = None
     if dispatcher is None and os.getenv("WAKE_ENGINE_DISPATCH") == "1":
-        dispatcher = _engine_dispatcher_factory(store, settings)
+        dispatch, engine_close = _engine_dispatcher_factory(store, settings)
+        dispatcher = dispatch
     if dispatcher is None:
         from market_service.nooa_harness.inference import default_wake_dispatcher
 
@@ -826,20 +833,19 @@ async def _build_supervisor(
         supervisor_ms=config.supervisor_ms,
         status_stream_maxlen=config.status_stream_maxlen,
         dispatcher=dispatcher,
+        on_stop=engine_close,
     )
 
 
 def _engine_dispatcher_factory(store: RedisRuntimeStore, settings: Any):
-    """Lazy engine-cycle dispatcher (Slice 2 seam).
+    """Lazy engine-cycle dispatcher (Slice-2 closed loop).
 
     Imports the engine only on first fire (keeps the worker module and its
     tests nooa-free). The engine's ``run_cycle`` expects a ``WakeEnvelope``
     plus wake_meta — exactly the in-memory assertion the worker produces.
+    Returns ``(dispatch, close)``; ``close`` shuts the lazily-built engine's
+    own stores down when the worker stops.
     """
-    from market_service.nooa_harness.engine import InferenceEngine
-    from market_service.nooa_harness.inference import (
-        CounterSnapshot as _CS,
-    )
     from market_service.nooa_harness.inference_runner import _build_engine
 
     engine_holder = {}
@@ -851,7 +857,7 @@ def _engine_dispatcher_factory(store: RedisRuntimeStore, settings: Any):
             )
         engine = engine_holder["engine"]
         artifact, cycle_meta = await engine.run_cycle(
-            envelope, {"decision": "fire",
+            envelope, {"decision": "fire", "source": "event_driven",
                        "consumed_wake_ids": [envelope.wake_id]},
         )
         return {
@@ -860,7 +866,15 @@ def _engine_dispatcher_factory(store: RedisRuntimeStore, settings: Any):
             "cycle": cycle_meta,
         }
 
-    return _dispatch
+    async def _close() -> None:
+        engine = engine_holder.pop("engine", None)
+        if engine is not None:
+            try:
+                await engine.close()
+            except Exception:
+                log.exception("engine dispatcher close failed")
+
+    return _dispatch, _close
 
 
 async def run_until_stopped(config: WakeSupervisorConfig) -> int:

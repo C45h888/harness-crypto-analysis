@@ -502,23 +502,24 @@ def micro_interpret(symbol: str, venue: str, evidence_id: str | None) -> None:
 # This is the OUTER-trigger plane: a human (or terminal agent) fires the
 # engine explicitly. Bounded by the same capability registry as every other
 # dispatch (BTCUSDT/spot frozen). Autonomous operation runs through the
-# condition-gated watcher (`inference watch`), never a lazy compute loop.
+# event-driven wake worker (`market_service.nooa_harness.wake_worker` or
+# `nooa market inference wake/watch`), never a lazy compute loop.
 # --------------------------------------------------------------------------
 
 
 @command.group("inference",
-               help="Statistical inference engine: trigger, read artifacts, watch.")
+               help="Statistical inference engine: trigger, read artifacts, wake/watch.")
 def inference_group() -> None:
-    """Wake, read, and watch the statistical inference engine."""
+    """Wake, read, watch, and fire the statistical inference engine."""
 
 
 @inference_group.command("run")
 @click.argument("symbol", default="BTCUSDT")
 @click.option("--venue", default="spot")
 @click.option("--force", is_flag=True,
-              help="bypass wake predicates — the manual trigger IS the wake")
+              help="synthesize a manual wake (the human trigger IS the wake)")
 def inference_run(symbol: str, venue: str, force: bool) -> None:
-    """Run ONE inference cycle now (drains pending wakes unless --force)."""
+    """Run ONE inference cycle now (event-driven envelope or manual force)."""
     from market_service.nooa_harness.inference_runner import run_inference_once
 
     async def _run() -> dict[str, Any]:
@@ -590,21 +591,23 @@ def inference_history(symbol: str, venue: str, limit: int) -> None:
 @click.argument("symbol", default="BTCUSDT")
 @click.option("--venue", default="spot")
 @click.option("--interval", "interval_s", type=float, default=30.0,
-              help="seconds between wake-drain ticks (cheap; fires only on wakes)")
+              help="kept for CLI compatibility; the loop is now event-driven (fire-by-data)")
 @click.option("--cycles", type=int, default=0,
-              help="number of drain ticks (0 = forever)")
+              help="number of wake cycles (0 = forever; -1 = one bounded pass)")
 def inference_watch(symbol: str, venue: str, interval_s: float, cycles: int) -> None:
-    """Condition-gated watcher: drain wakes each tick, run at most one cycle per fire.
+    """Event-driven engine loop: wake worker with the engine as dispatcher.
 
-    A tick without a firing wake costs two XLENs and one GET — never a
-    lazy compute loop.
+    Drives the WakeSupervisor (blocking reads + deterministic trigger
+    matrix) and runs the engine cycle on every firing wake — includes the
+    hard gate, narration (0 tokens on insufficient), Postgres-first
+    persistence, memory proposals. Never a lazy compute loop.
     """
     from market_service.nooa_harness.inference_runner import run_inference_loop
 
     async def _run() -> None:
         await run_inference_loop(
             symbol, venue=venue, interval_s=interval_s,
-            forever=(cycles == 0),
+            forever=(cycles != -1),
         )
 
     asyncio.run(_run())

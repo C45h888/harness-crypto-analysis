@@ -176,8 +176,16 @@ gap/reconnecting -> running transition). Every fire passes: status-
 established, artifact cooldown (60s default), timestamp-water (fresh data
 only), then the atomic dedupe (identical conditions collapse). Fires log
 and, by default, record an informational journal entry on the inference
-stream; ``WAKE_ENGINE_DISPATCH=1`` routes the envelope straight to
-``engine.run_cycle`` (the Slice-2 closed loop, no LLM at worker import).
+stream; the engine loop (``inference_runner.run_inference_loop``, or
+``WAKE_ENGINE_DISPATCH=1`` in the worker) routes the envelope straight to
+``engine.run_cycle`` — the closed loop. ``engine.acquire_manual_wake`` is
+the only manual wake factory (outer-CLI force trigger); the retired
+stream-drain path (``engine.acquire_wake`` -> ``read_pending_wakes`` /
+``coalesce_wakes`` / ``revalidate_wake``) is gone from the engine: the
+in-memory envelope IS the wake, never a transported artifact. Engine-side``run_cycle`` keeps the identical discipline: gather (capabilities) -> hard
+gate (NULL interpretation on insufficient, zero tokens) -> narrate (ONE
+tool round) -> Postgres-first persist -> memory proposals (LLM proposes,
+engine disposes).
 
 ### Calculation-model groups (Pass 3 pivot)
 

@@ -73,9 +73,56 @@ This document is the implementation contract for:
                           marketflow:stream:domain:{domain}:<SYM>
 ```
 
-`harness.py --nooa` routes to the NOOA inner CLI for analyst / briefing /
-memory operations. NOOA reads the canonical ledger that `harness.py
---analyze` populates; it does not run calculations itself.
+`harness.py --nooa` routes to the NOOA inner CLI for envelope / briefing /
+memory / microstructure / inference operations.
+
+## Statistical inference engine (primary interpretation plane)
+
+The specialist/controller analyst plane was REPLACED by the statistical
+inference engine (`nooa_harness.engine.InferenceEngine`). The engine:
+
+- wakes on deterministic conditions (typed `WakeEnvelope` on
+  `marketflow:stream:inference:wake:{venue}:{SYMBOL}`; predicates:
+  `event_delta`, `capture_recovery`, `cold_start`; two-phase revalidated
+  against live counters before any work),
+- commands the deterministic calculation modules as TOOLS through the
+  capability registry (11 tools: `micro.*` paper stack + `market.*` group /
+  ledger reads) — it never recomputes a value in its own reasoning,
+- hard-gates BEFORE any LLM call (`resolve_inference_status`): insufficient
+  → NULL interpretation, zero tokens,
+- narrates with a TWO-call budget (narrate#1 + optional tool round +
+  narrate#2), strictly JSON, PG-first persistence,
+- remembers via `MemoryNode` (propose/dispose: the LLM proposes ≤3
+  observations/hypotheses per cycle; the engine disposes; `fact` kind is
+  LLM-forbidden).
+
+Triggers (the engine is event-driven, never lazily polled):
+
+```bash
+python -m market_service.commands.harness BTCUSDT --inference            # manual cycle (no pending-wake drain)
+python -m market_service.commands.harness BTCUSDT --inference --inference-force  # manual override
+python -m market_service.commands.nooa_cli market inference run BTCUSDT  # inner-CLI trigger
+python -m market_service.commands.nooa_cli market inference read BTCUSDT  # read artifacts
+python -m market_service.commands.nooa_cli market inference history BTCUSDT
+python -m market_service.commands.nooa_cli market inference wake BTCUSDT  # event-driven wake worker (journal)
+python -m market_service.commands.nooa_cli market inference watch BTCUSDT  # event-driven engine loop
+```
+
+Durable surfaces:
+
+```text
+marketflow:stream:inference:wake:spot:<SYMBOL>   (wake envelopes)
+marketflow:latest:inference:spot:<SYMBOL>        (latest artifact projection)
+marketflow:stream:inference:spot:<SYMBOL>        (artifact history stream)
+postgres inference_artifact                      (durable ledger, PG-first)
+```
+
+Artifacts carry `status: validated|provisional|insufficient` (hard gate),
+`deterministic_state` (Python-computed, never LLM), `capability_log` (every
+dispatch), and `interpretation` (NULL when the gate refuses — a durable
+record of the refusal, never "nothing to say").
+
+## Optional microstructure capture (Pass 1-2)
 
 The poller never carries historical or cross-asset data. The run-cycle
 never re-fetches point-in-time book/ticker/funding/trades — those come from

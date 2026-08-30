@@ -14,7 +14,6 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 from market_service.nooa_harness.memory import MemoryNode, _keywords
-from market_service.nooa_harness.runner import _remember_cycle_outputs
 from market_service.runtime.contracts import (
     AGENT_MEMORY_SCHEMA_VERSION,
     AgentMemory,
@@ -226,57 +225,6 @@ class RedisMemoryDedupeTests(unittest.IsolatedAsyncioTestCase):
         self.redis.publish_agent_artifact.assert_awaited_once_with(
             SESSION_ID, "memory", tombstoned.to_json(), run_id=RUN_ID,
         )
-
-
-class CycleOutputMemoryHelperTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.redis, self.postgres = _fake_stores()
-        self.postgres.insert_agent_memory = AsyncMock(return_value=True)
-        self.node = MemoryNode(self.redis, self.postgres)
-
-    def _briefing(self) -> AnalystBriefing:
-        return AnalystBriefing.from_mapping({
-            "schema_version": 1,
-            "session_id": SESSION_ID,
-            "run_id": RUN_ID,
-            "model_provider": "openai",
-            "model_name": "test",
-            "generated_at": "2026-01-01T00:00:00+00:00",
-            "narrative": "net buying bias with weak follow-through",
-            "consensus": {"direction": "bullish", "confidence": "medium"},
-            "disagreements": [
-                {"topic": "OI expansion", "specialist_a": "macro", "specialist_b": "open_interest", "resolution": "unconfirmed"},
-            ],
-            "key_evidence": [
-                {"path": "canonical_state.analysis.analysis.demand.decomposition", "claim": "x"},
-            ],
-            "limitations": ["liq feed absent"],
-            "uncertainty_sources": [],
-            "parse_errors": [],
-            "envelope_summary": {},
-            "prompt_version": "nooa-harness-v1",
-            "completed_at": "2026-01-01T00:00:01+00:00",
-            "status": "healthy",
-            "specialist_reports": {},
-        })
-
-    async def test_remember_briefing_observation_hypothesis(self):
-        briefing = self._briefing()
-        result = await _remember_cycle_outputs(self.node, SESSION_ID, None, briefing)
-        self.assertEqual(result["count"], 3)  # briefing + observation + 1 hypothesis
-        self.assertEqual(result["error_count"], 0)
-        kinds = [r["kind"] for r in result["remembered"]]
-        self.assertEqual(kinds, ["briefing", "observation", "hypothesis"])
-        # evidence refs must flow into every stored memory
-        for call in self.postgres.insert_agent_memory.await_args_list:
-            memory = call.args[0]
-            self.assertIn("decomposition", memory.evidence_refs[0])
-
-    async def test_errors_are_non_fatal(self):
-        self.postgres.insert_agent_memory = AsyncMock(side_effect=RuntimeError("ledger down"))
-        result = await _remember_cycle_outputs(self.node, SESSION_ID, None, self._briefing())
-        self.assertEqual(result["count"], 0)
-        self.assertEqual(result["error_count"], 3)
 
 
 class MemoryNodeRenderTests(unittest.TestCase):

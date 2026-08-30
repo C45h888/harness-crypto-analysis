@@ -263,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--microstructure-status", action="store_true",
                    help="read the isolated Binance spot microstructure capture status from Redis; "
                         "does not start capture, run calculations, or invoke NOOA")
+    p.add_argument("--inference", action="store_true",
+                   help="trigger ONE statistical inference cycle (manual trigger; "
+                        "combine with --inference-force — the manual wake IS the trigger)")
+    p.add_argument("--inference-force", action="store_true",
+                   help="with --inference: bypass wake predicates — the manual trigger IS the wake")
     p.add_argument("--history-limit", type=int, default=100,
                    help="max keystone history entries to read for "
                         "--keystone-history (default 100)")
@@ -376,6 +381,20 @@ def main(argv: list[str] | None = None) -> int:
         result = asyncio.run(_read_microstructure_status(args))
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("status") is not None else 1
+
+    # --- Route 3.7: statistical inference cycle (outer-CLI trigger).
+    # Delegates to the engine runner via the same seam as the inner CLI's
+    # `nooa market inference run` — one wake-aware cycle, or a forced cycle
+    # with --inference-force. Never a lazy loop; use --nooa market
+    # inference watch for the event-driven engine loop.
+    if args.inference:
+        from market_service.nooa_harness.inference_runner import run_inference_once
+
+        result = asyncio.run(run_inference_once(
+            args.symbol, force=args.inference_force,
+        ))
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("status") != "no_wake" else 1
 
     # --- Route 4: legacy dev-only live waveform (explicit --live).
     if args.live:
@@ -523,141 +542,73 @@ async def _run_analyze(args: argparse.Namespace) -> dict[str, Any]:
 
 
 async def _run_groups(args: argparse.Namespace, groups: tuple[str, ...]) -> dict[str, Any]:
-    """Calculation-model group commands (Pass 3): focused, segregated analysis.
+    """Calculation-model group commands (Pass 3): typed GroupEnvelope emission.
 
-    Runs ONLY the calculation + analysis sections each requested domain group
-    needs. No envelope assembly, no persistence. Redis-only (no DATABASE_URL)
-    except ``wall`` which reads the wall-history ledger (Postgres fallback).
-
-    The model gets exactly the data its question needs — not the 5.7MB
-    combined envelope. This is the new primary interface for targeted
-    analysis; ``--analyze`` remains for the canonical persisted record.
+    Reads raw evidence DIRECTLY from the Redis store via
+    ``pipeline.run_group_cycle`` — no MarketRunEnvelope, no persistence.
+    Each requested group is returned as a versioned ``GroupEnvelope``
+    (schema_version=1) containing only its GROUP_MAP sections, bounded by
+    construction so it always fits an LLM context. This is the primary
+    read interface for targeted analysis; ``--analyze`` remains for the
+    canonical persisted audit record.
     """
     from market_service.nooa_harness.pipeline import (
-        GROUP_MAP, WINDOW_MINUTES_MAP, read_raw_window, resolve_analysis_sections,
-        resolve_calc_sections, run_analysis, run_calculations, sections_for_groups,
-        _merge_derivatives, fetch_derivative_evidence,
+        WINDOW_MINUTES_MAP, run_group_cycle,
     )
-    from market_service.clients.binance import Binance
 
     settings = Settings.from_redis_env()
     symbol = args.symbol.upper()
     window_minutes = WINDOW_MINUTES_MAP.get(args.window, 15)
-    window_s = window_minutes * 60
-    depth = args.depth or settings.depth_levels
 
+    started = time.monotonic()
     try:
-        calc_sections, anal_sections = sections_for_groups(groups)
+        envelopes = await run_group_cycle(
+            settings, symbol, window_minutes, groups,
+            deriv_ttl_s=args.deriv_ttl,
+            include_cross_asset=args.with_cross_asset,
+            include_derivatives=not args.no_derivatives,
+            force_refresh_derivatives=args.force_refresh_derivatives,
+            depth=args.depth or settings.depth_levels,
+        )
     except ValueError as e:
         return {"status": "invalid", "symbol": symbol, "groups": list(groups), "error": str(e)}
 
-    # Auto-include calculation prerequisites for the requested analysis adapters.
-    anal_sections, calc_sections = resolve_analysis_sections(anal_sections, calc_sections)
-    calc_sections = resolve_calc_sections(calc_sections)
-
-    started = time.monotonic()
-    store = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        evidence = await read_raw_window(store, symbol, window_minutes)
-
-        # Warm the derivative cache for groups that need it: oi (oi_history,
-        # L/S), demand (taker + cross_asset), regime (L/S), stage (klines).
-        # Cache-first; fetch on miss.
-        needs_deriv = bool({"oi", "demand", "regime", "stage"} & set(anal_sections or set()))
-        deriv = None
-        if needs_deriv and not args.no_derivatives:
-            cached = await store.read_derivative_evidence(symbol)
-            from market_service.nooa_harness.pipeline import DERIV_FRESH_MS_DEFAULT, _is_deriv_fresh
-            if cached and _is_deriv_fresh(cached, int(time.time() * 1000), DERIV_FRESH_MS_DEFAULT):
-                deriv = cached
-            else:
-                async with Binance() as client:
-                    deriv = await fetch_derivative_evidence(client, symbol, include_cross_asset=args.with_cross_asset)
-                try:
-                    await store.publish_derivative_evidence(symbol, deriv, ttl_s=args.deriv_ttl)
-                except Exception:
-                    log.exception("_run_groups %s: failed to publish derivative cache", symbol)
-        evidence = _merge_derivatives(evidence, deriv)
-    finally:
-        await store.close()
-
-    calc_result = run_calculations(evidence, depth, window_s, sections=calc_sections)
-
-    # Wall history for wall_migration (Postgres-first, Redis fallback) — only
-    # when the wall group is actually requested.
-    prior_walls: dict[float, float] = {}
-    prior_cycle_ts = None
-    if "wall_migration" in (anal_sections or set()):
-        prior_walls, prior_cycle_ts = await _load_prior_walls(settings, symbol)
-
-    analysis_result = run_analysis(
-        evidence, calc_result,
-        prior_walls=prior_walls or None,
-        prior_cycle_ts=prior_cycle_ts,
-        depth=depth,
-        sections=anal_sections,
-    )
-
     elapsed_ms = round((time.monotonic() - started) * 1000, 1)
-    all_errors = list(calc_result.get("errors") or []) + list(analysis_result.get("errors") or [])
-    status = "degraded" if all_errors else "healthy"
 
-    # Assemble focused per-group output: only the sections each group owns.
-    out_groups: dict[str, Any] = {}
-    for g in groups:
-        spec = GROUP_MAP[g]
-        anal_out = analysis_result.get("analysis") or {}
-        out_groups[g] = {
-            "calculations": {
-                k: (calc_result.get("calculations") or {}).get(k)
-                for k in spec["calculations"]
-            },
-            "analysis": {
-                ("open_interest" if k == "oi" else k):
-                    anal_out.get("open_interest" if k == "oi" else k)
-                for k in spec["analysis"]
-            },
-        }
+    envelope_dicts = {kind: ge.to_dict() for kind, ge in envelopes.items()}
+    run_ids = sorted({d["run_id"] for d in envelope_dicts.values()})
+    statuses = [d["status"] for d in envelope_dicts.values()]
 
     out: dict[str, Any] = {
-        "status": status,
+        "status": "degraded" if "degraded" in statuses else (
+            statuses[0] if statuses else "invalid"
+        ),
         "symbol": symbol,
         "groups": list(groups),
         "window_minutes": window_minutes,
-        "results": out_groups,
+        "run_id": run_ids[0] if len(run_ids) == 1 else run_ids,
+        "group_envelopes": envelope_dicts,
+        # Back-compat view of the per-group sections (superseded by
+        # group_envelopes; kept so existing readers don't break).
+        "results": {
+            kind: {
+                "calculations": d["calculations"],
+                "analysis": d["analysis"],
+            }
+            for kind, d in envelope_dicts.items()
+        },
         "elapsed_ms": elapsed_ms,
-        "errors": all_errors,
+        "errors": [
+            dict(e, group=kind)
+            for kind, d in envelope_dicts.items()
+            for e in d["errors"]
+        ],
     }
     # Keystone-history verdict rides along with the wall group.
     if "wall" in groups:
-        out["keystone_history"] = await _keystone_history_payload(settings, symbol, args.history_limit)
+        out["keystone_history"] = await _keystone_history_payload(
+            settings, symbol, args.history_limit)
     return out
-
-
-async def _load_prior_walls(settings: Settings, symbol: str) -> tuple[dict[float, float], str | None]:
-    """Load the wall-history ledger for wall_migration (Postgres-first, Redis fallback)."""
-    from market_service.nooa_harness.pipeline import _accumulate_prior_walls
-    from market_service.runtime.postgres_store import PostgresRuntimeStore
-    history: list[dict[str, Any]] = []
-    if settings.database_url:
-        pg = PostgresRuntimeStore(settings.database_url)
-        try:
-            await pg.connect()
-            history = await pg.read_wall_history(symbol)
-        except Exception:
-            log.warning("_load_prior_walls %s: postgres read failed; falling back to redis", symbol)
-            history = []
-        finally:
-            await pg.close()
-    if not history:
-        store = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
-        try:
-            history = await store.read_wall_history(symbol)
-        finally:
-            await store.close()
-    return _accumulate_prior_walls(history)
 
 
 async def _keystone_history_payload(settings: Settings, symbol: str, limit: int) -> dict[str, Any]:

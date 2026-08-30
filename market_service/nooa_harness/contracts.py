@@ -12,7 +12,14 @@ silently swallowing the failure.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class ContractViolation(Exception):
@@ -106,3 +113,118 @@ def contract_error_entry(violation: ContractViolation) -> dict[str, Any]:
         "error": violation.reason,
         "details": violation.details,
     }
+
+
+# ---------------------------------------------------------------------------
+# Specialized group envelopes — the interpretation-plane read interface.
+#
+# One typed envelope per calculation-model group (wall / flow / structure /
+# positioning). The harness reads the raw evidence window DIRECTLY from the
+# Redis store, runs only that group's calculation + analysis sections, and
+# emits a GroupEnvelope sized to fit an LLM context BY CONSTRUCTION (arrays
+# are capped at emission with explicit markers — never the silent collapse
+# the monolithic envelope suffered under bounded_envelope_view).
+#
+# The canonical MarketRunEnvelope stays the persisted audit record in
+# Postgres; GroupEnvelopes are the read/interpretation interface. When
+# derived from a canonical envelope (canonical_projection source) they carry
+# its run_id so every specialist claim stays audit-linked to one run.
+# ---------------------------------------------------------------------------
+
+GROUP_ENVELOPE_SCHEMA_VERSION = 1
+GROUP_KINDS: tuple[str, ...] = ("wall", "flow", "structure", "positioning")
+
+
+class GroupEnvelopeError(ValueError):
+    """Raised on an invalid group kind or schema version."""
+
+
+@dataclass(frozen=True)
+class GroupEnvelope:
+    """One specialized read envelope for a single calculation-model group.
+
+    ``kind`` selects the group (GROUP_MAP in nooa_harness.pipeline).
+    ``calculations`` / ``analysis`` carry ONLY that group's sections.
+    ``evidence_headlines`` is the compact shared evidence context (snake_case
+    scalars read from the evidence — price, funding, OI — never raw arrays).
+    ``source`` is ``group_cycle`` (built directly from the Redis raw stream)
+    or ``canonical_projection`` (derived from a persisted MarketRunEnvelope,
+    in which case ``run_id`` is the canonical run's id).
+    """
+
+    kind: str
+    symbol: str
+    status: str
+    generated_at: str
+    run_id: str
+    window_minutes: int
+    coverage: dict[str, Any]
+    calculations: dict[str, Any]
+    analysis: dict[str, Any]
+    evidence_headlines: dict[str, Any] = field(default_factory=dict)
+    errors: tuple[dict[str, Any], ...] = ()
+    source: str = "canonical_projection"
+    schema_version: int = GROUP_ENVELOPE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        # Fail fast: an invalid GroupEnvelope must never exist, even briefly.
+        self.validate()
+
+    def validate(self) -> None:
+        if self.schema_version != GROUP_ENVELOPE_SCHEMA_VERSION:
+            raise GroupEnvelopeError(
+                f"unsupported group envelope schema version: {self.schema_version}"
+            )
+        if self.kind not in GROUP_KINDS:
+            raise GroupEnvelopeError(
+                f"invalid group kind {self.kind!r}; expected one of {GROUP_KINDS!r}"
+            )
+        if not self.run_id:
+            raise GroupEnvelopeError("GroupEnvelope requires run_id")
+        if not self.symbol:
+            raise GroupEnvelopeError("GroupEnvelope requires symbol")
+        if self.status not in ("healthy", "degraded", "invalid"):
+            raise GroupEnvelopeError(f"invalid group envelope status: {self.status!r}")
+        if self.source not in ("group_cycle", "canonical_projection"):
+            raise GroupEnvelopeError(f"invalid group envelope source: {self.source!r}")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "symbol": self.symbol,
+            "status": self.status,
+            "generated_at": self.generated_at,
+            "run_id": self.run_id,
+            "window_minutes": self.window_minutes,
+            "coverage": self.coverage,
+            "calculations": self.calculations,
+            "analysis": self.analysis,
+            "evidence_headlines": self.evidence_headlines,
+            "errors": list(self.errors),
+            "source": self.source,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str, separators=(",", ":"))
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "GroupEnvelope":
+        envelope = cls(
+            kind=str(value.get("kind", "")),
+            symbol=str(value.get("symbol", "")).upper(),
+            status=str(value.get("status", "degraded")),
+            generated_at=str(value.get("generated_at") or _utc_iso()),
+            run_id=str(value.get("run_id") or ""),
+            window_minutes=int(value.get("window_minutes") or 15),
+            coverage=dict(value.get("coverage") or {}),
+            calculations=dict(value.get("calculations") or {}),
+            analysis=dict(value.get("analysis") or {}),
+            evidence_headlines=dict(value.get("evidence_headlines") or {}),
+            errors=tuple(value.get("errors") or ()),
+            source=str(value.get("source") or "canonical_projection"),
+            schema_version=int(value.get("schema_version") or GROUP_ENVELOPE_SCHEMA_VERSION),
+        )
+        envelope.validate()
+        return envelope

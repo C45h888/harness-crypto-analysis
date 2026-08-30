@@ -61,6 +61,7 @@ class _FakeRedis:
         self.artifact = artifact
         self.event_len = event_len
         self.status_stream_state = status_stream_state
+        self.deleted_keys: list = []
         self.supervisor_value: bytes | None = None
         self.script_sha: str | None = None
         self.evalsha_result: str = "1"  # default: allow
@@ -101,6 +102,7 @@ class _FakeRedis:
         self.supervisor_value = value.encode("utf-8") if isinstance(value, str) else value
 
     async def delete(self, key):
+        self.deleted_keys.append(key)
         self.supervisor_value = None
 
     async def script_load(self, source):
@@ -476,6 +478,21 @@ class SupervisorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await sup.start()
         await sup.stop()
         self.assertFalse(sup._running)
+        # The worker must NOT delete the capture-owned status stream.
+        self.assertEqual(store.redis.deleted_keys, [])
+
+    async def test_stop_invokes_on_stop_callback(self):
+        store = _FakeStore(status=_make_status(events=100))
+        closed: list[str] = []
+
+        async def _close():
+            closed.append("closed")
+
+        sup = _mk_supervisor(store)
+        sup._on_stop = _close
+        await sup.start()
+        await sup.stop()
+        self.assertEqual(closed, ["closed"])
 
 
 if __name__ == "__main__":
