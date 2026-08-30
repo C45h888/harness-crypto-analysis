@@ -78,7 +78,11 @@ def find_keystone(
         candidates.sort(key=lambda c: c["window_qty"], reverse=True)
         center = candidates[0]["price"]
     return {
+        # ``keystone`` is the densest bid-window center; ``bid`` is the same
+        # value under its intrinsic name (a buyer keystone IS a bid-side
+        # defense). Downstream readers (briefing summary) read ``bid``.
         "keystone": center,
+        "bid": center,
         "window_qty": max((c["window_qty"] for c in candidates), default=0.0),
         "tight": {"lo": center - 0.05, "hi": center + 0.05},
         "wide": {"lo": center - 0.10, "hi": center + 0.10},

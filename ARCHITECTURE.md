@@ -124,31 +124,60 @@ test suite is green. The live collation seam is also operational: a SOLUSDT
 `MarketRunEnvelope` can be persisted to PostgreSQL and published to Redis with
 the same `run_id`.
 
-## Domain container split (in progress)
+## Runtime topology (current reality)
 
-Per `docs/CONTAINERIZATION_CONTRACT.md` the unified runtime is split into
-independently-runnable domain services:
+The four-node pipeline (data-access → calculations → analysis → collator
+sequenced by a timer orchestrator over `stream:commands`) has been **replaced
+by a harness-owned pipeline**:
 
-  * `data-access`     - reads external APIs, publishes raw evidence
-  * `calculations`    - runs pure deterministic math over evidence
-  * `analysis`        - produces interpretation over calculations
-  * `orchestrator`    - timer-driven; sequences the three via `stream:commands`
-  * `collector`       - unchanged snapshot + signal-event path
-  * `collator`        - stable entrypoint `python -m market_service.commands.collate`
+* `market_service.poller` — 5-second firehose; the ONLY process that touches
+  the live Binance API for core data. Normalizes trades at the client
+  boundary and atomically appends raw evidence to the Redis stream
+  (`SET latest` + `XADD` in one Lua script, deduped on `observed_at_ms`).
+* `market_service.nooa_harness.pipeline.run_cycle` — the canonical
+  collation seam. Reads the raw window from Redis (deduping trades by
+  aggregate id), merges on-demand derivative evidence (cache-first, 5-min
+  TTL), runs the deterministic calculations and analysis sections, and
+  collates one immutable `MarketRunEnvelope` (Postgres first, then Redis).
+  One Redis connection + one Postgres connection per cycle, shared by every
+  persistence seam.
+* `market_service.nooa_harness.suite` — the interpretation plane. Four
+  specialists + one controller read a bounded LLM projection of the
+  envelope; raw model text crosses back into typed state only via
+  `SpecialistReport.from_llm_text` / `AnalystBriefing.from_controller_text`.
+* `market_service.microstructure.capture` — isolated WebSocket depth-delta
+  capture (spot), feeding its own ledger namespace; never touches the
+  poller path.
 
-The orchestrator mints a `run_id`, sends one `RefreshCommand` per domain
-keyed on that `run_id`, then invokes the collator with
-`--from-domain-state --run-id <run_id>`. The collator reads the three
-domain envelopes from Redis, **verifies** they all carry the orchestrator's
-`run_id`, and persists a `MarketRunEnvelope` whose `run_id` matches. The
-orchestrator also asserts the persisted `run_id` matches the one it tracked
-so a cycle is never silently attributed to a different run.
+### Calculation-model groups (Pass 3 pivot)
 
-Adapter discipline: every canonical function call goes through
-`market_service.nodes.contracts.strict_call` with shape adapters that raise
-`ContractViolation` on wrong input shape. The handler captures violations as
-structured `errors` on the envelope and produces `degraded` or `invalid`
-status - never silently swallows them.
+`nooa_harness.pipeline.GROUP_MAP` is the single source of truth for the
+segregated command surface (`--wall` / `--flow` / `--structure` /
+`--positioning` in `commands/harness.py`). Each group runs only the
+calculation/analysis sections it needs:
+
+| Group | Calculations | Analysis |
+|---|---|---|
+| `wall` | orderbook | wall_migration, path_absorption, oi |
+| `flow` | flow, bucketed_cvd, correlation, technical | demand, auction, delta |
+| `structure` | volume_profile, technical | regime, stage |
+| `positioning` | — | oi |
+
+Section dependencies resolve automatically (`turnover`/`signals` → `flow`;
+`correlation` shares `bucketed_cvd` with the bucketed section; `regime` →
+`flow`; `wall_migration` → `orderbook`). The monolithic run-cycle
+(`--analyze`) stays the canonical persisted-envelope path.
+
+### Time & coverage semantics
+
+- `evidence.observed_at` is the source snapshot time, not the harness read
+  time.
+- `coverage.evidence` (per envelope) records MEASURED window coverage:
+  actual trade span, dedupe effectiveness, snapshot count, and stream
+  staleness — never just the requested window.
+- `derivatives_meta` records the 5-minute bar period and per-series bar
+  counts so derivative series horizons (N × 5 min) are explicit regardless
+  of the requested 15m/1h/4h window.
 
 ## Deferred (next phases)
 

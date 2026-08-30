@@ -46,6 +46,7 @@ from market_service.calculations.delta import delta_variable, delta_state as _de
 
 from market_service.clients.binance import Binance
 from market_service.calculations.volume_profile import build_volume_profile, volume_profile_summary
+from market_service.config import default_depth_levels
 from market_service.analysis.auction import (
     auction_verdict,
     flow_persistence,
@@ -234,13 +235,24 @@ async def read_raw_window(
     """
     latest = await redis.read_raw_latest(symbol)
     if latest is None:
-        from market_service.config import default_depth_levels
         return {
             "observed_at": _utc_iso(),
             "observed_at_ms": int(time.time() * 1000),
             "fetch_window_ms": window_minutes * 60_000,
             "depth_levels": default_depth_levels(),
             "errors": [{"endpoint": "all", "error": "no raw evidence in Redis"}],
+            "coverage": {
+                "requested_window_seconds": window_minutes * 60,
+                "snapshots_used": 0,
+                "latest_observed_at_ms": None,
+                "stream_staleness_ms": None,
+                "spot_trades": {"trade_count": 0, "raw_trade_count": 0,
+                                "duplicates_removed": 0, "first_trade_ms": None,
+                                "last_trade_ms": None, "span_seconds": None},
+                "futures_trades": {"trade_count": 0, "raw_trade_count": 0,
+                                   "duplicates_removed": 0, "first_trade_ms": None,
+                                   "last_trade_ms": None, "span_seconds": None},
+            },
             "spot": {"ticker_24h": None, "order_book": {}, "trades_raw": [], "trades_normalized": []},
             "futures": {"ticker_24h": None, "order_book": {}, "trades_raw": [], "trades_normalized": [],
                         "funding": {}, "open_interest": {}},
@@ -277,12 +289,52 @@ async def read_raw_window(
     spot_trades = _dedupe(spot_raw)
     fut_trades = _dedupe(fut_raw)
 
+    # Actual coverage — measured, not requested. The doctrine requires the
+    # envelope to record what the window REALLY contains: the true trade span,
+    # dedupe effectiveness, how many snapshots fed the window, and how stale
+    # the latest stream entry is. Never claim a window the data doesn't cover.
+    def _trade_coverage(trades: list[dict[str, Any]], raw_count: int) -> dict[str, Any]:
+        tss: list[int] = []
+        for t in trades:
+            try:
+                tss.append(int(t["ts"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if tss:
+            span = {"first_trade_ms": min(tss), "last_trade_ms": max(tss),
+                    "span_seconds": (max(tss) - min(tss)) / 1000.0}
+        else:
+            span = {"first_trade_ms": None, "last_trade_ms": None,
+                    "span_seconds": None}
+        return {"trade_count": len(trades), "raw_trade_count": raw_count,
+                "duplicates_removed": raw_count - len(trades), **span}
+
+    raw_spot_count = sum(len(s.get("spot", {}).get("trades_normalized") or []) for s in snapshots)
+    raw_fut_count = sum(len(s.get("futures", {}).get("trades_normalized") or []) for s in snapshots)
+    latest_observed_ms = latest.get("observed_at_ms")
+    now_ms = int(time.time() * 1000)
+    coverage = {
+        "requested_window_seconds": window_minutes * 60,
+        "snapshots_used": len(snapshots),
+        "latest_observed_at_ms": latest_observed_ms,
+        "stream_staleness_ms": (
+            now_ms - int(latest_observed_ms)
+            if isinstance(latest_observed_ms, (int, float)) else None
+        ),
+        "spot_trades": _trade_coverage(spot_trades, raw_spot_count),
+        "futures_trades": _trade_coverage(fut_trades, raw_fut_count),
+    }
+
     return {
-        "observed_at": _utc_iso(),
+        # Evidence time: when the source snapshot was observed, not when the
+        # harness happened to read it. The read instant is coverage
+        # information, not evidence identity.
+        "observed_at": latest.get("observed_at") or _utc_iso(),
         "observed_at_ms": int(time.time() * 1000),
         "fetch_window_ms": window_minutes * 60_000,
         "depth_levels": latest.get("depth_levels") or default_depth_levels(),
         "errors": latest.get("errors", []),
+        "coverage": coverage,
         "spot": {
             "ticker_24h": latest.get("spot", {}).get("ticker_24h"),
             "order_book": latest.get("spot", {}).get("order_book") or {},
@@ -344,26 +396,20 @@ def _safe_last_price(bids: list[list[float]], asks: list[list[float]]) -> float 
 
 
 def _enrich_fut_keystone(keystone: dict[str, Any], asks: list[list[float]]) -> dict[str, Any]:
-    """Augment a find_keystone result with ``bid`` and ``ask`` aliases.
+    """Resolve the ``ask`` alias for the futures keystone result.
 
-    ``find_keystone`` historically returned ``{keystone, window_qty, tight, wide}``
-    where ``keystone`` is the densest bid-window center. Downstream readers
-    (notably ``_envelope_summary`` in ``runtime/contracts.py``) expect explicit
-    ``bid`` and ``ask`` keys. The ``bid`` is just an alias for the keystone
-    price (the bid side is where keystone lives). The ``ask`` is the nearest
-    ask at-or-above the keystone price — the first price sellers defend,
-    which is what the briefing wants to compare against buyer defence.
+    ``find_keystone`` natively emits ``bid`` (its contract is a densest
+    *bid*-window search). The one alias that remains adapter-side is ``ask``:
+    the nearest ask at-or-above the keystone price — the first price sellers
+    defend, which the briefing compares against buyer defence. The ask needs
+    the futures asks list, which the calc layer's ``find_keystone`` never
+    receives.
 
     Round-number anchors + mega-tier percentage are computed elsewhere
-    (``_adapt_wall_migration``) — this helper only fixes the keystone
-    naming mismatch.
+    (``_adapt_wall_migration``).
     """
     if not isinstance(keystone, dict):
         return keystone
-    if "bid" not in keystone:
-        bid = keystone.get("keystone")
-        if bid is not None:
-            keystone["bid"] = bid
     if "ask" not in keystone:
         bid = keystone.get("bid") or keystone.get("keystone")
         keystone["ask"] = None
@@ -418,17 +464,30 @@ def run_calculations(
                                depth_levels=depth, name="summarize"),
     }, errors) or {} if want("flow") else {}
 
+    # Bucketed CVD is computed ONCE and shared by the bucketed_cvd section
+    # and the correlation section (which previously re-ran bucketed_cvd
+    # twice inline — redundant deterministic work).
+    want_cvd_series = want("bucketed_cvd") or want("correlation")
+    spot_cvd_series = (
+        _strict(bucketed_cvd, _spot_trades(evidence), window_s=window, name="bucketed_cvd")
+        if want_cvd_series else None
+    )
+    fut_cvd_series = (
+        _strict(bucketed_cvd, _fut_trades(evidence), window_s=window, name="bucketed_cvd")
+        if want_cvd_series else None
+    )
+
     bucketed = _run_section("bucketed_cvd", lambda: {
-        "spot_bucketed_cvd": _strict(bucketed_cvd, _spot_trades(evidence), window_s=window, name="bucketed_cvd"),
-        "futures_bucketed_cvd": _strict(bucketed_cvd, _fut_trades(evidence), window_s=window, name="bucketed_cvd"),
+        "spot_bucketed_cvd": spot_cvd_series,
+        "futures_bucketed_cvd": fut_cvd_series,
     }, errors) or {} if want("bucketed_cvd") else {}
 
-    correlation = _run_section("correlation", lambda: (
-        _strict(cvd_series_corr,
-                _strict(bucketed_cvd, _spot_trades(evidence), window_s=window, name="bucketed_cvd"),
-                _strict(bucketed_cvd, _fut_trades(evidence), window_s=window, name="bucketed_cvd"),
-                window_s=window, name="cvd_series_corr")
-    ), errors) if want("correlation") else None
+    correlation = (
+        _run_section("correlation", lambda: _strict(
+            cvd_series_corr, spot_cvd_series, fut_cvd_series,
+            window_s=window, name="cvd_series_corr",
+        ), errors) if want("correlation") else None
+    )
 
     # Orderbook
     fut_book = _fut_book(evidence)
@@ -487,19 +546,28 @@ def run_calculations(
         orderbook = _run_section("orderbook", _orderbook_builder, errors) or {}
 
     # Volume profile
-    volume_profile = _run_section("volume_profile", lambda: {
-        "buckets": _strict(build_volume_profile, _fut_trades(evidence), 0.05, name="build_volume_profile"),
-        "summary": _strict(volume_profile_summary,
-                          _strict(build_volume_profile, _fut_trades(evidence), 0.05, name="build_volume_profile"),
-                          name="volume_profile_summary"),
-    }, errors) or {} if want("volume_profile") else {}
+    def _volume_profile_builder() -> dict[str, Any]:
+        # Build the profile ONCE — the previous code constructed it twice
+        # (once for ``buckets``, once for ``summary``) with identical inputs.
+        profile = _strict(build_volume_profile, _fut_trades(evidence), 0.05, name="build_volume_profile")
+        return {
+            "buckets": profile,
+            "summary": _strict(volume_profile_summary, profile, name="volume_profile_summary"),
+        }
+    volume_profile = _run_section("volume_profile", _volume_profile_builder, errors) or {} if want("volume_profile") else {}
 
     # Technical
-    technical = _run_section("technical", lambda: {
-        "emas": _strict(ema_series,
-                       [float(row[4]) for row in ((evidence.get("futures") or {}).get("klines") or [])
-                        if isinstance(row, (list, tuple)) and len(row) >= 5],
-                       name="ema_series"),
+    def _technical_builder() -> dict[str, Any]:
+        # 5m klines arrive only via the on-demand derivative fetch
+        # (_merge_derivatives); the 5-second poller never carries them.
+        # When absent, emit null with an explicit source marker instead of
+        # silently computing EMAs on an empty series.
+        kline_rows = (evidence.get("futures") or {}).get("klines") or []
+        closes = [float(row[4]) for row in kline_rows
+                  if isinstance(row, (list, tuple)) and len(row) >= 5]
+        return {
+            "emas": _strict(ema_series, closes, name="ema_series") if closes else None,
+            "emas_source": "derivatives.klines_5m" if closes else None,
         # Legacy port (sol_deep_monitor.py:191-247): tiered large-print flow
         # (large/huge/whale) over trailing 5m/15m windows.
         "tiered_large_flow": _strict(tiered_large_flow, _fut_trades(evidence),
@@ -508,7 +576,8 @@ def run_calculations(
         # classification from big prints >= 100 SOL in the last 5 min.
         "seller_aggression": _strict(seller_aggression_classify, _fut_trades(evidence),
                                      name="seller_aggression_classify"),
-    }, errors) or {} if want("technical") else {}
+        }
+    technical = _run_section("technical", _technical_builder, errors) or {} if want("technical") else {}
 
     # Turnover
     spot_flow = flow.get("spot_flow") or {}
@@ -711,8 +780,16 @@ def run_analysis(
         "regime": regime,
         "stage": stage,
     }
-    analysis_out = {k: v for k, v in all_analysis.items() if want(k if k != "open_interest" else "oi")} \
-        if sections is not None else all_analysis
+    # Section-id → output-key translation. The OI adapter historically emits
+    # under ``open_interest`` while its section id (GROUP_MAP, deps) is ``oi``.
+    # The mapping makes that translation explicit instead of burying it in a
+    # conditional inside the filter.
+    SECTION_OUTPUT_KEYS: dict[str, str] = {"oi": "open_interest"}
+    analysis_out = {
+        SECTION_OUTPUT_KEYS.get(k, k): v
+        for k, v in all_analysis.items()
+        if want(k)
+    } if sections is not None else all_analysis
 
     return {
         "status": "degraded" if errors else "healthy",
@@ -791,11 +868,17 @@ def _adapt_oi(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
     fut_book = fut.get("order_book") or {}
     asks = C.require_list_of_pairs(fut_book.get("asks"), function="oi.find_walls", where="futures.order_book.asks", max_items=depth)
     bids = C.require_list_of_pairs(fut_book.get("bids"), function="oi.find_walls", where="futures.order_book.bids", max_items=depth)
-    last_price = _last_price_e(bids, asks) or 0.0
+    last_price = _last_price_e(bids, asks)
+    # Null discipline: a missing/unparseable OI is ``None`` ("source did not
+    # provide / could not compute"), never a fabricated 0.0 — zero OI and
+    # absent OI are different market facts.
     oi_raw = fut.get("open_interest") or {}
     oi_value = oi_raw.get("open_interest") if isinstance(oi_raw, dict) else None
-    oi_float = float(oi_value) if isinstance(oi_value, (int, float)) else 0.0
-    walls = _strict(find_walls, asks, last_price, 0.005, 0.05, name="find_walls")
+    oi_float = float(oi_value) if isinstance(oi_value, (int, float)) else None
+    walls = (
+        _strict(find_walls, asks, float(last_price), 0.005, 0.05, name="find_walls")
+        if last_price is not None and last_price > 0 else []
+    )
 
     # OI history series — populated by the on-demand derivative fetch.
     # We extract the per-bar oi_value (USD notional) + oi (contracts) and feed
@@ -805,8 +888,14 @@ def _adapt_oi(evidence: dict[str, Any], *, depth: int) -> dict[str, Any]:
     oi_value_series = _oi_value_series(oi_hist)
     top_long_pct = _ls_last_pct(fut.get("top_ls"))
     glb_long_pct = _ls_last_pct(fut.get("global_ls"))
-    weighted = _strict(oi_weighted_contracts, oi_float, top_long_pct, glb_long_pct,
-                       name="oi_weighted_contracts")
+    # Weighted contracts need a real OI value — without one the output is an
+    # explicit null-shaped dict, never OI=0 multiplied by long percentages.
+    weighted = (
+        _strict(oi_weighted_contracts, oi_float, top_long_pct, glb_long_pct,
+                name="oi_weighted_contracts")
+        if oi_float is not None
+        else {"oi": None, "top_long_contracts": None, "global_long_contracts": None}
+    )
     inflow = _strict(oi_inflow_outflow, oi_series, name="oi_inflow_outflow")
     implied_rows = [
         {"bucket": i * 300_000, "oi": v, "oi_value": nv}
@@ -830,8 +919,31 @@ def _adapt_wall_migration(
     fut_book = _fut_book_e(evidence)
     fut = _fut_evidence(evidence)
     bids, asks = _levels(fut_book, depth, function="wall_migration.*")
-    price = _last_price_e(bids, asks) or 0.0
-    bid_floor = price * 0.97 if price else 0.0
+    price = _last_price_e(bids, asks)
+    if price is None or price <= 0:
+        # Null discipline (same precedent as _adapt_delta): without a real
+        # mid price the wall analysis cannot run — every price-dependent
+        # metric is an explicit null / empty, never computed against a
+        # fabricated 0.0. Tiers and round anchors are computed directly from
+        # the (possibly empty) book, so a zero there is a true zero.
+        return {
+            "verdict": "INSUFFICIENT_DATA",
+            "wall_delta": None, "fuel_ratio": None,
+            "densest_clusters": [], "trap_assessment": None,
+            "prior_cycle_ts": prior_cycle_ts,
+            "prior_wall_count": len(prior_walls or {}),
+            "tiers": compute_bid_tiers(bids),
+            "round_anchors": compute_round_anchors(bids),
+            "tier_balance": None, "mega_at_keystone": None,
+            "keystone_wall_balance": None,
+            "keystone_holds_scorecard": None,
+            "level_absorption": [], "wall_break": None,
+            "zone_ratio_grid": [], "zone_buy_sell": [],
+            "inputs_used": {"floors_count": 0, "ask_walls_built": 0,
+                            "ask_walls_eroded": 0, "fuel_ratio_value": None,
+                            "reason": "no order-book mid price"},
+        }
+    bid_floor = price * 0.97
     ask_target = price * 1.03 if price else 0.0
     delta = _strict(wall_delta, prior_walls or {}, asks, 0.02, 1.15, name="wall_delta")
     fuel = _strict(wall_fuel_ratio, bids, asks, price, bid_floor, ask_target, name="fuel_ratio")
@@ -868,7 +980,7 @@ def _adapt_wall_migration(
             "zone_ratio_grid": _wall_zone_grid(fut, keystone_for_mega, price),
             "zone_buy_sell": _wall_zone_intensity(fut, keystone_for_mega, price),
             "inputs_used": {"floors_count": len(floors), "ask_walls_built": built,
-                            "ask_walls_eroded": eroded, "fuel_ratio_value": float(fuel.get("ratio") or 0.0)}}
+                            "ask_walls_eroded": eroded, "fuel_ratio_value": fuel.get("ratio")}}
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1357,11 @@ def assemble_envelope(
         },
         "domain_status": domain_status,
     }
+    # Measured evidence coverage (actual trade span, dedupe stats, stream
+    # staleness) recorded by read_raw_window — the envelope reports what the
+    # window really contains, not just the requested window.
+    if evidence.get("coverage"):
+        coverage["evidence"] = dict(evidence["coverage"])
 
     canonical_state: dict[str, Any] = {"domain_status": dict(domain_status)}
     canonical_state["data-access"] = {
@@ -1285,14 +1402,23 @@ def assemble_envelope(
 async def persist_envelope(
     envelope: MarketRunEnvelope,
     settings: Settings,
+    *,
+    postgres: PostgresRuntimeStore | None = None,
+    redis: RedisRuntimeStore | None = None,
 ) -> dict[str, Any]:
-    """Persist to Postgres first, then publish to Redis."""
-    postgres = PostgresRuntimeStore(settings.database_url)
-    redis = RedisRuntimeStore(
+    """Persist to Postgres first, then publish to Redis.
+
+    Callers that already hold open stores (``run_cycle``) pass them via
+    ``postgres``/``redis`` to avoid opening a second connection pair per
+    cycle; standalone callers get fresh stores that are closed on exit.
+    """
+    own_pg = postgres is None
+    own_redis = redis is None
+    postgres = postgres or PostgresRuntimeStore(settings.database_url)
+    redis = redis or RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
     try:
-        await postgres.connect()
         inserted = await postgres.insert_run(envelope)
         redis_stream_id = await redis.publish_run(envelope)
         return {
@@ -1304,8 +1430,10 @@ async def persist_envelope(
             "status": envelope.status,
         }
     finally:
-        await postgres.close()
-        await redis.close()
+        if own_pg:
+            await postgres.close()
+        if own_redis:
+            await redis.close()
 
 # ---------------------------------------------------------------------------
 # Wall-snapshot seam — read the FULL recorded wall history into the migration
@@ -1332,16 +1460,25 @@ def _wall_snapshot_payload(
     wm = ((analysis_result.get("analysis") or {}).get("wall_migration")) or {}
     fuel = wm.get("fuel_ratio") or {}
     inputs = wm.get("inputs_used") or {}
+    # Null discipline: ``None`` (analysis degraded / not measured) must reach
+    # the ledger as NULL, not as a fabricated 0.0 fuel ratio. Keystone payload
+    # already follows this via its ``_f`` helper.
+    def _f(v: Any) -> float | None:
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
     return {
         "cycle_ts": _utc_iso(),
         "schema_version": 1,
         "asks": asks_raw,
         "bids": bids_raw,
-        "fuel_ratio": float(inputs.get("fuel_ratio_value") or 0.0),
-        "bid_pool": float(fuel.get("bid_pool") or 0.0),
-        "ask_pool": float(fuel.get("ask_pool") or 0.0),
-        "bid_floor": float(fuel.get("bid_floor") or 0.0),
-        "ask_target": float(fuel.get("ask_target") or 0.0),
+        "fuel_ratio": _f(inputs.get("fuel_ratio_value")),
+        "bid_pool": _f(fuel.get("bid_pool")),
+        "ask_pool": _f(fuel.get("ask_pool")),
+        "bid_floor": _f(fuel.get("bid_floor")),
+        "ask_target": _f(fuel.get("ask_target")),
         "ask_walls_built": int(inputs.get("ask_walls_built") or 0),
         "ask_walls_eroded": int(inputs.get("ask_walls_eroded") or 0),
     }
@@ -1353,20 +1490,28 @@ async def _record_wall_snapshot(
     run_id: str,
     evidence: dict[str, Any],
     analysis_result: dict[str, Any],
+    *,
+    postgres: PostgresRuntimeStore | None = None,
+    redis: RedisRuntimeStore | None = None,
 ) -> dict[str, Any]:
     """WRITE the current cycle's wall snapshot (Postgres first, then Redis).
 
     This closes the write seam: every cycle appends its wall state to the
     durable ledger so subsequent cycles can call ALL recorded walls, not
     just the one that happened to be written last.
+
+    Callers that already hold open stores (``run_cycle``) pass them via
+    ``postgres``/``redis`` to avoid connection churn; standalone callers get
+    fresh stores that are closed on exit.
     """
     payload = _wall_snapshot_payload(symbol, run_id, evidence, analysis_result)
-    postgres = PostgresRuntimeStore(settings.database_url)
-    redis = RedisRuntimeStore(
+    own_pg = postgres is None
+    own_redis = redis is None
+    postgres = postgres or PostgresRuntimeStore(settings.database_url)
+    redis = redis or RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
     try:
-        await postgres.connect()
         pg_ok = await postgres.record_wall_snapshot(symbol, run_id, payload)
         redis_id = await redis.record_wall_snapshot(symbol, run_id, payload)
         return {
@@ -1376,8 +1521,10 @@ async def _record_wall_snapshot(
             "wall_levels_recorded": len(payload.get("asks") or []),
         }
     finally:
-        await postgres.close()
-        await redis.close()
+        if own_pg:
+            await postgres.close()
+        if own_redis:
+            await redis.close()
 
 
 def _keystone_snapshot_payload(
@@ -1430,20 +1577,26 @@ async def _record_keystone_snapshot(
     symbol: str,
     run_id: str,
     calc_result: dict[str, Any],
+    *,
+    postgres: PostgresRuntimeStore | None = None,
+    redis: RedisRuntimeStore | None = None,
 ) -> dict[str, Any]:
     """WRITE the current cycle's keystone snapshot (Postgres first, then Redis).
 
     Cross-cycle companion to ``_record_wall_snapshot``: every cycle appends
     its keystone state to the durable ledger so the migration verdict can
     probe ALL recorded keystones, not just the most recent pull.
+
+    Shared-store discipline mirrors ``_record_wall_snapshot``.
     """
     payload = _keystone_snapshot_payload(symbol, run_id, calc_result)
-    postgres = PostgresRuntimeStore(settings.database_url)
-    redis = RedisRuntimeStore(
+    own_pg = postgres is None
+    own_redis = redis is None
+    postgres = postgres or PostgresRuntimeStore(settings.database_url)
+    redis = redis or RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
     try:
-        await postgres.connect()
         pg_ok = await postgres.record_keystone_snapshot(symbol, run_id, payload)
         redis_id = await redis.record_keystone_snapshot(symbol, run_id, payload)
         return {
@@ -1453,8 +1606,10 @@ async def _record_keystone_snapshot(
             "keystone_price": payload.get("keystone_price"),
         }
     finally:
-        await postgres.close()
-        await redis.close()
+        if own_pg:
+            await postgres.close()
+        if own_redis:
+            await redis.close()
 
 
 def _accumulate_prior_walls(
@@ -1653,6 +1808,18 @@ def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -
     if "cross_asset" in deriv and deriv["cross_asset"]:
         out["cross_asset"] = deriv["cross_asset"]
     out["derivative_observed_at_ms"] = deriv.get("observed_at_ms")
+    # Bar-horizon metadata: every derivative series is 5-minute bars, so a
+    # series of N bars covers N x 5 minutes — regardless of the requested
+    # 15m/1h/4h analysis window. Making the horizon explicit stops downstream
+    # readers from misreading the series as window-aligned.
+    deriv_fut = deriv.get("futures") or {}
+    out["derivatives_meta"] = {
+        "bar_period_s": 300,
+        "series": {
+            key: (len(deriv_fut[key]) if isinstance(deriv_fut.get(key), list) else None)
+            for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines")
+        },
+    }
     return out
 
 
@@ -1693,8 +1860,15 @@ async def run_cycle(
     depth = depth or settings.depth_levels
     window_s = window_minutes * 60
 
+    # One Redis + one Postgres pair for the WHOLE cycle. The previous flow
+    # opened/closed Redis twice and Postgres twice (wall-history read,
+    # wall/keystone ledger writes, persist_envelope) — every one of those
+    # seams now shares these two store instances.
     redis = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    pg: PostgresRuntimeStore | None = (
+        PostgresRuntimeStore(settings.database_url) if settings.database_url else None
     )
     try:
         evidence = await read_raw_window(redis, symbol, window_minutes)
@@ -1721,64 +1895,65 @@ async def run_cycle(
                 except Exception:
                     log.exception("run_cycle %s: failed to publish derivative cache", symbol)
         evidence = _merge_derivatives(evidence, deriv)
+
+        calc_result = run_calculations(evidence, depth, window_s)
+
+        # Read the FULL recorded wall history for analysis (async, done here).
+        # Postgres is the durable authority; Redis is the live projection fallback.
+        prior_walls: dict[float, float] = {}
+        prior_cycle_ts: str | None = None
+        if pg is not None:
+            try:
+                history = await pg.read_wall_history(symbol)
+            except Exception:
+                log.warning("run_cycle %s: postgres wall-history read failed; falling back to redis", symbol)
+                history = []
+            if not history:
+                history = await redis.read_wall_history(symbol)
+            prior_walls, prior_cycle_ts = _accumulate_prior_walls(history)
+        else:
+            # No durable ledger configured — Redis-only fallback.
+            try:
+                prior_walls, prior_cycle_ts = _accumulate_prior_walls(
+                    await redis.read_wall_history(symbol))
+            except Exception:
+                log.exception("run_cycle %s: failed to read wall history from redis", symbol)
+
+        analysis_result = run_analysis(evidence, calc_result,
+                                       prior_walls=prior_walls or None,
+                                       prior_cycle_ts=prior_cycle_ts,
+                                       depth=depth)
+
+        envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
+
+        if persist:
+            # WRITE the current cycle's wall snapshot so the ledger records it and
+            # later cycles can call ALL recorded walls (not just the last pull).
+            try:
+                await _record_wall_snapshot(settings, symbol, envelope.run_id, evidence,
+                                            analysis_result, postgres=pg, redis=redis)
+            except Exception:
+                log.exception("run_cycle %s: failed to record wall snapshot", symbol)
+            # WRITE the current cycle's keystone snapshot (cross-cycle keystone
+            # migration ledger — clean separation from the wall ledger).
+            try:
+                await _record_keystone_snapshot(settings, symbol, envelope.run_id,
+                                                calc_result, postgres=pg, redis=redis)
+            except Exception:
+                log.exception("run_cycle %s: failed to record keystone snapshot", symbol)
+            try:
+                await persist_envelope(envelope, settings, postgres=pg, redis=redis)
+            except Exception:
+                log.exception("failed to persist envelope for %s run_id=%s", symbol, envelope.run_id)
+        else:
+            log.info("run_cycle %s: dry-run (persist=False) — run_id=%s not written",
+                     symbol, envelope.run_id)
+
+        return envelope
     finally:
         await redis.close()
-
-    calc_result = run_calculations(evidence, depth, window_s)
-
-    # Read the FULL recorded wall history for analysis (async, done here).
-    # Postgres is the durable authority; Redis is the live projection fallback.
-    prior_walls: dict[float, float] = {}
-    prior_cycle_ts: str | None = None
-    pg = PostgresRuntimeStore(settings.database_url)
-    redis2 = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        try:
-            await pg.connect()
-            history = await pg.read_wall_history(symbol)
-        except Exception:
-            log.warning("run_cycle %s: postgres wall-history read failed; falling back to redis", symbol)
-            history = []
-        if not history:
-            history = await redis2.read_wall_history(symbol)
-        prior_walls, prior_cycle_ts = _accumulate_prior_walls(history)
-    except Exception:
-        log.exception("run_cycle %s: failed to read wall history", symbol)
-    finally:
-        await pg.close()
-        await redis2.close()
-
-    analysis_result = run_analysis(evidence, calc_result,
-                                   prior_walls=prior_walls or None,
-                                   prior_cycle_ts=prior_cycle_ts,
-                                   depth=depth)
-
-    envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
-
-    if persist:
-        # WRITE the current cycle's wall snapshot so the ledger records it and
-        # later cycles can call ALL recorded walls (not just the last pull).
-        try:
-            await _record_wall_snapshot(settings, symbol, envelope.run_id, evidence, analysis_result)
-        except Exception:
-            log.exception("run_cycle %s: failed to record wall snapshot", symbol)
-        # WRITE the current cycle's keystone snapshot (cross-cycle keystone
-        # migration ledger — clean separation from the wall ledger).
-        try:
-            await _record_keystone_snapshot(settings, symbol, envelope.run_id, calc_result)
-        except Exception:
-            log.exception("run_cycle %s: failed to record keystone snapshot", symbol)
-        try:
-            await persist_envelope(envelope, settings)
-        except Exception:
-            log.exception("failed to persist envelope for %s run_id=%s", symbol, envelope.run_id)
-    else:
-        log.info("run_cycle %s: dry-run (persist=False) — run_id=%s not written",
-                 symbol, envelope.run_id)
-
-    return envelope
+        if pg is not None:
+            await pg.close()
 
 
 __all__ = [

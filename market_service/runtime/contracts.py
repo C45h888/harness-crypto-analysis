@@ -18,6 +18,7 @@ MARKET_RUN_SCHEMA_VERSION = 1
 ANALYST_BRIEFING_SCHEMA_VERSION = 2
 SPECIALIST_REPORT_SCHEMA_VERSION = 2
 AGENT_MEMORY_SCHEMA_VERSION = 1
+INFERENCE_ARTIFACT_SCHEMA_VERSION = 1
 # Agent-artifact kinds the memory node can persist. Mirrors the agent-owned
 # write surfaces from NOOA_HARNESS_ARCHITECTURE.md: observations, hypotheses,
 # requests, briefings — plus 'fact'/'note' for durable analyst notes.
@@ -28,6 +29,12 @@ StateStatus = Literal["healthy", "degraded", "invalid"]
 ConfidenceLevel = Literal["low", "medium", "high"]
 AnalystStatus = Literal["healthy", "degraded", "failed"]
 ValidConfidence: tuple[str, ...] = ("low", "medium", "high")
+# Inference-artifact status trichotomy (Pass-3 discipline, generalized):
+# validated  — deterministic inputs passed every quality gate; narration may cite values
+# provisional — fitted but diagnostics incomplete; narration must caveat, never signal
+# insufficient — gates failed; interpretation is deterministically NULL (no LLM call)
+InferenceStatus = Literal["validated", "provisional", "insufficient"]
+ValidInferenceStatus: tuple[str, ...] = ("validated", "provisional", "insufficient")
 
 # ---------------------------------------------------------------------------
 # Typed sub-contracts for analyst-layer evidence, consensus, and disagreements.
@@ -534,12 +541,13 @@ def _coerce_list_of_objects(payload: dict[str, Any], key: str) -> tuple[dict[str
 
 
 def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
-    """Compact, bounded projection of the canonical envelope for the briefing.
+    """Compact, bounded, pure path-read projection of the canonical envelope.
 
     Stored on the briefing so downstream consumers (Hermes, human reviewers)
     can see what evidence boundary the briefing was produced against, without
-    re-fetching the full envelope. Preserves key market metrics so the briefing
-    is self-contained for adaptive reasoning. ``null`` values are preserved
+    re-fetching the full envelope. This is a projection ONLY: it performs no
+    arithmetic and no domain logic — every value is read at a fixed envelope
+    path owned by the layer that computed it. ``null`` values are preserved
     (not zero-substituted) per the canonical null discipline.
     """
     coverage = envelope.get("coverage") or {}
@@ -563,7 +571,12 @@ def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
     calculations = canonical.get("calculations") or {}
     analysis = canonical.get("analysis") or {}
 
-    # Key market metrics — null-preserving, never zero-substituted.
+    # Bounded path-reads ONLY — this projection performs no arithmetic and
+    # no domain logic. CVD, OBI, keystone, and wall metrics are all computed
+    # by the calculations/analysis layers before the envelope is assembled;
+    # this function reads them at fixed envelope paths. The Binance client
+    # normalizes every REST payload to snake_case at its boundary, so all
+    # reads below use the normalized key names.
     ticker = _path(data_access, "evidence", "futures", "ticker_24h") or {}
     funding = _path(data_access, "evidence", "futures", "funding") or {}
     oi = _path(data_access, "evidence", "futures", "open_interest") or {}
@@ -571,21 +584,11 @@ def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
     orderbook = _path(calculations, "calculations", "orderbook") or {}
     demand = _path(analysis, "analysis", "demand", "decomposition") or {}
 
-    # CVD = buy_volume - sell_volume (deterministic, null-safe).
-    spot_flow = _path(flow, "spot") or {}
-    fut_flow = _path(flow, "futures") or {}
-    spot_cvd: float | None = None
-    futures_cvd: float | None = None
-    try:
-        if isinstance(spot_flow, dict) and "buy_volume" in spot_flow and "sell_volume" in spot_flow:
-            spot_cvd = float(spot_flow["buy_volume"]) - float(spot_flow["sell_volume"])
-    except (TypeError, ValueError):
-        pass
-    try:
-        if isinstance(fut_flow, dict) and "buy_volume" in fut_flow and "sell_volume" in fut_flow:
-            futures_cvd = float(fut_flow["buy_volume"]) - float(fut_flow["sell_volume"])
-    except (TypeError, ValueError):
-        pass
+    # CVD is owned by the calculations layer (calculations.flow.summarize
+    # emits ``cvd``); the pipeline publishes it at flow.spot_flow /
+    # flow.futures_flow. Read — never recomputed here.
+    spot_flow = _path(flow, "spot_flow") or {}
+    fut_flow = _path(flow, "futures_flow") or {}
 
     return {
         "schema_version": envelope.get("schema_version"),
@@ -597,15 +600,15 @@ def _envelope_summary(envelope: dict[str, Any]) -> dict[str, Any]:
         "domain_status": domain_status,
         "error_count": len(envelope.get("errors") or []),
         # Key market metrics for downstream reasoning.
-        "last_price": ticker.get("lastPrice") if isinstance(ticker, dict) else None,
-        "volume_24h": ticker.get("volume") if isinstance(ticker, dict) else None,
-        "high_24h": ticker.get("highPrice") if isinstance(ticker, dict) else None,
-        "low_24h": ticker.get("lowPrice") if isinstance(ticker, dict) else None,
-        "funding_rate": funding.get("fundingRate") if isinstance(funding, dict) else None,
-        "mark_price": funding.get("markPrice") if isinstance(funding, dict) else None,
-        "open_interest": oi.get("openInterest") if isinstance(oi, dict) else None,
-        "spot_cvd": spot_cvd,
-        "futures_cvd": futures_cvd,
+        "last_price": ticker.get("last_price") if isinstance(ticker, dict) else None,
+        "volume_24h": ticker.get("quote_volume") if isinstance(ticker, dict) else None,
+        "high_24h": ticker.get("high_price") if isinstance(ticker, dict) else None,
+        "low_24h": ticker.get("low_price") if isinstance(ticker, dict) else None,
+        "funding_rate": funding.get("last_funding_rate") if isinstance(funding, dict) else None,
+        "mark_price": funding.get("mark_price") if isinstance(funding, dict) else None,
+        "open_interest": oi.get("open_interest") if isinstance(oi, dict) else None,
+        "spot_cvd": spot_flow.get("cvd") if isinstance(spot_flow, dict) else None,
+        "futures_cvd": fut_flow.get("cvd") if isinstance(fut_flow, dict) else None,
         "spot_obi": _path(demand, "spot", "obi"),
         "futures_obi": _path(demand, "futures", "obi"),
         "fut_keystone_bid": _path(orderbook, "fut_keystone", "bid"),
@@ -1108,6 +1111,168 @@ class AgentMemory:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "forgotten": self.forgotten,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class InferenceArtifact:
+    """Immutable output of one inference-engine cycle.
+
+    The inference engine is an orchestrator object with AUTHORITY over the
+    deterministic supporting modules: it reads price/microstructure data from
+    Redis, validates the request via the bounded capability registry, triggers
+    deterministic calculation + fitting, and then issues ONE bounded LLM call
+    that narrates only the deterministic section it produced itself.
+
+    Contract split inside the artifact:
+
+    - ``deterministic_state`` — everything computed by Python, never by the
+      LLM. Fits, calculations, coverage, input provenance. This section is
+      the authority the interpretation cites.
+    - ``interpretation`` — the LLM narration of ``deterministic_state``.
+      Deterministically NULL when ``status == "insufficient"``: the hard gate
+      guarantees no LLM call happens over data that failed the quality gates
+      (null discipline — an empty interpretation means "not produced", never
+      "nothing to say").
+    - ``capability_log`` — the audit trail of every supporting-module dispatch
+      the engine performed (module, scope, result status), so the artifact is
+      self-documenting about how its deterministic state was produced.
+
+    Persistence mirrors ``AnalystBriefing``: Postgres is the durable ledger
+    (``inference_artifact`` table, schema-versioned), Redis is the live
+    projection (``marketflow:latest:inference:<SYMBOL>`` + stream).
+    """
+
+    artifact_id: str
+    symbol: str
+    venue: str
+    generated_at: str
+    completed_at: str
+    status: InferenceStatus
+    window_minutes: int
+    interval_seconds: int
+    deterministic_state: dict[str, Any]
+    capability_log: tuple[dict[str, Any], ...]
+    input_hash: str
+    model_version: str
+    interpretation: dict[str, Any] | None = None
+    session_id: str | None = None
+    errors: tuple[dict[str, Any], ...] = ()
+    schema_version: int = INFERENCE_ARTIFACT_SCHEMA_VERSION
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        symbol: str,
+        venue: str,
+        generated_at: str,
+        completed_at: str,
+        status: InferenceStatus,
+        window_minutes: int,
+        interval_seconds: int,
+        deterministic_state: dict[str, Any],
+        capability_log: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        input_hash: str,
+        model_version: str,
+        interpretation: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        errors: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    ) -> "InferenceArtifact":
+        created = cls(
+            artifact_id=str(uuid.uuid4()),
+            symbol=symbol.upper(),
+            venue=venue,
+            generated_at=generated_at,
+            completed_at=completed_at,
+            status=status,
+            window_minutes=window_minutes,
+            interval_seconds=interval_seconds,
+            deterministic_state=deterministic_state,
+            capability_log=tuple(capability_log),
+            input_hash=input_hash,
+            model_version=model_version,
+            interpretation=interpretation,
+            session_id=session_id,
+            errors=tuple(errors),
+        )
+        # Construction-time enforcement: an insufficient artifact with a
+        # non-NULL interpretation can never be created through the sanctioned
+        # factory — the hard gate is structural, not advisory.
+        created.validate()
+        return created
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "InferenceArtifact":
+        artifact = cls(
+            artifact_id=str(value["artifact_id"]),
+            symbol=str(value["symbol"]).upper(),
+            venue=str(value["venue"]),
+            generated_at=str(value["generated_at"]),
+            completed_at=str(value["completed_at"]),
+            status=value["status"],
+            window_minutes=int(value["window_minutes"]),
+            interval_seconds=int(value["interval_seconds"]),
+            deterministic_state=dict(value.get("deterministic_state") or {}),
+            capability_log=tuple(value.get("capability_log") or ()),
+            input_hash=str(value["input_hash"]),
+            model_version=str(value["model_version"]),
+            interpretation=(
+                dict(value["interpretation"])
+                if value.get("interpretation") is not None else None
+            ),
+            session_id=(
+                str(value["session_id"])
+                if value.get("session_id") is not None else None
+            ),
+            errors=tuple(value.get("errors") or ()),
+            schema_version=int(
+                value.get("schema_version", INFERENCE_ARTIFACT_SCHEMA_VERSION)
+            ),
+        )
+        artifact.validate()
+        return artifact
+
+    def validate(self) -> None:
+        if self.schema_version != INFERENCE_ARTIFACT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported inference artifact schema version: {self.schema_version}"
+            )
+        if not self.artifact_id or not self.symbol or not self.venue:
+            raise ValueError("artifact_id, symbol, and venue are required")
+        if self.status not in ValidInferenceStatus:
+            raise ValueError(f"invalid inference status: {self.status}")
+        if self.window_minutes <= 0 or self.interval_seconds <= 0:
+            raise ValueError("window_minutes and interval_seconds must be positive")
+        if self.interpretation is not None and self.status == "insufficient":
+            raise ValueError(
+                "an insufficient artifact must carry a NULL interpretation "
+                "(hard gate: no LLM narration over gate-failed data)"
+            )
+        if not isinstance(self.deterministic_state, dict):
+            raise ValueError("deterministic_state must be an object")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "artifact_id": self.artifact_id,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "generated_at": self.generated_at,
+            "completed_at": self.completed_at,
+            "status": self.status,
+            "window_minutes": self.window_minutes,
+            "interval_seconds": self.interval_seconds,
+            "deterministic_state": self.deterministic_state,
+            "capability_log": list(self.capability_log),
+            "input_hash": self.input_hash,
+            "model_version": self.model_version,
+            "interpretation": self.interpretation,
+            "session_id": self.session_id,
+            "errors": list(self.errors),
         }
 
     def to_json(self) -> str:

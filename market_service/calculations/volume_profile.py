@@ -61,9 +61,12 @@ def volume_profile_summary(buckets: dict[str, dict]) -> dict | None:
         if cum >= total_vol * VALUE_AREA_RATIO:
             break
     vah, val = max(va_prices), min(va_prices)
-    # HVN = top-decile volume buckets; LVN = sparse (gap) buckets
+    # HVN = top-decile volume buckets; LVN = sparse (gap) buckets.
+    # Clamp the threshold index: a profile with <2 buckets (quiet window,
+    # single price bucket) must not raise IndexError.
     vols = sorted((d["buy"] + d["sell"]) for d in buckets.values())
-    hvn_threshold = vols[max(1, len(vols) // 10)]
+    hvn_idx = min(max(1, len(vols) // 10), len(vols) - 1)
+    hvn_threshold = vols[hvn_idx]
     hvn = sorted(float(d["price"]) for d in buckets.values() if (d["buy"] + d["sell"]) >= hvn_threshold)
     mean_vol = total_vol / len(buckets)
     lvn = sorted(float(d["price"]) for d in buckets.values() if (d["buy"] + d["sell"]) < mean_vol * 0.3)

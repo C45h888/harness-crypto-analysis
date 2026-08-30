@@ -9,7 +9,13 @@ from typing import Any
 
 import asyncpg
 
-from .contracts import AgentMemory, AnalystBriefing, MarketRunEnvelope, _json_safe
+from .contracts import (
+    AgentMemory,
+    AnalystBriefing,
+    InferenceArtifact,
+    MarketRunEnvelope,
+    _json_safe,
+)
 
 
 class PostgresRuntimeStore:
@@ -414,6 +420,11 @@ class PostgresRuntimeStore:
             cycle_ts_value = datetime.now()
         asks_json = json.dumps(payload.get("asks") or [])
         bids_json = json.dumps(payload.get("bids") or [])
+
+        def _opt_float(key: str) -> float | None:
+            v = payload.get(key)
+            return float(v) if v is not None else None
+
         row = await self.pool.fetchrow(
             """INSERT INTO wall_snapshot
                (symbol, cycle_ts, run_id, schema_version,
@@ -425,11 +436,11 @@ class PostgresRuntimeStore:
             symbol.upper(), cycle_ts_value, uuid.UUID(run_id),
             int(payload.get("schema_version") or 1),
             asks_json, bids_json,
-            float(payload.get("fuel_ratio") or 0.0),
-            float(payload.get("bid_pool") or 0.0),
-            float(payload.get("ask_pool") or 0.0),
-            float(payload.get("bid_floor") or 0.0),
-            float(payload.get("ask_target") or 0.0),
+            _opt_float("fuel_ratio"),
+            _opt_float("bid_pool"),
+            _opt_float("ask_pool"),
+            _opt_float("bid_floor"),
+            _opt_float("ask_target"),
             int(payload.get("ask_walls_built") or 0),
             int(payload.get("ask_walls_eroded") or 0),
         )
@@ -714,4 +725,118 @@ class PostgresRuntimeStore:
                     continue
             if isinstance(evidence, dict):
                 out.append(evidence)
+        return out
+
+    # ------------------------------------------------------------------
+    # Inference-engine artifact ledger (postgres-first durable layer).
+    # Redis latest-inference keys are projections of these rows only.
+    # ------------------------------------------------------------------
+
+    async def insert_inference_artifact(self, artifact: InferenceArtifact) -> bool:
+        """Durable, idempotent write of one ``InferenceArtifact``.
+
+        Primary key is ``artifact_id``: each engine cycle produces exactly
+        one immutable row. The interpretation column is NULL whenever the
+        hard status gate refused the LLM call — that is the durable record
+        of the refusal, never a missing value.
+        """
+        artifact.validate()
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO inference_artifact
+               (artifact_id, symbol, venue, generated_at, completed_at,
+                schema_version, status, window_minutes, interval_seconds,
+                deterministic_state, capability_log, input_hash, model_version,
+                interpretation, session_id, errors)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+               ON CONFLICT (artifact_id) DO NOTHING
+               RETURNING artifact_id""",
+            uuid.UUID(artifact.artifact_id),
+            artifact.symbol,
+            artifact.venue,
+            datetime.fromisoformat(artifact.generated_at.replace("Z", "+00:00")),
+            datetime.fromisoformat(artifact.completed_at.replace("Z", "+00:00")),
+            artifact.schema_version,
+            artifact.status,
+            artifact.window_minutes,
+            artifact.interval_seconds,
+            json.dumps(artifact.deterministic_state, default=str),
+            json.dumps(list(artifact.capability_log), default=str),
+            artifact.input_hash,
+            artifact.model_version,
+            json.dumps(artifact.interpretation, default=str)
+            if artifact.interpretation is not None else None,
+            uuid.UUID(artifact.session_id) if artifact.session_id else None,
+            json.dumps(list(artifact.errors), default=str),
+        )
+        return row is not None
+
+    async def read_inference_artifact(
+        self, symbol: str | None = None, artifact_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Durable read: one exact artifact_id, or the latest for a symbol."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        if artifact_id:
+            row = await self.pool.fetchrow(
+                "SELECT deterministic_state, interpretation, status, artifact_id,"
+                " symbol, venue, generated_at, input_hash, model_version,"
+                " window_minutes, interval_seconds, capability_log, session_id, errors"
+                " FROM inference_artifact WHERE artifact_id = $1",
+                uuid.UUID(artifact_id),
+            )
+        elif symbol:
+            row = await self.pool.fetchrow(
+                "SELECT deterministic_state, interpretation, status, artifact_id,"
+                " symbol, venue, generated_at, input_hash, model_version,"
+                " window_minutes, interval_seconds, capability_log, session_id, errors"
+                " FROM inference_artifact WHERE symbol = $1"
+                " ORDER BY generated_at DESC LIMIT 1",
+                symbol.upper(),
+            )
+        else:
+            return None
+        if row is None:
+            return None
+        result = dict(row)
+        for col in ("deterministic_state", "capability_log", "errors"):
+            value = result.get(col)
+            if isinstance(value, str):
+                try:
+                    result[col] = json.loads(value)
+                except (ValueError, json.JSONDecodeError):
+                    result[col] = {} if col == "deterministic_state" else []
+        interp = result.get("interpretation")
+        if isinstance(interp, str):
+            try:
+                result["interpretation"] = json.loads(interp)
+            except (ValueError, json.JSONDecodeError):
+                result["interpretation"] = None
+        if hasattr(result.get("generated_at"), "isoformat"):
+            result["generated_at"] = result["generated_at"].isoformat()
+        return result
+
+    async def read_inference_history(
+        self, symbol: str, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Durable read: recent artifacts for one symbol, newest first."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            "SELECT artifact_id, symbol, venue, generated_at, status,"
+            " window_minutes, interval_seconds, input_hash, model_version"
+            " FROM inference_artifact WHERE symbol = $1"
+            " ORDER BY generated_at DESC LIMIT $2",
+            symbol.upper(), limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            if hasattr(entry.get("generated_at"), "isoformat"):
+                entry["generated_at"] = entry["generated_at"].isoformat()
+            out.append(entry)
         return out

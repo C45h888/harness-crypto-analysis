@@ -11,7 +11,8 @@ from redis.asyncio import Redis
 
 from .contracts import (
     AGENT_MEMORY_SCHEMA_VERSION, ANALYST_BRIEFING_SCHEMA_VERSION,
-    AgentMemory, AnalystBriefing, MarketRunEnvelope, MarketStateEnvelope,
+    AgentMemory, AnalystBriefing, InferenceArtifact, MarketRunEnvelope,
+    MarketStateEnvelope,
 )
 
 
@@ -769,3 +770,40 @@ class RedisRuntimeStore:
             if isinstance(decoded, dict):
                 payloads.append(decoded)
         return payloads
+
+    # ------------------------------------------------------------------
+    # Inference-engine artifact projection — latest key + bounded stream.
+    # Postgres owns the durable ledger; these are the live read surfaces.
+    # ------------------------------------------------------------------
+
+    def inference_latest_key(self, symbol: str, venue: str = "spot") -> str:
+        return f"{self.prefix}:latest:inference:{venue.lower()}:{symbol.upper()}"
+
+    def inference_stream(self, symbol: str, venue: str = "spot") -> str:
+        return f"{self.prefix}:stream:inference:{venue.lower()}:{symbol.upper()}"
+
+    async def publish_inference_artifact(
+        self, artifact: InferenceArtifact, *, stream_maxlen: int | None = None,
+    ) -> str:
+        """Publish one inference artifact: latest-key projection + stream entry."""
+        artifact.validate()
+        body = artifact.to_json()
+        await self.redis.set(self.inference_latest_key(artifact.symbol, artifact.venue), body)
+        return str(await self.redis.xadd(
+            self.inference_stream(artifact.symbol, artifact.venue),
+            {"payload": body, "artifact_id": artifact.artifact_id,
+             "status": artifact.status},
+            maxlen=stream_maxlen or self.stream_maxlen, approximate=True,
+        ))
+
+    async def read_latest_inference_artifact(
+        self, symbol: str, venue: str = "spot",
+    ) -> dict[str, Any] | None:
+        raw = await self.redis.get(self.inference_latest_key(symbol, venue))
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None

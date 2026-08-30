@@ -50,21 +50,21 @@ _ENVELOPE_SCHEMA = json.dumps(
                         "order_book": {"bids": [["<price>", "<qty>"]], "asks": [["<price>", "<qty>"]]},
                         "trades_raw": [{"price": "<float>", "qty": "<float>", "side": "buy|sell", "time": "<int>"}],
                         "klines": [{"open": "<float>", "high": "<float>", "low": "<float>", "close": "<float>", "volume": "<float>"}],
-                        "ticker_24h": {"lastPrice": "<float>", "volume": "<float>", "highPrice": "<float>", "lowPrice": "<float>"},
+                        "ticker_24h": {"last_price": "<float>", "quote_volume": "<float>", "high_price": "<float>", "low_price": "<float>"},
                     },
                     "futures": {
                         "order_book": {"bids": [["<price>", "<qty>"]], "asks": [["<price>", "<qty>"]]},
                         "trades_raw": [{"price": "<float>", "qty": "<float>", "side": "buy|sell", "time": "<int>"}],
                         "klines": "array of kline objects",
                         "ticker_24h": "ticker object",
-                        "funding": {"fundingRate": "<float>", "markPrice": "<float>", "nextFundingTime": "<int>"},
-                        "open_interest": {"openInterest": "<float>", "timestamp": "<int>"},
+                        "funding": {"last_funding_rate": "<float>", "mark_price": "<float>", "next_funding_time": "<int>"},
+                        "open_interest": {"open_interest": "<float>", "timestamp": "<int>"},
                     },
                 }
             },
             "calculations": {
                 "calculations": {
-                    "flow": {"spot": "object", "futures": "object", "net": "object"},
+                    "flow": {"spot_flow": "object (summarize: cvd, buy_share, obi, ...)", "futures_flow": "object", "net": "object"},
                     "bucketed_cvd": "object",
                     "correlation": "object",
                     "signal_inputs": "object",
@@ -92,7 +92,7 @@ _ENVELOPE_SCHEMA = json.dumps(
                 }
             },
         },
-        "coverage": {"domain_status": "object", "freshness": "object", "completeness": "object"},
+        "coverage": {"domain_status": "object", "evidence": "measured window coverage: trade span, dedupe, staleness"},
         "errors": [{"source": "<string>", "error": "<string>", "details": "object"}],
         "source_metadata": {"domain_run_ids": "object"},
     },
