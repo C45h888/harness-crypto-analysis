@@ -658,6 +658,18 @@ class RedisRuntimeStore:
     def microstructure_status_key(self, venue: str, symbol: str) -> str:
         return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:status"
 
+    def microstructure_status_stream(self, venue: str, symbol: str) -> str:
+        """Status-TRANSITION ledger stream (written only on state change).
+
+        This is the event-driven companion to the latest-key status payload:
+        the capture node appends one entry here whenever ``state`` *changes*
+        (running -> gap -> reconnecting -> running ...), and the inference
+        wake worker blocks on it to fire capture-recovery wakes without
+        polling. Event-time is carried in the entry id, so age checks need
+        no extra payload fields.
+        """
+        return f"{self.prefix}:stream:microstructure:status:{venue.lower()}:{symbol.upper()}"
+
     def microstructure_evidence_key(self, venue: str, symbol: str) -> str:
         return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:evidence"
 
@@ -704,6 +716,23 @@ class RedisRuntimeStore:
             self.microstructure_status_key(venue, symbol),
             json.dumps(payload, default=str, separators=(",", ":")),
         )
+
+    async def publish_microstructure_status_transition(
+        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
+    ) -> str:
+        """Append one status-TRANSITION entry to the status ledger stream.
+
+        Written ONLY when capture state changes (see capture._status); the
+        inference wake worker consumes this stream to fire capture-recovery
+        wakes event-driven. Bounded and best-effort: a failed append is
+        tolerated by the capture loop (latest-key status remains authoritative).
+        """
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        return str(await self.redis.xadd(
+            self.microstructure_status_stream(venue, symbol),
+            {"payload": body, "state": str(payload.get("state", ""))},
+            maxlen=max(1, int(maxlen)), approximate=True,
+        ))
 
     async def read_microstructure_status(self, venue: str, symbol: str) -> dict[str, Any] | None:
         raw = await self.redis.get(self.microstructure_status_key(venue, symbol))
@@ -779,8 +808,53 @@ class RedisRuntimeStore:
     def inference_latest_key(self, symbol: str, venue: str = "spot") -> str:
         return f"{self.prefix}:latest:inference:{venue.lower()}:{symbol.upper()}"
 
+    def inference_wake_stream(self, symbol: str, venue: str = "spot") -> str:
+        """RETIRED wake transport stream (kept named so no reference dangles).
+
+        The wake plane no longer transports envelopes through Redis: a firing
+        condition is materialized as an in-memory assertion and dispatched
+        directly by the wake worker. This key is not written by the worker;
+        it is retained only so older tooling/docs pointing at it fail clearly
+        instead of silently writing into the nowhere.
+        """
+        return f"{self.prefix}:stream:inference:wake:{venue.lower()}:{symbol.upper()}"
+
+    def inference_wake_supervisor_key(self, symbol: str, venue: str = "spot") -> str:
+        """Supervisor heartbeat / last-fire ledger for one scope.
+
+        Written by the wake worker every tick (TTL-bounded). Carries liveness
+        (state, pid, last_tick_ms) plus the last fired condition (events_total,
+        status_state, fired_stamp_ms) so a restarted worker can see how far the
+        plane has already consumed — this key is observability + restart
+        recovery, and the in-memory dedupe uses it as the atomic guard.
+        """
+        return f"{self.prefix}:state:inference:wake:{venue.lower()}:{symbol.upper()}:supervisor"
+
     def inference_stream(self, symbol: str, venue: str = "spot") -> str:
         return f"{self.prefix}:stream:inference:{venue.lower()}:{symbol.upper()}"
+
+    async def publish_wake_record(
+        self, record: dict[str, Any], *, stream_maxlen: int | None = None,
+    ) -> str | None:
+        """Append one informational wake record to the inference journal.
+
+        The wake worker calls this on every fire (via the dispatcher) so a
+        human/operator can audit what predicate fired and when. This is the
+        INFORMATIONAL journal only — never load-bearing on control flow
+        (the retired ``publish_wake``/``read_pending_wakes`` transport is
+        gone). Bounded; a failure here is tolerated.
+        """
+        body = json.dumps(record, default=str, separators=(",", ":"))
+        key = self.inference_stream(
+            str(record.get("symbol", "BTCUSDT")).upper(),
+            str(record.get("venue", "spot")),
+        )
+        return str(await self.redis.xadd(
+            key,
+            {"payload": body, "wake_id": str(record.get("wake_id", "")),
+             "predicate": str(sorted(record.get("predicates_fired") or {}) or "")},
+            maxlen=stream_maxlen or self.stream_maxlen, approximate=True,
+        ))
 
     async def publish_inference_artifact(
         self, artifact: InferenceArtifact, *, stream_maxlen: int | None = None,

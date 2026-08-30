@@ -147,7 +147,37 @@ by a harness-owned pipeline**:
   `SpecialistReport.from_llm_text` / `AnalystBriefing.from_controller_text`.
 * `market_service.microstructure.capture` — isolated WebSocket depth-delta
   capture (spot), feeding its own ledger namespace; never touches the
-  poller path.
+  poller path. Also appends ONE status-transition entry to
+  ``marketflow:stream:microstructure:status:{venue}:{SYMBOL}`` ONLY on
+  state change (running -> gap -> reconnecting -> ...), the event-driven
+  companion to its latest-key status payload.
+* `market_service.nooa_harness.wake_worker` — the EVENT-DRIVEN wake worker
+  (Slice 1). Bounded ENTIRELY on the Redis plane: it blocks on the
+  microstructure event stream (XREADGROUP, one consumer per scope) +
+  status-transition stream, evaluates the deterministic trigger matrix
+  (``inference.evaluate_triggers``) against the artifact high-water
+  (``deterministic_state.coverage.events_total``), and on a fire
+  materializes a typed ``WakeEnvelope`` IN MEMORY and dispatches the engine
+  cycle as an async task. The retired ``publish_wake``/``read_pending_wakes``
+  envelope transport is gone — the envelope is an assertion object, never
+  a transported artifact. Dedupe is a supervisor-lua script on
+  ``marketflow:state:inference:wake:...:supervisor``; liveness is a
+  TTL-bounded heartbeat on the same key.
+
+### Wake plane (deterministic trigger -> engine dispatch)
+
+The inference engine is event-driven, never lazily polled. Durable
+position lives on the consumer group's advanced `>` marker (crash-resume
+for free); the artifact ledger (``coverage.events_total``) is the
+restart-safe high-water. Predicates: ``event_delta`` (≥ threshold new
+events since the last artifact), ``cold_start`` (established capture, no
+artifact yet), ``capture_recovery`` (status stream records a
+gap/reconnecting -> running transition). Every fire passes: status-
+established, artifact cooldown (60s default), timestamp-water (fresh data
+only), then the atomic dedupe (identical conditions collapse). Fires log
+and, by default, record an informational journal entry on the inference
+stream; ``WAKE_ENGINE_DISPATCH=1`` routes the envelope straight to
+``engine.run_cycle`` (the Slice-2 closed loop, no LLM at worker import).
 
 ### Calculation-model groups (Pass 3 pivot)
 
@@ -167,6 +197,33 @@ Section dependencies resolve automatically (`turnover`/`signals` → `flow`;
 `correlation` shares `bucketed_cvd` with the bucketed section; `regime` →
 `flow`; `wall_migration` → `orderbook`). The monolithic run-cycle
 (`--analyze`) stays the canonical persisted-envelope path.
+
+### Specialized group envelopes — the interpretation read plane
+
+The canonical `MarketRunEnvelope` is the **persisted audit record**; what
+analysts READ are specialized `GroupEnvelope` contracts
+(`nooa_harness/contracts.py`, schema_version=1):
+
+* `pipeline.run_group_cycle` reads raw evidence **directly from the Redis
+  store** (no monolithic envelope, no persistence), runs only the requested
+  group's sections, and emits one typed `GroupEnvelope` per group with its
+  own `run_id`.
+* `pipeline.build_group_envelopes` deterministically projects a persisted
+  canonical envelope into the four group envelopes, preserving its
+  `run_id` so every specialist claim stays audit-linked to one run.
+* `pipeline.build_controller_view` gives the controller a compact
+  cross-group block (bounded headlines per group) instead of the
+  monolithic envelope.
+* `SPECIALIST_GROUP_KINDS` assigns each NOOA specialist its group:
+  delta_orderflow→flow, macro→structure, open_interest→positioning,
+  liquidations→wall.
+
+Every group envelope carries `evidence_headlines` (compact snake_case
+scalars: price, funding, OI) and arrays bounded at emission (128-item cap
+with explicit `__truncated__` markers). Group envelopes fit the LLM context
+**by construction** — the monolithic envelope's `bounded_envelope_view`
+collapse path (realistic envelopes degraded to identity-only views) no
+longer participates in the read path.
 
 ### Time & coverage semantics
 

@@ -226,49 +226,10 @@ def memory_forget(session_id, memory_id) -> None:
 
 
 # --------------------------------------------------------------------------
-# analyst — runs the agentic classes from market_service/nooa_harness/agents.py
+# (analyst command REMOVED — the specialist/controller plane was deleted in
+# the inference-engine pass; `nooa market inference run/watch` is the engine
+# surface now.)
 # --------------------------------------------------------------------------
-@command.command("analyst")
-@click.argument("symbol", default="SOLUSDT")
-@click.option("--run-id", default=None, help="analyze one exact envelope")
-@click.option("--latest", "use_latest", is_flag=True, help="analyze the latest envelope")
-@click.option("--cycles", type=int, default=1, help="number of cycles (0 = forever)")
-@click.option("--interval", type=float, default=60.0, help="seconds between cycles")
-@click.option("--with-memory", is_flag=True, help="recall prior memory + remember outputs")
-@click.option("--session-id", default=None, help="stable analyst session UUID")
-def analyst_cmd(symbol, run_id, use_latest, cycles, interval,
-                with_memory, session_id) -> None:
-    """Run the NOOA analyst suite (ControllerAgent + 4 specialists).
-
-    Calculation flags (derivative fetch, cross-asset, TTL, raw-only) live
-    on the outer harness CLI — see ``market_service.commands.harness``
-    ``--analyze`` and ``--refresh-derivatives``. This command reuses
-    whatever derivatives are already cached in Redis by those flags.
-    """
-    from market_service.nooa_harness.runner import run_analyze_once
-
-    async def _loop() -> None:
-        if cycles == 0:
-            while True:
-                await run_analyze_once(
-                    symbol,
-                    use_latest=use_latest or (run_id is None),
-                    run_id=run_id,
-                    session_id=session_id,
-                    with_memory=with_memory,
-                )
-                await asyncio.sleep(interval)
-        for _ in range(cycles):
-            await run_analyze_once(
-                symbol,
-                use_latest=use_latest or (run_id is None),
-                run_id=run_id,
-                session_id=session_id,
-                with_memory=with_memory,
-            )
-            if _ < cycles - 1:
-                await asyncio.sleep(interval)
-    asyncio.run(_loop())
 
 
 # --------------------------------------------------------------------------
@@ -533,6 +494,165 @@ def micro_interpret(symbol: str, venue: str, evidence_id: str | None) -> None:
             await postgres.close()
 
     _emit(asyncio.run(_run()))
+
+
+# --------------------------------------------------------------------------
+# inference — the statistical inference engine's user-facing surfaces
+#
+# This is the OUTER-trigger plane: a human (or terminal agent) fires the
+# engine explicitly. Bounded by the same capability registry as every other
+# dispatch (BTCUSDT/spot frozen). Autonomous operation runs through the
+# condition-gated watcher (`inference watch`), never a lazy compute loop.
+# --------------------------------------------------------------------------
+
+
+@command.group("inference",
+               help="Statistical inference engine: trigger, read artifacts, watch.")
+def inference_group() -> None:
+    """Wake, read, and watch the statistical inference engine."""
+
+
+@inference_group.command("run")
+@click.argument("symbol", default="BTCUSDT")
+@click.option("--venue", default="spot")
+@click.option("--force", is_flag=True,
+              help="bypass wake predicates — the manual trigger IS the wake")
+def inference_run(symbol: str, venue: str, force: bool) -> None:
+    """Run ONE inference cycle now (drains pending wakes unless --force)."""
+    from market_service.nooa_harness.inference_runner import run_inference_once
+
+    async def _run() -> dict[str, Any]:
+        return await run_inference_once(symbol, venue=venue, force=force)
+
+    _emit(asyncio.run(_run()))
+
+
+@inference_group.command("read")
+@click.argument("symbol", default="BTCUSDT")
+@click.option("--venue", default="spot")
+@click.option("--artifact-id", default=None, help="read one exact artifact (durable ledger)")
+@click.option("--redis-only", is_flag=True, help="skip Postgres; read the live projection")
+def inference_read(symbol: str, venue: str, artifact_id: str | None,
+                   redis_only: bool) -> None:
+    """Read inference artifacts (Postgres-first durable ledger, Redis fallback)."""
+    async def _run() -> dict[str, Any]:
+        settings = _settings()
+        artifact = None
+        source = None
+        if not redis_only:
+            postgres = PostgresRuntimeStore(settings.database_url)
+            try:
+                await postgres.connect()
+                artifact = await postgres.read_inference_artifact(
+                    symbol, artifact_id=artifact_id,
+                )
+                source = "postgres"
+            finally:
+                await postgres.close()
+        if artifact is None:
+            redis = RedisRuntimeStore(
+                settings.redis_url, settings.redis_key_prefix,
+                settings.redis_stream_maxlen,
+            )
+            try:
+                artifact = await redis.read_latest_inference_artifact(
+                    symbol.upper(), venue,
+                )
+                source = "redis"
+            finally:
+                await redis.close()
+        return {"source": source, "artifact": artifact}
+
+    _emit(asyncio.run(_run()))
+
+
+@inference_group.command("history")
+@click.argument("symbol", default="BTCUSDT")
+@click.option("--venue", default="spot")
+@click.option("--limit", type=int, default=20)
+def inference_history(symbol: str, venue: str, limit: int) -> None:
+    """Read the inference cycle history (durable ledger, newest first)."""
+    async def _run() -> dict[str, Any]:
+        settings = _settings()
+        postgres = PostgresRuntimeStore(settings.database_url)
+        try:
+            await postgres.connect()
+            history = await postgres.read_inference_history(symbol, limit=limit)
+            return {"symbol": symbol.upper(), "count": len(history),
+                    "history": history}
+        finally:
+            await postgres.close()
+
+    _emit(asyncio.run(_run()))
+
+
+@inference_group.command("watch")
+@click.argument("symbol", default="BTCUSDT")
+@click.option("--venue", default="spot")
+@click.option("--interval", "interval_s", type=float, default=30.0,
+              help="seconds between wake-drain ticks (cheap; fires only on wakes)")
+@click.option("--cycles", type=int, default=0,
+              help="number of drain ticks (0 = forever)")
+def inference_watch(symbol: str, venue: str, interval_s: float, cycles: int) -> None:
+    """Condition-gated watcher: drain wakes each tick, run at most one cycle per fire.
+
+    A tick without a firing wake costs two XLENs and one GET — never a
+    lazy compute loop.
+    """
+    from market_service.nooa_harness.inference_runner import run_inference_loop
+
+    async def _run() -> None:
+        await run_inference_loop(
+            symbol, venue=venue, interval_s=interval_s,
+            forever=(cycles == 0),
+        )
+
+    asyncio.run(_run())
+
+
+@inference_group.command("wake")
+@click.argument("symbol", default="BTCUSDT")
+@click.option("--venue", default="spot")
+@click.option("--once", is_flag=True,
+              help="run a single bounded tick (smoke test) instead of the loop")
+@click.option("--read-block-ms", type=int, default=None,
+              help="blocking read wait per iteration")
+def inference_wake(symbol: str, venue: str, once: bool, read_block_ms: int | None) -> None:
+    """Event-driven wake worker: fires the engine on deterministic conditions.
+
+    Replaces the lazy drain loop with the blocker-only, clock-free wake
+    plane: XREADGROUP BLOCK on the microstructure event stream + status
+    transition stream, deterministic predicate evaluation, in-memory
+    WakeEnvelope, async engine dispatch. ``--once`` runs one bounded tick.
+    """
+    from market_service.nooa_harness.wake_worker import (
+        WakeSupervisorConfig,
+        _build_supervisor,
+    )
+
+    config = WakeSupervisorConfig.from_env(symbol)
+    config.venue = venue
+    if read_block_ms is not None:
+        config.read_block_ms = read_block_ms
+
+    async def _run() -> None:
+        supervisor = await _build_supervisor(config)
+        if once:
+            await supervisor.start()
+            try:
+                await supervisor._tick()
+                await supervisor._read_once(block_ms=10)
+                await supervisor._read_status_once(block_ms=10)
+            finally:
+                await supervisor.stop()
+            _emit({"mode": "once", "symbol": symbol.upper(),
+                   "venue": venue, "fired": supervisor.fired_count})
+        else:
+            fired = await supervisor.run_forever()
+            _emit({"mode": "loop", "symbol": symbol.upper(),
+                   "venue": venue, "fired": fired})
+
+    asyncio.run(_run())
 
 
 __all__ = ["command"]

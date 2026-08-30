@@ -19,11 +19,18 @@ ANALYST_BRIEFING_SCHEMA_VERSION = 2
 SPECIALIST_REPORT_SCHEMA_VERSION = 2
 AGENT_MEMORY_SCHEMA_VERSION = 1
 INFERENCE_ARTIFACT_SCHEMA_VERSION = 1
+WAKE_ENVELOPE_SCHEMA_VERSION = 1
 # Agent-artifact kinds the memory node can persist. Mirrors the agent-owned
 # write surfaces from NOOA_HARNESS_ARCHITECTURE.md: observations, hypotheses,
 # requests, briefings — plus 'fact'/'note' for durable analyst notes.
 ValidMemoryKinds: tuple[str, ...] = (
     "observation", "hypothesis", "request", "briefing", "fact", "note",
+)
+# Valid wake trigger sources (who materialized the envelope).
+ValidWakeSources: tuple[str, ...] = ("manual", "watcher", "hook")
+# Valid trigger predicates (the deterministic wake conditions).
+ValidWakePredicates: tuple[str, ...] = (
+    "event_delta", "capture_recovery", "cold_start", "manual",
 )
 StateStatus = Literal["healthy", "degraded", "invalid"]
 ConfidenceLevel = Literal["low", "medium", "high"]
@@ -35,6 +42,131 @@ ValidConfidence: tuple[str, ...] = ("low", "medium", "high")
 # insufficient — gates failed; interpretation is deterministically NULL (no LLM call)
 InferenceStatus = Literal["validated", "provisional", "insufficient"]
 ValidInferenceStatus: tuple[str, ...] = ("validated", "provisional", "insufficient")
+
+
+@dataclass(frozen=True)
+class WakeEnvelope:
+    """Typed wake assertion for the statistical inference engine.
+
+    One envelope is a DETERMINISTIC ASSERTION that the inference engine
+    should run a cycle, produced by a pure trigger evaluation over Redis
+    counter state (never by an LLM). The engine treats it as an assertion,
+    not a command: at dispatch it re-validates the counters against live
+    Redis (two-phase wake) before doing expensive work.
+
+    Delivery: XADDed to ``marketflow:stream:inference:wake:<venue>:<SYMBOL>``
+    (durable, replayable, survives engine downtime — never pub/sub).
+    ``wake_id`` is a deterministic dedupe hash (predicate-set + high-water
+    counters) so identical wake conditions collapse to one cycle.
+    """
+
+    symbol: str
+    venue: str
+    trigger_source: str
+    predicates_fired: dict[str, Any]
+    counter_snapshot: dict[str, Any]
+    high_water: dict[str, Any]
+    wake_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: str = field(default_factory=lambda: _utc_iso())
+    schema_version: int = WAKE_ENVELOPE_SCHEMA_VERSION
+
+    def validate(self) -> None:
+        if self.schema_version != WAKE_ENVELOPE_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported wake envelope schema version: {self.schema_version}"
+            )
+        if not self.symbol or not self.venue:
+            raise ValueError("WakeEnvelope requires symbol and venue")
+        if self.trigger_source not in ValidWakeSources:
+            raise ValueError(
+                f"invalid trigger source {self.trigger_source!r}; "
+                f"expected one of {ValidWakeSources!r}"
+            )
+        if not self.predicates_fired:
+            raise ValueError("WakeEnvelope requires at least one fired predicate")
+        for predicate in self.predicates_fired:
+            if predicate not in ValidWakePredicates:
+                raise ValueError(
+                    f"invalid wake predicate {predicate!r}; "
+                    f"expected one of {ValidWakePredicates!r}"
+                )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        symbol: str,
+        venue: str,
+        trigger_source: str,
+        predicates_fired: dict[str, Any],
+        counter_snapshot: dict[str, Any],
+        high_water: dict[str, Any],
+    ) -> "WakeEnvelope":
+        created = cls(
+            symbol=symbol.upper(),
+            venue=venue,
+            trigger_source=trigger_source,
+            predicates_fired=dict(predicates_fired),
+            counter_snapshot=dict(counter_snapshot),
+            high_water=dict(high_water),
+        )
+        created.validate()
+        return created
+
+    def _replace_wake_id(self, wake_id: str) -> "WakeEnvelope":
+        """Return a copy with the deterministic dedupe ``wake_id``.
+
+        The deterministic condition hash (``wake_dedupe_id``) replaces the
+        random UUID so identical wake conditions collapse to one wake. The
+        envelope has already been validated by ``create``; only the id and
+        created-at stamps change.
+        """
+        return WakeEnvelope(
+            wake_id=wake_id,
+            symbol=self.symbol,
+            venue=self.venue,
+            trigger_source=self.trigger_source,
+            predicates_fired=self.predicates_fired,
+            counter_snapshot=self.counter_snapshot,
+            high_water=self.high_water,
+            created_at=self.created_at,
+            schema_version=self.schema_version,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "WakeEnvelope":
+        envelope = cls(
+            wake_id=str(value["wake_id"]),
+            symbol=str(value["symbol"]).upper(),
+            venue=str(value["venue"]),
+            trigger_source=str(value["trigger_source"]),
+            predicates_fired=dict(value.get("predicates_fired") or {}),
+            counter_snapshot=dict(value.get("counter_snapshot") or {}),
+            high_water=dict(value.get("high_water") or {}),
+            created_at=str(value.get("created_at") or _utc_iso()),
+            schema_version=int(
+                value.get("schema_version", WAKE_ENVELOPE_SCHEMA_VERSION)
+            ),
+        )
+        envelope.validate()
+        return envelope
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "wake_id": self.wake_id,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "trigger_source": self.trigger_source,
+            "predicates_fired": self.predicates_fired,
+            "counter_snapshot": self.counter_snapshot,
+            "high_water": self.high_water,
+            "created_at": self.created_at,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str, separators=(",", ":"))
+
 
 # ---------------------------------------------------------------------------
 # Typed sub-contracts for analyst-layer evidence, consensus, and disagreements.

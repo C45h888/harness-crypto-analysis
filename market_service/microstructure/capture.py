@@ -75,6 +75,7 @@ class BinanceSpotDepthCapture:
         self.intervals = 0
         self._book: OrderBookReconstructor | None = None
         self._aggregator = OFIAggregator(settings.interval_seconds * 1_000)
+        self._last_written_status_state: str | None = None
 
     async def close(self) -> None:
         await self.store.close()
@@ -212,6 +213,27 @@ class BinanceSpotDepthCapture:
             "error": error,
         }
         await self.store.set_microstructure_status(self.settings.venue, self.settings.symbol, payload)
+        # Event-driven status ledger: append ONE entry only on a state
+        # transition (running -> gap -> reconnecting -> running ...). The
+        # wake worker blocks on this stream to fire capture-recovery wakes
+        # WITHOUT polling — the entry time is carried in the stream id, and
+        # the payload carries the transition itself.
+        if self._last_written_status_state != state:
+            prior = self._last_written_status_state
+            self._last_written_status_state = state
+            transition_payload = dict(payload)
+            transition_payload["from_state"] = prior
+            transition_payload["to_state"] = state
+            try:
+                await self.store.publish_microstructure_status_transition(
+                    self.settings.venue, self.settings.symbol, transition_payload,
+                    maxlen=self.settings.stream_maxlen,
+                )
+            except Exception:
+                # A failed transition append must NEVER break the capture
+                # loop or its status bookkeeping. The latest-key status is
+                # already written; the transition ledger is best-effort.
+                pass
 
 
 async def main_async(symbol: str) -> int:
