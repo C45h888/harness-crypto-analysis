@@ -1,6 +1,6 @@
 """NOOA-free tests for the analyst contract surface.
 
-These tests exercise SpecialistReport / AnalystBriefing contracts, the
+These tests exercise the SpecialistReport contract, the
 env-driven model backend config, the runner's read-vs-refresh modes, and the
 postgres-first persistence ordering. They import NOOA-free code only, so they
 run fast without ever loading litellm.
@@ -17,22 +17,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from market_service.nooa_harness.backends import ModelBackendConfig
 from market_service.runtime.contracts import (
-    ANALYST_BRIEFING_SCHEMA_VERSION,
-    AnalystBriefing,
     MARKET_RUN_SCHEMA_VERSION,
-    MarketRunEnvelope,
     SPECIALIST_REPORT_SCHEMA_VERSION,
     SpecialistReport,
     SpecialistReportParseError,
 )
 
 try:  # discover -s tests puts tests/ on sys.path
-    from _nooa_fixtures import _MOCK_RESPONSES, _SAMPLE_ENVELOPE, _SAMPLE_ENVELOPE_BRIEFING
+    from _nooa_fixtures import _MOCK_RESPONSES, _SAMPLE_ENVELOPE
 except ImportError:  # module-style invocation (tests.*)
     from tests._nooa_fixtures import (  # type: ignore[no-redef]
         _MOCK_RESPONSES,
         _SAMPLE_ENVELOPE,
-        _SAMPLE_ENVELOPE_BRIEFING,
     )
 
 
@@ -70,26 +66,26 @@ class BackendConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ModelBackendConfig.from_env()
 
-    def test_anthropic_endpoint_routes_model_with_prefix(self):
+    def test_model_is_verbatim_passthrough_regardless_of_provider(self):
         cfg = ModelBackendConfig(
             provider="Minimax.io",
             model="claude-something",
             base_url="https://gateway.example/anthropic",
             api_key="k",
         )
-        self.assertEqual(cfg.routed_model(), "anthropic/claude-something")
+        self.assertEqual(cfg.routed_model(), "claude-something")
 
-    def test_vllm_routes_to_openai_prefix(self):
+    def test_vllm_model_sent_verbatim(self):
         cfg = ModelBackendConfig(provider="vllm", model="llama-3-70b", base_url="http://host:8000/v1")
-        self.assertEqual(cfg.routed_model(), "openai/llama-3-70b")
+        self.assertEqual(cfg.routed_model(), "llama-3-70b")
 
-    def test_ollama_routes_to_ollama_prefix(self):
+    def test_ollama_model_sent_verbatim(self):
         cfg = ModelBackendConfig(provider="ollama", model="llama3")
-        self.assertEqual(cfg.routed_model(), "ollama/llama3")
+        self.assertEqual(cfg.routed_model(), "llama3")
 
-    def test_existing_prefix_is_preserved(self):
-        cfg = ModelBackendConfig(provider="litellm", model="anthropic/claude-something")
-        self.assertEqual(cfg.routed_model(), "anthropic/claude-something")
+    def test_existing_model_prefix_is_preserved(self):
+        cfg = ModelBackendConfig(provider="openai", model="deepseek/deepseek-chat", base_url="https://openrouter.ai/api/v1")
+        self.assertEqual(cfg.routed_model(), "deepseek/deepseek-chat")
 
     def test_api_key_is_not_exported_as_model_metadata(self):
         cfg = ModelBackendConfig(
@@ -193,80 +189,9 @@ class SpecialistReportContractTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# AnalystBriefingContractTests
-# ---------------------------------------------------------------------------
-
-
-class AnalystBriefingContractTests(unittest.TestCase):
-    """AnalystBriefing.from_controller_text always produces a briefing, even on parse failure."""
-
-    def _controller_json(self) -> str:
-        return json.dumps({
-            "narrative": "Bullish bias with futures leading.",
-            "consensus": {"direction": "up", "confidence": "medium"},
-            "disagreements": [{"topic": "OI", "specialist_a": "delta", "specialist_b": "oi"}],
-            "key_evidence": [{"run_id": "test-run-002", "path": "calc.flow", "claim": "net +50"}],
-            "limitations": ["sample size"],
-            "uncertainty_sources": ["freshness"],
-        })
-
-    def test_valid_controller_text_produces_typed_briefing(self):
-        briefing = AnalystBriefing.from_controller_text(
-            session_id="sess-1", run_id="test-run-002",
-            model_provider="openai", model_name="gpt-x",
-            generated_at="2026-01-01T00:00:02+00:00",
-            raw=self._controller_json(),
-            envelope=_SAMPLE_ENVELOPE_BRIEFING,
-        )
-        self.assertEqual(briefing.run_id, "test-run-002")
-        self.assertEqual(briefing.session_id, "sess-1")
-        self.assertEqual(briefing.model_provider, "openai")
-        self.assertEqual(briefing.consensus.direction, "up")
-        self.assertEqual(briefing.consensus.confidence, "medium")
-        self.assertEqual(len(briefing.key_evidence), 1)
-        self.assertEqual(len(briefing.disagreements), 1)
-        self.assertEqual(briefing.schema_version, ANALYST_BRIEFING_SCHEMA_VERSION)
-        self.assertEqual(briefing.envelope_summary["status"], "healthy")
-        self.assertEqual(briefing.parse_errors, ())
-
-    def test_malformed_controller_still_produces_briefing_with_parse_errors(self):
-        briefing = AnalystBriefing.from_controller_text(
-            session_id="sess-1", run_id="test-run-002",
-            model_provider="openai", model_name="gpt-x",
-            generated_at="2026-01-01T00:00:02+00:00",
-            raw="not json", envelope=_SAMPLE_ENVELOPE_BRIEFING,
-        )
-        self.assertEqual(briefing.run_id, "test-run-002")
-        self.assertIn("raw_narrative", briefing.extra)
-        self.assertEqual(briefing.parse_errors[0]["stage"], "controller")
-        self.assertEqual(briefing.consensus.direction, "unknown")
-        self.assertEqual(briefing.consensus.confidence, "low")
-
-    def test_invalid_confidence_in_consensus_is_clamped(self):
-        raw = json.dumps({
-            "narrative": "x", "consensus": {"direction": "up", "confidence": "extreme"},
-        })
-        briefing = AnalystBriefing.from_controller_text(
-            session_id="sess-1", run_id="r", model_provider="o", model_name="m",
-            generated_at="t", raw=raw, envelope=_SAMPLE_ENVELOPE_BRIEFING,
-        )
-        self.assertEqual(briefing.consensus.confidence, "low")
-
-    def test_from_mapping_roundtrip(self):
-        b1 = AnalystBriefing.from_controller_text(
-            session_id="sess-1", run_id="r", model_provider="o", model_name="m",
-            generated_at="t", raw=self._controller_json(),
-            envelope=_SAMPLE_ENVELOPE_BRIEFING,
-        )
-        b2 = AnalystBriefing.from_mapping(b1.to_dict())
-        self.assertEqual(b1.to_dict(), b2.to_dict())
-        self.assertEqual(b2.parse_errors, b1.parse_errors)
-
-
-# ---------------------------------------------------------------------------
-# (RunnerModeTests + PersistenceOrderingTests REMOVED — they tested the old
-# analyst runner (`run_analyze_once` / `_persist_briefing`), which was
-# deleted in the inference-engine pass. The engine's persistence ordering is
+# (AnalystBriefingContractTests + RunnerModeTests + PersistenceOrderingTests
+# REMOVED — the AnalystBriefing dataclass family was retired 2026-08-31
+# in the market-read deviation. The engine's persistence ordering is
 # covered by tests/test_engine.py: PG insert before Redis publish.)
 # ---------------------------------------------------------------------------
 

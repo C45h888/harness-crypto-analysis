@@ -36,10 +36,13 @@ class NooaCliMountTests(unittest.TestCase):
         self.assertIn("market", _MOUNTED.commands)
 
     def test_market_group_has_harness_subcommands(self):
+        # The envelope dataclass read path was retired 2026-08-30 in favour
+        # of ``market read`` (runtime.read_paths): the surface is now read /
+        # memory / microstructure / inference.
         names = set(_MOUNTED.commands["market"].commands)
         self.assertEqual(
             names,
-            {"envelope", "briefing", "memory", "microstructure", "inference"},
+            {"read", "memory", "microstructure", "inference"},
         )
 
     def test_mount_does_not_write_into_framework_package(self):

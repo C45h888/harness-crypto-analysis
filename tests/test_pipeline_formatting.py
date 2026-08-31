@@ -47,11 +47,11 @@ def _trade(ts: int, tid: int, qty: float = 1.0, maker: bool = False) -> dict[str
 
 
 class EnvelopeSummaryProjectionTests(unittest.TestCase):
-    """The briefing summary reads REAL envelope paths — no math, no dead keys."""
+    """The snapshot reads REAL payload paths — no math, no dead keys."""
 
     def _envelope(self) -> dict[str, Any]:
-        from market_service.runtime.contracts import _envelope_summary
-        return _envelope_summary({
+        from market_service.runtime import read_paths
+        return read_paths.market_snapshot({
             "schema_version": 1,
             "symbol": "SOLUSDT",
             "status": "healthy",

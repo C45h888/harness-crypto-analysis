@@ -17,7 +17,6 @@ from market_service.nooa_harness.memory import MemoryNode, _keywords
 from market_service.runtime.contracts import (
     AGENT_MEMORY_SCHEMA_VERSION,
     AgentMemory,
-    AnalystBriefing,
     ValidMemoryKinds,
 )
 from market_service.runtime.redis_store import RedisRuntimeStore

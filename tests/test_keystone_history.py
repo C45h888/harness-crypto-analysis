@@ -124,7 +124,7 @@ class KeystoneSnapshotPayloadTests(unittest.TestCase):
 
 class ProjectionInventoryTests(unittest.TestCase):
     def test_signal_inventory_and_headlines(self):
-        from market_service.commands.harness import _projection
+        from market_service.runtime import read_paths
         env = {
             "schema_version": 1, "symbol": "SOLUSDT", "status": "healthy",
             "canonical_state": {
@@ -141,18 +141,21 @@ class ProjectionInventoryTests(unittest.TestCase):
                 "analysis": {"analysis": {"wall_migration": {}}},
             },
         }
-        out = _projection(env)
+        out = read_paths.market_inventory(env)
         self.assertIn("fut_keystone", out["orderbook_keys"])
         self.assertIn("seller_aggression", out["technical_keys"])
-        self.assertEqual(out["headlines"]["fut_keystone_bid"], 93.5)
-        self.assertEqual(out["headlines"]["seller_aggression"], "MEDIUM")
-        self.assertEqual(out["headlines"]["hourly_keystone_verdict"], "FLAT")
+        # Headlines live inside the snapshot sub-projection now
+        snap = out["snapshot"]
+        self.assertEqual(snap["fut_keystone_bid"], 93.5)
+        self.assertEqual(snap["seller_aggression"], "MEDIUM")
+        self.assertEqual(snap["hourly_keystone_verdict"], "FLAT")
 
     def test_headlines_null_when_absent(self):
-        from market_service.commands.harness import _projection
-        out = _projection({"canonical_state": {}})
-        self.assertEqual(out["headlines"]["fut_keystone_bid"], None)
-        self.assertEqual(out["headlines"]["seller_aggression"], None)
+        from market_service.runtime import read_paths
+        out = read_paths.market_inventory({"canonical_state": {}})
+        snap = out["snapshot"]
+        self.assertIsNone(snap["fut_keystone_bid"])
+        self.assertIsNone(snap["seller_aggression"])
 
 
 if __name__ == "__main__":

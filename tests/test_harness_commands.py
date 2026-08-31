@@ -14,12 +14,12 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from market_service.commands.harness import (
-    _projection,
     _refresh_derivatives,
     _run_analyze,
     _summarize_derivatives_cache,
     build_parser,
 )
+from market_service.runtime import read_paths
 
 
 class HarnessParserTests(unittest.TestCase):
@@ -265,7 +265,7 @@ class HarnessAnalyzeProjectionTests(unittest.TestCase):
                 }
             },
         }
-        proj = _projection(env)
+        proj = read_paths.market_inventory(env)
         self.assertEqual(proj["symbol"], "SOLUSDT")
         self.assertEqual(proj["run_id"], "uuid")
         self.assertNotIn("canonical_state", proj)
@@ -339,7 +339,7 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
         from market_service.commands.harness import _run_analyze
         import argparse
 
-        mock_run_cycle.return_value = MarketRunEnvelopeStub(**self._env_dict())
+        mock_run_cycle.return_value = dict(self._env_dict())
         args = argparse.Namespace(
             symbol="SOLUSDT", window="15m", deriv_ttl=300,
             no_persist=True, no_derivatives=False,
@@ -364,7 +364,7 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
         from market_service.commands.harness import _run_analyze
 
         mock_run_cycle.side_effect = lambda settings, env, window, **kw: (
-            MarketRunEnvelopeStub(**self._env_dict())
+            dict(self._env_dict())
         )
         args = argparse.Namespace(
             symbol="SOLUSDT", window="15m", deriv_ttl=300,
@@ -372,7 +372,12 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
             with_cross_asset=False, force_refresh_derivatives=False,
             envelope_summary=False,
         )
-        result = await _run_analyze(args)
+        with patch.dict(
+            os.environ, {"DATABASE_URL": "postgresql://x:***@localhost/z",
+                          "REDIS_URL": "redis://x:6379/0"},
+            clear=False,
+        ):
+            result = await _run_analyze(args)
         call_kwargs = mock_run_cycle.call_args.kwargs
         self.assertIs(call_kwargs["persist"], True)
         self.assertEqual(result["persistence"], {"mode": "persisted"})
@@ -383,28 +388,28 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
         from market_service.commands.harness import _run_analyze
         from tests._nooa_fixtures import _SAMPLE_ENVELOPE
 
-        import market_service.runtime.contracts as RC
-        envelope_obj = RC.MarketRunEnvelope.from_mapping(dict(_SAMPLE_ENVELOPE))
-        mock_run_cycle.side_effect = lambda settings, env, ws, **kw: envelope_obj
+        # run_cycle now returns a plain dict — _SAMPLE_ENVELOPE is already a dict
+        envelope_dict = dict(_SAMPLE_ENVELOPE)
+        mock_run_cycle.side_effect = lambda settings, env, ws, **kw: envelope_dict
         args = argparse.Namespace(
             symbol="SOLUSDT", window="15m", deriv_ttl=300,
             no_persist=False, no_derivatives=False,
             with_cross_asset=False, force_refresh_derivatives=False,
             envelope_summary=True,
         )
-        result = await _run_analyze(args)
+        with patch.dict(
+            os.environ, {"DATABASE_URL": "postgresql://x:***@localhost/z",
+                          "REDIS_URL": "redis://x:6379/0"},
+            clear=False,
+        ):
+            result = await _run_analyze(args)
         self.assertIn("envelope_summary", result)
         self.assertNotIn("envelope", result)
 
 
-class MarketRunEnvelopeStub:
-    """Minimal duck-typed stub exposing only what _run_analyze needs."""
-
-    def __init__(self, **fields):
-        self._fields = fields
-
-    def to_dict(self):
-        return dict(self._fields)
+def _env_dict_stub(env_dict):
+    """Return a plain dict — run_cycle now returns dict, not a dataclass."""
+    return dict(env_dict)
 
 
 if __name__ == "__main__":
