@@ -61,10 +61,31 @@ Uncited numeric claims are contract violations.
 
 ## T2 — Market correlation tools (canonical pipeline)
 
-### `market.envelope`
-- When: you need the full canonical market state (flow, OBI, CVD, delta,
-  technicals) as collated by the outer harness.
-- Returns: latest MarketRunEnvelope dict, or null when none persisted.
+### `market.read`
+- When: you need the latest collated market run — prices, funding, OI,
+  keystone/wall, flow, technical classification, CVD sign series.
+- Args: `mode` (optional): `snapshot` (default — bounded headline view),
+  `inventory` (section keys + snapshot), `full` (raw payload deep-dive;
+  only when the snapshot demonstrably lacks the field you need — prefer
+  citing what the snapshot has).
+- Returns (snapshot): run identity (`schema_version`, `symbol`, `status`,
+  `run_id`, `generated_at`, `completed_at`, `data_source`,
+  `domain_status`, `error_count`), headline scalars (`last_price`,
+  `volume_24h`, `high_24h`, `low_24h`, `funding_rate`, `mark_price`,
+  `open_interest`, `spot_cvd`, `futures_cvd`, `spot_obi`, `futures_obi`,
+  `fut_keystone_bid`, `fut_keystone_ask`, `keystone_bid_qty`,
+  `keystone_ask_qty`, `bid_ladder_notional`, `ask_ladder_notional`,
+  `keystone_trade_buy_qty`, `keystone_trade_sell_qty`,
+  `hourly_keystone_verdict`, `seller_aggression`, `bid_anchor_count`,
+  `mega_tier_pct`, `fut_microprice_skew_bps`), and `cvd_sign_series` —
+  per-window `{window_seconds, buckets, delta_usd_sum, sign}` across
+  900/300/120/60/30s. Sign flips across these windows are the
+  institutional delta-flip signal.
+- Citation paths use this tool name and its field names:
+  `market.read → fut_keystone_bid`.
+- `null` means not-computable/absent — never zero, never invent. A
+  `schema_mismatch` error means the writer is on a different contract:
+  report it, do not retry.
 
 ### `market.group`
 - When: you need a FRESH computation of one domain group over the raw

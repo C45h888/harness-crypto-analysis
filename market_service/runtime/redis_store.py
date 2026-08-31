@@ -10,8 +10,7 @@ from typing import Any
 from redis.asyncio import Redis
 
 from .contracts import (
-    AGENT_MEMORY_SCHEMA_VERSION, ANALYST_BRIEFING_SCHEMA_VERSION,
-    AgentMemory, AnalystBriefing, InferenceArtifact, MarketRunEnvelope,
+    AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, InferenceArtifact,
     MarketStateEnvelope,
 )
 
@@ -23,7 +22,6 @@ from .contracts import (
 _AGENT_ARTIFACT_SCHEMA_VERSION: dict[str, int] = {
     "observations": 1,
     "hypotheses": 1,
-    "briefings": ANALYST_BRIEFING_SCHEMA_VERSION,
     "memory": AGENT_MEMORY_SCHEMA_VERSION,
 }
 
@@ -143,10 +141,18 @@ class RedisRuntimeStore:
             out.append({"id": entry_id, "ts": fields.get("ts", ""), **value})
         return out
 
-    async def publish_run(self, envelope: MarketRunEnvelope) -> str:
-        envelope.validate()
-        payload = envelope.to_json()
-        dedupe_key = f"{self.prefix}:run:{envelope.run_id}"
+    async def publish_run(self, envelope: dict[str, Any]) -> str:
+        """Publish one canonical run payload dict to the collated stream.
+
+        The envelope dataclass was retired 2026-08-31 — the payload shape
+        (field names + schema_version) is the contract, assembled by
+        ``pipeline.assemble_envelope`` and JSON-safe at the write seam.
+        """
+        payload = json.dumps(envelope, default=str, separators=(",", ":"))
+        run_id = str(envelope["run_id"])
+        symbol = str(envelope["symbol"]).upper()
+        schema_version = str(envelope.get("schema_version", ""))
+        dedupe_key = f"{self.prefix}:run:{run_id}"
         # One Redis-side transaction makes the latest projection, stream entry,
         # and idempotency marker succeed or fail together. The XADD
         # uses MAXLEN ~ to bound the collated stream (telemetry hygiene
@@ -165,22 +171,10 @@ class RedisRuntimeStore:
         return id
         """
         return str(await self.redis.eval(
-            script, 3, dedupe_key, self.collated_latest_key(envelope.symbol),
-            self.collated_stream(envelope.symbol), payload, envelope.run_id,
-            envelope.symbol, str(envelope.schema_version),
+            script, 3, dedupe_key, self.collated_latest_key(symbol),
+            self.collated_stream(symbol), payload, run_id,
+            symbol, schema_version,
         ))
-
-    async def read_latest_run(self, symbol: str) -> MarketRunEnvelope | None:
-        raw = await self.redis.get(self.collated_latest_key(symbol))
-        return MarketRunEnvelope.from_mapping(json.loads(raw)) if raw else None
-
-    async def read_run(self, run_id: str) -> MarketRunEnvelope | None:
-        raw = await self.redis.get(f"{self.prefix}:run:{run_id}")
-        return MarketRunEnvelope.from_mapping(json.loads(raw)) if raw else None
-
-    async def read_runs(self, symbol: str, count: int = 100) -> list[MarketRunEnvelope]:
-        rows = await self.redis.xrevrange(self.collated_stream(symbol), count=count)
-        return [MarketRunEnvelope.from_mapping(json.loads(fields["payload"])) for _, fields in rows]
 
     async def has_run(self, run_id: str) -> bool:
         return bool(await self.redis.exists(f"{self.prefix}:run:{run_id}"))
@@ -190,10 +184,10 @@ class RedisRuntimeStore:
         *, run_id: str | None = None,
     ) -> str:
         """Publish advisory output into the agent-owned namespace only."""
-        if artifact_type not in {"observations", "hypotheses", "briefings", "memory"}:
+        if artifact_type not in {"observations", "hypotheses", "memory"}:
             raise ValueError(f"unsupported agent artifact type: {artifact_type}")
         # Resolve schema_version from the contract so the stream-field
-        # reflects the true payload version (briefings=2, memory=1).
+        # reflects the true payload version (memory=1).
         # The contract is the source of truth — keeps Redis entries
         # in sync if a future bump changes the constant.
         schema_version = _AGENT_ARTIFACT_SCHEMA_VERSION.get(artifact_type, 1)
@@ -211,37 +205,6 @@ class RedisRuntimeStore:
             maxlen=self.stream_maxlen,
             approximate=True,
         )
-
-    async def publish_briefing(self, briefing: AnalystBriefing) -> str:
-        """Publish one validated ``AnalystBriefing`` to the agent namespace.
-
-        The stream entry carries the briefing's ``run_id`` as a top-level
-        field so downstream consumers can correlate advisory output with
-        the canonical envelope without parsing the payload. The full
-        briefing is JSON-encoded as the payload.
-        """
-        briefing.validate()
-        return await self.publish_agent_artifact(
-            briefing.session_id, "briefings", briefing.to_json(), run_id=briefing.run_id,
-        )
-
-    async def read_recent_briefings(
-        self, session_id: str, count: int = 16,
-    ) -> list[AnalystBriefing]:
-        """Read the most recent briefings for one session (highest first)."""
-        rows = await self.redis.xrevrange(
-            self.agent_stream(session_id, "briefings"), count=count
-        )
-        out: list[AnalystBriefing] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                out.append(AnalystBriefing.from_mapping(json.loads(raw)))
-            except (ValueError, json.JSONDecodeError):
-                continue
-        return out
 
     async def read_recent_memories(
         self, session_id: str, count: int = 32,
@@ -874,6 +837,67 @@ class RedisRuntimeStore:
         self, symbol: str, venue: str = "spot",
     ) -> dict[str, Any] | None:
         raw = await self.redis.get(self.inference_latest_key(symbol, venue))
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    # ------------------------------------------------------------------
+    # Poller control plane — dynamic symbol selection
+    # ------------------------------------------------------------------
+    # The poller is a long-running container that resolves its symbol set
+    # at boot from env (POLL_SYMBOLS > SYMBOLS). The harness writes a
+    # control key into Redis; the poller reads it every cycle so changes
+    # take effect within one poll interval without a container restart.
+    #
+    # Precedence (highest wins):
+    #   Redis control key  >  POLL_SYMBOLS env  >  SYMBOLS env
+    # Deleting the control key restores env-based resolution.
+
+    def poller_control_key(self) -> str:
+        return f"{self.prefix}:poller:active_symbols"
+
+    def poller_status_key(self) -> str:
+        return f"{self.prefix}:poller:status"
+
+    async def set_poller_symbols(self, symbols: list[str]) -> None:
+        """Write the active-symbol override the poller picks up next cycle."""
+        if not symbols:
+            raise ValueError("set_poller_symbols: at least one symbol required")
+        cleaned = sorted({s.strip().upper() for s in symbols if s.strip()})
+        if not cleaned:
+            raise ValueError("set_poller_symbols: at least one symbol required")
+        await self.redis.set(self.poller_control_key(), json.dumps(cleaned))
+
+    async def read_poller_symbols(self) -> list[str] | None:
+        """Return the override list, or None when no control key is set."""
+        raw = await self.redis.get(self.poller_control_key())
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if isinstance(decoded, list) and decoded:
+            return [s.upper() for s in decoded]
+        return None
+
+    async def clear_poller_symbols(self) -> None:
+        """Delete the override so the poller falls back to env defaults."""
+        await self.redis.delete(self.poller_control_key())
+
+    async def publish_poller_status(self, payload: dict[str, Any]) -> None:
+        """Operator-visible confirmation of what the poller is doing now."""
+        await self.redis.set(
+            self.poller_status_key(),
+            json.dumps(payload, default=str, separators=(",", ":")),
+        )
+
+    async def read_poller_status(self) -> dict[str, Any] | None:
+        raw = await self.redis.get(self.poller_status_key())
         if not raw:
             return None
         try:

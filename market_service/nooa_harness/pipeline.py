@@ -4,8 +4,10 @@ Replaces the four-node pipeline (data-access → calculations → analysis → c
 The 5-second poller continuously feeds the raw stream; the harness calls
 ``run_cycle()`` on its own schedule with a configurable time window.
 
-The output is a ``MarketRunEnvelope`` persisted to the same Redis keys
-the harness already reads from — the harness agents see zero difference.
+The output of ``run_cycle`` is one plain dict payload persisted to the
+same Redis keys the harness already reads from. The read plane
+(``runtime.read_paths``) consumes the same JSON — the frozen envelope
+dataclass was retired 2026-08-31; the payload SHAPE is the contract.
 """
 
 from __future__ import annotations
@@ -81,7 +83,10 @@ from market_service.analysis.wall_migration import (
     wall_trap_assessment,
 )
 from market_service.config import Settings
-from market_service.runtime.contracts import MarketRunEnvelope
+from market_service.runtime.contracts import (
+    MARKET_RUN_SCHEMA_VERSION,
+    _json_safe,
+)
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
@@ -781,15 +786,14 @@ def run_analysis(
         "regime": regime,
         "stage": stage,
     }
-    # Section-id → output-key translation. The OI adapter historically emits
-    # under ``open_interest`` while its section id (GROUP_MAP, deps) is ``oi``.
-    # The mapping makes that translation explicit instead of burying it in a
-    # conditional inside the filter.
-    SECTION_OUTPUT_KEYS: dict[str, str] = {"oi": "open_interest"}
+    # The OI adapter historically emits under ``open_interest`` while its
+    # section id (GROUP_MAP, deps) is ``oi``. Filter by the section id, but
+    # preserve the established output key for downstream readers.
+    SECTION_IDS: dict[str, str] = {"open_interest": "oi"}
     analysis_out = {
-        SECTION_OUTPUT_KEYS.get(k, k): v
+        k: v
         for k, v in all_analysis.items()
-        if want(k)
+        if want(SECTION_IDS.get(k, k))
     } if sections is not None else all_analysis
 
     return {
@@ -1309,7 +1313,7 @@ def _adapt_stage(evidence: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — collate into MarketRunEnvelope
+# Step 4 — collate into the canonical run payload (plain dict)
 # ---------------------------------------------------------------------------
 
 def assemble_envelope(
@@ -1318,8 +1322,19 @@ def assemble_envelope(
     calculations: dict[str, Any],
     analysis: dict[str, Any],
     run_id: str | None = None,
-) -> MarketRunEnvelope:
-    """Assemble a MarketRunEnvelope from the three domain outputs."""
+) -> dict[str, Any]:
+    """Assemble the canonical run payload dict from the three domain outputs.
+
+    The frozen ``MarketRunEnvelope`` dataclass was retired 2026-08-31: this
+    function emits the EXACT field names the dataclass's ``to_dict()`` used
+    to publish (schema_version, run_id, symbol, generated_at, completed_at,
+    status, data_source, coverage, canonical_state, domain_outputs, errors,
+    source_metadata) so the Redis/Postgres stored format is byte-compatible
+    with every existing read path (``runtime.read_paths`` guards on the
+    same schema_version) — the payload shape IS the contract. JSON-safety
+    (NaN/Inf scrub via ``_json_safe``) happens here at the write seam,
+    where the dataclass's ``to_dict()`` did it before.
+    """
     started_ms = int(time.time() * 1000)
     completed_ms = started_ms
     run_id = run_id or str(uuid.uuid4())
@@ -1359,8 +1374,8 @@ def assemble_envelope(
         "domain_status": domain_status,
     }
     # Measured evidence coverage (actual trade span, dedupe stats, stream
-    # staleness) recorded by read_raw_window — the envelope reports what the
-    # window really contains, not just the requested window.
+    # staleness) recorded by read_raw_window — the run payload reports what
+    # the window really contains, not just the requested window.
     if evidence.get("coverage"):
         coverage["evidence"] = dict(evidence["coverage"])
 
@@ -1377,23 +1392,25 @@ def assemble_envelope(
     canonical_state["calculations"] = dict(calculations)
     canonical_state["analysis"] = dict(analysis)
 
-    return MarketRunEnvelope(
-        run_id=run_id,
-        symbol=symbol.upper(),
-        generated_at=_utc_iso(),
-        completed_at=_utc_iso(),
-        status=status,
-        data_source="domain_pipeline",
-        coverage=coverage,
-        canonical_state=canonical_state,
-        domain_outputs=canonical_state,
-        errors=tuple(all_errors),
-        source_metadata={
+    payload: dict[str, Any] = {
+        "schema_version": MARKET_RUN_SCHEMA_VERSION,
+        "run_id": run_id,
+        "symbol": symbol.upper(),
+        "generated_at": _utc_iso(),
+        "completed_at": _utc_iso(),
+        "status": status,
+        "data_source": "domain_pipeline",
+        "coverage": _json_safe(coverage),
+        "canonical_state": _json_safe(canonical_state),
+        "domain_outputs": _json_safe(canonical_state),
+        "errors": list(all_errors),
+        "source_metadata": _json_safe({
             "runtime": "market_service",
             "path": "harness_pipeline",
             "latency_ms": round((completed_ms - started_ms), 1),
-        },
-    )
+        }),
+    }
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1401,13 +1418,13 @@ def assemble_envelope(
 # ---------------------------------------------------------------------------
 
 async def persist_envelope(
-    envelope: MarketRunEnvelope,
+    envelope: dict[str, Any],
     settings: Settings,
     *,
     postgres: PostgresRuntimeStore | None = None,
     redis: RedisRuntimeStore | None = None,
 ) -> dict[str, Any]:
-    """Persist to Postgres first, then publish to Redis.
+    """Persist one canonical run payload dict — Postgres first, then Redis.
 
     Callers that already hold open stores (``run_cycle``) pass them via
     ``postgres``/``redis`` to avoid opening a second connection pair per
@@ -1423,12 +1440,12 @@ async def persist_envelope(
         inserted = await postgres.insert_run(envelope)
         redis_stream_id = await redis.publish_run(envelope)
         return {
-            "run_id": envelope.run_id,
+            "run_id": envelope["run_id"],
             "postgres_inserted": inserted,
             "redis_stream_id": redis_stream_id,
-            "redis_key": redis.collated_latest_key(envelope.symbol),
-            "schema_version": envelope.schema_version,
-            "status": envelope.status,
+            "redis_key": redis.collated_latest_key(envelope["symbol"]),
+            "schema_version": envelope["schema_version"],
+            "status": envelope["status"],
         }
     finally:
         if own_pg:
@@ -1827,23 +1844,12 @@ def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -
 # ---------------------------------------------------------------------------
 # Specialized group envelopes — the interpretation-plane read interface.
 #
-# The canonical MarketRunEnvelope is the persisted AUDIT record; these
-# GroupEnvelopes are what analysts actually READ. They are emitted either
-# (a) directly from the Redis raw stream via run_group_cycle (the harness
-# group commands: --wall/--flow/--structure/--positioning), or (b) as a
-# deterministic projection of a persisted canonical envelope so NOOA
-# specialists can be handed exactly the section surface their remit covers
-# — bounded by construction, with the canonical run_id preserved for audit.
+# The canonical run payload dict is the persisted AUDIT record; these
+# GroupEnvelopes are what analysts actually READ. They are emitted
+# directly from the Redis raw stream via run_group_cycle (the harness
+# group commands: --wall/--flow/--structure/--positioning) — bounded by
+# construction, with a fresh run_id for audit.
 # ---------------------------------------------------------------------------
-
-# Per-specialist group assignment (nooa_harness.agents.SPECIALIST_GROUP_KINDS
-# mirrors this; kept here as the single source of truth for the projection).
-SPECIALIST_GROUP_KINDS: dict[str, str] = {
-    "delta_orderflow": "flow",
-    "macro": "structure",
-    "open_interest": "positioning",
-    "liquidations": "wall",
-}
 
 # Hard per-array cap at contract-emission level. The largest legitimate
 # arrays (volume-profile buckets over a 4h window, ask-wall ladders) fit
@@ -1896,191 +1902,6 @@ def _evidence_headlines(evidence: dict[str, Any]) -> dict[str, Any]:
         "low_24h": _p(ticker, "low_price") or _p(ticker, "lowPrice"),
         "quote_volume_24h": _p(ticker, "quote_volume") or _p(ticker, "quoteVolume"),
         "spot_quote_volume_24h": _p(spot_ticker, "quote_volume") or _p(spot_ticker, "quoteVolume"),
-    }
-
-
-def build_group_envelopes(
-    envelope_dict: dict[str, Any],
-    *,
-    bound_cap: int = _GROUP_ARRAY_CAP,
-) -> dict[str, GroupEnvelope]:
-    """Project one canonical MarketRunEnvelope dict into the four group envelopes.
-
-    Pure deterministic projection: each group envelope carries ONLY the
-    calculation/analysis sections GROUP_MAP assigns to it, the canonical
-    run_id, the shared coverage, the domain errors, and the compact evidence
-    headlines. Arrays are bounded at emission (explicit markers) so every
-    group envelope fits an LLM context BY CONSTRUCTION.
-    """
-    cs = envelope_dict.get("canonical_state") or {}
-    calc_all = (cs.get("calculations") or {}).get("calculations") or {}
-    anal_all = (cs.get("analysis") or {}).get("analysis") or {}
-    errors_all = envelope_dict.get("errors") or []
-    coverage = envelope_dict.get("coverage") or {}
-    run_id = str(envelope_dict.get("run_id") or "")
-    symbol = str(envelope_dict.get("symbol") or "").upper()
-    domain_status = coverage.get("domain_status") or {}
-
-    headlines = _evidence_headlines((cs.get("data-access") or {}).get("evidence") or {})
-    generated_at = str(envelope_dict.get("completed_at") or envelope_dict.get("generated_at") or "")
-
-    # Requested analysis window, if recorded (falls back to flow_window).
-    window_minutes = int((coverage.get("flow_window_seconds") or 900) // 60) or 15
-
-    out: dict[str, GroupEnvelope] = {}
-    for kind, spec in GROUP_MAP.items():
-        calculations = {
-            k: _bound_arrays(calc_all.get(k), bound_cap)
-            for k in spec["calculations"]
-        }
-        analysis = {}
-        for k in spec["analysis"]:
-            out_key = "open_interest" if k == "oi" else k
-            analysis[out_key] = _bound_arrays(anal_all.get(out_key), bound_cap)
-
-        # Projection carries the canonical error list verbatim — every
-        # group sees the full degradation picture of the run it came from.
-        group_errors = list(errors_all)
-        status = envelope_dict.get("status") or (
-            "degraded" if group_errors else "healthy"
-        )
-        out[kind] = GroupEnvelope(
-            kind=kind,
-            symbol=symbol,
-            status=str(status),
-            generated_at=generated_at,
-            run_id=run_id,
-            window_minutes=window_minutes,
-            coverage={
-                "domain_status": domain_status,
-                "evidence": coverage.get("evidence") or {},
-            },
-            calculations=calculations,
-            analysis=analysis,
-            evidence_headlines=headlines,
-            errors=tuple(group_errors),
-            source="canonical_projection",
-        )
-    return out
-
-
-def build_controller_view(
-    envelope_dict: dict[str, Any],
-    group_envelopes: dict[str, GroupEnvelope],
-) -> dict[str, Any]:
-    """Compact cross-group view for the controller agent.
-
-    Replaces feeding the controller the monolithic bounded envelope: the
-    controller sees one compact block per group (status + scalar headlines
-    extracted from the group's deterministic sections) plus shared coverage
-    and errors. Bounded by construction — no collapse path needed.
-    """
-    cs = envelope_dict.get("canonical_state") or {}
-    calc_all = (cs.get("calculations") or {}).get("calculations") or {}
-    anal_all = (cs.get("analysis") or {}).get("analysis") or {}
-
-    def _p(d: Any, *keys: str) -> Any:
-        for k in keys:
-            if not isinstance(d, dict):
-                return None
-            d = d.get(k)
-        return d
-
-    def _flow(kind: str) -> dict[str, Any]:
-        ge = group_envelopes.get(kind)
-        if ge is None:
-            return {}
-        return ge.to_dict()
-
-    flow_view = _flow("flow")
-    wall_view = _flow("wall")
-    structure_view = _flow("structure")
-    positioning_view = _flow("positioning")
-
-    flow_calc = (flow_view.get("calculations") or {}).get("flow") or {}
-    spot_flow = _p(flow_calc, "spot_flow") or {}
-    fut_flow = _p(flow_calc, "futures_flow") or {}
-    delta = _p(flow_view, "analysis", "delta") or {}
-    demand = _p(flow_view, "analysis", "demand", "decomposition") or {}
-    auction = _p(flow_view, "analysis", "auction") or {}
-    wm = _p(wall_view, "analysis", "wall_migration") or {}
-    pa = _p(wall_view, "analysis", "path_absorption") or {}
-    oi_out = _p(positioning_view, "analysis", "open_interest") or {}
-    regime = _p(structure_view, "analysis", "regime") or {}
-    stage = _p(structure_view, "analysis", "stage") or {}
-
-    orderbook_wall = (wall_view.get("calculations") or {}).get("orderbook") or {}
-    technical_wall = (wall_view.get("calculations") or {}).get("technical") or {}
-
-    return {
-        "schema_version": envelope_dict.get("schema_version"),
-        "run_id": envelope_dict.get("run_id"),
-        "symbol": envelope_dict.get("symbol"),
-        "status": envelope_dict.get("status"),
-        "generated_at": envelope_dict.get("generated_at"),
-        "completed_at": envelope_dict.get("completed_at"),
-        "coverage": {
-            "domain_status": (envelope_dict.get("coverage") or {}).get("domain_status"),
-            "evidence": (envelope_dict.get("coverage") or {}).get("evidence"),
-        },
-        "errors": list(envelope_dict.get("errors") or []),
-        "groups": {
-            "flow": {
-                "status": flow_view.get("status"),
-                "spot_flow": {k: spot_flow.get(k) for k in (
-                    "cvd", "buy_share", "obi", "vwap", "trade_count", "last_price")},
-                "futures_flow": {k: fut_flow.get(k) for k in (
-                    "cvd", "buy_share", "obi", "vwap", "trade_count", "last_price")},
-                "delta": {k: delta.get(k) for k in (
-                    "delta", "verdict", "wall_imbalance", "flow_alignment",
-                    "tbr_last_pct", "tbr_3avg_pct")},
-                "demand": {
-                    "spot": _p(demand, "spot"),
-                    "futures": _p(demand, "futures"),
-                    "verdict": _p(flow_view, "analysis", "demand", "verdict"),
-                },
-                "auction": {k: auction.get(k) for k in (
-                    "verdict", "reasons", "microprice")},
-            },
-            "wall": {
-                "status": wall_view.get("status"),
-                "fut_keystone": _p(orderbook_wall, "fut_keystone"),
-                "keystone_bid_stack": _p(orderbook_wall, "keystone_bid_stack"),
-                "keystone_trade_intensity": _p(orderbook_wall, "keystone_trade_intensity"),
-                "ask_wall_ladder": _p(orderbook_wall, "ask_wall_ladder"),
-                "seller_aggression": _p(technical_wall, "seller_aggression"),
-                "wall_migration": {
-                    "fuel_ratio": _p(wm, "fuel_ratio"),
-                    "wall_delta": _p(wm, "wall_delta"),
-                    "trap_assessment": _p(wm, "trap_assessment"),
-                    "densest_clusters": _p(wm, "densest_clusters"),
-                    "tiers": _p(wm, "tiers"),
-                    "round_anchors": _p(wm, "round_anchors"),
-                },
-                "path_absorption": {
-                    "fuel_ratio": _p(pa, "fuel_ratio"),
-                    "simulated_ascent": _p(pa, "simulated_ascent"),
-                    "simulated_descent": _p(pa, "simulated_descent"),
-                },
-            },
-            "structure": {
-                "status": structure_view.get("status"),
-                "regime": regime,
-                "stage": stage,
-            },
-            "positioning": {
-                "status": positioning_view.get("status"),
-                "open_interest": {
-                    "raw_open_interest": _p(oi_out, "raw_open_interest"),
-                    "weighted_contracts": _p(oi_out, "weighted_contracts"),
-                    "inflow_outflow": _p(oi_out, "inflow_outflow"),
-                    "implied_value": _p(oi_out, "implied_value"),
-                    "walls": _p(oi_out, "walls"),
-                },
-            },
-        },
-        "evidence_headlines": _evidence_headlines(
-            (cs.get("data-access") or {}).get("evidence") or {}),
     }
 
 
@@ -2264,8 +2085,8 @@ async def run_cycle(
     include_derivatives: bool = True,
     force_refresh_derivatives: bool = False,
     persist: bool = True,
-) -> MarketRunEnvelope:
-    """Run one complete pipeline cycle and return the envelope.
+) -> dict[str, Any]:
+    """Run one complete pipeline cycle and return the canonical run payload dict.
 
     New keyword args (all backward compatible — defaults preserve old behavior):
       deriv_ttl_s           — TTL of derivative cache in Redis (default 300s)
@@ -2274,7 +2095,7 @@ async def run_cycle(
       include_derivatives   — master switch; False = behave exactly like the pre-change pipeline
       force_refresh_derivatives — bypass cache and always re-fetch
       persist               — when False, skip Postgres + Redis persistence entirely
-                             (real dry-run; the envelope is computed but not written)
+                             (real dry-run; the run payload is computed but not written)
 
     This module is a stream-fed calculation object: ``read_raw_window`` reads
     the poller-written Redis stream (the single coherent Binance source) — it
@@ -2355,24 +2176,25 @@ async def run_cycle(
             # WRITE the current cycle's wall snapshot so the ledger records it and
             # later cycles can call ALL recorded walls (not just the last pull).
             try:
-                await _record_wall_snapshot(settings, symbol, envelope.run_id, evidence,
+                await _record_wall_snapshot(settings, symbol, envelope["run_id"], evidence,
                                             analysis_result, postgres=pg, redis=redis)
             except Exception:
                 log.exception("run_cycle %s: failed to record wall snapshot", symbol)
             # WRITE the current cycle's keystone snapshot (cross-cycle keystone
             # migration ledger — clean separation from the wall ledger).
             try:
-                await _record_keystone_snapshot(settings, symbol, envelope.run_id,
+                await _record_keystone_snapshot(settings, symbol, envelope["run_id"],
                                                 calc_result, postgres=pg, redis=redis)
             except Exception:
                 log.exception("run_cycle %s: failed to record keystone snapshot", symbol)
             try:
                 await persist_envelope(envelope, settings, postgres=pg, redis=redis)
             except Exception:
-                log.exception("failed to persist envelope for %s run_id=%s", symbol, envelope.run_id)
+                log.exception("failed to persist run payload for %s run_id=%s",
+                              symbol, envelope["run_id"])
         else:
             log.info("run_cycle %s: dry-run (persist=False) — run_id=%s not written",
-                     symbol, envelope.run_id)
+                     symbol, envelope["run_id"])
 
         return envelope
     finally:
@@ -2390,9 +2212,6 @@ __all__ = [
     "persist_envelope",
     "run_cycle",
     "run_group_cycle",
-    "build_group_envelopes",
-    "build_controller_view",
-    "SPECIALIST_GROUP_KINDS",
     "fetch_derivative_evidence",
     "_merge_derivatives",
     "_is_deriv_fresh",

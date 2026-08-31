@@ -255,6 +255,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="read the latest persisted collated MarketRunEnvelope "
                         "(direct runtime.contracts read, NOT a nooa_harness op)")
     p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
+
+    # --- Poller control plane (dynamic symbol selection) ---
+    # Redis control-key writes/reads. No Binance calls, no envelope, no
+    # persistence. The poller picks up changes within one poll interval.
+    p.add_argument("--poller-symbols", metavar="SYM[,SYM...]",
+                   help="set the poller's active symbols via the Redis control "
+                        "key (e.g. --poller-symbols SOLUSDT). Takes effect "
+                        "within one poll interval without restarting the poller.")
+    p.add_argument("--poller-symbols-reset", action="store_true",
+                   help="delete the Redis control key so the poller falls back "
+                        "to POLL_SYMBOLS / SYMBOLS env defaults")
+    p.add_argument("--poller-status", action="store_true",
+                   help="read the poller's live status (active symbols, source, "
+                        "last cycle time) from Redis")
     p.add_argument("--keystone-history", action="store_true",
                    help="read the cross-cycle keystone ledger (Redis first, "
                         "Postgres fallback) and derive the keystone migration "
@@ -296,6 +310,13 @@ def main(argv: list[str] | None = None) -> int:
         if passthrough and passthrough[0] == "--":
             passthrough = passthrough[1:]
         return nooa_main(passthrough)
+
+    # --- Route 0.5: poller control plane (dynamic symbol selection).
+    # Pure Redis read/write — no Binance calls, no envelope, no persist.
+    if args.poller_symbols or args.poller_symbols_reset or args.poller_status:
+        result = asyncio.run(_poller_control(args))
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if result.get("status") == "ok" else 1
 
     # --- Route 1: refresh derivative evidence (write-only to Redis cache).
     if args.refresh_derivatives:
@@ -345,10 +366,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(summary, indent=2, default=str))
         return 0
 
-    # --- Route 3: read a persisted collated MarketRunEnvelope directly.
-    # Redis-only read — no DATABASE_URL required. For Postgres fallback on
-    # envelope reads, use --nooa market envelope --run-id <UUID>.
+    # --- Route 3: read a persisted collated run payload directly.
+    # Redis-only read via runtime.read_paths (raw GET -> json.loads ->
+    # schema guard) — no envelope dataclass, no DATABASE_URL required.
     if args.latest or args.run_id:
+        from market_service.runtime import read_paths
+
         settings = Settings.from_redis_env()
         async def _read():
             store = RedisRuntimeStore(
@@ -357,11 +380,9 @@ def main(argv: list[str] | None = None) -> int:
                 settings.redis_stream_maxlen,
             )
             try:
-                value = await (
-                    store.read_run(args.run_id) if args.run_id
-                    else store.read_latest_run(args.symbol)
-                )
-                return value.to_dict() if value else None
+                if args.run_id:
+                    return await read_paths.read_collated_by_run(store, args.run_id)
+                return await read_paths.read_collated(store, args.symbol)
             finally:
                 await store.close()
         result = asyncio.run(_read())
@@ -432,6 +453,56 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 # Calculation-pipeline route handlers
 # ---------------------------------------------------------------------------
+
+
+async def _poller_control(args: argparse.Namespace) -> dict[str, Any]:
+    """Poller control plane: set / reset / read the dynamic symbol selection.
+
+    Pure Redis read/write — no Binance calls, no envelope, no persistence.
+    The long-running poller container reads the control key once per cycle,
+    so a change takes effect within one poll interval without a restart.
+
+    Precedence inside the poller:
+        Redis control key  >  POLL_SYMBOLS env  >  SYMBOLS env
+    """
+    settings = Settings.from_redis_env()
+    store = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    try:
+        if args.poller_symbols:
+            symbols = [s.strip().upper() for s in args.poller_symbols.split(",") if s.strip()]
+            if not symbols:
+                return {"status": "error", "error": "no valid symbols provided"}
+            await store.set_poller_symbols(symbols)
+            return {
+                "status": "ok",
+                "action": "set",
+                "control_key": store.poller_control_key(),
+                "active_symbols": sorted(set(symbols)),
+                "note": "poller picks this up within one poll interval",
+            }
+        if args.poller_symbols_reset:
+            await store.clear_poller_symbols()
+            return {
+                "status": "ok",
+                "action": "reset",
+                "control_key": store.poller_control_key(),
+                "fallback_symbols": list(settings.poll_symbols),
+                "note": "poller reverted to POLL_SYMBOLS / SYMBOLS env",
+            }
+        # --poller-status
+        status = await store.read_poller_status()
+        if status is None:
+            return {
+                "status": "error",
+                "action": "status",
+                "error": "no poller status found — is the poller container running?",
+            }
+        return {"status": "ok", "action": "status", **status}
+    finally:
+        await store.close()
+
 
 async def _refresh_derivatives(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch + cache one derivative evidence snapshot in Redis.
@@ -518,7 +589,7 @@ async def _run_analyze(args: argparse.Namespace) -> dict[str, Any]:
     persistence_status = "persisted" if not args.no_persist else "dry_run"
 
     elapsed_ms = round((time.monotonic() - started) * 1000, 1)
-    envelope_dict = envelope.to_dict()
+    envelope_dict = envelope if isinstance(envelope, dict) else envelope.to_dict()
 
     derivatives_cache = _summarize_derivatives_cache(envelope_dict)
     out: dict[str, Any] = {
@@ -532,9 +603,12 @@ async def _run_analyze(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     if args.envelope_summary:
-        # MarketRunEnvelope.to_dict() has NO envelope_summary field (that lives
-        # on AnalystBriefing). Always derive the compact projection explicitly.
-        out["envelope_summary"] = _projection(envelope_dict)
+        # Successor of the retired local _projection duplicate (2026-08-31):
+        # the shared read_paths inventory view — the same projection the
+        # agent's market.read mode="inventory" returns.
+        from market_service.runtime import read_paths
+
+        out["envelope_summary"] = read_paths.market_inventory(envelope_dict)
     else:
         out["envelope"] = envelope_dict
 
@@ -706,54 +780,6 @@ async def _read_microstructure_status(args: argparse.Namespace) -> dict[str, Any
         }
     finally:
         await store.close()
-
-
-def _projection(envelope_dict: dict[str, Any]) -> dict[str, Any]:
-    """Signal-inventory projection of an envelope: keys per section + scalar
-    headlines, never raw arrays.
-
-    CLI convenience for ``--analyze --envelope-summary``. The canonical
-    read path for the model is the FULL envelope via ``--latest`` /
-    ``--run-id``; this projection only inventories what signal groups are
-    present and surfaces a handful of scalar headlines so a human can
-    verify the Pass 1/Pass 2 ports landed without dumping the whole
-    envelope. Null discipline: headlines pass through None untouched.
-    """
-    out = {k: v for k, v in envelope_dict.items()
-           if k in ("schema_version", "symbol", "status", "generated_at",
-                    "completed_at", "coverage", "run_id")}
-    cs = envelope_dict.get("canonical_state") or {}
-    analysis = (cs.get("analysis") or {}).get("analysis") or {}
-    calculations = (cs.get("calculations") or {}).get("calculations") or {}
-    orderbook = calculations.get("orderbook") or {}
-    technical = calculations.get("technical") or {}
-
-    # Signal inventory: which groups are present per section.
-    out["analysis_keys"] = sorted(analysis.keys()) if isinstance(analysis, dict) else []
-    out["calculations_keys"] = sorted(calculations.keys()) if isinstance(calculations, dict) else []
-    out["orderbook_keys"] = sorted(orderbook.keys()) if isinstance(orderbook, dict) else []
-    out["technical_keys"] = sorted(technical.keys()) if isinstance(technical, dict) else []
-
-    # Scalar headlines for the Pass 1/Pass 2 ports (bounded, no raw arrays).
-    def _path(d: Any, *keys: str) -> Any:
-        for k in keys:
-            if not isinstance(d, dict):
-                return None
-            d = d.get(k)
-        return d
-
-    fz = orderbook.get("fut_keystone") or {}
-    out["headlines"] = {
-        "fut_keystone_bid": fz.get("bid") if isinstance(fz, dict) else None,
-        "fut_keystone_ask": fz.get("ask") if isinstance(fz, dict) else None,
-        "keystone_bid_qty": _path(orderbook, "keystone_bid_stack", "tight", "total_qty"),
-        "ask_ladder_notional": _path(orderbook, "ask_wall_ladder", "total_notional"),
-        "keystone_trade_buy_qty": _path(orderbook, "keystone_trade_intensity", "tight", "buy_qty"),
-        "keystone_trade_sell_qty": _path(orderbook, "keystone_trade_intensity", "tight", "sell_qty"),
-        "seller_aggression": _path(technical, "seller_aggression", "classification"),
-        "hourly_keystone_verdict": _path(orderbook, "hourly_keystone_migration", "verdict"),
-    }
-    return out
 
 
 def _summarize_derivatives_cache(envelope_dict: dict[str, Any]) -> dict[str, Any]:

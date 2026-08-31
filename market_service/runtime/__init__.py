@@ -3,7 +3,6 @@
 from .contracts import (
     MARKET_STATE_SCHEMA_VERSION,
     MARKET_RUN_SCHEMA_VERSION,
-    MarketRunEnvelope,
     MarketStateEnvelope,
 )
 
@@ -13,6 +12,5 @@ from .contracts import (
 __all__ = [
     "MARKET_STATE_SCHEMA_VERSION",
     "MARKET_RUN_SCHEMA_VERSION",
-    "MarketRunEnvelope",
     "MarketStateEnvelope",
 ]

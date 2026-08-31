@@ -18,9 +18,10 @@ engine. Two disciplines make that safe:
    deterministic state was produced. Out-of-scope requests are denied
    before any module runs.
 
-This module is nooa-free: it imports only runtime contracts and the
-deterministic microstructure stack, so contract tests never pay the
-litellm import cost.
+This module is openai-free (the client is injected via
+``backends.build_llm``): it imports only runtime contracts and the
+deterministic microstructure stack, so contract tests never pay the OpenAI
+SDK import cost.
 """
 
 from __future__ import annotations
@@ -558,7 +559,7 @@ TOOL_NAMES: dict[str, str] = {
     "micro.fit_beta": "fitting.assemble_evidence",
     "micro.evidence": "redis.read_evidence",
     # T2 — market correlation (canonical pipeline seams)
-    "market.envelope": "market.read_envelope",
+    "market.read": "market.read",
     "market.group": "market.run_group",
     "market.derivatives": "market.read_derivatives",
     "market.keystone_history": "market.read_keystone_history",
@@ -576,7 +577,7 @@ _MARKET_TOOLS: dict[str, Capability] = {
     for name, description in {
         "redis.read_intervals": "Read completed OFI interval rows from the capture ledger.",
         "redis.read_evidence": "Read the latest immutable MicrostructureEvidence projection.",
-        "market.read_envelope": "Read the latest collated MarketRunEnvelope for the symbol.",
+        "market.read": "Read the latest collated market run from Redis. Modes: snapshot (bounded headline view, default), inventory (section keys + snapshot), full (raw payload deep-dive).",
         "market.run_group": "Run one calculation-model group (wall/flow/structure/positioning) fresh from the raw Redis window; never persists.",
         "market.read_derivatives": "Read the cached derivative evidence (funding, OI, cross-asset).",
         "market.read_keystone_history": "Read the bounded keystone cross-cycle ledger.",
@@ -623,21 +624,57 @@ async def dispatch_read_evidence(
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
 
 
-async def dispatch_read_envelope(
-    store: RedisRuntimeStore, symbol: str,
+async def dispatch_market_read(
+    store: RedisRuntimeStore, symbol: str, *, mode: str = "snapshot",
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Tool: market.envelope — latest collated canonical envelope."""
-    cap = CAPABILITIES["market.read_envelope"]
-    scope = {"symbol": symbol.upper()}
+    """Tool: market.read — latest collated market run, raw from Redis.
+
+    Post-envelope deviation: no dataclass round trip. One GET, one
+    json.loads, one schema-version guard (read_paths), then a bounded
+    projection. ``mode`` selects the agent-facing shape:
+
+      snapshot  — headline scalars + CVD multi-window sign series (default;
+                  small by construction, the primary inference view)
+      inventory — section key inventory + the snapshot
+      full      — the raw collated payload (explicit deep-dive; the
+                  engine's 40k tool-result gate is the bound)
+
+    A schema-version mismatch is a structured ``error`` payload, never a
+    coercion — the writer is on a different contract and must escalate.
+    """
+    from market_service.runtime import read_paths
+
+    cap = CAPABILITIES["market.read"]
+    scope = {"symbol": symbol.upper(), "mode": mode}
     try:
         cap.validate_scope(symbol, "spot")
-        envelope = await store.read_latest_run(symbol.upper())
-        return (
-            envelope.to_dict() if envelope is not None else None,
-            capability_log_entry(cap.name, scope, "ok"),
+        if mode not in ("snapshot", "inventory", "full"):
+            raise CapabilityDenied(f"unknown market.read mode: {mode!r}")
+        payload = await read_paths.read_collated(store, symbol.upper())
+        if payload is None:
+            return None, capability_log_entry(
+                cap.name, scope, "ok", detail={"status": "no_run_persisted"},
+            )
+        if mode == "full":
+            result: dict[str, Any] = payload
+        elif mode == "inventory":
+            result = read_paths.market_inventory(payload)
+        else:
+            result = read_paths.market_snapshot(payload)
+        # NaN-safe at the tool seam: the stored payload passed the write
+        # gate, but projections traverse live pipeline dicts that may hold
+        # raw float('nan') (pipeline flow math). The engine's json.loads
+        # round trip would choke on a bare NaN token.
+        result = read_paths.json_safe(result)
+        return result, capability_log_entry(
+            cap.name, scope, "ok",
+            detail={"schema_version": payload.get("schema_version")},
         )
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except ValueError as exc:
+        # Schema guard breach — stale writer on a different contract.
+        return None, capability_log_entry(cap.name, scope, "error", detail=str(exc))
 
 
 async def dispatch_read_derivatives(
@@ -775,8 +812,10 @@ async def execute_tool(
         return await _tool_fit_beta(store, symbol, venue, args)
     if name == "micro.evidence":
         return await dispatch_read_evidence(store, symbol, venue)
-    if name == "market.envelope":
-        return await dispatch_read_envelope(store, symbol)
+    if name == "market.read":
+        return await dispatch_market_read(
+            store, symbol, mode=str(args.get("mode") or "snapshot"),
+        )
     if name == "market.group":
         return await dispatch_market_group(
             symbol, str(args.get("group") or "flow"),

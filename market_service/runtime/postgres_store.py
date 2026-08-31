@@ -11,9 +11,7 @@ import asyncpg
 
 from .contracts import (
     AgentMemory,
-    AnalystBriefing,
     InferenceArtifact,
-    MarketRunEnvelope,
     _json_safe,
 )
 
@@ -60,15 +58,14 @@ class PostgresRuntimeStore:
         )
         return dict(row) if row else None
 
-    async def insert_run(self, envelope: MarketRunEnvelope) -> bool:
-        """Append one canonical run (deduped, 2026-08-27 pass).
+    async def insert_run(self, envelope: dict[str, Any]) -> bool:
+        """Append one canonical run payload dict (deduped, 2026-08-27 pass).
 
-        The `envelope` jsonb column is left NULL: coverage /
-        canonical_state / domain_outputs / errors are stored as first-class
-        columns and the full envelope is reconstructed on read from them.
-        The old double-write made every row ~2x its necessary size.
+        The envelope dataclass was retired 2026-08-31: PG runs stay as the
+        dict-fed durable archive — the payload shape is the contract. The
+        `envelope` jsonb column is left NULL: coverage / canonical_state /
+        domain_outputs / errors are stored as first-class columns.
         """
-        envelope.validate()
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
@@ -80,51 +77,23 @@ class PostgresRuntimeStore:
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                ON CONFLICT (run_id) DO NOTHING
                RETURNING run_id""",
-            uuid.UUID(envelope.run_id), envelope.symbol,
-            datetime.fromisoformat(envelope.generated_at),
-            datetime.fromisoformat(envelope.completed_at), envelope.status, envelope.data_source,
-            envelope.schema_version, json.dumps(_json_safe(envelope.coverage)),
-            json.dumps(_json_safe(envelope.canonical_state)), json.dumps(_json_safe(envelope.domain_outputs)),
-            json.dumps(_json_safe(list(envelope.errors))), json.dumps(_json_safe(envelope.source_metadata or {})),
+            uuid.UUID(str(envelope["run_id"])), str(envelope["symbol"]).upper(),
+            datetime.fromisoformat(str(envelope["generated_at"]).replace("Z", "+00:00")),
+            datetime.fromisoformat(str(envelope["completed_at"]).replace("Z", "+00:00")),
+            envelope["status"], envelope["data_source"],
+            int(envelope["schema_version"]), json.dumps(_json_safe(envelope.get("coverage") or {})),
+            json.dumps(_json_safe(envelope.get("canonical_state") or {})),
+            json.dumps(_json_safe(envelope.get("domain_outputs") or {})),
+            json.dumps(_json_safe(list(envelope.get("errors") or ()))),
+            json.dumps(_json_safe(envelope.get("source_metadata") or {})),
         )
         return row is not None
 
-    @staticmethod
-    def _envelope_from_row(row: dict) -> MarketRunEnvelope:
-        """Reconstruct a MarketRunEnvelope from split columns.
-
-        Prefers the reconstructed mapping; falls back to the stored
-        `envelope` column for legacy rows (written before the dedupe pass)
-        so pre-existing envelopes keep round-tripping byte-identically.
-        """
-        stored = row.get("envelope")
-        if stored is not None:
-            return MarketRunEnvelope.from_mapping(
-                json.loads(stored) if isinstance(stored, str) else stored
-            )
-        def _as_dict(v):
-            if isinstance(v, str):
-                v = json.loads(v)
-            return dict(v or {})
-        generated_at = row["generated_at"]
-        completed_at = row["completed_at"]
-        errors = row.get("errors")
-        if isinstance(errors, str):
-            errors = json.loads(errors)
-        return MarketRunEnvelope.from_mapping({
-            "schema_version": row["schema_version"],
-            "run_id": str(row["run_id"]),
-            "symbol": row["symbol"],
-            "generated_at": generated_at.isoformat() if hasattr(generated_at, "isoformat") else str(generated_at),
-            "completed_at": completed_at.isoformat() if hasattr(completed_at, "isoformat") else str(completed_at),
-            "status": row["status"],
-            "data_source": row["data_source"],
-            "coverage": _as_dict(row.get("coverage")),
-            "canonical_state": _as_dict(row.get("canonical_state")),
-            "domain_outputs": _as_dict(row.get("domain_outputs")),
-            "errors": tuple(errors or ()),
-            "source_metadata": _as_dict(row.get("source_metadata")),
-        })
+    # --- Durable archive reads (dict payload, 2026-08-31) -----------------
+    # The envelope dataclass readers were retired with the dataclass. These
+    # reconstruct the SAME payload shape ``assemble_envelope`` publishes
+    # (runtime.read_paths guards the schema on the consumer side). The
+    # legacy `envelope` jsonb column is honoured for pre-dedupe rows.
 
     _RUN_COLUMNS = (
         "run_id, symbol, generated_at, completed_at, status, data_source, "
@@ -132,108 +101,51 @@ class PostgresRuntimeStore:
         "source_metadata, envelope"
     )
 
-    async def read_run(self, run_id: str) -> MarketRunEnvelope | None:
+    @staticmethod
+    def _run_payload_from_row(row: dict) -> dict[str, Any]:
+        """Reconstruct the canonical run payload dict from split columns."""
+        stored = row.get("envelope")
+        if stored is not None:
+            return json.loads(stored) if isinstance(stored, str) else dict(stored)
+
+        def _as_dict(v: Any) -> dict[str, Any]:
+            if isinstance(v, str):
+                v = json.loads(v)
+            return dict(v or {})
+
+        def _as_iso(v: Any) -> str:
+            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+        errors = row.get("errors")
+        if isinstance(errors, str):
+            errors = json.loads(errors)
+        return {
+            "schema_version": row["schema_version"],
+            "run_id": str(row["run_id"]),
+            "symbol": row["symbol"],
+            "generated_at": _as_iso(row["generated_at"]),
+            "completed_at": _as_iso(row["completed_at"]),
+            "status": row["status"],
+            "data_source": row["data_source"],
+            "coverage": _as_dict(row.get("coverage")),
+            "canonical_state": _as_dict(row.get("canonical_state")),
+            "domain_outputs": _as_dict(row.get("domain_outputs")),
+            "errors": list(errors or ()),
+            "source_metadata": _as_dict(row.get("source_metadata")),
+        }
+
+    async def read_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read one persisted run payload by run_id (durable archive)."""
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
         row = await self.pool.fetchrow(
             f"SELECT {self._RUN_COLUMNS} FROM market_run WHERE run_id = $1", run_id
         )
-        if row is None:
-            return None
-        return self._envelope_from_row(dict(row))
+        return self._run_payload_from_row(dict(row)) if row else None
 
-    async def insert_analyst_briefing(self, briefing: AnalystBriefing) -> bool:
-        """Durable, idempotent write of one ``AnalystBriefing``.
-
-        Primary key is ``(session_id, run_id)``: a re-run of the same
-        session over the same canonical run_id updates the row instead of
-        producing a duplicate. The briefing always carries the run_id of
-        the canonical envelope it was produced from, so the durable record
-        is linked back to ``market_run`` by ``run_id`` even though there is
-        no FK (the agent layer must not be able to corrupt canonical state
-        by deleting a briefing).
-        """
-        briefing.validate()
-        if self.pool is None:
-            await self.connect()
-        assert self.pool is not None
-        try:
-            generated_at = datetime.fromisoformat(
-                briefing.generated_at.replace("Z", "+00:00")
-            )
-        except (TypeError, ValueError):
-            generated_at = datetime.now()
-        row = await self.pool.fetchrow(
-            """INSERT INTO analyst_briefing
-               (session_id, run_id, schema_version, model_provider, model_name,
-                generated_at, briefing, parse_errors, envelope_summary)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-               ON CONFLICT (session_id, run_id) DO UPDATE
-               SET schema_version = EXCLUDED.schema_version,
-                   model_provider = EXCLUDED.model_provider,
-                   model_name = EXCLUDED.model_name,
-                   generated_at = EXCLUDED.generated_at,
-                   briefing = EXCLUDED.briefing,
-                   parse_errors = EXCLUDED.parse_errors,
-                   envelope_summary = EXCLUDED.envelope_summary
-               RETURNING session_id, run_id""",
-            uuid.UUID(briefing.session_id),
-            uuid.UUID(briefing.run_id),
-            briefing.schema_version,
-            briefing.model_provider,
-            briefing.model_name,
-            generated_at,
-            json.dumps(briefing.to_dict(), default=str),
-            json.dumps(list(briefing.parse_errors), default=str),
-            json.dumps(briefing.envelope_summary, default=str),
-        )
-        return row is not None
-
-    async def read_analyst_briefing(
-        self, session_id: str, run_id: str
-    ) -> AnalystBriefing | None:
-        """Read one durable briefing by its (session_id, run_id) key."""
-        if self.pool is None:
-            await self.connect()
-        assert self.pool is not None
-        raw = await self.pool.fetchval(
-            "SELECT briefing FROM analyst_briefing "
-            "WHERE session_id = $1 AND run_id = $2",
-            uuid.UUID(session_id), uuid.UUID(run_id),
-        )
-        if raw is None:
-            return None
-        return AnalystBriefing.from_mapping(
-            json.loads(raw) if isinstance(raw, str) else raw
-        )
-
-    async def read_briefings_for_run(
-        self, run_id: str, limit: int = 32,
-    ) -> list[AnalystBriefing]:
-        """All briefings produced for one canonical run_id (any session)."""
-        if self.pool is None:
-            await self.connect()
-        assert self.pool is not None
-        rows = await self.pool.fetch(
-            "SELECT briefing FROM analyst_briefing "
-            "WHERE run_id = $1 ORDER BY generated_at DESC LIMIT $2",
-            uuid.UUID(run_id), limit,
-        )
-        out: list[AnalystBriefing] = []
-        for row in rows:
-            raw = row["briefing"]
-            if raw is None:
-                continue
-            try:
-                out.append(AnalystBriefing.from_mapping(
-                    json.loads(raw) if isinstance(raw, str) else raw
-                ))
-            except (ValueError, json.JSONDecodeError):
-                continue
-        return out
-
-    async def latest_run(self, symbol: str) -> MarketRunEnvelope | None:
+    async def latest_run(self, symbol: str) -> dict[str, Any] | None:
+        """Read the most recent persisted run payload for one symbol."""
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
@@ -242,9 +154,7 @@ class PostgresRuntimeStore:
             "WHERE symbol = $1 ORDER BY completed_at DESC LIMIT 1",
             symbol.upper(),
         )
-        if row is None:
-            return None
-        return self._envelope_from_row(dict(row))
+        return self._run_payload_from_row(dict(row)) if row else None
 
     async def insert_agent_memory(self, memory: AgentMemory) -> bool:
         """Durable, idempotent write of one ``AgentMemory``.

@@ -1,10 +1,12 @@
 """``nooa market`` — the harness surface exposed inside the ``nooa`` CLI.
 
-This is the "nooa runtime harness CLI": it lets you speak to the collated
-data class objects (``MarketRunEnvelope``, ``AnalystBriefing``,
-``AgentMemory``) and run the defined agentic classes
-(``ControllerAgent`` + specialists in ``market_service/nooa_harness/agents.py``)
-directly from a terminal ``nooa`` invocation.
+This is the "nooa runtime harness CLI": it reads the collated runtime
+records straight from the stores (Redis primary, Postgres durable ledger)
+and runs the surviving agent classes directly from a terminal ``nooa``
+invocation. The envelope dataclass read path was retired 2026-08-30: the
+market read commands go through ``runtime.read_paths`` (raw Redis payload
++ bounded projections), same discipline as the OO agent's ``market.read``
+tool.
 
 Registration: ``nooa-cli`` v0.0.6 auto-discovers command modules from its own
 ``nooa_cli/commands/*.py`` directory (modules exporting ``command``; see
@@ -12,11 +14,11 @@ Registration: ``nooa-cli`` v0.0.6 auto-discovers command modules from its own
 nooa_cli_install.py`` drops a thin shim module there that re-exports the
 ``command`` group below under the name ``market``, so:
 
-    nooa market envelope SOLUSDT --latest
-    nooa market envelope SOLUSDT --run-id <UUID>
-    nooa market briefing --session-id <UUID> --run-id <UUID>
+    nooa market read SOLUSDT                      # headline snapshot
+    nooa market read SOLUSDT --mode inventory
+    nooa market read SOLUSDT --mode full          # raw payload deep-dive
+    nooa market read --run-id <UUID>
     nooa market memory recall --session-id <UUID>
-    nooa market analyst SOLUSDT --cycles 1 --with-memory
 
 Every handler reads/writes through the canonical runtime stores (Redis
 primary read, Postgres durable ledger) — no second pipeline.
@@ -33,6 +35,7 @@ from click import echo as click_echo
 
 from market_service.config import Settings
 from market_service.nooa_harness.memory import MemoryNode
+from market_service.runtime import read_paths
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
@@ -41,10 +44,10 @@ def _settings() -> Settings:
     return Settings.from_env()
 
 
-async def _read_envelope(
+async def _read_collated_run(
     settings: Settings, symbol: str, run_id: str | None,
-):
-    """Redis-first, Postgres-fallback read of a collated MarketRunEnvelope."""
+) -> dict[str, Any] | None:
+    """Redis-first, Postgres-fallback read of a collated market run payload."""
     redis = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
@@ -52,35 +55,14 @@ async def _read_envelope(
     try:
         await postgres.connect()
         if run_id:
-            env = await redis.read_run(run_id)
-            if env is None:
-                env = await postgres.read_run(run_id)
+            payload = await read_paths.read_collated_by_run(redis, run_id)
+            if payload is None:
+                payload = await postgres.read_run(run_id)
         else:
-            env = await redis.read_latest_run(symbol)
-            if env is None:
-                env = await postgres.latest_run(symbol)
-        return env
-    finally:
-        await redis.close()
-        await postgres.close()
-
-
-async def _read_briefing(
-    settings: Settings, session_id: str, run_id: str,
-) -> Any | None:
-    postgres = PostgresRuntimeStore(settings.database_url)
-    redis = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        await postgres.connect()
-        briefing = await postgres.read_analyst_briefing(session_id, run_id)
-        if briefing is not None:
-            return briefing
-        for candidate in await redis.read_recent_briefings(session_id):
-            if candidate.run_id == run_id:
-                return candidate
-        return None
+            payload = await read_paths.read_collated(redis, symbol)
+            if payload is None:
+                payload = await postgres.latest_run(symbol)
+        return payload
     finally:
         await redis.close()
         await postgres.close()
@@ -98,31 +80,26 @@ def command() -> None:
     """Commands mounted into the ``nooa`` tree by nooa_cli_install."""
 
 
-@command.command("envelope")
+@command.command("read")
 @click.argument("symbol", default="SOLUSDT")
-@click.option("--run-id", default=None, help="read one exact collated envelope by run id")
-@click.option("--latest", "use_latest", is_flag=True, help="read the latest collated envelope (default)")
-def envelope_cmd(symbol: str, run_id: str | None, use_latest: bool) -> None:
-    """Read a collated MarketRunEnvelope data class object."""
-    if run_id and use_latest:
-        raise click.ClickException("--run-id and --latest are mutually exclusive")
-    env = asyncio.run(_read_envelope(_settings(), symbol, run_id))
-    if env is None:
-        _emit({"envelope": None})
+@click.option("--run-id", default=None, help="read one exact collated run by id")
+@click.option(
+    "--mode", default="snapshot",
+    type=click.Choice(["snapshot", "inventory", "full"]),
+    help="output shape (same as the agent's market.read tool)",
+)
+def read_cmd(symbol: str, run_id: str | None, mode: str) -> None:
+    """Read a collated market run — raw payload through the shared projections."""
+    payload = asyncio.run(_read_collated_run(_settings(), symbol, run_id))
+    if payload is None:
+        _emit({"run": None})
         return
-    _emit(env.to_dict())
-
-
-@command.command("briefing")
-@click.option("--session-id", required=True, help="analyst session UUID")
-@click.option("--run-id", required=True, help="canonical run UUID")
-def briefing_cmd(session_id: str, run_id: str) -> None:
-    """Read one persisted AnalystBriefing data class object."""
-    briefing = asyncio.run(_read_briefing(_settings(), session_id, run_id))
-    if briefing is None:
-        _emit({"briefing": None})
-        return
-    _emit(briefing.to_dict())
+    if mode == "full":
+        _emit(payload)
+    elif mode == "inventory":
+        _emit(read_paths.market_inventory(payload))
+    else:
+        _emit(read_paths.market_snapshot(payload))
 
 
 # --------------------------------------------------------------------------
