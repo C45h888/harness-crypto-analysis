@@ -35,6 +35,7 @@ class Settings:
     redis_key_prefix: str
     redis_stream_maxlen: int
     symbols: tuple[str, ...]
+    poll_symbols: tuple[str, ...]
     poll_seconds: int
     flow_window_seconds: int
     depth_levels: int
@@ -80,6 +81,11 @@ class Settings:
         symbols = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip())
         if not symbols:
             raise ValueError("SYMBOLS must contain at least one symbol")
+        # POLL_SYMBOLS: the subset the poller actively pulls. Separates
+        # "what exists in the system" (SYMBOLS) from "what the poller
+        # spends Binance weight on". Empty/unset -> full SYMBOLS set.
+        # A live Redis control key overrides both at runtime (see poller.py).
+        poll_env = tuple(s.strip().upper() for s in os.getenv("POLL_SYMBOLS", "").split(",") if s.strip())
         return cls(
             database_url=url,
             redis_url=redis_url,
@@ -87,6 +93,7 @@ class Settings:
             redis_stream_maxlen=_positive_int("REDIS_STREAM_MAXLEN", 1200),
             wall_history_maxlen=_positive_int("WALL_HISTORY_MAXLEN", 200),
             symbols=symbols,
+            poll_symbols=poll_env or symbols,
             poll_seconds=_positive_int("POLL_SECONDS", 5),
             flow_window_seconds=_positive_int("FLOW_WINDOW_SECONDS", 300),
             depth_levels=default_depth_levels(),

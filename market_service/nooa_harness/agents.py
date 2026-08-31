@@ -46,9 +46,11 @@ def bounded_envelope_view(
     complete canonical envelope is never mutated — this is only the LLM-bound
     projection.
     """
+    from market_service.runtime.read_paths import json_safe_dumps
+
     if not payload:
         return "{}"
-    rendered = json.dumps(payload, default=str)
+    rendered = json_safe_dumps(payload)
     if len(rendered) <= roof:
         return rendered
 
@@ -65,7 +67,7 @@ def bounded_envelope_view(
             return [_cap(item, max_items) for item in value]
         return value
 
-    rendered = json.dumps(_cap(payload, list_cap), default=str)
+    rendered = json_safe_dumps(_cap(payload, list_cap))
     if len(rendered) <= roof:
         return rendered
 
@@ -77,7 +79,7 @@ def bounded_envelope_view(
     kept["coverage"] = payload.get("coverage")
     kept["errors"] = payload.get("errors")
     kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
-    return json.dumps(kept, default=str)
+    return json_safe_dumps(kept)
 
 
 def response_text(resp: Any) -> str:

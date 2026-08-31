@@ -184,15 +184,22 @@ def _transition_from_state(status_rows: list[dict[str, Any]]) -> str | None:
 def _high_water_from_artifact(artifact: dict[str, Any] | None) -> int | None:
     """Read the last artifact's recorded ``events_total`` high-water.
 
-    The engine persists ``deterministic_state.coverage.events_total`` on every
-    artifact; that is the RESTART-SAFE authority for what the wake plane has
-    already consumed. Returns ``None`` when no artifact exists yet (cold
-    start) — the trigger evaluator treats that as the cold-start branch.
+    The engine persists ``events_total`` on the microstructure evidence
+    inside ``deterministic_state`` (``…microstructure_evidence.coverage``);
+    a legacy top-level ``deterministic_state.coverage`` layout is accepted
+    too. That counter is the RESTART-SAFE authority for what the wake plane
+    has already consumed. ``None`` when no artifact exists yet (cold start) —
+    the trigger evaluator treats that as the cold-start branch.
     """
     if not artifact:
         return None
     state = artifact.get("deterministic_state") or {}
-    coverage = state.get("coverage") or {}
+    evidence = state.get("microstructure_evidence") or {}
+    coverage = (
+        evidence.get("coverage")
+        or state.get("coverage")
+        or {}
+    )
     value = coverage.get("events_total")
     return _parse_int(value)
 
@@ -501,7 +508,6 @@ class WakeSupervisor:
                 "symbol": self.symbol,
                 "venue": self.venue,
                 "pid": os.getpid(),
-                "current_events": self._collect_pending_estimate() if self._last_fired_events_total is not None else None,
                 "last_fire_started_ms": self._last_fire_started_ms,
                 "last_fired_events_total": self._last_fired_events_total,
                 "last_tick_ms": self._now(),
@@ -813,8 +819,8 @@ async def _build_supervisor(
     # Set ``WAKE_ENGINE_DISPATCH=1`` (or inject an ``engine_dispatcher``
     # callable) to hand the firing envelope DIRECTLY to the engine's
     # ``run_cycle`` — the Slice-2 closed loop. The engine path is lazy
-    # (nooa is imported only when actually dispatching), so the worker
-    # module stays nooa-free at import.
+    # (openai is imported only when actually dispatching), so the worker
+    # module stays openai-free at import.
     engine_close: Callable[[], Awaitable[None]] | None = None
     if dispatcher is None and os.getenv("WAKE_ENGINE_DISPATCH") == "1":
         dispatch, engine_close = _engine_dispatcher_factory(store, settings)
@@ -841,7 +847,7 @@ def _engine_dispatcher_factory(store: RedisRuntimeStore, settings: Any):
     """Lazy engine-cycle dispatcher (Slice-2 closed loop).
 
     Imports the engine only on first fire (keeps the worker module and its
-    tests nooa-free). The engine's ``run_cycle`` expects a ``WakeEnvelope``
+    tests openai-free). The engine's ``run_cycle`` expects a ``WakeEnvelope``
     plus wake_meta — exactly the in-memory assertion the worker produces.
     Returns ``(dispatch, close)``; ``close`` shuts the lazily-built engine's
     own stores down when the worker stops.

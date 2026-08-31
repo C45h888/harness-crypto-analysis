@@ -8,18 +8,17 @@ Only ``build_llm()`` imports ``nooa`` / litellm, so importing this module
 (and running the contract/runner/persistence tests) never pays litellm's
 import cost.
 
-Provider routing — the ``routed_model()`` method maps a canonical provider
-token to the litellm model prefix that selects the right thin provider SDK:
-
-    openai    -> openai/<model>     (OpenAI-compatible gateways, vLLM)
-    ollama    -> ollama/<model>     (local Apple Silicon)
-    anthropic -> anthropic/<model>  (Anthropic API or compatible gateway)
-    minimax   -> minimax/<model>    (litellm native minimax provider, /v1)
-    <other>   -> passthrough         (model name must carry its own prefix)
-
-As a convenience, a base URL ending in ``/anthropic`` routes an unprefixed
-model to ``anthropic/`` — this covers Anthropic-compatible gateways whose
-vendor name is not litellm-native (e.g. a minimax anthropic endpoint).
+Transport: ``build_llm()`` returns a ``nooa.unifiedllm`` client
+(``CompletionClient`` / ``ResponsesClient``) built on the LITELLM framework.
+This is the upstream NOOA-native transport. The model id in ``routed_model()``
+carries its own litellm provider prefix where needed (e.g.
+``openrouter/deepseek/deepseek-chat``), and ``NOOA_MODEL_BASE_URL`` /
+``NOOA_API_KEY`` are passed to litellm as ``api_base`` / ``api_key``
+overrides. To change the model an operator edits only the env layer:
+``NOOA_MODEL_NAME`` (the model id / routing string),
+``NOOA_MODEL_BASE_URL`` (the endpoint surface), and ``NOOA_API_KEY`` (the
+credential for that surface). ``provider`` is informational and carried on
+the config for observability; litellm + unifiedllm handle provider routing.
 """
 
 from __future__ import annotations
@@ -27,17 +26,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any
-
-# Canonical provider tokens -> litellm model prefix.
-_PROVIDER_PREFIX: dict[str, str] = {
-    "openai": "openai/",
-    "vllm": "openai/",
-    "ollama": "ollama/",
-    "anthropic": "anthropic/",
-    "minimax": "minimax/",
-}
-
-_KNOWN_PREFIXES = tuple(sorted(_PROVIDER_PREFIX.values()))
 
 
 @dataclass(frozen=True)
@@ -97,24 +85,17 @@ class ModelBackendConfig:
         )
 
     def routed_model(self) -> str:
-        """Return the litellm model string for the configured endpoint."""
-        model = self.model.strip()
-        # If the model name already carries a litellm prefix, respect it.
-        if any(model.startswith(prefix) for prefix in _KNOWN_PREFIXES):
-            return model
-        provider = self.provider.strip().lower()
-        if provider in _PROVIDER_PREFIX:
-            return f"{_PROVIDER_PREFIX[provider]}{model}"
-        # Convenience heuristic for Anthropic-compatible gateways whose base
-        # URL carries /anthropic (e.g. an internal minimax/vertex path).
-        if self.base_url and self.base_url.rstrip("/").endswith("/anthropic"):
-            return f"anthropic/{model}"
-        # Unknown vendor -> litellm passthrough; routing is decided by the
-        # model prefix the operator supplied.
-        return model
+        """Return the model id / litellm routing string for the endpoint.
+
+        The operator's ``NOOA_MODEL_NAME`` is passed through verbatim — it
+        carries its own litellm provider prefix where needed (e.g.
+        ``openrouter/deepseek/deepseek-chat``). There is no prefix-rewriting
+        here; upstream unifiedllm/litellm route the string directly.
+        """
+        return self.model.strip()
 
     def build_llm(self):
-        """Build NOOA's unified model client only when a run actually starts.
+        """Build NOOA's unified LLM client only when a run actually starts.
 
         This is the ONLY call site that imports ``nooa`` / litellm, keeping
         module import, contract tests, and the runner's read path free of the

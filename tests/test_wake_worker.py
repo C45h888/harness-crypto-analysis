@@ -462,6 +462,23 @@ class HighWaterTests(unittest.TestCase):
     def test_reads_events_total_from_artifact_coverage(self):
         self.assertEqual(_high_water_from_artifact(_make_artifact(events_total=777)), 777)
 
+    def test_reads_events_total_from_evidence_coverage(self):
+        # The engine persists the high-water on the microstructure evidence:
+        # deterministic_state.microstructure_evidence.coverage.events_total.
+        artifact = _make_artifact()
+        artifact["deterministic_state"] = {
+            "microstructure_evidence": {"coverage": {"events_total": 12345}},
+        }
+        self.assertEqual(_high_water_from_artifact(artifact), 12345)
+
+    def test_evidence_coverage_wins_over_legacy_top_level(self):
+        artifact = _make_artifact(events_total=100)
+        artifact["deterministic_state"] = {
+            "coverage": {"events_total": 100},
+            "microstructure_evidence": {"coverage": {"events_total": 999}},
+        }
+        self.assertEqual(_high_water_from_artifact(artifact), 999)
+
     def test_none_when_no_artifact_or_no_coverage(self):
         self.assertIsNone(_high_water_from_artifact(None))
         # An artifact WITHOUT a coverage.events_total field (schema with no

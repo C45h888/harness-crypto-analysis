@@ -162,6 +162,14 @@ class RunAnalysisSectionsFilterTests(unittest.TestCase):
         self.assertNotIn("wall_migration", anal)
         self.assertNotIn("demand", anal)
 
+    def test_oi_section_preserves_open_interest_output_key(self):
+        evidence, calc = self._minimal()
+        r = run_analysis(evidence, calc, depth=50,
+                         sections=frozenset({"oi"}))
+        anal = r["analysis"]
+        self.assertIn("open_interest", anal)
+        self.assertNotIn("oi", anal)
+
     def test_none_runs_all(self):
         evidence, calc = self._minimal()
         r = run_analysis(evidence, calc, depth=50, sections=None)

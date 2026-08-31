@@ -8,6 +8,7 @@ license = { text = "Proprietary" }
 dependencies = [
     "nooa[viewer]>=0.0.8",
     "nooa-cli>=0.0.8",
+    "openai>=1.40",
 ]
 
 [project.urls]

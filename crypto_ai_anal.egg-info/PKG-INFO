@@ -8,6 +8,7 @@ Requires-Python: >=3.12
 Description-Content-Type: text/markdown
 Requires-Dist: nooa[viewer]>=0.0.8
 Requires-Dist: nooa-cli>=0.0.8
+Requires-Dist: openai>=1.40
 
 # Crypto AI Analytics
 
@@ -81,19 +82,26 @@ uv run --python 3.12 --with-requirements requirements.txt \
 uv run --python 3.12 --with-requirements requirements.txt \
   python -m market_service.commands.harness SOLUSDT --json
 
-# Ask the running canonical orchestrator for one exact, scoped live run.
-docker compose --profile tools run --rm harness SOLUSDT --trigger --scope all --json
+# Canonical calculation pipeline: reads the poller-fed Redis stream, runs the
+# deterministic calcs, returns a MarketRunEnvelope v2. This is the default and
+# the coherent single market-data source for the terminal-based agents.
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --analyze --window 15m --json
 
-# Ask one data node for a targeted refresh.
-docker compose --profile tools run --rm harness SOLUSDT --domain data-access --scope order_book --json
+# Warm the on-demand derivative cache in Redis (no pipeline, Redis-only).
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
 
-# Read the exact run returned by a prior trigger; this does not depend on the
-# moving latest projection.
+# Read the latest persisted canonical envelope (Redis-only read, no DATABASE_URL).
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --latest --json
+
+# Read an exact immutable run by run_id (Redis-only, no DATABASE_URL).
 docker compose --profile tools run --rm harness --run-id <RUN_ID> --json
 
-# The same harness surface from Docker. The image work directory is /app;
-# no host repository mount or Docker socket is used.
-docker compose --profile tools run --rm harness SOLUSDT --trigger --scope all --json
+# Legacy dev-only live waveform (opens its own Binance session; NOT canonical)
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --live --json
 
 # Verify every canonical runtime module imports cleanly
 uv run --python 3.12 --with-requirements requirements.txt \
@@ -111,15 +119,30 @@ uv run --python 3.12 --with-requirements requirements.txt \
 The NOOA CLI is mounted at the repo root without touching the installed
 `nooa-cli` package: `market_service/commands/nooa_cli.py` attaches the
 repo's `market` harness group to the framework root `oo` group at import
-time. One mount point covers host shell, Docker, and the harness command:
+time.
+
+**Runtime authority split** (terminal-based coding agents — pi, hermes,
+claude code — mount through the outer harness, never directly through the
+subordinate `nooa_harness` runtime module):
+
+```text
+harness.py                            OUTER CLI
+├── clean market-data contract        (no direct nooa_harness.* imports)
+└── --nooa ─► nooa_cli.py             INNER CLI (mounted at import time)
+            │
+            └─► nooa_cli_ext.py       the ``market`` click group
+                                      ─── sole direct caller of
+                                          market_service/nooa_harness/*
+```
+
+**One mount point covers host shell, Docker, and the harness CLI:**
 
 ```bash
 # VSCode shell (uses .venv; repo .env is loaded non-clobbering)
-./nooa market envelope SOLUSDT --latest            # read collated envelope
+./nooa market envelope SOLUSDT --latest            # inner CLI direct
 ./nooa market envelope SOLUSDT --run-id <UUID>     # exact immutable run
 ./nooa market memory recall --session-id <UUID>    # MemoryNode recall
 ./nooa market analyst SOLUSDT --cycles 1 --with-memory  # ControllerAgent + 4 specialists
-./nooa market refresh SOLUSDT --all                # bounded canonical refresh
 
 # Console-script equivalent (installed into the venv)
 nooa-market market envelope SOLUSDT --latest
@@ -127,18 +150,79 @@ nooa-market market envelope SOLUSDT --latest
 # Docker runtime (tools profile, same image/env as the harness)
 docker compose --profile tools run --rm nooa market envelope SOLUSDT --latest
 
-# Mounted through harness.py itself
+# Outer harness → inner CLI: terminal-based agents (pi, hermes, claude code)
+# reach the subordinate nooa_harness runtime module ONLY through --nooa
 python -m market_service.commands.harness --nooa market envelope SOLUSDT --latest
 docker compose --profile tools run --rm harness --nooa market envelope SOLUSDT --latest
+docker compose --profile tools run --rm harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
+docker compose --profile tools run --rm harness --nooa market briefing --session-id <UUID> --run-id <UUID>
 ```
 
-The `market` group speaks to the canonical stores (Redis primary read,
-Postgres durable ledger) through the python objects in
-`market_service/nooa_harness/` — `agents.py` defines the ControllerAgent +
-specialist nodes, `suite.py`/`runner.py` compose them, `memory.py` persists
-MemoryNode. The CLI stays read-only against canonical state; only the
-`refresh`/`analyst` commands request bounded cycles or produce advisory
-briefings, exactly as the harness does.
+The `market` group is the **sole direct caller** of the python objects in
+`market_service/nooa_harness/` — `agents.py` defines the ControllerAgent
++ specialist nodes, `suite.py`/`runner.py` compose them, `memory.py`
+persists MemoryNode. The CLI stays read-only against canonical state;
+only the `analyst` command runs bounded cycles and produces advisory
+briefings. The outer `harness.py` never imports anything from
+`market_service/nooa_harness/` — every analyst operation is reached
+through the `--nooa` bridge into the inner CLI.
+
+## Analyst contract objects (schema v2)
+
+The NOOA analyst suite produces validated, schema-versioned contract objects
+that cross the boundary to downstream consumers (Hermes, human reviewers,
+the memory node). All objects are frozen dataclasses with `to_dict()` /
+`from_mapping()` round-trips, persisted Postgres-first with Redis live
+projections. See `docs/NOOA_HARNESS_ARCHITECTURE.md` for the full contract
+surface.
+
+Key objects crossing the boundary:
+
+| Object | Purpose | Key fields |
+|---|---|---|
+| `SpecialistReport` | One specialist's output (delta/macro/OI/liquidation) | `summary`, `evidence: [EvidenceEntry]`, `confidence`, `limitations` |
+| `EvidenceEntry` | One piece of cited evidence | `path`, `interpretation`, `value`, `metric_name` |
+| `AnalystBriefing` | Controller's synthesis of all specialists | `narrative`, `consensus: Consensus`, `key_evidence: [KeyEvidence]`, `disagreements: [Disagreement]`, `specialist_reports` |
+| `Consensus` | Structured market verdict | `direction`, `confidence`, `confidence_score`, `timeframe`, `magnitude` |
+| `KeyEvidence` | Cross-referenced evidence claim | `path`, `claim`, `value`, `specialist` |
+| `Disagreement` | Specialist disagreement | `topic`, `specialist_a`, `specialist_b`, `resolution` |
+| `AgentMemory` | Durable analyst memory | `kind`, `content`, `importance`, `evidence_refs` |
+
+The `envelope_summary` on each briefing is enriched with key market metrics
+(last_price, open_interest, funding_rate, spot_cvd, futures_cvd, spot_obi,
+futures_obi, keystone levels) so downstream consumers can reason over the
+briefing without re-fetching the full envelope.
+
+## Architecture: two-layer reasoning
+
+The system operates as three layers:
+
+1. **NOOA analyst suite** (innermost layer, subordinate runtime module)
+   — domain-focused specialists (delta_orderflow, macro, open_interest,
+   liquidations) + controller, running on any OpenAI-compatible backend
+   (Minimax, vLLM, Ollama). Produces structured `AnalystBriefing` objects
+   from canonical market envelopes. Lives in
+   `market_service/nooa_harness/`.
+
+2. **Inner NOOA CLI** (`market_service/commands/nooa_cli.py` +
+   `nooa_cli_ext.py`) — the mounted `market` click group. **Sole direct
+   caller of the `nooa_harness` runtime module.** Reached from the outer
+   harness via `--nooa`.
+
+3. **Outer harness CLI** (`market_service/commands/harness.py`) — the
+   thin router that emits the clean aggregated market-data contract and
+   bridges into the inner NOOA CLI for any analyst / briefing / memory /
+   agent operation. **No direct `nooa_harness.*` imports.**
+
+Terminal-based coding agents (pi, hermes, claude code) shell out to the
+outer harness. They reach the subordinate `nooa_harness` runtime only
+through the `--nooa` bridge — never directly. The contract objects are
+the quality gate — every consumer's reasoning is bounded by the quality
+of what crosses the contract boundary.
+
+The harness CLI is the single mount point every terminal-based agent
+uses. Reading the latest briefing or triggering a fresh analysis cycle
+all flow through `harness.py --nooa market …`.
 
 ## Shared-domain map (container-split prep)
 

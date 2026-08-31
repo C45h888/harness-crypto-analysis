@@ -1,4 +1,4 @@
- # Plan — market.read: OO-agent deviation from the envelope format
+ /ster# Plan — market.read: OO-agent deviation from the envelope format
 
 Slice: inner CLI / OO agent loop (first of the envelope-debt passes).
 User decisions (locked):

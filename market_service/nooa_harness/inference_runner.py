@@ -13,8 +13,8 @@ The runner is the engine's only sanctioned host seam:
 
 Store lifecycle mirrors the analyst runner: Redis-only reads never construct
 Postgres; the durable ledger is contacted only when DATABASE_URL is set.
-The LLM client is built lazily inside run_inference_once (the single nooa
-import site), keeping module import litellm-free.
+The OpenAI SDK client is built lazily inside run_inference_once (the single
+openai import site), keeping module import openai-free.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 
 def _build_llm() -> Any | None:
-    """Lazily build the narration LLM client (the only nooa import site)."""
+    """Lazily build the narration LLM client (the single nooa/litellm import site)."""
     try:
         from market_service.nooa_harness.backends import ModelBackendConfig
 
@@ -74,10 +74,14 @@ async def _build_engine(
     )
 
     cooldown = int(os.getenv("INFERENCE_COOLDOWN_S", str(DEFAULT_CYCLE_COOLDOWN_S)))
+    # Operator-pinned session id (NOOA_SESSION_ID) wins; otherwise the engine
+    # derives a stable UUID per (symbol, venue) so memory stays coherent.
+    session_id = os.getenv("NOOA_SESSION_ID") or None
     return InferenceEngine(
         store, postgres, memory, llm,
         symbol=symbol, venue=venue,
         config=WakeConfig(cooldown_seconds=cooldown),
+        session_id=session_id,
     )
 
 

@@ -10,3 +10,4 @@ psycopg2-binary==2.9.12
 # git/build toolchain is required in the Docker image).
 nooa==0.0.8
 nooa-cli==0.0.8
+openai>=1.40

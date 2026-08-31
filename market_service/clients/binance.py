@@ -20,8 +20,37 @@ from typing import Any
 
 import aiohttp
 
+from market_service.rate_limit import RateLimitSubstrate, SurfaceId
+
 SPOT_BASE = "https://api.binance.com"
 FUT_BASE = "https://fapi.binance.com"
+
+
+# ---------- endpoint weight model ----------
+# Conservative (rounded-up) weight estimates per Binance's public tables.
+# Overestimating only makes the pre-flight gate fire earlier — safe direction.
+
+
+def _depth_weight(limit: int) -> int:
+    """GET depth: <100→1, ≤500→5, ≤1000→10, else 50."""
+    if limit < 100:
+        return 1
+    if limit <= 500:
+        return 5
+    if limit <= 1000:
+        return 10
+    return 50
+
+
+def _kline_weight(limit: int) -> int:
+    """GET klines/premiumIndexKlines: ≤100→1, ≤500→2, ≤1000→5, else 10."""
+    if limit <= 100:
+        return 1
+    if limit <= 500:
+        return 2
+    if limit <= 1000:
+        return 5
+    return 10
 
 
 # ---------- shared helpers ----------
@@ -70,10 +99,19 @@ class _Rest:
 
     Every call returns a real coroutine and parses JSON natively.
     No pydantic, no oneOf wrappers, no ApiResponse nonsense.
+
+    Rate limiting: every ``_get`` passes through the shared
+    :class:`RateLimitSubstrate` — pre-flight ``acquire`` on the request
+    side, header ``record`` + 429/418 translation on the response side.
+    The surface defaults to the session's bucket; per-call overrides route
+    ``/futures/data/*`` into the tighter pool.
     """
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, substrate: RateLimitSubstrate,
+                 surface: SurfaceId) -> None:
         self.base_url = base_url
+        self.substrate = substrate
+        self.surface = surface
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> "_Rest":
@@ -96,10 +134,23 @@ class _Rest:
             await self._session.close()
         self._session = None
 
-    async def _get(self, path: str, **params: Any) -> Any:
+    async def _get(self, path: str, *, weight: int = 1,
+                   surface: SurfaceId | None = None, **params: Any) -> Any:
+        """One rate-limited GET.
+
+        Order: substrate.acquire (pre-flight gate; raises IpBanError when
+        the surface is banned, BEFORE any network I/O) → HTTP GET →
+        header record → 429/418 translation (raises typed error) →
+        raise_for_status for everything else → JSON.
+        """
+        target = surface or self.surface
+        await self.substrate.acquire(target, weight)
         await self._ensure_session()
         assert self._session is not None
         async with self._session.get(path, params=_drop_none(params)) as resp:
+            self.substrate.record(target, resp.headers)
+            if resp.status in (429, 418):
+                self.substrate.handle_error(target, resp.status, resp.headers)
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
@@ -114,11 +165,19 @@ class Binance:
     Spot and futures run on independent aiohttp sessions.
     Binance camelCase fields are normalized to snake_case at the response
     boundary so the rest of the project uses one naming convention.
+
+    Rate limiting: one :class:`RateLimitSubstrate` is shared by both
+    sessions (default: ``RateLimitSubstrate.from_env()``). Spot calls
+    route to the SPOT worker, futures calls to the FUTURES worker, and
+    the ``/futures/data/*`` statistics endpoints route to the tighter
+    FUTURES_DATA worker. Pass an explicit substrate (or a disabled one)
+    to override env-driven construction.
     """
 
-    def __init__(self) -> None:
-        self._spot = _Rest(SPOT_BASE)
-        self._fut = _Rest(FUT_BASE)
+    def __init__(self, *, substrate: RateLimitSubstrate | None = None) -> None:
+        self.substrate = substrate if substrate is not None else RateLimitSubstrate.from_env()
+        self._spot = _Rest(SPOT_BASE, self.substrate, SurfaceId.SPOT)
+        self._fut = _Rest(FUT_BASE, self.substrate, SurfaceId.FUTURES)
 
     async def __aenter__(self) -> "Binance":
         await self._spot.__aenter__()
@@ -137,12 +196,14 @@ class Binance:
     async def spot_book(self, symbol: str, limit: int = 50) -> dict:
         """L2 orderbook. Returns `{lastUpdateId, bids: [[p,q],...], asks: [[p,q],...]}`."""
         self._require_symbol(symbol, "spot_book")
-        return await self._spot._get("/api/v3/depth", symbol=symbol, limit=limit)
+        return await self._spot._get("/api/v3/depth", weight=_depth_weight(limit),
+                                     symbol=symbol, limit=limit)
 
     async def spot_trades(self, symbol: str, limit: int = 500) -> list[dict]:
         """Recent raw trade prints (oldest-first)."""
         self._require_symbol(symbol, "spot_trades")
-        return await self._spot._get("/api/v3/trades", symbol=symbol, limit=limit)
+        return await self._spot._get("/api/v3/trades", weight=1 if limit <= 500 else 2,
+                                     symbol=symbol, limit=limit)
 
     async def spot_agg_trades(
         self,
@@ -155,6 +216,7 @@ class Binance:
         self._require_symbol(symbol, "spot_agg_trades")
         return await self._spot._get(
             "/api/v3/aggTrades",
+            weight=1 if limit <= 500 else 2,
             symbol=symbol,
             limit=limit,
             startTime=start_time,
@@ -164,15 +226,16 @@ class Binance:
     async def spot_book_ticker(self, symbol: str | None = None) -> list[dict] | dict:
         """Best bid/ask across one symbol (wrapped in a list) or all symbols."""
         if symbol:
-            data = await self._spot._get("/api/v3/ticker/bookTicker", symbol=symbol)
+            data = await self._spot._get("/api/v3/ticker/bookTicker", weight=1,
+                                         symbol=symbol)
             return [data] if not isinstance(data, list) else data
-        return await self._spot._get("/api/v3/ticker/bookTicker")
+        return await self._spot._get("/api/v3/ticker/bookTicker", weight=2)
 
     async def spot_24h(self, symbol: str) -> dict:
         """Returns fields are camelCase (priceChangePercent, quoteVolume, etc.).
         Renamed to snake_case at this boundary."""
         self._require_symbol(symbol, "spot_24h")
-        r = await self._spot._get("/api/v3/ticker/24hr", symbol=symbol)
+        r = await self._spot._get("/api/v3/ticker/24hr", weight=1, symbol=symbol)
         return _camel_to_snake(
             r,
             (
@@ -196,6 +259,7 @@ class Binance:
         iv = _require_kline_interval(interval)
         return await self._spot._get(
             "/api/v3/klines",
+            weight=_kline_weight(limit),
             symbol=symbol,
             interval=iv,
             limit=limit,
@@ -206,12 +270,14 @@ class Binance:
     async def fut_book(self, symbol: str, limit: int = 50) -> dict:
         """L2 orderbook snapshot. `lastUpdateId` field is camelCase."""
         self._require_symbol(symbol, "fut_book")
-        return await self._fut._get("/fapi/v1/depth", symbol=symbol, limit=limit)
+        return await self._fut._get("/fapi/v1/depth", weight=_depth_weight(limit),
+                                    symbol=symbol, limit=limit)
 
     async def fut_trades(self, symbol: str, limit: int = 500) -> list[dict]:
         """Recent raw trade prints. Binance fields: `time`, `price`, `qty`, `isBuyerMaker`."""
         self._require_symbol(symbol, "fut_trades")
-        return await self._fut._get("/fapi/v1/trades", symbol=symbol, limit=limit)
+        return await self._fut._get("/fapi/v1/trades", weight=1 if limit <= 500 else 2,
+                                    symbol=symbol, limit=limit)
 
     async def fut_agg_trades(
         self,
@@ -223,6 +289,7 @@ class Binance:
         self._require_symbol(symbol, "fut_agg_trades")
         return await self._fut._get(
             "/fapi/v1/aggTrades",
+            weight=1 if limit <= 500 else 2,
             symbol=symbol,
             limit=limit,
             startTime=start_time,
@@ -254,7 +321,8 @@ class Binance:
                 break
             page += 1
             batch = await self._fut._get(
-                "/fapi/v1/aggTrades", symbol=symbol, limit=limit,
+                "/fapi/v1/aggTrades", weight=1 if limit <= 500 else 2,
+                symbol=symbol, limit=limit,
                 fromId=last_id + 1, endTime=end_time,
             )
             if not batch:
@@ -269,13 +337,13 @@ class Binance:
         """Best bid/ask for one symbol. Returns a one-element list (shape
         consistency with `spot_book_ticker`)."""
         self._require_symbol(symbol, "fut_book_ticker")
-        data = await self._fut._get("/fapi/v1/ticker/bookTicker", symbol=symbol)
+        data = await self._fut._get("/fapi/v1/ticker/bookTicker", weight=1, symbol=symbol)
         return [data] if not isinstance(data, list) else data
 
     async def fut_24h(self, symbol: str) -> dict:
         """24h ticker. All Binance fields normalized to snake_case."""
         self._require_symbol(symbol, "fut_24h")
-        r = await self._fut._get("/fapi/v1/ticker/24hr", symbol=symbol)
+        r = await self._fut._get("/fapi/v1/ticker/24hr", weight=1, symbol=symbol)
         return _camel_to_snake(
             r,
             (
@@ -296,7 +364,7 @@ class Binance:
         `last_funding_rate`, `nextFundingTime` -> `next_funding_time`.
         """
         self._require_symbol(symbol, "fut_funding")
-        r = await self._fut._get("/fapi/v1/premiumIndex", symbol=symbol)
+        r = await self._fut._get("/fapi/v1/premiumIndex", weight=1, symbol=symbol)
         if not r:
             raise ValueError(f"fut_funding: no data returned for symbol={symbol!r}")
         return _camel_to_snake(r, ("lastFundingRate", "nextFundingTime", "markPrice",
@@ -305,7 +373,7 @@ class Binance:
     async def fut_open_interest(self, symbol: str) -> dict:
         """Current open interest in contracts. `openInterest` -> `open_interest`."""
         self._require_symbol(symbol, "fut_open_interest")
-        r = await self._fut._get("/fapi/v1/openInterest", symbol=symbol)
+        r = await self._fut._get("/fapi/v1/openInterest", weight=1, symbol=symbol)
         if not r:
             raise ValueError(f"fut_open_interest: no data for symbol={symbol!r}")
         return _camel_to_snake(r, ("openInterest",))
@@ -322,19 +390,21 @@ class Binance:
         self._require_symbol(symbol, "fut_klines")
         _require_kline_interval(interval)
         return await self._fut._get(
-            "/fapi/v1/klines", symbol=symbol, interval=interval,
+            "/fapi/v1/klines", weight=_kline_weight(limit),
+            symbol=symbol, interval=interval,
             limit=limit, startTime=start_time, endTime=end_time,
         )
 
     async def fut_price(self, symbol: str) -> dict:
         """Current USD-M contract price."""
         self._require_symbol(symbol, "fut_price")
-        return await self._fut._get("/fapi/v1/ticker/price", symbol=symbol)
+        return await self._fut._get("/fapi/v1/ticker/price", weight=1, symbol=symbol)
 
     async def fut_funding_history(self, symbol: str, limit: int = 30) -> list[dict]:
         """Historical USD-M funding events, normalized to snake_case."""
         self._require_symbol(symbol, "fut_funding_history")
-        rows = await self._fut._get("/fapi/v1/fundingRate", symbol=symbol, limit=limit)
+        rows = await self._fut._get("/fapi/v1/fundingRate", weight=1,
+                                    symbol=symbol, limit=limit)
         if not isinstance(rows, list):
             raise ValueError("fut_funding_history: expected a list")
         for row in rows:
@@ -344,7 +414,7 @@ class Binance:
     async def fut_mark_price(self, symbol: str) -> dict:
         """Mark price + funding snapshot. Symbol required."""
         self._require_symbol(symbol, "fut_mark_price")
-        r = await self._fut._get("/fapi/v1/premiumIndex", symbol=symbol)
+        r = await self._fut._get("/fapi/v1/premiumIndex", weight=1, symbol=symbol)
         return _camel_to_snake(r, ("lastFundingRate", "nextFundingTime", "markPrice",
                                    "indexPrice", "estimatedSettlePrice", "interestRate"))
 
@@ -365,6 +435,8 @@ class Binance:
         self._require_symbol(symbol, "fut_open_interest_history")
         r = await self._fut._get(
             "/futures/data/openInterestHist",
+            weight=1,
+            surface=SurfaceId.FUTURES_DATA,
             symbol=symbol,
             period=period,
             limit=limit,
@@ -395,6 +467,8 @@ class Binance:
         self._require_symbol(symbol, "fut_taker_buy_sell")
         r = await self._fut._get(
             "/futures/data/takerlongshortRatio",
+            weight=1,
+            surface=SurfaceId.FUTURES_DATA,
             symbol=symbol,
             period=period,
             limit=limit,
@@ -426,6 +500,8 @@ class Binance:
         self._require_symbol(symbol, "fut_top_long_short_accounts")
         r = await self._fut._get(
             "/futures/data/topLongShortAccountRatio",
+            weight=1,
+            surface=SurfaceId.FUTURES_DATA,
             symbol=symbol,
             period=period,
             limit=limit,
@@ -456,6 +532,8 @@ class Binance:
         self._require_symbol(symbol, "fut_long_short_ratio")
         r = await self._fut._get(
             "/futures/data/globalLongShortAccountRatio",
+            weight=1,
+            surface=SurfaceId.FUTURES_DATA,
             symbol=symbol,
             period=period,
             limit=limit,
@@ -488,6 +566,7 @@ class Binance:
         _require_kline_interval(interval)
         return await self._fut._get(
             "/fapi/v1/premiumIndexKlines",
+            weight=_kline_weight(limit),
             symbol=symbol,
             interval=interval,
             limit=limit,

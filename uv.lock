@@ -332,12 +332,14 @@ source = { editable = "." }
 dependencies = [
     { name = "nooa", extra = ["viewer"] },
     { name = "nooa-cli" },
+    { name = "openai" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "nooa", extras = ["viewer"], specifier = ">=0.0.8" },
     { name = "nooa-cli", specifier = ">=0.0.8" },
+    { name = "openai", specifier = ">=1.40" },
 ]
 
 [[package]]

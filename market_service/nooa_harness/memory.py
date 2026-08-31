@@ -19,7 +19,7 @@ Persistence discipline mirrors the rest of the runtime:
   excluded from recall everywhere.
 
 This module is NOOA-free: importing it (and running the contract/store
-tests) never pulls in ``nooa``/litellm. The optional in-agent
+tests) never pulls in ``nooa``/litellm nor the OpenAI SDK. The optional in-agent
 ``nooa-memory`` ``MemorySkill`` attachment is a separate, import-guarded
 seam (``memory_skill.py``) so the fast test path stays clean.
 """

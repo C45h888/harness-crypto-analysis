@@ -22,13 +22,15 @@ wake factory kept is ``acquire_manual_wake`` (outer-CLI force trigger).
 The narration LLM call budget is TWO per cycle (narrate + one tool round).
 Gate-failed cycles spend ZERO tokens. The LLM client is INJECTED (built by
 the caller via ``backends.build_llm``) so module import stays nooa-free and
-contract tests never pay the litellm cost.
+contract tests never pay the OpenAI SDK import cost.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,14 @@ from market_service.runtime.redis_store import RedisRuntimeStore
 log = logging.getLogger(__name__)
 
 SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
+
+# Narration token budget. The backend is a reasoning-capable model
+# (qwen3.8-flash): reasoning tokens and the final JSON share ONE generation
+# budget, so the engine must budget past the reasoning preamble or the final
+# content block is starved (null content). Operators override with
+# NOOA_MODEL_MAX_TOKENS.
+DEFAULT_NARRATION_MAX_TOKENS = 12_000
+NARRATION_MAX_TOKENS_ENV = "NOOA_MODEL_MAX_TOKENS"
 
 # Bounded memory recall per cycle (spec §3).
 MEMORY_RECALL_LIMIT = 8
@@ -102,6 +112,30 @@ def _load_kb(path: Path) -> str:
         return path.read_text(encoding="utf-8")[:12_000]
     except OSError:
         return ""
+
+
+def _narration_max_tokens() -> int:
+    """Resolve the narration generation budget (reasoning-aware)."""
+    try:
+        return max(
+            2_000,
+            int(os.getenv(NARRATION_MAX_TOKENS_ENV, str(DEFAULT_NARRATION_MAX_TOKENS))),
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_NARRATION_MAX_TOKENS
+
+
+def _stable_session_id(symbol: str, venue: str) -> str:
+    """Deterministic per-(symbol, venue) UUID session id.
+
+    The durable stores (agent_memory, inference_artifact) cast session_id to
+    a UUID column, so the engine must hand them a real UUID. Deriving it from
+    symbol+venue keeps memory coherent across cycles for one scope — a random
+    id per cycle would fragment the memory plane.
+    """
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL, f"inference-engine://{symbol.lower()}/{venue}",
+    ))
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -179,9 +213,7 @@ class InferenceEngine:
         self.symbol = symbol.upper()
         self.venue = venue
         self.config = config or WakeConfig()
-        self.session_id = session_id or SESSION_TEMPLATE.format(
-            symbol=self.symbol.lower(), venue=self.venue,
-        )
+        self.session_id = session_id or _stable_session_id(self.symbol, self.venue)
 
     # ------------------------------------------------------------------
     # Wake plane adapters (Redis counter collection + two-phase gate)
@@ -353,8 +385,25 @@ class InferenceEngine:
                 {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=4_000,
+            max_tokens=_narration_max_tokens(),
         )
+        # 1) The client's parsed text surface (nooa LLMResponse.content) is the
+        #    authoritative transport-agnostic extraction.
+        content = getattr(response, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+            if any(p.strip() for p in parts):
+                return "".join(parts)
+        # 2) Reasoning-model fallback: with a reasoning backend, the final JSON
+        #    may be parked in ``reasoning`` when the generation budget ran out
+        #    in the reasoning preamble before a content block was emitted.
+        #    Extract from reasoning rather than serializing the raw response.
+        reasoning = getattr(response, "reasoning", None)
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning
+        # 3) Legacy raw-transport extraction (direct litellm/OpenAI shapes).
         raw = getattr(response, "raw_response", response)
         choices = getattr(raw, "choices", None)
         if choices:

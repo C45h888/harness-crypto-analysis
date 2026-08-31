@@ -16,8 +16,10 @@ Covers the full engine cycle with fakes (no Redis, no Postgres, no litellm):
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from market_service.nooa_harness.engine import (
     MAX_MEMORY_PROPOSALS,
@@ -114,7 +116,12 @@ class _FakeMemory:
 
 
 class _FakeLLM:
-    """Scripted narration LLM: returns queued responses, counts calls."""
+    """Scripted narration LLM: returns queued responses, counts calls.
+
+    Mirrors the NOOA unified-LLM surface the engine calls: an async
+    ``.acall(...)`` returning a response whose ``.raw_response.choices[0].message.content``
+    is the scripted text.
+    """
 
     def __init__(self, responses: list[str]):
         self.responses = list(responses)
@@ -123,11 +130,13 @@ class _FakeLLM:
     async def acall(self, messages, max_tokens=None):
         self.calls.append({"messages": messages, "max_tokens": max_tokens})
         if self.responses:
-            return type("R", (), {"raw_response": type(
-                "Raw", (), {"choices": [type(
-                    "C", (), {"message": type(
-                        "Msg", (), {"content": self.responses.pop(0)})()})()]})()})()
-        raise AssertionError("LLM called more times than scripted")
+            content = self.responses.pop(0)
+        else:
+            raise AssertionError("LLM called more times than scripted")
+        return type("R", (), {"raw_response": type(
+            "Raw", (), {"choices": [type(
+                "C", (), {"message": type(
+                    "Msg", (), {"content": content})()})()]})()})()
 
 
 def _good_narration(with_tools: bool = False) -> str:
@@ -226,7 +235,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         async def _boom(messages, max_tokens=None):
             raise RuntimeError("gateway down")
 
-        engine.llm.acall = _boom
+        engine.llm.acall = _boom  # type: ignore[union-attr]
         artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 0)
         self.assertIsNone(artifact.interpretation)
@@ -332,6 +341,67 @@ class MemoryProposalTests(unittest.TestCase):
         accepted, dispositions = engine.resolve_memory_proposals("not a list")
         self.assertEqual(accepted, [])
         self.assertEqual(dispositions[0]["reason"], "proposals_not_a_list")
+
+
+class SessionIdTests(unittest.TestCase):
+    """The engine's session id must be a real UUID (durable stores cast it)
+    and stable per (symbol, venue) so the memory plane stays coherent."""
+
+    def test_stable_uuid_for_same_scope(self):
+        import uuid as _uuid
+
+        e1 = InferenceEngine(_FakeStore(), _FakePostgres(), None, None,
+                             symbol="BTCUSDT", venue="spot")
+        e2 = InferenceEngine(_FakeStore(), _FakePostgres(), None, None,
+                             symbol="BTCUSDT", venue="spot")
+        self.assertEqual(e1.session_id, e2.session_id)
+        _uuid.UUID(e1.session_id)  # must be a real UUID (Pg casts it)
+
+    def test_explicit_session_id_wins(self):
+        engine = InferenceEngine(_FakeStore(), _FakePostgres(), None, None,
+                                 symbol="BTCUSDT", venue="spot",
+                                 session_id="00000000-0000-0000-0000-000000000001")
+        self.assertEqual(engine.session_id, "00000000-0000-0000-0000-000000000001")
+
+
+class NarrationCallTests(unittest.IsolatedAsyncioTestCase):
+    """Reasoning-aware narration: parsed content first, reasoning fallback,
+    and a reasoning-sized token budget."""
+
+    async def test_call_llm_uses_parsed_content_first(self):
+        class _Plain:
+            async def acall(self, messages, max_tokens=None):
+                class R:
+                    content = '{"summary": "ok"}'
+                    reasoning = None
+                    raw_response = None
+                return R()
+
+        engine = InferenceEngine(_FakeStore(), _FakePostgres(), None, _Plain(),
+                                 symbol="BTCUSDT", venue="spot")
+        raw = await engine._call_llm("prompt")
+        self.assertIn('"summary": "ok"', raw)
+
+    async def test_call_llm_falls_back_to_reasoning_when_content_empty(self):
+        class _Reasoning:
+            async def acall(self, messages, max_tokens=None):
+                class R:
+                    content = ""
+                    reasoning = '{"summary": "from reasoning"}'
+                    raw_response = None
+                return R()
+
+        engine = InferenceEngine(_FakeStore(), _FakePostgres(), None, _Reasoning(),
+                                 symbol="BTCUSDT", venue="spot")
+        raw = await engine._call_llm("prompt")
+        self.assertIn("from reasoning", raw)
+
+    async def test_narration_budget_is_reasoning_sized(self):
+        from market_service.nooa_harness.engine import _narration_max_tokens
+
+        self.assertGreaterEqual(_narration_max_tokens(), 8_000)
+        with patch.dict(os.environ, {"NOOA_MODEL_MAX_TOKENS": "6000"}):
+            self.assertEqual(_narration_max_tokens(), 6000)
 
 
 class ExtractJsonTests(unittest.TestCase):
