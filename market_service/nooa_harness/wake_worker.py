@@ -473,6 +473,16 @@ class WakeSupervisor:
         last_event_water = self._last_event_water_ms
         self._running = True
 
+        # Initial trigger evaluation: fire cold_start / capture_recovery on
+        # the current state BEFORE entering the blocking read loop. Without
+        # this the worker waits for new events that may never arrive, and
+        # the cold-start wake is silently skipped.
+        try:
+            now = self._now()
+            await self._handle_delta([], [], now)
+        except Exception as exc:
+            log.warning("wake initial trigger evaluation failed: %s", exc)
+
         while self._running:
             now = self._now()
             if now - last_tick >= self.tick_reset_ms:
@@ -590,16 +600,15 @@ class WakeSupervisor:
         predicates = evaluation["predicates"]
 
         # Timestamp-water gate: the stream must be strictly NEWER than the
-        # last artifact (or no artifact yet = cold start). Without this a
-        # consumer restart replays OLD deltas and re-fires a stale wake.
+        # last artifact. Without this a consumer restart replays OLD deltas
+        # and re-fires a stale event_delta wake. cold_start fires on the
+        # ABSENCE of a prior artifact — it does not need a water timestamp.
         # Recovery/status-only wakes have NO event row (no water timestamp) —
         # they bypass this gate by definition.
         water_age_ms = _stream_age_ms(
             event_rows[0]["id"] if event_rows else None, now_ms,
         )
-        needs_water = bool(
-            predicates.get("event_delta") or predicates.get("cold_start")
-        )
+        needs_water = bool(predicates.get("event_delta"))
         if needs_water and water_age_ms is None:
             return
         if predicates.get("event_delta"):
@@ -936,3 +945,7 @@ async def _once(config: WakeSupervisorConfig) -> int:
     finally:
         await supervisor.stop()
     return supervisor.fired_count
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

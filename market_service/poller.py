@@ -182,7 +182,10 @@ async def _safe(coro, name: str) -> tuple[Any, str | None]:
     except _RATE_ERRORS:
         raise
     except Exception as exc:
-        log.warning("poller endpoint %s failed: %s", name, exc)
+        # Use %r (repr) so the exception TYPE is always visible — for
+        # asyncio.TimeoutError, str(exc) is '' and the log line would
+        # otherwise be unreadable ("poller endpoint X failed: ").
+        log.warning("poller endpoint %s failed: %r", name, exc)
         return None, f"{type(exc).__name__}: {exc}"
 
 

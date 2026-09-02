@@ -659,8 +659,9 @@ class PostgresRuntimeStore:
                (artifact_id, symbol, venue, generated_at, completed_at,
                 schema_version, status, window_minutes, interval_seconds,
                 deterministic_state, capability_log, input_hash, model_version,
-                interpretation, session_id, errors)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                interpretation, session_id, errors,
+                hypothesis, hypothesis_verdict, verdict_reason, calculations)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
                ON CONFLICT (artifact_id) DO NOTHING
                RETURNING artifact_id""",
             uuid.UUID(artifact.artifact_id),
@@ -680,6 +681,10 @@ class PostgresRuntimeStore:
             if artifact.interpretation is not None else None,
             uuid.UUID(artifact.session_id) if artifact.session_id else None,
             json.dumps(list(artifact.errors), default=str),
+            json.dumps(artifact.hypothesis, default=str) if artifact.hypothesis is not None else None,
+            artifact.hypothesis_verdict,
+            artifact.verdict_reason,
+            json.dumps(artifact.calculations, default=str) if artifact.calculations is not None else None,
         )
         return row is not None
 
@@ -694,7 +699,8 @@ class PostgresRuntimeStore:
             row = await self.pool.fetchrow(
                 "SELECT deterministic_state, interpretation, status, artifact_id,"
                 " symbol, venue, generated_at, input_hash, model_version,"
-                " window_minutes, interval_seconds, capability_log, session_id, errors"
+                " window_minutes, interval_seconds, capability_log, session_id, errors,"
+                " hypothesis, hypothesis_verdict, verdict_reason, calculations"
                 " FROM inference_artifact WHERE artifact_id = $1",
                 uuid.UUID(artifact_id),
             )
@@ -702,7 +708,8 @@ class PostgresRuntimeStore:
             row = await self.pool.fetchrow(
                 "SELECT deterministic_state, interpretation, status, artifact_id,"
                 " symbol, venue, generated_at, input_hash, model_version,"
-                " window_minutes, interval_seconds, capability_log, session_id, errors"
+                " window_minutes, interval_seconds, capability_log, session_id, errors,"
+                " hypothesis, hypothesis_verdict, verdict_reason, calculations"
                 " FROM inference_artifact WHERE symbol = $1"
                 " ORDER BY generated_at DESC LIMIT 1",
                 symbol.upper(),
@@ -712,13 +719,13 @@ class PostgresRuntimeStore:
         if row is None:
             return None
         result = dict(row)
-        for col in ("deterministic_state", "capability_log", "errors"):
+        for col in ("deterministic_state", "capability_log", "errors", "hypothesis", "calculations"):
             value = result.get(col)
             if isinstance(value, str):
                 try:
                     result[col] = json.loads(value)
                 except (ValueError, json.JSONDecodeError):
-                    result[col] = {} if col == "deterministic_state" else []
+                    result[col] = {} if col in ("deterministic_state","hypothesis","calculations") else []
         interp = result.get("interpretation")
         if isinstance(interp, str):
             try:

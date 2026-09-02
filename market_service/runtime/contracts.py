@@ -34,6 +34,8 @@ ValidWakePredicates: tuple[str, ...] = (
 StateStatus = Literal["healthy", "degraded", "invalid"]
 ConfidenceLevel = Literal["low", "medium", "high"]
 ValidConfidence: tuple[str, ...] = ("low", "medium", "high")
+# LLMs sometimes use "moderate" instead of "medium" — accept it as an alias.
+_CONFIDENCE_ALIASES: dict[str, str] = {"moderate": "medium"}
 # Inference-artifact status trichotomy (Pass-3 discipline, generalized):
 # validated  — deterministic inputs passed every quality gate; narration may cite values
 # provisional — fitted but diagnostics incomplete; narration must caveat, never signal
@@ -350,6 +352,9 @@ def _require_str(payload: dict[str, Any], key: str) -> str:
 
 def _require_confidence(payload: dict[str, Any], key: str = "confidence") -> str:
     value = payload.get(key)
+    mapped = _CONFIDENCE_ALIASES.get(str(value)) if value is not None else None
+    if mapped is not None:
+        value = mapped
     if value not in ValidConfidence:
         raise ValueError(
             f"confidence must be one of {ValidConfidence!r}, got {value!r}"
@@ -684,6 +689,15 @@ class InferenceArtifact:
     interpretation: dict[str, Any] | None = None
     session_id: str | None = None
     errors: tuple[dict[str, Any], ...] = ()
+    # Pass C: paper-centered hypothesis validation. The combined formula
+    # ΔP_k = α_i + c·OFI_k/AD_i^λ + (ν_i·OFI_k + ε_k) remains a DERIVED
+    # statistical hypothesis (heteroskedastic ν·OFI), never a shortcut
+    # single calculation. hypothesis_verdict is the deterministic
+    # validation of the LLM's H0/H1 against the fits.
+    hypothesis: dict[str, Any] | None = None
+    hypothesis_verdict: str | None = None  # validated|invalidated|inconclusive
+    verdict_reason: str | None = None
+    calculations: dict[str, Any] | None = None  # {ofi_blocks, ad_blocks, derived_diagnostic}
     schema_version: int = INFERENCE_ARTIFACT_SCHEMA_VERSION
 
     @classmethod
@@ -704,6 +718,10 @@ class InferenceArtifact:
         interpretation: dict[str, Any] | None = None,
         session_id: str | None = None,
         errors: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        hypothesis: dict[str, Any] | None = None,
+        hypothesis_verdict: str | None = None,
+        verdict_reason: str | None = None,
+        calculations: dict[str, Any] | None = None,
     ) -> "InferenceArtifact":
         created = cls(
             artifact_id=str(uuid.uuid4()),
@@ -721,6 +739,10 @@ class InferenceArtifact:
             interpretation=interpretation,
             session_id=session_id,
             errors=tuple(errors),
+            hypothesis=hypothesis,
+            hypothesis_verdict=hypothesis_verdict,
+            verdict_reason=verdict_reason,
+            calculations=calculations,
         )
         # Construction-time enforcement: an insufficient artifact with a
         # non-NULL interpretation can never be created through the sanctioned
@@ -752,6 +774,10 @@ class InferenceArtifact:
                 if value.get("session_id") is not None else None
             ),
             errors=tuple(value.get("errors") or ()),
+            hypothesis=dict(value["hypothesis"]) if value.get("hypothesis") is not None else None,
+            hypothesis_verdict=value.get("hypothesis_verdict"),
+            verdict_reason=value.get("verdict_reason"),
+            calculations=dict(value["calculations"]) if value.get("calculations") is not None else None,
             schema_version=int(
                 value.get("schema_version", INFERENCE_ARTIFACT_SCHEMA_VERSION)
             ),
@@ -777,6 +803,11 @@ class InferenceArtifact:
             )
         if not isinstance(self.deterministic_state, dict):
             raise ValueError("deterministic_state must be an object")
+        if self.hypothesis_verdict is not None and self.hypothesis_verdict not in ("validated", "invalidated", "inconclusive"):
+            raise ValueError(f"invalid hypothesis_verdict: {self.hypothesis_verdict}")
+        # Combined formula is derived hypothesis only — never a shortcut stored as deterministic prediction.
+        if self.calculations and self.calculations.get("combined_prediction") is not None:
+            raise ValueError("calculations.combined_prediction must not be stored as deterministic prediction; use derived_diagnostic")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -796,6 +827,10 @@ class InferenceArtifact:
             "interpretation": self.interpretation,
             "session_id": self.session_id,
             "errors": list(self.errors),
+            "hypothesis": self.hypothesis,
+            "hypothesis_verdict": self.hypothesis_verdict,
+            "verdict_reason": self.verdict_reason,
+            "calculations": self.calculations,
         }
 
     def to_json(self) -> str:

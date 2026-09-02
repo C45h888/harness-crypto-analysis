@@ -258,9 +258,12 @@ class MicrostructureInterpretationAgent(Agent):
             )
         extra = f"{extra_context}\n\n" if extra_context else ""
         user = (
-            "Return ONLY one valid JSON object: {summary, evidence: "
+            "Return ONLY one valid JSON object with fields: "
+            "{summary, evidence: "
             "[{path, value, interpretation, metric_name}], confidence, "
-            "limitations, model_separation}.\n\n"
+            "limitations, model_separation}.\n"
+            "confidence MUST be EXACTLY one of: \"low\", \"medium\", \"high\" "
+            "(NOT the evidence status like provisional/insufficient).\n\n"
             f"{extra}"
             "Evidence schema (shape reference):\n"
             f"{self._envelope_schema()}\n\n"

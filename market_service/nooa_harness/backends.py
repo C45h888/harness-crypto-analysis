@@ -87,12 +87,27 @@ class ModelBackendConfig:
     def routed_model(self) -> str:
         """Return the model id / litellm routing string for the endpoint.
 
-        The operator's ``NOOA_MODEL_NAME`` is passed through verbatim — it
-        carries its own litellm provider prefix where needed (e.g.
-        ``openrouter/deepseek/deepseek-chat``). There is no prefix-rewriting
-        here; upstream unifiedllm/litellm route the string directly.
+        If ``NOOA_MODEL_NAME`` already carries a provider prefix (contains
+        ``/``) it is passed through verbatim — e.g.
+        ``openrouter/deepseek/deepseek-chat``. Otherwise the configured
+        ``NOOA_MODEL_PROVIDER`` is used to prefix the model so litellm can
+        route it. This is what fixes "native" / local models:
+
+        * ``openai`` / ``vllm``  -> ``openai/<model>`` (OpenAI-compatible)
+        * ``ollama``             -> ``ollama/<model>``
+        * otherwise              -> ``<provider>/<model>``
         """
-        return self.model.strip()
+        raw = self.model.strip()
+        if "/" in raw:
+            return raw
+        provider = (self.provider or "openai").strip().lower()
+        if provider in ("openai", "vllm"):
+            return f"openai/{raw}"
+        if provider == "ollama":
+            return f"ollama/{raw}"
+        if provider in ("ollama_chat", "ollama-chat"):
+            return f"ollama_chat/{raw}"
+        return f"{provider}/{raw}" if provider else raw
 
     def build_llm(self):
         """Build NOOA's unified LLM client only when a run actually starts.

@@ -110,6 +110,27 @@ class SurfaceRateWorker:
                 self._state.reset_window(self._clock())
             self._state.used_weight += weight
 
+    async def rollback(self, weight: int) -> None:
+        """Release a reservation made by ``acquire`` when the HTTP call
+        never produced a response (network timeout, connection error,
+        DNS failure, etc.).
+
+        Without rollback, a sequence of failed requests would leave the
+        bucket inflated and could trip the ceiling gate on the next
+        cycle even after the upstream recovered. The 60-second window
+        roll-over eventually self-corrects, but explicit rollback makes
+        the bucket honest immediately.
+
+        Idempotent against over-rollback: ``used_weight`` is floored at 0.
+        Must be called with the same ``weight`` that was passed to
+        ``acquire`` so local reservation and server header sync stay
+        consistent.
+        """
+        if weight <= 0:
+            raise ValueError(f"weight must be positive, got {weight}")
+        async with self._lock:
+            self._state.used_weight = max(0, self._state.used_weight - weight)
+
     # ------------------------------------------------------------------
     # response path
     # ------------------------------------------------------------------

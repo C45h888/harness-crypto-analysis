@@ -142,17 +142,43 @@ class _Rest:
         the surface is banned, BEFORE any network I/O) → HTTP GET →
         header record → 429/418 translation (raises typed error) →
         raise_for_status for everything else → JSON.
+
+        On transport failure (timeout, DNS, connection) the local
+        weight reservation is rolled back so a cascade doesn't inflate the
+        bucket. 429/418 and 5xx responses DID reach Binance and counted —
+        those reservations stay.
         """
+        import asyncio as _asyncio
+
+        import aiohttp as _aiohttp
+
+        from market_service.rate_limit import IpBanError as _IpBanError
+        from market_service.rate_limit import RateLimitError as _RateLimitError
+
         target = surface or self.surface
         await self.substrate.acquire(target, weight)
-        await self._ensure_session()
-        assert self._session is not None
-        async with self._session.get(path, params=_drop_none(params)) as resp:
-            self.substrate.record(target, resp.headers)
-            if resp.status in (429, 418):
-                self.substrate.handle_error(target, resp.status, resp.headers)
-            resp.raise_for_status()
-            return await resp.json(content_type=None)
+        try:
+            await self._ensure_session()
+            assert self._session is not None
+            async with self._session.get(path, params=_drop_none(params)) as resp:
+                self.substrate.record(target, resp.headers)
+                if resp.status in (429, 418):
+                    self.substrate.handle_error(target, resp.status, resp.headers)
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+        except (_RateLimitError, _IpBanError):
+            # Server saw the request — reservation stays, bucket now has
+            # pause/ban state.
+            raise
+        except (_aiohttp.ClientConnectorError, _aiohttp.ClientOSError,
+                _aiohttp.ServerDisconnectedError, _asyncio.TimeoutError):
+            # No HTTP response — Binance did not count this weight.
+            await self.substrate.rollback(target, weight)
+            raise
+        except Exception:
+            # 5xx / JSON errors: response DID arrive, weight already synced
+            # via record(). Do not rollback — would under-count.
+            raise
 
 
 # ---------- combined client ----------

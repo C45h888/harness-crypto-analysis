@@ -122,6 +122,14 @@ class RateLimitSubstrate:
             return
         await self.worker(surface).acquire(weight)
 
+    async def rollback(self, surface: SurfaceId, weight: int = 1) -> None:
+        """Release a reservation when the HTTP call never produced a
+        response. Mirrors :meth:`acquire` — transports wrap their HTTP
+        call in try/except and call ``rollback`` on any network failure."""
+        if not self.enabled:
+            return
+        await self.worker(surface).rollback(weight)
+
     def record(self, surface: SurfaceId, headers: Mapping[str, str]) -> None:
         if not self.enabled:
             return

@@ -220,11 +220,11 @@ def memory_forget(session_id, memory_id) -> None:
 # --------------------------------------------------------------------------
 
 # Bounded request scope — frozen for the initial soft-test phase.
-_MICRO_ALLOWED_SYMBOLS = frozenset({"BTCUSDT"})
+_MICRO_ALLOWED_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
 _MICRO_ALLOWED_VENUES = frozenset({"spot"})
 _MICRO_ALLOWED_INTERVALS_S = frozenset({10, 15, 30})
 _MICRO_ALLOWED_WINDOWS_M = frozenset({15, 30, 60})
-_MICRO_DEFAULT_TICK_SIZES = {"BTCUSDT": "0.01"}
+_MICRO_DEFAULT_TICK_SIZES = {"BTCUSDT": "0.01", "SOLUSDT": "0.01", "ETHUSDT": "0.01"}
 
 
 def _parse_duration_ms(text: str) -> int:

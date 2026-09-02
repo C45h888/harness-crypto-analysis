@@ -145,9 +145,13 @@ class Capability:
             )
 
 
-# Frozen initial scope — mirrors the Pass-3 bounded request validator.
-_INITIAL_SYMBOLS = frozenset({"BTCUSDT"})
-_INITIAL_VENUES = frozenset({"spot"})
+# Frozen initial scope — extended for SOL-USDT perps (per/user request).
+# Microstructure capture remains spot-only (event-level tape), but
+# calculation modules (market.group/read) are venue-agnostic via raw poller
+# which fetches spot + USD-M perps. This lets inference validate SOL perps
+# statistically even when micro evidence is spot-derived.
+_INITIAL_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
+_INITIAL_VENUES = frozenset({"spot", "perps", "perp", "usdm", "futures"})
 
 CAPABILITIES: dict[str, Capability] = {
     "redis.read_capture_status": Capability(
@@ -551,13 +555,21 @@ def revalidate_wake(
 # ---------------------------------------------------------------------------
 
 TOOL_NAMES: dict[str, str] = {
-    # T1 — microstructure (paper stack)
+    # T1 — microstructure (paper stack) — split AD/OFI per Pass C
     "micro.capture_status": "redis.read_capture_status",
     "micro.events": "redis.read_events",
     "micro.ofi_intervals": "redis.read_intervals",
     "micro.replay": "fitting.replay",
     "micro.fit_beta": "fitting.assemble_evidence",
     "micro.evidence": "redis.read_evidence",
+    # T1 split: AD/OFI separate tools, final fit is hypothesis validation
+    "calc.ofi.intervals": "calc.ofi_intervals",
+    "calc.depth.average": "calc.ad_average",
+    "calc.observation.build": "calc.observation_build",
+    "calc.fit.price_impact": "calc.fit_price_impact",
+    "calc.fit.depth_scaling": "calc.fit_depth_scaling",
+    "calc.derived_diagnostic": "calc.derived_diagnostic",
+    "memory.recall_paper": "memory.recall_paper",
     # T2 — market correlation (canonical pipeline seams)
     "market.read": "market.read",
     "market.group": "market.run_group",
@@ -582,6 +594,13 @@ _MARKET_TOOLS: dict[str, Capability] = {
         "market.read_derivatives": "Read the cached derivative evidence (funding, OI, cross-asset).",
         "market.read_keystone_history": "Read the bounded keystone cross-cycle ledger.",
         "market.read_wall_history": "Read the bounded wall cross-cycle ledger.",
+        "calc.ofi_intervals": "Deterministic OFI per interval: sum e_n in [t_{k-1},t_k) — clock-bound, no AD. Paper Cont eq OFI_k.",
+        "calc.ad_average": "Deterministic AD per block: event-average (qB+qA)/2 — separate from OFI, needs tick_size. Paper AD_i.",
+        "calc.observation_build": "Join OFI intervals + AD blocks + mid → PriceImpactObservation[] (ΔP ticks vs OFI), quality filtered.",
+        "calc.fit_price_impact": "OLS ΔP_k = α + β·OFI_k (HC0 SE) — returns PriceImpactFit, status trichotomy. Takes observations, not raw intervals.",
+        "calc.fit_depth_scaling": "Log-log ln β = ln c - λ ln AD across blocks — needs ≥3 distinct AD_i, derived diagnostic only.",
+        "calc.derived_diagnostic": "Derived combined ΔP = α + c·OFI/AD^λ + (ν·OFI+ε) — heteroskedastic ν·OFI, diagnostic not prediction.",
+        "memory.recall_paper": "Recall Cont-Kukanov-Stoikov paper facts from real MemoryNode (kind=fact, paper-kb session) — not prompt.",
     }.items()
 }
 CAPABILITIES.update(_MARKET_TOOLS)
@@ -723,6 +742,170 @@ async def dispatch_read_wall_history(
         return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
 
 
+# ------------------------------------------------------------------
+# Pass C split: AD/OFI separate tools + derived diagnostic
+# The final formula ΔP = α + c·OFI/AD^λ + (ν·OFI+ε) remains DERIVED
+# hypothesis (heteroskedastic ν·OFI), never shortcut calculation.
+# ------------------------------------------------------------------
+
+async def dispatch_calc_ofi_intervals(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, interval_ms: int = 10_000, window_minutes: int = 30,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Tool: calc.ofi.intervals — deterministic OFI per interval (no AD)."""
+    from decimal import Decimal
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.ofi_intervals"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "interval_ms": interval_ms, "window_minutes": window_minutes}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, dropped = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        intervals = fm.replay_intervals(windowed, interval_ms=interval_ms)
+        # Return OFI-only projection (paper Cont OFI_k), AD stripped for split discipline
+        projected = [{"start_ts_ms": i.start_ts_ms, "end_ts_ms": i.end_ts_ms, "ofi": str(i.ofi), "event_count": i.event_count, "quality": i.quality} for i in intervals]
+        return _bounded(projected, 200), capability_log_entry(cap.name, scope, "ok", detail={"intervals": len(intervals), "dropped": dropped, "note": "AD excluded — use calc.depth.average separately"})
+    except CapabilityDenied as exc:
+        return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+async def dispatch_calc_ad_average(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.depth.average — AD per block, separate from OFI (paper AD_i)."""
+    from decimal import Decimal
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.ad_average"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "window_minutes": window_minutes}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, dropped = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        intervals = fm.replay_intervals(windowed, interval_ms=10_000)
+        # AD per block via DepthAverager semantics: mean (qB+qA)/2
+        ads = [str(i.average_depth) if i.average_depth is not None else None for i in intervals]
+        valid_ads = [a for a in ads if a is not None]
+        mean_ad = str(sum(Decimal(a) for a in valid_ads) / len(valid_ads)) if valid_ads else None
+        result = {"window_minutes": window_minutes, "n_intervals": len(intervals), "ad_per_interval": _bounded(ads, 200), "mean_ad": mean_ad, "depth_estimator": fm.DEPTH_ESTIMATOR, "note": "OFI excluded — use calc.ofi.intervals separately; ν·OFI heteroskedastic"}
+        return result, capability_log_entry(cap.name, scope, "ok", detail={"mean_ad": mean_ad, "n": len(valid_ads)})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+async def dispatch_calc_observation_build(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, interval_seconds: int = 10, window_minutes: int = 30,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Tool: calc.observation.build — join OFI+AD+ΔP → observations (ΔP ticks vs OFI)."""
+    from decimal import Decimal
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.observation_build"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "interval_seconds": interval_seconds, "window_minutes": window_minutes}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, dropped = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        intervals = fm.replay_intervals(windowed, interval_ms=interval_seconds*1000)
+        observations, excluded = fm.build_observations(intervals, tick_size=Decimal("0.01"))
+        proj = [{"ofi": str(o.ofi), "delta_ticks": str(o.delta_ticks), "average_depth": str(o.average_depth) if o.average_depth else None, "quality": o.quality} for o in observations[:50]]
+        return proj, capability_log_entry(cap.name, scope, "ok", detail={"n_observations": len(observations), "excluded": excluded, "note": "ΔP = α+β·OFI observations ready for calc.fit.price_impact"})
+    except CapabilityDenied as exc:
+        return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+async def dispatch_calc_fit_price_impact(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, interval_seconds: int = 10, window_minutes: int = 30,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.fit.price_impact — OLS ΔP=α+β·OFI (HC0), takes split observations."""
+    from decimal import Decimal
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.fit_price_impact"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "interval_seconds": interval_seconds}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        windowed = [e for e in events if e.current.exchange_ts_ms >= (events[-1].current.exchange_ts_ms - window_minutes*60_000)] if events else []
+        intervals = fm.replay_intervals(windowed, interval_ms=interval_seconds*1000)
+        fit, _ = fm.fit_price_impact(intervals, symbol=symbol, venue=venue, tick_size=Decimal("0.01"), interval_seconds=interval_seconds)
+        return fit.to_dict(), capability_log_entry(cap.name, scope, "ok", detail={"beta": str(fit.beta), "status": fit.status})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+async def dispatch_calc_fit_depth_scaling(
+    store: RedisRuntimeStore, symbol: str, venue: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.fit.depth_scaling — lnβ = ln c - λ ln AD, needs ≥3 blocks. Derived diagnostic."""
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.fit_depth_scaling"]
+    scope = {"symbol": symbol.upper(), "venue": venue}
+    try:
+        cap.validate_scope(symbol, venue)
+        # For split discipline, we can only fit depth scaling from history — single window gives n_blocks=1 → insufficient by design
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        intervals = fm.replay_intervals(events, interval_ms=10_000)
+        fit, _ = fm.fit_price_impact(intervals, symbol=symbol, venue=venue, tick_size=fm.DECIMAL("0.01") if hasattr(fm,"DECIMAL") else __import__("decimal").Decimal("0.01"), interval_seconds=10) if intervals else (None,None)
+        if fit is None:
+            return None, capability_log_entry(cap.name, scope, "ok", detail={"status": "insufficient", "reason": "no intervals"})
+        depth_fit = fm.fit_depth_scaling([fit], symbol=symbol, venue=venue)
+        return depth_fit.to_dict(), capability_log_entry(cap.name, scope, "ok", detail={"status": depth_fit.status, "n_blocks": depth_fit.n_blocks, "note": "derived, not prediction"})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+async def dispatch_calc_derived_diagnostic(
+    store: RedisRuntimeStore, symbol: str, venue: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.derived_diagnostic — ΔP = α + c·OFI/AD^λ + (ν·OFI+ε), heteroskedastic ν·OFI, diagnostic only."""
+    cap = CAPABILITIES["calc.derived_diagnostic"]
+    scope = {"symbol": symbol.upper(), "venue": venue}
+    try:
+        cap.validate_scope(symbol, venue)
+        result = {"formula": "ΔP_k = α_i + c·OFI_k/AD_i^λ + (ν_i·OFI_k + ε_k)", "note": "DERIVED hypothesis — ν·OFI heteroskedastic, variance depends on OFI. Never single shortcut; fit β and c/λ separately then derive.", "status": "diagnostic_only", "paper": "Cont 1011.6402 §3"}
+        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+
+async def dispatch_memory_recall_paper(
+    symbol: str, venue: str, *, query: str = "Cont OFI AD beta",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Tool: memory.recall_paper — pull paper facts from real MemoryNode, not prompt."""
+    import uuid as _uuid
+    from market_service.config import Settings
+    from market_service.nooa_harness.memory import MemoryNode
+    cap = CAPABILITIES["memory.recall_paper"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "query": query}
+    try:
+        cap.validate_scope(symbol, venue)
+        paper_session = str(_uuid.uuid5(_uuid.NAMESPACE_URL, "paper-kb://cont1011"))
+        settings = Settings.from_env()
+        # Use from_settings but override redis url to env (no DB required for recall)
+        node = MemoryNode.from_settings(settings)
+        mems = await node.recall(paper_session, query=query, limit=8)
+        await node.postgres.close()
+        await node.redis.close()
+        projected = [{"content": m.content[:600], "tags": list(m.tags), "importance": m.importance} for m in mems]
+        return projected, capability_log_entry(cap.name, scope, "ok", detail={"facts": len(projected), "query": query})
+    except CapabilityDenied as exc:
+        return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
 async def dispatch_market_group(
     symbol: str, group: str, *, window_minutes: int = 15,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -831,6 +1014,20 @@ async def execute_tool(
         return await dispatch_read_wall_history(
             store, symbol, count=int(args.get("count") or 100),
         )
+    if name == "calc.ofi.intervals":
+        return await dispatch_calc_ofi_intervals(store, symbol, venue, interval_ms=int(args.get("interval_ms") or args.get("interval_seconds", 10)*1000 if "interval_seconds" in args else 10_000), window_minutes=int(args.get("window_minutes") or 30))
+    if name == "calc.depth.average":
+        return await dispatch_calc_ad_average(store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30))
+    if name == "calc.observation.build":
+        return await dispatch_calc_observation_build(store, symbol, venue, interval_seconds=int(args.get("interval_seconds") or 10), window_minutes=int(args.get("window_minutes") or 30))
+    if name == "calc.fit.price_impact":
+        return await dispatch_calc_fit_price_impact(store, symbol, venue, interval_seconds=int(args.get("interval_seconds") or 10), window_minutes=int(args.get("window_minutes") or 30))
+    if name == "calc.fit.depth_scaling":
+        return await dispatch_calc_fit_depth_scaling(store, symbol, venue)
+    if name == "calc.derived_diagnostic":
+        return await dispatch_calc_derived_diagnostic(store, symbol, venue)
+    if name == "memory.recall_paper":
+        return await dispatch_memory_recall_paper(symbol, venue, query=str(args.get("query") or "Cont OFI AD beta"))
     return None, capability_log_entry(
         "tool.unrouted", {"name": name}, "denied", detail="no dispatch path",
     )

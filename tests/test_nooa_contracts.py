@@ -67,21 +67,27 @@ class BackendConfigTests(unittest.TestCase):
                 ModelBackendConfig.from_env()
 
     def test_model_is_verbatim_passthrough_regardless_of_provider(self):
+        # Already-prefixed model is passed through verbatim (openrouter etc.)
         cfg = ModelBackendConfig(
             provider="Minimax.io",
-            model="claude-something",
+            model="minimax/claude-something",
             base_url="https://gateway.example/anthropic",
             api_key="k",
         )
-        self.assertEqual(cfg.routed_model(), "claude-something")
+        self.assertEqual(cfg.routed_model(), "minimax/claude-something")
 
-    def test_vllm_model_sent_verbatim(self):
+    def test_vllm_model_gets_openai_prefix(self):
+        # vllm is OpenAI-compatible -> openai/<model> for litellm routing
         cfg = ModelBackendConfig(provider="vllm", model="llama-3-70b", base_url="http://host:8000/v1")
-        self.assertEqual(cfg.routed_model(), "llama-3-70b")
+        self.assertEqual(cfg.routed_model(), "openai/llama-3-70b")
 
-    def test_ollama_model_sent_verbatim(self):
+    def test_ollama_model_gets_ollama_prefix(self):
         cfg = ModelBackendConfig(provider="ollama", model="llama3")
-        self.assertEqual(cfg.routed_model(), "llama3")
+        self.assertEqual(cfg.routed_model(), "ollama/llama3")
+
+    def test_native_qwen_ollama_prefix(self):
+        cfg = ModelBackendConfig(provider="ollama", model="qwen3:8b")
+        self.assertEqual(cfg.routed_model(), "ollama/qwen3:8b")
 
     def test_existing_model_prefix_is_preserved(self):
         cfg = ModelBackendConfig(provider="openai", model="deepseek/deepseek-chat", base_url="https://openrouter.ai/api/v1")

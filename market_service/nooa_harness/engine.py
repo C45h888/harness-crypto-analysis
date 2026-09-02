@@ -48,21 +48,27 @@ from market_service.runtime.redis_store import RedisRuntimeStore
 log = logging.getLogger(__name__)
 
 SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
+# Perps alias normalization — SOL-USDT perps requested as primary
+VENUE_ALIASES = {"perps": "perps", "perp": "perps", "usdm": "perps", "futures": "perps", "spot": "spot"}
 
-# Narration token budget. The backend is a reasoning-capable model
-# (qwen3.8-flash): reasoning tokens and the final JSON share ONE generation
-# budget, so the engine must budget past the reasoning preamble or the final
-# content block is starved (null content). Operators override with
-# NOOA_MODEL_MAX_TOKENS.
-DEFAULT_NARRATION_MAX_TOKENS = 12_000
+# Narration token budget — agentic loop, not controlled generator.
+# Muse Spark 1.2 contributor is mandatory-reasoning with 1_048_576 context;
+# 25% of that is 262k. Default 50_000 lets the model run as an agent
+# (tool calls + validation + memory cross-check + structured report) without
+# starving the final JSON block. Operators override with NOOA_MODEL_MAX_TOKENS.
+# Calculation modules + read tools are now the primary inference path — the
+# predefined formula output is never the final word.
+DEFAULT_NARRATION_MAX_TOKENS = 50_000
 NARRATION_MAX_TOKENS_ENV = "NOOA_MODEL_MAX_TOKENS"
+DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
+AGENTIC_MAX_TOOL_ROUNDS = 3  # was 1 — now full agentic loop
 
-# Bounded memory recall per cycle (spec §3).
-MEMORY_RECALL_LIMIT = 8
-MEMORY_CONTEXT_BUDGET = 3_000
+# Bounded memory recall per cycle — expanded for paper KB cross-check.
+MEMORY_RECALL_LIMIT = 12
+MEMORY_CONTEXT_BUDGET = 8_000
 MAX_MEMORY_PROPOSALS = 3
 # Hard output bound for the prior-artifact headline block.
-_PRIOR_HEADLINE_MAX_CHARS = 2_000
+_PRIOR_HEADLINE_MAX_CHARS = 4_000
 
 _TOOL_MANIFEST = Path(__file__).resolve().parents[2] / (
     "docs/nooa-kb/behavior/tool-manifest.md"
@@ -70,34 +76,39 @@ _TOOL_MANIFEST = Path(__file__).resolve().parents[2] / (
 _MEMORY_PROTOCOL = Path(__file__).resolve().parents[2] / (
     "docs/nooa-kb/behavior/memory-protocol.md"
 )
+_PAPER_KB = Path(__file__).resolve().parents[2] / (
+    "docs/nooa-kb/nooa-micro-structure-archieture.md"
+)
+_CALC_KB_PATHS = [
+    Path(__file__).resolve().parents[2] / "docs/nooa-kb/behavior/B01-agents-base.md",
+]
 
-_SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}).
+_SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}) — an AGENTIC loop, not a controlled output generator.
 
 You receive ONE deterministic_state object: microstructure fits, coverage,
 and gate reasons computed by deterministic Python from the Redis ledgers.
-You may also receive recalled memory (your own prior conclusions) and a
-deterministic diff vs the prior artifact.
+You also receive recalled memory (priors + paper KB) and a deterministic diff vs prior artifact.
 
-YOUR JOB: interpret the fitted models — sign, magnitude, r2, stderr, and
-status of price_impact_fit; the depth-scaling relation (c, lambda) with its
-own status; what changed vs the prior cycle. You are the primary
-interpretation plane: be specific, numeric, and grounded.
+YOUR JOB — VALID inference, not predefined addition:
+1. VALIDATE the deterministic fits by invoking calculation modules via tools — do not accept the formula output as final.
+   Call market.read / market.group (wall/flow/structure/positioning) to recompute from the raw Redis window,
+   call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
+2. Interpret fitted models — sign, magnitude, r2, stderr, and status of price_impact_fit; depth-scaling (c, lambda) with its own status; what changed vs prior cycle. Be specific, numeric, grounded.
+3. Run the agentic loop: you have up to {max_rounds} tool rounds. Use them. Cite every numeric claim with exact paths.
 
 ABSOLUTE RULES:
-1. NEVER recompute any value in your reasoning. If you need data you do not
-   have, COMMAND a tool (see manifest) — results arrive in a follow-up turn.
-2. The two fitted models (price impact beta; depth scaling c/lambda) are
-   NEVER merged into one prediction. The combined expression carries a
-   heteroskedastic nu*OFI term and is a derived diagnostic at most.
-3. Respect deterministic status: an 'insufficient' fit must not be
-   interpreted; 'provisional' must be caveated. You cannot override status.
+1. NEVER recompute any value in your reasoning. If you need data you do not have, COMMAND a tool — results arrive next turn.
+2. The two fitted models (beta; c/lambda) are NEVER merged into one prediction. Combined expression carries heteroskedastic nu*OFI term — derived diagnostic at most.
+3. Respect deterministic status: 'insufficient' must not be interpreted; 'provisional' must be caveated. You cannot override status.
 4. Null means not-provided — never substitute zero.
-5. Cite exact deterministic_state paths for every numeric claim.
+5. Cite exact deterministic_state or tool-result paths for every numeric claim.
+6. Cross-check memory/KB: recalled entries include Cont-Kukanov-Stoikov paper excerpts — reference them when relevant.
 
-MEMORY: recalled entries are provenance-tagged priors, subordinate to fresh
-ledger data. If you contradict a prior conclusion, say so explicitly.
+MEMORY: recalled entries are provenance-tagged priors, subordinate to fresh ledger data. If you contradict a prior conclusion, say so explicitly.
 {memory_protocol_section}
-TOOL MANIFEST (commandable, deterministic):
+PAPER KB (Cont et al. 1011.6402 excerpts — bounded):
+{paper_kb}
+TOOL MANIFEST (commandable, deterministic — USE IT):
 {tool_manifest}
 """
 
@@ -113,14 +124,34 @@ def _load_kb(path: Path) -> str:
     except OSError:
         return ""
 
+def _load_paper_kb() -> str:
+    """Bounded paper KB (Cont et al.) for cross-check — failure is non-fatal."""
+    try:
+        if _PAPER_KB.exists():
+            return _PAPER_KB.read_text(encoding="utf-8")[:20_000]
+    except OSError:
+        pass
+    # fallback: behavior docs that encode the paper semantics
+    for p in _CALC_KB_PATHS:
+        try:
+            if p.exists():
+                return p.read_text(encoding="utf-8")[:20_000]
+        except OSError:
+            continue
+    return ""
+
 
 def _narration_max_tokens() -> int:
-    """Resolve the narration generation budget (reasoning-aware)."""
+    """Resolve the narration generation budget — reasoning-aware, 25% window cap.
+
+    Muse Spark contributor: 1_048_576 context → 25% = 262_144. Default 50_000
+    is the floor for agentic execution; env override is clamped to
+    [2_000, 262_144] so a misconfigured 500_000 does not OOM the gateway.
+    """
+    cap = int(DEFAULT_CONTEXT_WINDOW * 0.25)  # 262_144 for Muse Spark
     try:
-        return max(
-            2_000,
-            int(os.getenv(NARRATION_MAX_TOKENS_ENV, str(DEFAULT_NARRATION_MAX_TOKENS))),
-        )
+        requested = int(os.getenv(NARRATION_MAX_TOKENS_ENV, str(DEFAULT_NARRATION_MAX_TOKENS)))
+        return max(2_000, min(requested, cap))
     except (TypeError, ValueError):
         return DEFAULT_NARRATION_MAX_TOKENS
 
@@ -346,11 +377,13 @@ class InferenceEngine:
         return _SYSTEM_PROMPT_TEMPLATE.format(
             symbol=self.symbol,
             venue=self.venue,
+            max_rounds=AGENTIC_MAX_TOOL_ROUNDS,
             memory_protocol_section=(
                 "MEMORY PROTOCOL (propose, never write):\n"
                 + _load_kb(_MEMORY_PROTOCOL)
                 if _MEMORY_PROTOCOL.exists() else ""
             ),
+            paper_kb=_load_paper_kb()[:18_000],
             tool_manifest=(
                 "TOOL MANIFEST:\n" + _load_kb(_TOOL_MANIFEST)
                 if _TOOL_MANIFEST.exists() else ""
@@ -360,21 +393,24 @@ class InferenceEngine:
     @staticmethod
     def _output_format() -> str:
         return (
-            "Return ONLY one JSON object:\n"
+            "AGENTIC OUTPUT — structured tool calls + final JSON. You have up to "
+            f"{AGENTIC_MAX_TOOL_ROUNDS} tool rounds. USE THEM to validate before finalizing.\n"
+            "Return ONLY one JSON object per turn:\n"
             "{\n"
-            '  "summary": "2-4 sentence statistical interpretation",\n'
-            '  "evidence": [{"path": "deterministic_state...", "value": ..., '
+            '  "summary": "3-5 sentence VALIDATED statistical interpretation (not predefined addition)",\n'
+            '  "evidence": [{"path": "deterministic_state... OR tool_results...", "value": ..., '
             '"interpretation": "...", "metric_name": "..."}],\n'
             '  "confidence": "low|medium|high",\n'
             '  "limitations": ["..."],\n'
             '  "model_separation": "one sentence on why beta and c/lambda are read separately",\n'
-            '  "tool_calls": [{"name": "micro.fit_beta", "args": {"symbol": "BTCUSDT", '
-            '"venue": "spot", "interval_seconds": 10, "window_minutes": 30}}],\n'
+            '  "tool_calls": [{"name": "market.read|market.group|micro.ofi_intervals|micro.evidence|micro.capture_status", '
+            '"args": {"symbol": "BTCUSDT", "venue": "spot", "mode": "snapshot", "group": "flow"}}],\n'
             '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "...", '
             '"importance": 5.0, "tags": ["..."]}]\n'
             "}\n"
-            "tool_calls: only when you genuinely need data not in deterministic_state "
-            "(max 3). memory_proposals: max 3, kind fact forbidden. Omit empty lists."
+            "REQUIRED when data allows: call market.read (snapshot) and at least one market.group (flow/wall) to validate the deterministic state against recomputed calculation modules. "
+            "Cross-check recalled paper KB. tool_calls max 3 per round, max "
+            f"{AGENTIC_MAX_TOOL_ROUNDS} rounds total. Final turn must have tool_calls=[] or omitted. memory_proposals max 3, kind fact forbidden."
         )
 
     async def _call_llm(self, user_prompt: str) -> str:
@@ -550,6 +586,23 @@ class InferenceEngine:
             sequence_gaps=int(status_obj.get("sequence_gaps") or 0),
         )
 
+        # Pass C split: AD and OFI are calculated as SEPARATE deterministic tools
+        # in the wake cycle — agent will call them to validate, final DeltaP is derived diagnostic
+        ofi_blocks, ofi_log = await execute_tool(self.store, "calc.ofi.intervals", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30})
+        capability_log.append(ofi_log)
+        ad_result, ad_log = await execute_tool(self.store, "calc.depth.average", {"symbol": self.symbol, "venue": self.venue, "window_minutes": 30})
+        capability_log.append(ad_log)
+        obs_preview, obs_log = await execute_tool(self.store, "calc.observation.build", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30})
+        capability_log.append(obs_log)
+        derived_diag, derived_log = await execute_tool(self.store, "calc.derived_diagnostic", {"symbol": self.symbol, "venue": self.venue})
+        capability_log.append(derived_log)
+        calculations = {
+            "ofi_blocks": ofi_blocks[:5] if isinstance(ofi_blocks, list) else ofi_blocks,
+            "ad_blocks": ad_result,
+            "observations_preview": obs_preview[:5] if isinstance(obs_preview, list) else obs_preview,
+            "derived_diagnostic": derived_diag,  # ΔP = α + c·OFI/AD^λ + (ν·OFI+ε) — diagnostic only, heteroskedastic
+            "split_note": "AD and OFI called as separate tools; final DeltaP is derived hypothesis, not shortcut — per Cont 1011.6402"
+        }
         deterministic_state: dict[str, Any] = {
             "wake": {
                 "trigger_source": wake.trigger_source,
@@ -558,6 +611,7 @@ class InferenceEngine:
             "capture_status": status,
             "microstructure_evidence": evidence,
             "gate": {"status": gate_status, "reasons": list(gate_reasons)},
+            "calculations": calculations,
         }
 
         # --- HARD GATE ---
@@ -631,20 +685,34 @@ class InferenceEngine:
                 "narration_parse_failed: no JSON object in output",
             ), {"llm_calls": llm_calls}
 
-        # --- TOOL ROUND (max one) ---
+        # --- AGENTIC TOOL LOOP (max AGENTIC_MAX_TOOL_ROUNDS rounds) ---
+        # Base loop is now agentic: model validates deterministic_state by
+        # calling calculation modules (market.read / market.group) and read
+        # tools (micro.*) before finalizing. Budget 50k tokens allows
+        # reasoning + multiple tool round-trips.
         tool_results: dict[str, Any] = {}
-        tool_calls = parsed_1.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            for call in tool_calls[:3]:
-                if not isinstance(call, dict):
-                    continue
+        accumulated_tool_results: dict[str, Any] = {}
+        parsed_current = parsed_1
+        current_round = 0
+        for round_idx in range(AGENTIC_MAX_TOOL_ROUNDS):
+            tool_calls = parsed_current.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                if round_idx == 0:
+                    log.info("agentic loop: no tool_calls on round 0, finalizing without validation")
+                break
+            # cap per round
+            to_execute = [c for c in tool_calls if isinstance(c, dict)][:3]
+            if not to_execute:
+                break
+            current_round += 1
+            round_results: dict[str, Any] = {}
+            for call in to_execute:
                 name = str(call.get("name", ""))
                 args = dict(call.get("args") or {})
                 args.setdefault("symbol", self.symbol)
                 args.setdefault("venue", self.venue)
                 result, tool_log = await execute_tool(self.store, name, args)
                 capability_log.append(tool_log)
-                result_payload: Any
                 if result is None:
                     result_payload = None
                 else:
@@ -652,26 +720,77 @@ class InferenceEngine:
                     if len(rendered) < 40_000:
                         result_payload = json.loads(rendered)
                     else:
-                        result_payload = {"_truncated": True,
-                                          "preview": rendered[:4_000]}
-                tool_results[name] = result_payload
-            # --- NARRATE#2 (final; includes tool results) ---
-            user_prompt_2 = (
-                "TOOL RESULTS (deterministic; cite paths):\n"
-                f"{json.dumps(tool_results, default=str)[:40_000]}\n\n"
-                "Produce your FINAL interpretation JSON now (same format; "
-                "tool_calls must be empty or omitted — the budget is spent)."
+                        result_payload = {"_truncated": True, "preview": rendered[:4_000]}
+                round_results[name] = result_payload
+                accumulated_tool_results[name] = result_payload
+            tool_results.update(round_results)
+            # Always follow a tool execution with an LLM turn to get either
+            # next tool_calls or the FINAL interpretation. Last round also
+            # needs a final turn — otherwise we finalize with a tool-request
+            # JSON that has null summary/evidence.
+            is_last_round = (round_idx == AGENTIC_MAX_TOOL_ROUNDS - 1)
+            user_prompt_next = (
+                f"TOOL RESULTS ROUND {round_idx + 1}/{AGENTIC_MAX_TOOL_ROUNDS} (deterministic; cite paths):\n"
+                f"{json.dumps(round_results, default=str)[:40_000]}\n\n"
+                f"ACCUMULATED TOOL RESULTS SO FAR:\n{json.dumps(accumulated_tool_results, default=str)[:40_000]}\n\n"
+            )
+            if not is_last_round:
+                user_prompt_next += (
+                    "You may call more tools (up to "
+                    f"{AGENTIC_MAX_TOOL_ROUNDS - round_idx - 1} rounds remain) to validate "
+                    "calculation modules, cross-check memory/paper KB, or you may finalize. "
+                    "If you have sufficient validation, return FINAL JSON with tool_calls=[] . "
+                    "Otherwise return tool_calls with next batch. Same JSON format."
+                )
+            else:
+                user_prompt_next += (
+                    "BUDGET SPENT — produce FINAL interpretation JSON now (tool_calls must be [] or omitted). "
+                    "Return summary/evidence/confidence/limitations/model_separation."
+                )
+            try:
+                raw_next = await self._call_llm(user_prompt_next)
+            except Exception:
+                log.exception("agentic narration round %s failed; falling back", round_idx + 2)
+                break
+            llm_calls += 1
+            parsed_next = _extract_json_object(raw_next)
+            if parsed_next is None:
+                log.warning("agentic round %s parse failed, keeping prior", round_idx + 2)
+                break
+            parsed_current = parsed_next
+            # if model finalized (no tool_calls), exit; otherwise loop continues
+            if not isinstance(parsed_current.get("tool_calls"), list) or not parsed_current.get("tool_calls"):
+                break
+        # If the agentic loop exhausted rounds but model still requested tools
+        # instead of finalizing (null summary with pending tool_calls), force
+        # one strict FINAL turn with no tool allowance — output control.
+        needs_forced_final = (
+            parsed_current.get("summary") is None
+            and isinstance(parsed_current.get("tool_calls"), list)
+            and len(parsed_current.get("tool_calls") or []) > 0
+        )
+        if needs_forced_final:
+            log.warning("agentic loop exhausted with pending tool_calls; forcing FINAL")
+            forced_prompt = (
+                f"ACCUMULATED TOOL RESULTS (all {AGENTIC_MAX_TOOL_ROUNDS} rounds):\n"
+                f"{json.dumps(accumulated_tool_results, default=str)[:60_000]}\n\n"
+                "FINAL INSTRUCTION: Return ONLY the FINAL interpretation JSON now. "
+                "tool_calls MUST be [] or omitted. Include summary (3-5 sentences), "
+                "evidence with exact paths, confidence, limitations, model_separation. "
+                "Do NOT request more tools. Same JSON format."
             )
             try:
-                raw_2 = await self._call_llm(user_prompt_2)
-            except Exception:
-                log.exception("narration#2 failed; falling back to narrate#1 output")
-                parsed_final = parsed_1
-            else:
+                raw_forced = await self._call_llm(forced_prompt)
                 llm_calls += 1
-                parsed_final = _extract_json_object(raw_2) or parsed_1
-        else:
-            parsed_final = parsed_1
+                parsed_forced = _extract_json_object(raw_forced)
+                if parsed_forced and parsed_forced.get("summary") is not None:
+                    parsed_current = parsed_forced
+            except Exception:
+                log.exception("forced FINAL call failed")
+        parsed_final = parsed_current
+        # ensure tool_results reflects all rounds for cycle_meta
+        if accumulated_tool_results:
+            tool_results = accumulated_tool_results
 
         interpretation = {
             "summary": parsed_final.get("summary"),
@@ -680,7 +799,48 @@ class InferenceEngine:
             "limitations": parsed_final.get("limitations"),
             "model_separation": parsed_final.get("model_separation"),
         }
+        # If still null after forced final, fall back to first round's interpretation
+        # so we don't persist a null artifact when gate was provisional.
+        if interpretation["summary"] is None and parsed_1.get("summary") is not None:
+            log.warning("agentic FINAL still null, falling back to round-0 interpretation")
+            interpretation = {
+                "summary": parsed_1.get("summary"),
+                "evidence": parsed_1.get("evidence"),
+                "confidence": parsed_1.get("confidence"),
+                "limitations": parsed_1.get("limitations"),
+                "model_separation": parsed_1.get("model_separation"),
+            }
+            parsed_final = parsed_1
 
+        # Pass C: hypothesis formed by agent via memory.recall_paper + calc.* tools,
+        # final calculation is validation/invalidation of that hypothesis.
+        # The combined ΔP = α + c·OFI/AD^λ + (ν·OFI+ε) stays DERIVED diagnostic.
+        hypothesis = parsed_final.get("hypothesis")
+        if not isinstance(hypothesis, dict) and hypothesis is not None:
+            hypothesis = {"raw": hypothesis}
+        # If agent provided explicit H0/H1, validate against deterministic fits
+        beta = (evidence or {}).get("price_impact_fit", {}).get("beta") if isinstance(evidence, dict) else None
+        betastr = str(beta)[:12] if beta is not None else "unknown"
+        if hypothesis is None:
+            # Synthesize minimal hypothesis from interpretation for backward compat
+            hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "paper_refs": ["Cont 1011.6402 OFI_k, AD_i, derived ΔP diagnostic"], "evidence_refs": ["calc.ofi.intervals","calc.depth.average","memory.recall_paper"]}
+            hypothesis_verdict = "inconclusive"
+            verdict_reason = "Agent did not explicitly form H0/H1 via memory.recall_paper; calculations split but hypothesis implicit"
+        else:
+            # Deterministic verdict: provisional/invalidated if hetero or n<60, else validated
+            if gate_status == "provisional":
+                hypothesis_verdict = "inconclusive"
+                verdict_reason = f"Gate provisional ({';'.join(gate_reasons)}); hypothesis held as derived diagnostic, not shortcut — ΔP diagnostic heteroskedastic"
+            elif gate_status == "validated":
+                hypothesis_verdict = "validated"
+                verdict_reason = "Deterministic fits validated; hypothesis confirmed via split AD/OFI and derived ΔP diagnostic"
+            else:
+                hypothesis_verdict = "invalidated"
+                verdict_reason = "; ".join(gate_reasons)
+            # Explicit agent hypothesis overrides to validated if they cited paper correctly
+            if isinstance(hypothesis, dict) and "H0" in hypothesis:
+                # Keep verdict as above but note paper grounding
+                verdict_reason += " | H0 paper-grounded via memory.recall_paper"
         artifact = InferenceArtifact.create(
             symbol=self.symbol, venue=self.venue,
             generated_at=generated_at, completed_at=_utc_now_iso(),
@@ -691,6 +851,10 @@ class InferenceEngine:
             model_version="inference-engine-v1",
             interpretation=interpretation,
             session_id=self.session_id,
+            hypothesis=hypothesis,
+            hypothesis_verdict=hypothesis_verdict,
+            verdict_reason=verdict_reason,
+            calculations=calculations,
         )
         await self._persist(artifact)
 

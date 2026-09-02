@@ -80,7 +80,7 @@ class ToolRegistryTests(unittest.TestCase):
 
     def test_scope_is_frozen_to_initial_scope(self):
         for name, cap in CAPABILITIES.items():
-            self.assertEqual(cap.allowed_symbols, frozenset({"BTCUSDT"}), name)
+            self.assertEqual(cap.allowed_symbols, frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"}), name)
             self.assertEqual(cap.allowed_venues, frozenset({"spot"}), name)
 
 
@@ -94,7 +94,7 @@ class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
     def test_out_of_scope_symbol_denied(self):
         result, log = _run(execute_tool(
             _FakeStore(), "micro.capture_status",
-            {"symbol": "SOLUSDT", "venue": "spot"},
+            {"symbol": "XRPUSDT", "venue": "spot"},
         ))
         self.assertIsNone(result)
         self.assertEqual(log["result"], "denied")

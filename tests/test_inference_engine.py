@@ -204,7 +204,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         for name, cap in CAPABILITIES.items():
             self.assertEqual(cap.name, name)
             with self.assertRaises(CapabilityDenied):
-                cap.validate_scope("SOLUSDT", "spot")
+                cap.validate_scope("XRPUSDT", "spot")
             with self.assertRaises(CapabilityDenied):
                 cap.validate_scope("BTCUSDT", "futures")
 
@@ -219,7 +219,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertEqual(log["result"], "ok")
 
         _e, _i, _d, denied = dispatch_replay(
-            payloads, symbol="SOLUSDT", venue="spot", interval_ms=10_000,
+            payloads, symbol="XRPUSDT", venue="spot", interval_ms=10_000,
         )
         self.assertEqual(denied["result"], "denied")
 
@@ -234,7 +234,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertEqual(evidence.symbol, "BTCUSDT")
 
         _none, denied = dispatch_assemble_evidence(
-            intervals, symbol="ETHUSDT", venue="spot", tick_size=Decimal("0.01"),
+            intervals, symbol="XRPUSDT", venue="spot", tick_size=Decimal("0.01"),
             interval_seconds=10, evidence_id="ev-x", generated_at_ms=400_000,
         )
         self.assertEqual(denied["result"], "denied")
