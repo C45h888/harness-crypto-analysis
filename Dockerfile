@@ -7,12 +7,21 @@ WORKDIR /app
 
 RUN addgroup --system marketflow && adduser --system --ingroup marketflow marketflow
 
+# nooa / nooa-cli come from PyPI wheels (pinned in requirements.txt), so no
+# git or build toolchain is needed in the image.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY binance.py ./
 COPY market_service ./market_service
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
+
+# The canonical client modules may arrive from a source checkout with private
+# mode bits. The runtime user must be able to import the complete package.
+RUN chmod -R a+rX /app/market_service /app/alembic /app/alembic.ini
 
 USER marketflow
 
-CMD ["python", "-m", "market_service.collector"]
+# Each service specifies its own command via docker-compose. No default CMD
+# here so the image is reusable for data-access, calculations, analysis,
+# orchestrator, collector, and collator.

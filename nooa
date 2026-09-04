@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Mounted NOOA CLI — repository entry point (canonical harness mount).
+#
+# Runs the installed nooa CLI with the repo's `market` harness group mounted
+# at import time (see market_service/commands/nooa_cli.py). The framework's
+# site-packages are never modified; everything lives inside this repository.
+#
+#   ./nooa market envelope SOLUSDT --latest
+#   ./nooa market analyst SOLUSDT --cycles 1 --with-memory
+#   ./nooa market refresh SOLUSDT --all
+#
+# Equivalent Docker surface:
+#   docker compose --profile tools run --rm nooa market envelope SOLUSDT --latest
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${ROOT}/.venv/bin/python"
+
+if [[ ! -x "$PY" ]]; then
+  echo "error: ${PY} not found" >&2
+  echo "create the dev runtime first:  uv venv && uv pip install -r requirements.txt -e ." >&2
+  exit 1
+fi
+
+exec "$PY" -m market_service.commands.nooa_cli "$@"

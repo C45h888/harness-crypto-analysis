@@ -1,0 +1,9 @@
+surface,kind,owner,status
+marketflow:stream:microstructure:events:{venue}:{SYMBOL},stream,capture,existing-readonly
+marketflow:latest:microstructure:{venue}:{SYMBOL}:status,latest-key,capture,existing-readonly
+marketflow:stream:microstructure:status:{venue}:{SYMBOL},stream,capture,new
+marketflow:latest:inference:{venue}:{SYMBOL},latest-key,engine,existing-readonly
+marketflow:stream:inference:{venue}:{SYMBOL},stream,engine,existing-readonly
+marketflow:state:inference:wake:{venue}:{SYMBOL}:supervisor,state-key,worker,new
+marketflow:stream:inference:wake:{venue}:{SYMBOL},stream,worker,retired
+marketflow:state:inference:wake:{venue}:{SYMBOL}:last-published,state-key,worker,not-created

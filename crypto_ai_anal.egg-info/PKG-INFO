@@ -1,0 +1,334 @@
+Metadata-Version: 2.4
+Name: crypto-ai-anal
+Version: 2.0.0
+Summary: Containerized, human-in-the-loop crypto market data harness with NOOA analyst integration
+License: Proprietary
+Project-URL: Repository, https://github.com/kamii/crypto-ai-anal
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: nooa[viewer]>=0.0.8
+Requires-Dist: nooa-cli>=0.0.8
+Requires-Dist: openai>=1.40
+
+# Crypto AI Analytics
+
+Live crypto market-data system for a discretionary SOL/ETH/BTC perp trader. It
+collects evidence, computes deterministic metrics, and renders an auditable
+market snapshot for a human (or an analyst model) to interpret. It does **not**
+place, size, or manage orders.
+
+## Runtime layout (single coherent state)
+
+```text
+crypto-ai-anal/
+├── market_service/          # canonical package (one authority)
+│   ├── clients/             #   Binance / CoinGecko / CryptoQuant
+│   ├── calculations/        #   flow + deterministic signals
+│   ├── analysis/            #   market / oi / liquidations / macro
+│   ├── commands/snapshot.py #   harness snapshot CLI
+│   ├── collector.py         #   persistent DB collector
+│   └── config.py
+├── db/init/001_schema.sql   # Postgres schema
+├── tests/
+├── Dockerfile               # runs market_service.collector
+└── docker-compose.yml
+```
+
+`market_service/` is the single runtime authority. All former legacy
+exploratory scripts have been fully migrated into it (`market_service/manifest.py`
+`MIGRATIONS` records provenance) and deleted — there is no legacy tree.
+
+## Entrypoints
+
+## Runtime paths
+
+Docker Compose is the canonical runtime. The root `.env` is loaded by Compose;
+`.env.example` is only a template and is never used directly at runtime.
+
+For local Python-only development, use Python 3.12 through `uv`; the host
+macOS Python 3.9 is unsupported:
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --json
+```
+
+The following Docker command is the canonical analyst entrypoint:
+
+```bash
+docker compose --profile tools run --rm harness SOLUSDT \
+  --analyst-loop --latest --cycles 1
+```
+
+The harness reads an existing immutable canonical envelope. It does not start
+another market cycle. Canonical refresh remains an explicit harness command
+using `--trigger`, outside the analyst path.
+
+```bash
+# Start the canonical runtime
+docker compose up -d
+
+# Live harness snapshot (JSON contract with raw evidence + derived metrics)
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.snapshot SOLUSDT --json
+
+# Same data, pretty text
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.analysis.market SOLUSDT
+
+# CLEAN AGGREGATED MARKET DATA for the model — the single harness surface.
+# All clean data for a symbol in one contract (core snapshot + signals + OI +
+# liquidation + macro). The model reads THIS, not scattered scripts.
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --json
+
+# Canonical calculation pipeline: reads the poller-fed Redis stream, runs the
+# deterministic calcs, returns a MarketRunEnvelope v2. This is the default and
+# the coherent single market-data source for the terminal-based agents.
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --analyze --window 15m --json
+
+# Warm the on-demand derivative cache in Redis (no pipeline, Redis-only).
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
+
+# Read the latest persisted canonical envelope (Redis-only read, no DATABASE_URL).
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --latest --json
+
+# Read an exact immutable run by run_id (Redis-only, no DATABASE_URL).
+docker compose --profile tools run --rm harness --run-id <RUN_ID> --json
+
+# Legacy dev-only live waveform (opens its own Binance session; NOT canonical)
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.harness SOLUSDT --live --json
+
+# Verify every canonical runtime module imports cleanly
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.run_all
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.run_all --domain calculation
+
+# Persistent collector (needs DATABASE_URL; see docker-compose.yml)
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.collector
+```
+
+## NOOA CLI — mounted at the canonical harness mount point
+
+The NOOA CLI is mounted at the repo root without touching the installed
+`nooa-cli` package: `market_service/commands/nooa_cli.py` attaches the
+repo's `market` harness group to the framework root `oo` group at import
+time.
+
+**Runtime authority split** (terminal-based coding agents — pi, hermes,
+claude code — mount through the outer harness, never directly through the
+subordinate `nooa_harness` runtime module):
+
+```text
+harness.py                            OUTER CLI
+├── clean market-data contract        (no direct nooa_harness.* imports)
+└── --nooa ─► nooa_cli.py             INNER CLI (mounted at import time)
+            │
+            └─► nooa_cli_ext.py       the ``market`` click group
+                                      ─── sole direct caller of
+                                          market_service/nooa_harness/*
+```
+
+**One mount point covers host shell, Docker, and the harness CLI:**
+
+```bash
+# VSCode shell (uses .venv; repo .env is loaded non-clobbering)
+./nooa market envelope SOLUSDT --latest            # inner CLI direct
+./nooa market envelope SOLUSDT --run-id <UUID>     # exact immutable run
+./nooa market memory recall --session-id <UUID>    # MemoryNode recall
+./nooa market analyst SOLUSDT --cycles 1 --with-memory  # ControllerAgent + 4 specialists
+
+# Console-script equivalent (installed into the venv)
+nooa-market market envelope SOLUSDT --latest
+
+# Docker runtime (tools profile, same image/env as the harness)
+docker compose --profile tools run --rm nooa market envelope SOLUSDT --latest
+
+# Outer harness → inner CLI: terminal-based agents (pi, hermes, claude code)
+# reach the subordinate nooa_harness runtime module ONLY through --nooa
+python -m market_service.commands.harness --nooa market envelope SOLUSDT --latest
+docker compose --profile tools run --rm harness --nooa market envelope SOLUSDT --latest
+docker compose --profile tools run --rm harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
+docker compose --profile tools run --rm harness --nooa market briefing --session-id <UUID> --run-id <UUID>
+```
+
+The `market` group is the **sole direct caller** of the python objects in
+`market_service/nooa_harness/` — `agents.py` defines the ControllerAgent
++ specialist nodes, `suite.py`/`runner.py` compose them, `memory.py`
+persists MemoryNode. The CLI stays read-only against canonical state;
+only the `analyst` command runs bounded cycles and produces advisory
+briefings. The outer `harness.py` never imports anything from
+`market_service/nooa_harness/` — every analyst operation is reached
+through the `--nooa` bridge into the inner CLI.
+
+## Analyst contract objects (schema v2)
+
+The NOOA analyst suite produces validated, schema-versioned contract objects
+that cross the boundary to downstream consumers (Hermes, human reviewers,
+the memory node). All objects are frozen dataclasses with `to_dict()` /
+`from_mapping()` round-trips, persisted Postgres-first with Redis live
+projections. See `docs/NOOA_HARNESS_ARCHITECTURE.md` for the full contract
+surface.
+
+Key objects crossing the boundary:
+
+| Object | Purpose | Key fields |
+|---|---|---|
+| `SpecialistReport` | One specialist's output (delta/macro/OI/liquidation) | `summary`, `evidence: [EvidenceEntry]`, `confidence`, `limitations` |
+| `EvidenceEntry` | One piece of cited evidence | `path`, `interpretation`, `value`, `metric_name` |
+| `AnalystBriefing` | Controller's synthesis of all specialists | `narrative`, `consensus: Consensus`, `key_evidence: [KeyEvidence]`, `disagreements: [Disagreement]`, `specialist_reports` |
+| `Consensus` | Structured market verdict | `direction`, `confidence`, `confidence_score`, `timeframe`, `magnitude` |
+| `KeyEvidence` | Cross-referenced evidence claim | `path`, `claim`, `value`, `specialist` |
+| `Disagreement` | Specialist disagreement | `topic`, `specialist_a`, `specialist_b`, `resolution` |
+| `AgentMemory` | Durable analyst memory | `kind`, `content`, `importance`, `evidence_refs` |
+
+The `envelope_summary` on each briefing is enriched with key market metrics
+(last_price, open_interest, funding_rate, spot_cvd, futures_cvd, spot_obi,
+futures_obi, keystone levels) so downstream consumers can reason over the
+briefing without re-fetching the full envelope.
+
+## Architecture: two-layer reasoning
+
+The system operates as three layers:
+
+1. **NOOA analyst suite** (innermost layer, subordinate runtime module)
+   — domain-focused specialists (delta_orderflow, macro, open_interest,
+   liquidations) + controller, running on any OpenAI-compatible backend
+   (Minimax, vLLM, Ollama). Produces structured `AnalystBriefing` objects
+   from canonical market envelopes. Lives in
+   `market_service/nooa_harness/`.
+
+2. **Inner NOOA CLI** (`market_service/commands/nooa_cli.py` +
+   `nooa_cli_ext.py`) — the mounted `market` click group. **Sole direct
+   caller of the `nooa_harness` runtime module.** Reached from the outer
+   harness via `--nooa`.
+
+3. **Outer harness CLI** (`market_service/commands/harness.py`) — the
+   thin router that emits the clean aggregated market-data contract and
+   bridges into the inner NOOA CLI for any analyst / briefing / memory /
+   agent operation. **No direct `nooa_harness.*` imports.**
+
+Terminal-based coding agents (pi, hermes, claude code) shell out to the
+outer harness. They reach the subordinate `nooa_harness` runtime only
+through the `--nooa` bridge — never directly. The contract objects are
+the quality gate — every consumer's reasoning is bounded by the quality
+of what crosses the contract boundary.
+
+The harness CLI is the single mount point every terminal-based agent
+uses. Reading the latest briefing or triggering a fresh analysis cycle
+all flow through `harness.py --nooa market …`.
+
+## Shared-domain map (container-split prep)
+
+`market_service/manifest.py` classifies every canonical module into one shared
+domain (`CLEAN_MODULES`). This is the single source of truth for the target
+multi-container architecture.
+
+| Domain | What | Modules |
+|---|---|---|
+| `data-access` | pulls raw evidence | `market_service.clients.*` |
+| `calculation` | pure math over inputs | `calculations.flow`, `orderbook`, `volume_profile`, `technical`, `signals` |
+| `analysis` | derived interpretation | `analysis.market`, `oi`, `liquidations`, `macro`, `auction`, `demand`, `regime`, `wall_migration`, `path_absorption`, `stage` |
+| `monitor` | watch / summarise | (collector / long-running monitors) |
+
+## Live JSON contract
+
+`python -m market_service.commands.snapshot SYMBOL --json` returns:
+
+- contract metadata + version
+- request parameters + timestamps + coverage spans
+- source status (`healthy` / `degraded`) and per-endpoint errors
+- raw evidence (spot/futures order books, tickers, trades, funding, OI)
+- deterministic flow metrics (CVD, OBI, VWAP, buy/sell, spread) — as *figures*
+- spot/futures CVD correlation
+- deterministic signals with the rule + input evidence that fired them
+- OI, liquidation-pressure, and macro analyses (when `--window` path used)
+- CryptoQuant on-chain context
+
+`null` means a source did not provide a value — it is never substituted with
+zero. Use `--trades N` / `--depth N` to cap raw payload size.
+
+## Stack
+
+- **Binance** public REST (Spot + USD-M futures) — no API key for public data
+- **CoinGecko** public — global/market-cap/dominance overlay
+- **CryptoQuant** via MCP bridge — on-chain metric descriptions (basic plan:
+  numerics locked, descriptions/interpretations still flow)
+- **Python 3.12**, deps in `requirements.txt` (run via `uv run` or Docker)
+- **PostgreSQL** via Docker for the persistent collector
+- **Redis 7** via Docker for latest state, telemetry streams, and bounded refresh commands
+
+## Stack (database)
+
+`docker compose up --build` runs Redis, PostgreSQL, and the collector. The
+one-shot `collator` service can be run separately for live envelope validation.
+PostgreSQL
+is bound to `127.0.0.1:5433`; Redis is bound to `127.0.0.1:6379` for local
+inspection. Redis uses AOF persistence and capped streams. Schema:
+`market_snapshot` + `signal_event` + `market_run`. Run against your own `.env` (see
+`.env.example`) — `.env` is private and gitignored.
+
+The infrastructure adapters are in `market_service/runtime/`:
+
+- `RedisRuntimeStore` owns latest-state keys, telemetry streams, and refresh commands.
+- `PostgresRuntimeStore` owns the durable ledger connection and read boundary.
+- `market_service.commands.health` checks both services.
+
+Redis key conventions are versioned at the adapter boundary:
+
+```text
+marketflow:latest:<SYMBOL>:<SOURCE>   latest state projection
+marketflow:stream:market:<SYMBOL>     append-only telemetry
+marketflow:stream:commands             bounded refresh requests
+marketflow:stream:results              node results
+```
+
+The collector publishes the validated snapshot to the `collector` latest-state
+projection and its symbol telemetry stream after the PostgreSQL transaction
+commits. Redis is therefore a live projection and command bus; PostgreSQL
+remains the durable ledger.
+
+The one-shot canonical collation seam is:
+
+```bash
+docker compose --profile tools run --rm collator SOLUSDT --json
+```
+
+It writes one immutable `market_run` envelope to PostgreSQL first, then writes
+the same envelope to `marketflow:latest:SOLUSDT:collated` and
+`marketflow:stream:collated:SOLUSDT`. The Docker `collator` service runs this
+same SOLUSDT path once for live validation. The collated stream is intentionally
+untrimmed; apply retention manually when required.
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m market_service.commands.health
+```
+
+```bash
+docker compose exec postgres psql -U marketflow -d marketflow \
+  -c 'SELECT symbol, observed_at, price, spot_buy_share FROM market_snapshot ORDER BY observed_at DESC LIMIT 1;'
+```
+
+## Testing
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python -m unittest discover -s tests -q
+```
+
+## Docs
+
+- `ARCHITECTURE.md` — Phase 1 architecture, operating rules, migration path
+- `docs/CONTAINERIZATION_CONTRACT.md` — implementation contract for the domain
+  container split
+- `docs/DOCKER_RUNTIME_VERIFICATION_DOCTRINE.md` — independent Docker test and
+  acceptance doctrine for the live runtime seam
+- `docs/CANONICAL_RUNTIME_DOCTRINE.md` — governing authority, state, evidence,
+  determinism, and agent-boundary doctrine

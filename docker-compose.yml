@@ -1,4 +1,29 @@
+# Canonical runtime topology — poller feeds raw evidence into Redis on the
+# cadence set by POLL_SECONDS (30s default); the harness runs the pipeline
+# (calc + analysis + collate) on demand and passes the envelope to the NOOA
+# analyst suite, which itself runs on demand under the `tools` profile.
 services:
+  redis:
+    build:
+      context: ./docker-redis
+    image: crypto-ai-anal-redis:latest
+    user: "redis"
+    command: ["/usr/local/bin/redis-entrypoint.sh"]
+    environment:
+      TELEMETRY_HYGIENE_INTERVAL_S: "300"
+      TELEMETRY_HYGIENE_MIN_AGE_S: "3600"
+      REDIS_HYGIENE_URL: "unix:///tmp/redis.sock"
+      TELEMETRY_HYGIENE_DRY_RUN: "false"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -16,15 +41,194 @@ services:
       timeout: 3s
       retries: 12
 
-  collector:
+  # One-shot schema bootstrap via Alembic. Runs once on `up`, exits.
+  db-init:
     build: .
+    command: ["alembic", "upgrade", "head"]
     env_file:
       - path: .env
         required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+    volumes:
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
     depends_on:
       postgres:
         condition: service_healthy
+    restart: "no"
+
+  # 5-second raw-evidence firehose. Fetches Binance data and appends
+  # to the Redis raw stream. No math, no analysis — just Binance → Redis.
+  poller:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.poller"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      POLL_SYMBOLS: ${POLL_SYMBOLS:-}
+      POLL_SECONDS: ${POLL_SECONDS:-5}
+      FLOW_WINDOW_SECONDS: ${FLOW_WINDOW_SECONDS:-300}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-500}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BINANCE_RATE_LIMIT_ENABLED: ${BINANCE_RATE_LIMIT_ENABLED:-1}
+      BINANCE_WEIGHT_LIMIT: ${BINANCE_WEIGHT_LIMIT:-6000}
+      BINANCE_WEIGHT_CEILING: ${BINANCE_WEIGHT_CEILING:-4800}
+      BINANCE_DATA_WEIGHT_LIMIT: ${BINANCE_DATA_WEIGHT_LIMIT:-3000}
+      BINANCE_DATA_WEIGHT_CEILING: ${BINANCE_DATA_WEIGHT_CEILING:-2400}
+      BINANCE_BAN_COOLDOWN_S: ${BINANCE_BAN_COOLDOWN_S:-30}
+      BINANCE_BASE_URL: ${BINANCE_BASE_URL:-}
+      CRYPTOQUANT_API_KEY: ${CRYPTOQUANT_API_KEY:-}
+      COINGECKO_BASE_URL: ${COINGECKO_BASE_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+  # Optional, isolated event-level source for the paper-derived OFI work.
+  # This is deliberately separate from `poller`: a depth-stream reconnect or
+  # sequence gap cannot delay the five-second REST evidence path.
+  microstructure-capture:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.microstructure.capture", "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
+      MICROSTRUCTURE_STREAM_MAXLEN: ${MICROSTRUCTURE_STREAM_MAXLEN:-100000}
+      MICROSTRUCTURE_SNAPSHOT_LEVELS: ${MICROSTRUCTURE_SNAPSHOT_LEVELS:-1000}
+      MICROSTRUCTURE_RECONNECT_SECONDS: ${MICROSTRUCTURE_RECONNECT_SECONDS:-2}
+      MICROSTRUCTURE_INTERVAL_SECONDS: ${MICROSTRUCTURE_INTERVAL_SECONDS:-10}
+      BINANCE_SPOT_WS_BASE: ${BINANCE_SPOT_WS_BASE:-wss://stream.binance.com:9443/ws}
+      BINANCE_FUTURES_WS_BASE: ${BINANCE_FUTURES_WS_BASE:-wss://fstream.binance.com/ws}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["microstructure"]
+    restart: unless-stopped
+
+  # EVENT-DRIVEN wake worker — the single inference runtime surface.
+  # Bounded on the Redis plane: XREADGROUP BLOCK on the microstructure event
+  # stream + status-transition stream, deterministic predicate evaluation,
+  # in-memory WakeEnvelope, async engine dispatch via the dispatcher seam.
+  # WAKE_ENGINE_DISPATCH=1 closes the loop: a fire runs the full engine
+  # cycle (hard gate, narration, Postgres-first persist, memory proposals).
+  # Set it to 0 for a no-LLM journal-only worker.
+  wake-worker:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.nooa_harness.wake_worker",
+              "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
+      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-}
+      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
+      NOOA_API_KEY: ${NOOA_API_KEY:-}
+      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
+      WAKE_ENGINE_DISPATCH: ${WAKE_ENGINE_DISPATCH:-1}
+      WAKE_COOLDOWN_S: ${WAKE_COOLDOWN_S:-60}
+      WAKE_EVENT_DELTA_THRESHOLD: ${WAKE_EVENT_DELTA_THRESHOLD:-1800}
+      WAKE_READ_BLOCK_MS: ${WAKE_READ_BLOCK_MS:-1000}
+      WAKE_TICK_RESET_MS: ${WAKE_TICK_RESET_MS:-5000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["inference"]
+    restart: unless-stopped
+
+  # One-shot harness. Reads raw evidence from Redis, runs the pipeline
+  # (calc + analysis + collate), then invokes NOOA agents. Use via:
+  #   docker compose --profile tools run --rm harness SOLUSDT --analyze --window 15m --json
+  harness:
+    build: .
+    user: "marketflow"
+    entrypoint: ["python", "-m", "market_service.commands.harness"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
+      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
+      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
+      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
+      NOOA_API_KEY: ${NOOA_API_KEY:-}
+      PROVIDER: ${PROVIDER:-}
+      PROVIDER_API_KEY: ${PROVIDER_API_KEY:-}
+      PROVIDER_BASE_URL: ${PROVIDER_BASE_URL:-}
+      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    profiles: ["tools"]
+    restart: "no"
+
+  # NOOA CLI host. On-demand only (profiles: ["tools"]) — running it
+  # always-on would burn LLM tokens every cycle for no reason. Invoke with:
+  #   docker compose --profile tools run --rm nooa \
+  #       market envelope SOLUSDT --latest
+  #   docker compose --profile tools run --rm nooa \
+  #       market analyst SOLUSDT --cycles 1 --with-memory
+  nooa:
+    build: .
+    user: "marketflow"
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
+      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
+      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
+      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
+      NOOA_API_KEY: ${NOOA_API_KEY:-}
+      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    restart: "no"
 
 volumes:
   postgres_data:
+  redis_data:

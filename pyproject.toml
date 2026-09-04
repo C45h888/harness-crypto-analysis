@@ -1,0 +1,33 @@
+[project]
+name = "crypto-ai-anal"
+version = "2.0.0"
+description = "Containerized, human-in-the-loop crypto market data harness with NOOA analyst integration"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Proprietary" }
+dependencies = [
+    "nooa[viewer]>=0.0.8",
+    "nooa-cli>=0.0.8",
+    "openai>=1.40",
+]
+
+[project.urls]
+Repository = "https://github.com/kamii/crypto-ai-anal"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["market_service*"]
+
+[project.scripts]
+nooa-market = "market_service.commands.nooa_cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
