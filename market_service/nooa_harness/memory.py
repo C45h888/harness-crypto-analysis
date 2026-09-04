@@ -40,6 +40,17 @@ log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
+# Single source of truth for the paper-KB memory namespace. The seed script
+# (scripts/seed_paper_kb.py), the engine's memory.recall_paper tool, and any
+# future writer MUST use this helper — the session UUID is contract, not
+# a local constant.
+PAPER_KB_URI = "paper-kb://cont1011"
+
+
+def paper_kb_session_id() -> str:
+    """Stable UUID for the Cont-Kukanov-Stoikov paper-KB memory session."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, PAPER_KB_URI))
+
 
 def _keywords(text: str) -> set[str]:
     return set(_TOKEN_RE.findall((text or "").lower()))
@@ -224,4 +235,4 @@ def new_memory_id() -> str:
     return str(uuid.uuid4())
 
 
-__all__ = ["MemoryNode", "new_memory_id"]
+__all__ = ["MemoryNode", "new_memory_id", "paper_kb_session_id", "PAPER_KB_URI"]

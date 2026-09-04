@@ -47,6 +47,43 @@ from market_service.runtime.redis_store import RedisRuntimeStore
 
 log = logging.getLogger(__name__)
 
+try:
+    from pydantic import BaseModel, Field
+except ImportError:  # pragma: no cover — narration falls back to raw JSON
+    BaseModel = None  # type: ignore[assignment]
+    Field = None  # type: ignore[assignment]
+
+
+if BaseModel is not None:
+    class NarrationToolCall(BaseModel):
+        """One validated tool dispatch request from a narration turn."""
+        name: str
+        args: dict[str, Any] = Field(default_factory=dict)
+
+    class NarrationTurn(BaseModel):
+        """Structured narration turn — enforced via output_model when supported.
+
+        Interpretation fields are optional so a tool-request turn parses;
+        tool_calls entries REQUIRE a non-empty name (nameless calls fail
+        validation here instead of dying later as tool.unknown).
+        """
+        summary: str | None = None
+        evidence: list[dict[str, Any]] | None = None
+        confidence: str | None = None
+        limitations: list[str] | None = None
+        model_separation: str | None = None
+        hypothesis: dict[str, Any] | None = None
+        phase: str = "P1"
+        tool_calls: list[NarrationToolCall] = Field(default_factory=list)
+        memory_proposals: list[dict[str, Any]] | None = None
+else:
+    NarrationToolCall = None  # type: ignore[assignment]
+    NarrationTurn = None  # type: ignore[assignment]
+
+# Module-level probe flag: once a backend rejects output_model, stop paying
+# the failed structured attempt on every subsequent turn (same process).
+_STRUCTURED_OK: bool | None = None
+
 SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
 
 # Narration token budget — agentic loop, not controlled generator.
@@ -59,7 +96,10 @@ SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
 DEFAULT_NARRATION_MAX_TOKENS = 50_000
 NARRATION_MAX_TOKENS_ENV = "NOOA_MODEL_MAX_TOKENS"
 DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
-AGENTIC_MAX_TOOL_ROUNDS = 3  # was 1 — now full agentic loop
+AGENTIC_MAX_TOOL_ROUNDS = 5  # one per phase + spare; phased P1→P5 cycle
+AGENTIC_MAX_LLM_TURNS = 8  # narrate#1 + tool follow-ups + repair + forced-final
+AGENTIC_PER_ROUND_CALL_CAP = 3  # unchanged: max dispatches per tool round
+SUMMARY_MIN_CHARS = 200  # P4 explanation floor — thinner finals are repaired
 
 # Bounded memory recall per cycle — expanded for paper KB cross-check.
 MEMORY_RECALL_LIMIT = 12
@@ -210,6 +250,151 @@ def _extract_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
+def _coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize one narration turn: drop undispatchable tool_calls entries.
+
+    Entries without a non-empty string ``name`` can never dispatch — drop
+    them here (logged) instead of burning a tool round on tool.unknown.
+    Missing/invalid ``args`` become {}. A non-dict hypothesis is wrapped.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    calls = parsed.get("tool_calls")
+    if calls is None:
+        return parsed
+    if not isinstance(calls, list):
+        parsed["tool_calls"] = []
+        return parsed
+    kept: list[dict[str, Any]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name")
+        if not isinstance(name, str) or not name.strip():
+            log.warning("dropping tool_call without a registry name: %.120r", call)
+            continue
+        args = call.get("args")
+        kept.append({"name": name.strip(),
+                     "args": dict(args) if isinstance(args, dict) else {}})
+    parsed["tool_calls"] = kept
+    hypothesis = parsed.get("hypothesis")
+    if hypothesis is not None and not isinstance(hypothesis, dict):
+        parsed["hypothesis"] = {"raw": hypothesis}
+    return parsed
+
+
+def _validate_final_turn(
+    parsed: dict[str, Any],
+    coverage: dict[str, set[str]],
+) -> tuple[bool, list[str]]:
+    """Phase-aware final gate: depth is structural, not advisory.
+
+    A FINAL turn passes only when every required phase family has at least
+    one executed tool (P1 OFI, P2 AD/fits, P3 market correlation, P5 paper
+    + derived ΔP), the hypothesis carries H0, the P4 explanation meets the
+    length floor, and evidence cites at least two distinct roots with at
+    least one fresh tool result (not just deterministic_state). Returns
+    (passed, missing[]) — missing drives the repair prompt.
+    """
+    from market_service.nooa_harness.inference import _REQUIRED_PHASES
+
+    missing: list[str] = []
+    for phase in _REQUIRED_PHASES:
+        if not coverage.get(phase):
+            missing.append(
+                f"phase {phase} uncovered: execute its tools before finalizing "
+                f"(covered so far: {sorted(coverage.get(phase) or [])})"
+            )
+    if not coverage.get("P6"):
+        missing.append(
+            "P6 output-generation turn required: synthesize the primary inference "
+            "output from this run's reasoning (declare phase P6, no tools)"
+        )
+    hypothesis = parsed.get("hypothesis")
+    if not isinstance(hypothesis, dict) or not str(hypothesis.get("H0") or "").strip():
+        missing.append("hypothesis.H0 required: frame H0/H1 grounded in recalled paper facts")
+    summary = parsed.get("summary") or ""
+    if not isinstance(summary, str) or len(summary.strip()) < SUMMARY_MIN_CHARS:
+        missing.append(
+            f"P4 explanation too thin ({len(summary.strip())}/{SUMMARY_MIN_CHARS} chars): "
+            "say what the fits show AND why it is happening now"
+        )
+    roots: set[str] = set()
+    evidence = parsed.get("evidence")
+    if isinstance(evidence, list):
+        for entry in evidence:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "")
+            head = path.split("→")[0].strip().split(".")[0].strip()
+            if head:
+                roots.add(head)
+    if len(roots) < 2 or not (roots - {"deterministic_state"}):
+        missing.append(
+            "evidence must cite ≥2 distinct roots including ≥1 fresh tool result "
+            f"(got roots: {sorted(roots) or 'none'}" + ")"
+        )
+    delta_paths = [
+        str(entry.get("path") or "")
+        for entry in (evidence if isinstance(evidence, list) else [])
+        if isinstance(entry, dict)
+    ]
+    if not any(
+        head in ("calc.price.delta", "calc.derived_diagnostic")
+        for path in delta_paths
+        for head in [path.split("→")[0].strip()]
+    ):
+        missing.append(
+            "evidence must cite the derived ΔP via a calc.price.delta → … path"
+        )
+    return (not missing), missing
+
+
+# Per-phase steering fragments — appended to follow-up prompts so each
+# turn knows what the next uncovered phase demands. Window freedom is
+# stated once here: the agent may vary interval_seconds (10/15/30) and
+# window_minutes (15/30/60) in calc/fit tool args; deterministic code
+# executes, the agent never recomputes.
+_PHASE_GUIDANCE: dict[str, str] = {
+    "P1": ("PHASE P1 — OFI INFERENCE: call calc.ofi.intervals "
+           "(and/or micro.ofi_intervals). Judge tape quality: n vs minimum, "
+           "capture gaps, hetero flag. Verdict: is this OFI tape usable or degraded, and why. "
+           "You may vary interval_seconds (10/15/30) and window_minutes (15/30/60) in tool args."),
+    "P2": ("PHASE P2 — AD INFERENCE: call calc.depth.average + "
+           "calc.observation.build (and/or micro.fit_beta, calc.fit.price_impact). "
+           "Judge AD stability and observation count separately from OFI — never merge. "
+           "You may vary interval_seconds/window_minutes in tool args."),
+    "P3": ("PHASE P3 — CORRELATE: call market.read (snapshot, or full only if a field is missing) "
+           "plus at least one market.group (flow/wall/structure/positioning, window_minutes of your choice) "
+           "to cross-validate P1/P2 against the Redis plane. Name agreements AND contradictions explicitly. "
+           "Derivatives/keystone/wall histories are available for regime context."),
+    "P4": ("PHASE P4 — EXPLAIN: no new tools required. Write the synthesis: what the fits show "
+           f"(≥{SUMMARY_MIN_CHARS} chars in summary) AND why it is happening now — regime, capture quality, "
+           "flow/positioning drivers. Then proceed to P5."),
+    "P5": ("PHASE P5 — DERIVE: call memory.recall_paper FIRST (ground H0/H1 in Cont 1011.6402 facts), "
+           "then calc.price.delta (alias calc.derived_diagnostic) with an OFI value — scenario arg or "
+           "latest-interval default — for the NUMERIC derived ΔP (route A direct + route B when c/λ exist, "
+           "with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it."),
+    "P6": ("PHASE P6 — OUTPUT GENERATION (final): no tools. Synthesize the PRIMARY inference output "
+           "strictly from this run's reasoning: H0/H1 verdict, numeric ΔP with band, regime explanation, "
+           "confidence, limitations. Every numeric claim cites its tool path, including a "
+           "calc.price.delta → … path for the ΔP. Return FINAL JSON: tool_calls=[], full summary/evidence/"
+           "confidence/limitations/model_separation/hypothesis{H0,H1,paper_refs,evidence_refs}."),
+}
+
+
+def _next_uncovered_phase(coverage: dict[str, set[str]]) -> str:
+    """First required phase family with no executed tool yet; then P6."""
+    from market_service.nooa_harness.inference import _REQUIRED_PHASES
+
+    for phase in _REQUIRED_PHASES:
+        if not coverage.get(phase):
+            return phase
+    if not coverage.get("P6"):
+        return "P6"
+    return "P5"
+
+
 class NarrationParseError(ValueError):
     """Narration output was not parseable into the required JSON contract."""
 
@@ -234,6 +419,7 @@ class InferenceEngine:
         venue: str = "spot",
         config: WakeConfig | None = None,
         session_id: str | None = None,
+        settings: Any | None = None,
     ) -> None:
         self.store = store
         self.postgres = postgres
@@ -243,6 +429,10 @@ class InferenceEngine:
         self.venue = venue
         self.config = config or WakeConfig()
         self.session_id = session_id or _stable_session_id(self.symbol, self.venue)
+        # Operator settings (one read at construction, threaded to tools).
+        # dispatch_market_group needs depth/tier/scorecard config through
+        # this — tools NEVER re-read the environment (two-plane boundary pass).
+        self.settings = settings
 
     # ------------------------------------------------------------------
     # Wake plane adapters (Redis counter collection + two-phase gate)
@@ -390,37 +580,77 @@ class InferenceEngine:
 
     @staticmethod
     def _output_format() -> str:
+        rounds = AGENTIC_MAX_TOOL_ROUNDS
         return (
-            "AGENTIC OUTPUT — structured tool calls + final JSON. You have up to "
-            f"{AGENTIC_MAX_TOOL_ROUNDS} tool rounds. USE THEM to validate before finalizing.\n"
-            "Return ONLY one JSON object per turn:\n"
+            f"STAGED INFERENCE — 6 phases (P1→P6), one JSON object per turn, up to {rounds} tool rounds. Declare your phase every turn.\n"
+            "Return ONLY one JSON object per turn with EXACTLY these keys:\n"
             "{\n"
-            '  "summary": "3-5 sentence VALIDATED statistical interpretation (not predefined addition)",\n'
-            '  "evidence": [{"path": "deterministic_state... OR tool_results...", "value": ..., '
-            '"interpretation": "...", "metric_name": "..."}],\n'
-            '  "confidence": "low|medium|high",\n'
-            '  "limitations": ["..."],\n'
-            '  "model_separation": "one sentence on why beta and c/lambda are read separately",\n'
-            '  "tool_calls": [{"name": "market.read|market.group|micro.ofi_intervals|micro.evidence|micro.capture_status", '
-            '"args": {"symbol": "BTCUSDT", "venue": "spot", "mode": "snapshot", "group": "flow"}}],\n'
-            '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "...", '
-            '"importance": 5.0, "tags": ["..."]}]\n'
+            '  "phase": "P1|P2|P3|P4|P5|P6 — the phase this turn advances (P6 = final output generation, no tools)",\n'
+            '  "summary": "P4 explanation (≥200 chars: what the fits show AND why now), or null while tools are still pending",\n'
+            '  "evidence": [{"path": "deterministic_state.… OR <tool-name> → <field>", "value": …, "interpretation": "…", "metric_name": "…"}] or null,\n'
+            '  "confidence": "low|medium|high" or null,\n'
+            '  "limitations": ["…"] or null,\n'
+            '  "model_separation": "one sentence on why beta and c/lambda are read separately" or null,\n'
+            '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], "evidence_refs": ["calc.ofi.intervals", …]} or null (REQUIRED at final),\n'
+            '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
+            '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "…", "importance": 5.0, "tags": ["…"]}] or null\n'
             "}\n"
-            "REQUIRED when data allows: call market.read (snapshot) and at least one market.group (flow/wall) to validate the deterministic state against recomputed calculation modules. "
-            "Cross-check recalled paper KB. tool_calls max 3 per round, max "
-            f"{AGENTIC_MAX_TOOL_ROUNDS} rounds total. Final turn must have tool_calls=[] or omitted. memory_proposals max 3, kind fact forbidden."
+            "REGISTRY TOOL NAMES (use EXACTLY — any other name is denied):\n"
+            "  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n"
+            "  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
+            "  P3 market: market.read, market.group, market.derivatives, market.keystone_history, market.wall_history;\n"
+            "  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic);\n"
+            "  P6 output: no tools — synthesis only.\n"
+            "STAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n"
+            "  P1 OFI inference → P2 AD inference (split — never merged) → P3 Redis correlation "
+            "(market.read + ≥1 market.group; name agreements AND contradictions) → "
+            "P4 explanation (the why-now synthesis) → P5 derivation (memory.recall_paper FIRST, then "
+            "calc.price.delta with an OFI value for the NUMERIC ΔP + band) → "
+            "P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\n"
+            "WINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds "
+            "(10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\n"
+            f"Rules: tool_calls max {AGENTIC_PER_ROUND_CALL_CAP} per round, max {rounds} rounds. "
+            "Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn "
+            "(phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, "
+            "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, "
+            "and evidence cites ≥2 distinct roots incl. a calc.price.delta → … ΔP path plus ≥1 more fresh tool result. "
+            "memory_proposals max 3, kind fact forbidden."
         )
 
     async def _call_llm(self, user_prompt: str) -> str:
         if self.llm is None:
             raise NarrationParseError("no LLM client configured for narration")
-        response = await self.llm.acall(
-            messages=[
-                {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=_narration_max_tokens(),
-        )
+        messages = [
+            {"role": "system", "content": self._system_prompt()},
+            {"role": "user", "content": user_prompt},
+        ]
+        # Structured attempt first (schema rejects nameless tool_calls at the
+        # source); plain-JSON fallback preserves current behavior on backends
+        # that refuse response_format. The probe flag avoids paying the failed
+        # attempt on every turn once a backend has refused.
+        global _STRUCTURED_OK
+        response = None
+        if NarrationTurn is not None and _STRUCTURED_OK is not False:
+            try:
+                response = await self.llm.acall(
+                    messages=messages,
+                    output_model=NarrationTurn,
+                    max_tokens=_narration_max_tokens(),
+                )
+                _STRUCTURED_OK = True
+            except Exception:
+                log.warning("structured narration call refused; falling back to raw JSON")
+                _STRUCTURED_OK = False
+                response = None
+        if response is None:
+            response = await self.llm.acall(
+                messages=messages,
+                max_tokens=_narration_max_tokens(),
+            )
+        # 0) Structured-model surface: already validated, serialize to JSON.
+        content = getattr(response, "content", None)
+        if BaseModel is not None and isinstance(content, BaseModel):
+            return json.dumps(content.model_dump(), default=str)
         # 1) The client's parsed text surface (nooa LLMResponse.content) is the
         #    authoritative transport-agnostic extraction.
         content = getattr(response, "content", None)
@@ -554,15 +784,19 @@ class InferenceEngine:
         }]
 
         # --- GATHER: capture status + deterministic fit via the tool base ---
+        # All dispatches run on the ENGINE's injected connections + settings;
+        # no tool opens its own store (two-plane boundary pass).
         status, status_log = await execute_tool(
             self.store, "micro.capture_status",
             {"symbol": self.symbol, "venue": self.venue},
+            memory=self.memory, settings=self.settings,
         )
         capability_log.append(status_log)
         evidence, fit_log = await execute_tool(
             self.store, "micro.fit_beta",
             {"symbol": self.symbol, "venue": self.venue,
              "interval_seconds": 10, "window_minutes": 30},
+            postgres=self.postgres, memory=self.memory, settings=self.settings,
         )
         capability_log.append(fit_log)
 
@@ -586,13 +820,13 @@ class InferenceEngine:
 
         # Pass C split: AD and OFI are calculated as SEPARATE deterministic tools
         # in the wake cycle — agent will call them to validate, final DeltaP is derived diagnostic
-        ofi_blocks, ofi_log = await execute_tool(self.store, "calc.ofi.intervals", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30})
+        ofi_blocks, ofi_log = await execute_tool(self.store, "calc.ofi.intervals", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30}, memory=self.memory, settings=self.settings)
         capability_log.append(ofi_log)
-        ad_result, ad_log = await execute_tool(self.store, "calc.depth.average", {"symbol": self.symbol, "venue": self.venue, "window_minutes": 30})
+        ad_result, ad_log = await execute_tool(self.store, "calc.depth.average", {"symbol": self.symbol, "venue": self.venue, "window_minutes": 30}, memory=self.memory, settings=self.settings)
         capability_log.append(ad_log)
-        obs_preview, obs_log = await execute_tool(self.store, "calc.observation.build", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30})
+        obs_preview, obs_log = await execute_tool(self.store, "calc.observation.build", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30}, memory=self.memory, settings=self.settings)
         capability_log.append(obs_log)
-        derived_diag, derived_log = await execute_tool(self.store, "calc.derived_diagnostic", {"symbol": self.symbol, "venue": self.venue})
+        derived_diag, derived_log = await execute_tool(self.store, "calc.derived_diagnostic", {"symbol": self.symbol, "venue": self.venue}, memory=self.memory, settings=self.settings)
         capability_log.append(derived_log)
         calculations = {
             "ofi_blocks": ofi_blocks[:5] if isinstance(ofi_blocks, list) else ofi_blocks,
@@ -610,6 +844,16 @@ class InferenceEngine:
             "microstructure_evidence": evidence,
             "gate": {"status": gate_status, "reasons": list(gate_reasons)},
             "calculations": calculations,
+            "data_quality": {
+                "capture_state": status_obj.get("state"),
+                "sequence_gaps": int(status_obj.get("sequence_gaps") or 0),
+                "heteroskedasticity_flag": ((evidence or {}).get("price_impact_fit") or {}).get("heteroskedasticity_flag"),
+                "fit_status": fit_status,
+                "n_observations": n_observations,
+                "spine": {"interval_seconds": 10, "window_minutes": 30},
+                "note": ("provisional persists while gaps>0 or hetero=true; "
+                         "agent may recompute at interval 10/15/30s × window 15/30/60m via tool args"),
+            },
         }
 
         # --- HARD GATE ---
@@ -676,116 +920,156 @@ class InferenceEngine:
                 f"narration_failed: {type(exc).__name__}: {exc}",
             ), {"llm_calls": llm_calls}
         llm_calls += 1
-        parsed_1 = _extract_json_object(raw_1)
+        parsed_1 = _coerce_turn(_extract_json_object(raw_1))
         if parsed_1 is None:
             return await self._degraded_artifact(
                 deterministic_state, capability_log,
                 "narration_parse_failed: no JSON object in output",
             ), {"llm_calls": llm_calls}
 
-        # --- AGENTIC TOOL LOOP (max AGENTIC_MAX_TOOL_ROUNDS rounds) ---
-        # Base loop is now agentic: model validates deterministic_state by
-        # calling calculation modules (market.read / market.group) and read
-        # tools (micro.*) before finalizing. Budget 50k tokens allows
-        # reasoning + multiple tool round-trips.
+        # --- STAGED TOOL LOOP (P1→P5, phase coverage enforced) ---
+        # The model advances OFI (P1) → AD (P2) → market correlation (P3) →
+        # explanation (P4) → paper + derived ΔP (P5). Coverage is credited
+        # from TOOL FAMILIES actually executed with result "ok"; a FINAL turn
+        # with empty tool_calls is validated and REJECTED FOR REPAIR while
+        # LLM budget remains (depth is structural, not advisory).
+        from market_service.nooa_harness.inference import (
+            TOOL_PHASE,
+            _normalize_tool_name,
+            capability_log_entry,
+        )
+
         tool_results: dict[str, Any] = {}
         accumulated_tool_results: dict[str, Any] = {}
+        phase_coverage: dict[str, set[str]] = {
+            phase: set() for phase in ("P1", "P2", "P3", "P4", "P5", "P6")
+        }
+
+        def _mark_declared(parsed: dict[str, Any]) -> None:
+            declared = str(parsed.get("phase") or "").strip().upper()
+            if declared in ("P4", "P6"):
+                phase_coverage[declared].add("declared")
+
+        _mark_declared(parsed_1)
         parsed_current = parsed_1
-        current_round = 0
-        for round_idx in range(AGENTIC_MAX_TOOL_ROUNDS):
+        tool_rounds_used = 0
+        repairs_sent = 0
+        finalize_now = False
+        final_validation: dict[str, Any] = {"passed": False, "missing": ["loop_not_run"]}
+        while llm_calls < AGENTIC_MAX_LLM_TURNS and not finalize_now:
             tool_calls = parsed_current.get("tool_calls")
-            if not isinstance(tool_calls, list) or not tool_calls:
-                if round_idx == 0:
-                    log.info("agentic loop: no tool_calls on round 0, finalizing without validation")
-                break
-            # cap per round
-            to_execute = [c for c in tool_calls if isinstance(c, dict)][:3]
-            if not to_execute:
-                break
-            current_round += 1
-            round_results: dict[str, Any] = {}
-            for call in to_execute:
-                name = str(call.get("name", ""))
-                args = dict(call.get("args") or {})
-                args.setdefault("symbol", self.symbol)
-                args.setdefault("venue", self.venue)
-                result, tool_log = await execute_tool(self.store, name, args)
-                capability_log.append(tool_log)
-                if result is None:
-                    result_payload = None
-                else:
-                    rendered = json.dumps(result, default=str)
-                    if len(rendered) < 40_000:
-                        result_payload = json.loads(rendered)
+            if (
+                isinstance(tool_calls, list)
+                and tool_calls
+                and tool_rounds_used < AGENTIC_MAX_TOOL_ROUNDS
+            ):
+                to_execute = [
+                    c for c in tool_calls if isinstance(c, dict)
+                ][:AGENTIC_PER_ROUND_CALL_CAP]
+                if not to_execute:
+                    break
+                tool_rounds_used += 1
+                round_results: dict[str, Any] = {}
+                for call in to_execute:
+                    raw_name = str(call.get("name", ""))
+                    args = dict(call.get("args") or {})
+                    args.setdefault("symbol", self.symbol)
+                    args.setdefault("venue", self.venue)
+                    canonical = _normalize_tool_name(raw_name) or raw_name
+                    try:
+                        result, tool_log = await execute_tool(
+                            self.store, raw_name, args, postgres=self.postgres,
+                            memory=self.memory, settings=self.settings,
+                        )
+                    except Exception as exc:  # one bad tool never kills the cycle
+                        log.exception("staged loop: tool %s raised", raw_name)
+                        result, tool_log = None, capability_log_entry(
+                            f"tool.error:{canonical}",
+                            {"symbol": self.symbol, "venue": self.venue},
+                            "error",
+                            detail=f"{type(exc).__name__}: {exc}",
+                        )
+                    capability_log.append(tool_log)
+                    # Phase credit needs a real dispatch: denials, errors,
+                    # and explicit null-discipline refusals never count. A
+                    # successful read that legitimately returns null
+                    # (absent evidence, empty cache) still counts — the
+                    # absence itself is information the agent must interpret.
+                    _detail = tool_log.get("detail")
+                    _refused = isinstance(_detail, dict) and _detail.get("status") == "refused"
+                    if tool_log.get("result") == "ok" and not _refused:
+                        phase = TOOL_PHASE.get(canonical)
+                        if phase is not None:
+                            phase_coverage[phase].add(canonical)
+                    if result is None:
+                        result_payload = None
                     else:
-                        result_payload = {"_truncated": True, "preview": rendered[:4_000]}
-                round_results[name] = result_payload
-                accumulated_tool_results[name] = result_payload
-            tool_results.update(round_results)
-            # Always follow a tool execution with an LLM turn to get either
-            # next tool_calls or the FINAL interpretation. Last round also
-            # needs a final turn — otherwise we finalize with a tool-request
-            # JSON that has null summary/evidence.
-            is_last_round = (round_idx == AGENTIC_MAX_TOOL_ROUNDS - 1)
-            user_prompt_next = (
-                f"TOOL RESULTS ROUND {round_idx + 1}/{AGENTIC_MAX_TOOL_ROUNDS} (deterministic; cite paths):\n"
-                f"{json.dumps(round_results, default=str)[:40_000]}\n\n"
-                f"ACCUMULATED TOOL RESULTS SO FAR:\n{json.dumps(accumulated_tool_results, default=str)[:40_000]}\n\n"
-            )
-            if not is_last_round:
-                user_prompt_next += (
-                    "You may call more tools (up to "
-                    f"{AGENTIC_MAX_TOOL_ROUNDS - round_idx - 1} rounds remain) to validate "
-                    "calculation modules, cross-check memory/paper KB, or you may finalize. "
-                    "If you have sufficient validation, return FINAL JSON with tool_calls=[] . "
-                    "Otherwise return tool_calls with next batch. Same JSON format."
+                        rendered = json.dumps(result, default=str)
+                        if len(rendered) < 40_000:
+                            result_payload = json.loads(rendered)
+                        else:
+                            result_payload = {"_truncated": True, "preview": rendered[:4_000]}
+                    round_results[canonical] = result_payload
+                    accumulated_tool_results[canonical] = result_payload
+                tool_results.update(round_results)
+                next_phase = _next_uncovered_phase(phase_coverage)
+                user_prompt_next = (
+                    f"TOOL RESULTS ROUND {tool_rounds_used}/{AGENTIC_MAX_TOOL_ROUNDS} (deterministic; cite paths):\n"
+                    f"{json.dumps(round_results, default=str)[:40_000]}\n\n"
+                    f"ACCUMULATED TOOL RESULTS SO FAR:\n{json.dumps(accumulated_tool_results, default=str)[:40_000]}\n\n"
+                    "PHASE COVERAGE (families with ≥1 ok tool): "
+                    f"{json.dumps({p: sorted(s) for p, s in phase_coverage.items()})}\n"
+                    f"{_PHASE_GUIDANCE[next_phase]}\n"
+                    f"Tool rounds remaining: {AGENTIC_MAX_TOOL_ROUNDS - tool_rounds_used}. "
+                    "Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
                 )
-            else:
-                user_prompt_next += (
-                    "BUDGET SPENT — produce FINAL interpretation JSON now (tool_calls must be [] or omitted). "
-                    "Return summary/evidence/confidence/limitations/model_separation."
-                )
-            try:
-                raw_next = await self._call_llm(user_prompt_next)
-            except Exception:
-                log.exception("agentic narration round %s failed; falling back", round_idx + 2)
-                break
-            llm_calls += 1
-            parsed_next = _extract_json_object(raw_next)
-            if parsed_next is None:
-                log.warning("agentic round %s parse failed, keeping prior", round_idx + 2)
-                break
-            parsed_current = parsed_next
-            # if model finalized (no tool_calls), exit; otherwise loop continues
-            if not isinstance(parsed_current.get("tool_calls"), list) or not parsed_current.get("tool_calls"):
-                break
-        # If the agentic loop exhausted rounds but model still requested tools
-        # instead of finalizing (null summary with pending tool_calls), force
-        # one strict FINAL turn with no tool allowance — output control.
-        needs_forced_final = (
-            parsed_current.get("summary") is None
-            and isinstance(parsed_current.get("tool_calls"), list)
-            and len(parsed_current.get("tool_calls") or []) > 0
-        )
-        if needs_forced_final:
-            log.warning("agentic loop exhausted with pending tool_calls; forcing FINAL")
-            forced_prompt = (
-                f"ACCUMULATED TOOL RESULTS (all {AGENTIC_MAX_TOOL_ROUNDS} rounds):\n"
-                f"{json.dumps(accumulated_tool_results, default=str)[:60_000]}\n\n"
-                "FINAL INSTRUCTION: Return ONLY the FINAL interpretation JSON now. "
-                "tool_calls MUST be [] or omitted. Include summary (3-5 sentences), "
-                "evidence with exact paths, confidence, limitations, model_separation. "
-                "Do NOT request more tools. Same JSON format."
-            )
-            try:
-                raw_forced = await self._call_llm(forced_prompt)
+                try:
+                    raw_next = await self._call_llm(user_prompt_next)
+                except Exception:
+                    log.exception("staged narration round failed; falling back")
+                    break
                 llm_calls += 1
-                parsed_forced = _extract_json_object(raw_forced)
-                if parsed_forced and parsed_forced.get("summary") is not None:
-                    parsed_current = parsed_forced
-            except Exception:
-                log.exception("forced FINAL call failed")
+                parsed_next = _coerce_turn(_extract_json_object(raw_next))
+                if parsed_next is None:
+                    log.warning("staged round parse failed, keeping prior")
+                    break
+                parsed_current = parsed_next
+                _mark_declared(parsed_current)
+                continue
+            # No (more) tool calls this turn → validate the final.
+            passed, missing = _validate_final_turn(parsed_current, phase_coverage)
+            if passed:
+                final_validation = {"passed": True, "missing": []}
+                finalize_now = True
+            else:
+                repairs_sent += 1
+                repair_prompt = (
+                    "FINAL REJECTED — staged inference incomplete. Missing:\n"
+                    + "\n".join(f"- {item}" for item in missing)
+                    + f"\n\nACCUMULATED TOOL RESULTS:\n{json.dumps(accumulated_tool_results, default=str)[:40_000]}\n\n"
+                    f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in phase_coverage.items()})}\n"
+                    f"{_PHASE_GUIDANCE[_next_uncovered_phase(phase_coverage)]}\n"
+                    "Return the next turn now: declare \"phase\", include the missing tool_calls, "
+                    "and finalize (tool_calls=[]) only when every missing item is addressed."
+                )
+                try:
+                    raw_repair = await self._call_llm(repair_prompt)
+                except Exception:
+                    log.exception("repair turn failed; falling back")
+                    break
+                llm_calls += 1
+                parsed_repair = _coerce_turn(_extract_json_object(raw_repair))
+                if parsed_repair is None:
+                    log.warning("repair parse failed, keeping prior")
+                    break
+                parsed_current = parsed_repair
+                _mark_declared(parsed_current)
         parsed_final = parsed_current
+        # Honest record when the loop exited via break (exception/parse fail
+        # or LLM budget spent): validate whatever we finalize with.
+        if not finalize_now:
+            passed, missing = _validate_final_turn(parsed_final, phase_coverage)
+            final_validation = {"passed": passed, "missing": missing}
         # ensure tool_results reflects all rounds for cycle_meta
         if accumulated_tool_results:
             tool_results = accumulated_tool_results
@@ -858,6 +1142,10 @@ class InferenceEngine:
             "llm_calls": llm_calls,
             "gate": gate_status,
             "tool_round": bool(tool_results),
+            "tool_rounds": tool_rounds_used,
+            "repairs": repairs_sent,
+            "phase_coverage": {p: sorted(s) for p, s in phase_coverage.items()},
+            "final_validation": final_validation,
             "memory": {"accepted": accepted, "dispositions": dispositions,
                        "written": written},
         }
@@ -915,4 +1203,252 @@ class InferenceEngine:
                 log.debug("memory store close failed", exc_info=True)
 
 
-__all__ = ["SESSION_TEMPLATE", "InferenceEngine", "NarrationParseError"]
+# ======================================================================
+# Absorbed from the retired ``agents`` module (final decomposition pass,
+# 2026-09-04). The historical interpretation-plane agents were deleted in
+# the inference-engine pass; what remained was:
+#
+#   - ``bounded_envelope_view`` / ``response_text`` — LLM-view helpers
+#   - ``MicrostructureInterpretationAgent`` — the Pass-3 read-only reader
+#     for ``nooa market microstructure interpret``
+#
+# They lived in a separate module only to inherit the NOOA ``Agent`` base —
+# a framework coupling the inference plane does not need. This class is a
+# plain object with an INJECTED llm client (exactly like InferenceEngine
+# itself), so engine.py stays nooa-free at import and the agent surface is
+# one plane, one home: everything the LLM narrates lives HERE.
+# ======================================================================
+
+
+def bounded_envelope_view(
+    payload: dict[str, Any] | None,
+    roof: int = 180_000,
+    list_cap: int = 60,
+) -> str:
+    """Serialized envelope sized for the LLM param limit (never silent).
+
+    Returns the full envelope when it already fits. Otherwise large lists
+    are capped with an explicit ``__truncated__`` marker that records the
+    original count, and only as a last resort is the payload reduced to run
+    identity + coverage + errors with the trimmed top-level keys listed. The
+    complete canonical envelope is never mutated — this is only the LLM-bound
+    projection.
+    """
+    from market_service.runtime.read_paths import json_safe_dumps
+
+    if not payload:
+        return "{}"
+    rendered = json_safe_dumps(payload)
+    if len(rendered) <= roof:
+        return rendered
+
+    def _cap(value: Any, max_items: int) -> Any:
+        if isinstance(value, dict):
+            return {k: _cap(v, max_items) for k, v in value.items()}
+        if isinstance(value, list):
+            if len(value) > max_items:
+                return {
+                    "__truncated__": True,
+                    "count": len(value),
+                    "items": [_cap(item, max_items) for item in value[:max_items]],
+                }
+            return [_cap(item, max_items) for item in value]
+        return value
+
+    rendered = json_safe_dumps(_cap(payload, list_cap))
+    if len(rendered) <= roof:
+        return rendered
+
+    kept = {
+        k: payload.get(k)
+        for k in ("run_id", "symbol", "status", "schema_version",
+                  "generated_at", "completed_at", "data_source")
+    }
+    kept["coverage"] = payload.get("coverage")
+    kept["errors"] = payload.get("errors")
+    kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
+    return json_safe_dumps(kept)
+
+
+def response_text(resp: Any) -> str:
+    """Extract the text content from a NOOA unified-LLM response."""
+    raw = getattr(resp, "raw_response", resp)
+    choices = getattr(raw, "choices", None)
+    if choices:
+        content = getattr(getattr(choices[0], "message", None), "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+            if parts:
+                return "".join(parts)
+    if isinstance(resp, str):
+        return resp
+    return str(raw)
+
+
+_MICROSTRUCTURE_EVIDENCE_SCHEMA = json.dumps(
+    {
+        "schema_version": 1,
+        "symbol": "BTCUSDT",
+        "venue": "spot",
+        "evidence_id": "ev-<hash-prefix>",
+        "input_hash": "<sha256>",
+        "model_version": "ofi-depth-v1",
+        "interval_seconds": 10,
+        "window_start_ms": "<int>",
+        "window_end_ms": "<int>",
+        "tick_size": "<decimal>",
+        "depth_estimator": "event_mean_best_bid_ask_v1",
+        "price_impact_fit": {
+            "fit_id": "beta-<hash>",
+            "alpha": "<decimal>",
+            "beta": "<decimal>",
+            "stderr_beta": "<decimal|null>",
+            "r2": "<decimal|null>",
+            "n_observations": "<int>",
+            "excluded_observations": "<int>",
+            "heteroskedasticity_flag": "<bool>",
+            "mean_ad": "<decimal|null>",
+            "price_unit": "ticks",
+            "status": "validated|provisional|insufficient",
+        },
+        "sensitivity_fit": "same shape as price_impact_fit, OFI recomputed without price-changing events, or null",
+        "depth_scaling_fit": {
+            "fit_id": "depth-<hash>",
+            "c": "<decimal|null>",
+            "lambda": "<decimal|null>",
+            "stderr_lambda": "<decimal|null>",
+            "n_blocks": "<int>",
+            "r2": "<decimal|null>",
+            "fit_ids": ["beta-<hash>", "..."],
+            "status": "validated|provisional|insufficient",
+        },
+        "coverage": "object: events/intervals captured, gaps, reconnects",
+        "status": "validated|provisional|insufficient",
+    },
+    indent=2,
+)
+
+
+class MicrostructureInterpretationAgent:
+    """Read-only interpreter of one persisted MicrostructureEvidence.
+
+    RECEIVES BOTH fitted models — the empirical price-impact fit
+    (ΔP_k = α + β·OFI_k) and the depth-scaling fit (β = c·AD^-λ) — each with
+    independent diagnostics, and explains fit quality, sign, magnitude and
+    limitations. The two models are NEVER merged into a single point
+    prediction: the substituted combined expression
+    ΔP = α + c·OFI/AD^λ + (ν·OFI + ε) carries a heteroskedastic ν·OFI term,
+    so it is a derived diagnostic at most.
+
+    Authority: this agent never recomputes OFI, never refits β/c/λ, never
+    opens Binance, never reconstructs the book, and never overrides a
+    deterministic status. It cites evidence paths and states what the data
+    cannot establish.
+
+    Lives in the inference plane (engine module) since the decomposition
+    pass; the llm client is INJECTED exactly like InferenceEngine — no NOOA
+    ``Agent`` base, no framework import at module load.
+    """
+
+    remit: str = (
+        "Interpret fitted microstructure evidence without recomputing any "
+        "value. The deterministic fitter is the only producer of coefficients."
+    )
+
+    _MAX_LLM_ENVELOPE_CHARS = 190_000
+    _LIST_CAP = 200
+    _MAX_TOKENS = 4000
+
+    def __init__(self, symbol: str, *, llm: Any):
+        self.llm = llm
+        self.symbol = symbol.upper()
+
+    def _envelope_schema(self) -> str:
+        """Shape reference for MicrostructureEvidence (not the market envelope)."""
+        return _MICROSTRUCTURE_EVIDENCE_SCHEMA
+
+    @staticmethod
+    def _evidence_from_envelope(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Locate microstructure evidence inside a canonical envelope view."""
+        if not isinstance(envelope, dict):
+            return None
+        for key in ("microstructure", "microstructure_evidence"):
+            candidate = envelope.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        canonical = envelope.get("canonical_state")
+        if isinstance(canonical, dict):
+            for key in ("microstructure", "microstructure_evidence"):
+                candidate = canonical.get(key)
+                if isinstance(candidate, dict):
+                    return candidate
+        return None
+
+    async def assess(self, evidence: dict[str, Any]) -> str:
+        """Interpret one evidence object; deterministic unavailable when absent.
+
+        When no evidence is present this returns a parseable unavailable report
+        WITHOUT a model call (null discipline — no LLM call to state absence).
+        """
+        payload = evidence if isinstance(evidence, dict) else None
+        resolved = payload
+        if resolved is None or "evidence_id" not in resolved:
+            resolved = self._evidence_from_envelope(payload)
+        if resolved is None:
+            return json.dumps({
+                "summary": "Microstructure evidence unavailable for this run.",
+                "evidence": [],
+                "confidence": "low",
+                "limitations": ["no MicrostructureEvidence persisted or present in the envelope"],
+                "null_fields": ["microstructure"],
+            })
+        return await self._call_model_once(resolved)
+
+    async def _call_model_once(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        max_tokens: int | None = None,
+        extra_context: str | None = None,
+    ) -> str:
+        """One deterministic LLM call over the evidence payload."""
+        if self.llm is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: no NOOA model client configured"
+            )
+        extra = f"{extra_context}\n\n" if extra_context else ""
+        user = (
+            "Return ONLY one valid JSON object with fields: "
+            "{summary, evidence: "
+            "[{path, value, interpretation, metric_name}], confidence, "
+            "limitations, model_separation}.\n"
+            "confidence MUST be EXACTLY one of: \"low\", \"medium\", \"high\" "
+            "(NOT the evidence status like provisional/insufficient).\n\n"
+            f"{extra}"
+            "Evidence schema (shape reference):\n"
+            f"{self._envelope_schema()}\n\n"
+            "MicrostructureEvidence for this run:\n"
+            f"{bounded_envelope_view(payload, self._MAX_LLM_ENVELOPE_CHARS, self._LIST_CAP)}"
+            "\n\nIMPORTANT: Output ONLY one valid JSON object. No markdown fences."
+        )
+        system = self.remit
+        resp = await self.llm.acall(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens or self._MAX_TOKENS,
+        )
+        return response_text(resp)
+
+
+__all__ = [
+    "SESSION_TEMPLATE",
+    "InferenceEngine",
+    "NarrationParseError",
+    "MicrostructureInterpretationAgent",
+    "bounded_envelope_view",
+    "response_text",
+]

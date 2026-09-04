@@ -1,25 +1,45 @@
 """NOOA harness package — the statistical inference engine runtime.
 
-The old interpretation plane (specialist/controller agents, AnalystSuite,
-run_analyze_once) was REMOVED in the inference-engine pass. The engine is
-the primary interpretation plane:
+Two-plane layout (semantic-debt boundary pass, 2026-09-04):
+
+INTERPRETATION PLANE — deterministic math + canonical persistence, no LLM:
+
+- ``bedrock``                    — shared deterministic core: GROUP_MAP,
+                                   section deps, read_raw_window,
+                                   run_calculations/run_analysis, adapters.
+                                   ONE source of truth for calc semantics.
+- ``pipeline_interpretation``    — the outer-CLI plane: envelope assembly,
+                                   Postgres/Redis persistence, wall/keystone
+                                   ledgers, the ONE Binance derivative fetch,
+                                   run_cycle / run_group_cycle
+- ``pipeline``                   — thin re-export shim (compat path)
+
+INFERENCE PLANE — the OO agent, LLM narration over injected state:
 
 - ``engine.InferenceEngine``     — the OO inference agent (receive in-memory
-                                   wake → compute → narrate → persist → remember)
+                                   wake → compute → narrate → persist → remember);
+                                   now also owns the absorbed microstructure
+                                   reader (``MicrostructureInterpretationAgent``,
+                                   ``bounded_envelope_view``, ``response_text``)
 - ``inference``                  — mechanics: hard gate, capability registry,
-                                   tool base, wake plane
+                                   tool base, wake plane. Tool dispatchers use
+                                   ONLY the engine's injected store/memory/
+                                   settings — never env, never a second pool
+- ``pipeline_inference``         — the agent's single read seam into bedrock
+                                   (``run_inference_group``); never imports
+                                   the interpretation plane
 - ``inference_runner``           — one-shot cycle (envelope / manual / no-wake)
                                    + event-driven engine loop
 - ``wake_worker``                — the event-driven wake worker (blocking reads,
                                    deterministic trigger matrix, in-memory
                                    WakeEnvelope → engine dispatch)
-- ``pipeline``                   — the deterministic calculation pipeline
-                                   (unchanged; the engine commands it as tools)
-- ``memory.MemoryNode``          — the engine's episodic memory
+- ``memory.MemoryNode``          — the engine's episodic memory + the shared
+                                   ``paper_kb_session_id()`` contract
 - ``backends.ModelBackendConfig``— narration LLM client config
-- ``agents.MarketAnalyst``       — legacy base kept only for
-                                   ``MicrostructureInterpretationAgent`` until
-                                   its removal in a follow-up cleanup
+
+Boundary rule: the inference plane imports ``bedrock`` / ``pipeline_inference``
+only; the interpretation plane never imports the inference plane. The retired
+``agents`` module is gone — everything the LLM narrates lives in ``engine``.
 
 CLI surfaces (``nooa market inference run/read/history/watch/wake``, outer
 ``harness --inference [--inference-force]``) are the sanctioned triggers.

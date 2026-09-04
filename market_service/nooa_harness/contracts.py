@@ -164,6 +164,11 @@ class GroupEnvelope:
     evidence_headlines: dict[str, Any] = field(default_factory=dict)
     errors: tuple[dict[str, Any], ...] = ()
     source: str = "canonical_projection"
+    # Substrate attribution for the sections in this envelope: section id →
+    # owning substrate(s) (from nooa_harness.bedrock.SUBSTRATE_GRAPH). Lets the
+    # interpretation plane explain WHICH calculation substrate produced each
+    # section. Additive-only; older readers ignore it (schema_version 1).
+    substrate_provenance: dict[str, Any] = field(default_factory=dict)
     schema_version: int = GROUP_ENVELOPE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -204,6 +209,7 @@ class GroupEnvelope:
             "evidence_headlines": self.evidence_headlines,
             "errors": list(self.errors),
             "source": self.source,
+            "substrate_provenance": dict(self.substrate_provenance),
         }
 
     def to_json(self) -> str:
@@ -224,6 +230,7 @@ class GroupEnvelope:
             evidence_headlines=dict(value.get("evidence_headlines") or {}),
             errors=tuple(value.get("errors") or ()),
             source=str(value.get("source") or "canonical_projection"),
+            substrate_provenance=dict(value.get("substrate_provenance") or {}),
             schema_version=int(value.get("schema_version") or GROUP_ENVELOPE_SCHEMA_VERSION),
         )
         envelope.validate()
