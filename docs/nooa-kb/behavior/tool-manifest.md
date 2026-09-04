@@ -3,7 +3,7 @@
 The statistical inference engine commands deterministic calculation modules
 as TOOLS. The LLM never recomputes a value: it dispatches a tool, receives
 deterministic output, and cites it. Every dispatch is scope-validated
-(BTCUSDT / spot frozen), audit-logged to the artifact's `capability_log`,
+(SOLUSDT / BTCUSDT / ETHUSDT × spot / futures / perps), audit-logged to the artifact's `capability_log`,
 and bounded in output size.
 
 Citation rule: every numeric claim in an interpretation MUST name the tool
@@ -58,6 +58,61 @@ Uncited numeric claims are contract violations.
 - When: you need the last PERSISTED immutable evidence object (the fit at
   last cycle), not a fresh fit.
 - Returns: the stored MicrostructureEvidence dict, or null.
+
+## Staged inference cycle (P1→P5)
+
+Coverage is measured from tool families you EXECUTE, not phases you declare.
+A FINAL turn (`tool_calls=[]`) is rejected for repair unless P1+P2+P3+P5
+all have ≥1 executed tool, `hypothesis.H0` is set, `summary` is ≥200 chars
+(the P4 why-now explanation), and `evidence` cites ≥2 distinct roots
+including ≥1 fresh tool result. Budgets: 5 tool rounds (≤3 calls each),
+8 LLM turns per cycle.
+
+The two fitted models are NEVER merged. Call OFI and AD as SEPARATE tools,
+then join via `calc.observation.build`. The combined formula is a derived
+diagnostic only (`calc.derived_diagnostic`).
+
+### `calc.ofi.intervals`
+- When: you need deterministic OFI per interval (paper Cont `OFI_k` = sum e_n
+over half-open clock-bound `[t_{k-1}, t_k)`), with AD explicitly excluded.
+- Args: `interval_seconds` (default 10), `window_minutes` (default 30).
+- Returns: OFI-only interval rows (`ofi`, `event_count`, `quality`).
+
+### `calc.depth.average`
+- When: you need deterministic AD per block (paper `AD_i` = event-average
+  `(qB+qA)/2`), with OFI explicitly excluded.
+- Returns: `ad_per_interval`, `mean_ad`, `depth_estimator`.
+
+### `calc.observation.build`
+- When: you need the joined observations (ΔP ticks vs OFI) that feed the fits.
+- Returns: observation rows (`ofi`, `delta_ticks`, `average_depth`, `quality`)
+  plus excluded count.
+
+### `calc.fit.price_impact` / `calc.fit.depth_scaling`
+- When: you need the OLS ΔP=α+β·OFI fit (HC0 SE) or the log-log depth-scaling
+  fit recomputed as an independent check on `micro.fit_beta`.
+- Depth scaling needs ≥3 distinct-AD blocks; a single window yields
+  `insufficient` by design — that is a correct null, not an error.
+
+### `calc.price.delta` (alias `calc.derived_diagnostic`)
+- When: P5 derivation — you have an OFI value (scenario arg, or latest
+  closed interval by default) and need the NUMERIC derived ΔP.
+- Args: `ofi` (optional; default = latest interval OFI, `ofi_source` echoed),
+  `interval_seconds` (10/15/30), `window_minutes` (15/30/60).
+- Returns: `route_a_direct` (ΔP ticks + quote + 95% band from α+β·OFI),
+  `route_b_depth_scaled` (depth-scaled ΔP when c/λ identify, else
+  `unavailable` with reason), `agreement_ticks`, hetero warning.
+- Refuses (`status: refused`, result null) on gate-failed fits, empty tape,
+  or bad OFI — a refusal is a finding, report it, never substitute zero.
+  Cite as `calc.price.delta → route_a_direct.delta_ticks`.
+
+### `memory.recall_paper`
+- When: FIRST step of every validation workflow — pull Cont-Kukanov-Stoikov
+  paper facts (OFI definition, β regression, depth scaling, heteroskedastic
+  caveat) from the real MemoryNode paper KB to ground H0/H1.
+- Args: `query` (default "Cont OFI AD beta").
+- Returns: paper fact entries (`content`, `tags`, `importance`). Empty means
+  the KB is unseeded — report it, do not invent paper claims.
 
 ## T2 — Market correlation tools (canonical pipeline)
 

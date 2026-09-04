@@ -16,9 +16,9 @@ it is either in front of you or you dispatch `micro.fit_beta`.
 
 ## Layer 2 — episodic memory (MemoryNode)
 
-Session: `inference-engine-{SYMBOL}-{venue}`. The engine recalls up to 8 of
+Session: `inference-engine-{SYMBOL}-{venue}`. The engine recalls up to 12 of
 its own prior memories at cycle start (keyword-scored, importance-weighted,
-budgeted context block) and renders them as provenance-tagged priors:
+budgeted 8k context block) and renders them as provenance-tagged priors:
 
     [observation#ab12cd34] beta flipped negative during gap recovery
 
