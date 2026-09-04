@@ -277,3 +277,84 @@ def test_interval_contract_carries_estimator_and_mids() -> None:
     assert closed.mid_end == _mid(q1)
     restored = OFIInterval.from_dict(closed.to_dict())
     assert restored == closed
+
+
+def _synthetic_price_fit(status="provisional"):
+    return PriceImpactFit(
+        fit_id="beta-test", symbol="BTCUSDT", venue="spot",
+        window_start_ms=0, window_end_ms=600_000, interval_seconds=10,
+        alpha=Decimal("0.05"), beta=Decimal("0.002"),
+        stderr_beta=Decimal("0.0002"), robust_se_method="HC0",
+        n_observations=40, excluded_observations=2,
+        r2=Decimal("0.4"), residual_std=Decimal("1.5"),
+        heteroskedasticity_flag=True, mean_ad=Decimal("200"),
+        price_unit="ticks", tick_size=Decimal("0.01"),
+        input_hash="abc", model_version=FIT_MODEL_VERSION,
+        sensitivity=False, status=status,
+    )
+
+
+def _synthetic_depth_fit(status="validated"):
+    from market_service.microstructure.contracts import DepthScalingFit
+
+    return DepthScalingFit(
+        fit_id="depth-test", symbol="BTCUSDT", venue="spot",
+        c=Decimal("0.4"), lambda_=Decimal("0.5"),
+        stderr_lambda=Decimal("0.05"), n_blocks=4, r2=Decimal("0.9"),
+        fit_ids=("beta-test",), depth_estimator=DEPTH_ESTIMATOR,
+        model_version=FIT_MODEL_VERSION, status=status,
+    )
+
+
+def test_derive_route_a_math():
+    out = fitting.derive_price_delta(
+        _synthetic_price_fit(), ofi=Decimal("100"),
+        tick_size=Decimal("0.01"),
+    )
+    route_a = out["route_a_direct"]
+    assert Decimal(route_a["delta_ticks"]) == Decimal("0.05") + Decimal("0.002") * Decimal(100)
+    assert Decimal(route_a["delta_quote"]) == Decimal(route_a["delta_ticks"]) * Decimal("0.01")
+    assert Decimal(route_a["band_95_ticks"]) == Decimal("1.96") * Decimal("0.0002") * Decimal(100)
+    assert out["route_b_depth_scaled"]["status"] == "unavailable"
+    assert out["agreement_ticks"] is None
+    assert out["heteroskedasticity_flag"] is True
+
+
+def test_derive_route_b_when_identified():
+    out = fitting.derive_price_delta(
+        _synthetic_price_fit(), ofi=Decimal("100"),
+        tick_size=Decimal("0.01"), depth_fit=_synthetic_depth_fit(),
+        average_depth=Decimal("200"),
+    )
+    route_b = out["route_b_depth_scaled"]
+    assert route_b["status"] == "derived_ok"
+    from decimal import localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = 50
+        beta_implied = Decimal("0.4") * (Decimal("200").ln() * Decimal("-0.5")).exp()
+        expected_b = Decimal("0.05") + beta_implied * Decimal(100)
+    assert Decimal(route_b["beta_implied"]) == beta_implied
+    assert Decimal(route_b["delta_ticks"]) == expected_b
+    assert out["agreement_ticks"] is not None
+
+
+def test_derive_refuses_insufficient_fit():
+    import pytest
+
+    with pytest.raises(ValueError, match="insufficient"):
+        fitting.derive_price_delta(
+            _synthetic_price_fit(status="insufficient"), ofi=Decimal("10"),
+            tick_size=Decimal("0.01"),
+        )
+
+
+def test_derive_route_b_unavailable_without_c_lambda():
+    bad_depth = _synthetic_depth_fit(status="insufficient")
+    out = fitting.derive_price_delta(
+        _synthetic_price_fit(), ofi=Decimal("10"),
+        tick_size=Decimal("0.01"), depth_fit=bad_depth,
+        average_depth=Decimal("200"),
+    )
+    assert out["route_b_depth_scaled"]["status"] == "unavailable"
+    assert out["route_a_direct"]["delta_ticks"] is not None

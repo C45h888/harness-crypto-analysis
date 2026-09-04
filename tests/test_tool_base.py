@@ -2,8 +2,8 @@
 
 Covers the agent's commandable calculation surface, all nooa-free:
 
-- Registry: 11 tools, every tool name maps to a registered capability,
-  frozen scope (BTCUSDT/spot only).
+- Registry: 19 tools, every tool name maps to a registered capability,
+  frozen scope (SOL/BTC/ETH × spot/futures/perps).
 - ``execute_tool``: unknown tool denied, out-of-scope denied, pure T1
   dispatches (replay) execute and log, output bounds respected.
 - ``micro.fit_beta`` over synthetic ledger data via a fake store.
@@ -19,6 +19,7 @@ from decimal import Decimal
 from market_service.nooa_harness.inference import (
     CAPABILITIES,
     TOOL_NAMES,
+    _normalize_tool_name,
     execute_tool,
 )
 
@@ -71,8 +72,9 @@ class _FakeStore:
 
 
 class ToolRegistryTests(unittest.TestCase):
-    def test_eleven_tools_registered(self):
-        self.assertEqual(len(TOOL_NAMES), 11)
+    def test_nineteen_tools_registered(self):
+        # 6 micro + 6 Pass-C split calc + calc.price.delta + memory.recall_paper + 5 market.
+        self.assertEqual(len(TOOL_NAMES), 19)
 
     def test_every_tool_backed_by_a_capability(self):
         for tool, capability in TOOL_NAMES.items():
@@ -81,7 +83,7 @@ class ToolRegistryTests(unittest.TestCase):
     def test_scope_is_frozen_to_initial_scope(self):
         for name, cap in CAPABILITIES.items():
             self.assertEqual(cap.allowed_symbols, frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"}), name)
-            self.assertEqual(cap.allowed_venues, frozenset({"spot"}), name)
+            self.assertEqual(cap.allowed_venues, frozenset({"spot", "perps", "perp", "usdm", "futures"}), name)
 
 
 class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
@@ -103,7 +105,7 @@ class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
     def test_out_of_scope_venue_denied(self):
         result, log = _run(execute_tool(
             _FakeStore(), "micro.capture_status",
-            {"symbol": "BTCUSDT", "venue": "futures"},
+            {"symbol": "BTCUSDT", "venue": "binance-options"},
         ))
         self.assertIsNone(result)
         self.assertEqual(log["result"], "denied")
@@ -195,6 +197,95 @@ class FitBetaToolTests(unittest.IsolatedAsyncioTestCase):
         # validated, and never sufficient for depth scaling.
         self.assertEqual(result["price_impact_fit"]["status"], "provisional")
         self.assertEqual(result["depth_scaling_fit"]["status"], "insufficient")
+
+
+class ToolAliasTests(unittest.TestCase):
+    def test_exact_keys_resolve(self):
+        for key in TOOL_NAMES:
+            self.assertEqual(_normalize_tool_name(key), key)
+
+    def test_separator_variants_resolve(self):
+        self.assertEqual(_normalize_tool_name("calc.ofi_intervals"), "calc.ofi.intervals")
+        self.assertEqual(_normalize_tool_name("calc.depth_average"), "calc.depth.average")
+        self.assertEqual(_normalize_tool_name("micro.ofi.intervals"), "micro.ofi_intervals")
+        self.assertEqual(_normalize_tool_name("micro.fit.beta"), "micro.fit_beta")
+        self.assertEqual(_normalize_tool_name("  MARKET.READ  "), "market.read")
+
+    def test_truncated_aliases_resolve(self):
+        self.assertEqual(_normalize_tool_name("calc.ofi"), "calc.ofi.intervals")
+        self.assertEqual(_normalize_tool_name("calc.ad"), "calc.depth.average")
+        self.assertEqual(_normalize_tool_name("micro.fit"), "micro.fit_beta")
+
+    def test_unknown_returns_none_and_denies_with_attempt(self):
+        self.assertIsNone(_normalize_tool_name("market.nuke"))
+        self.assertIsNone(_normalize_tool_name(""))
+        self.assertIsNone(_normalize_tool_name(None))
+        result, log = _run(execute_tool(_FakeStore(), "market.nuke", {"x": 1}))
+        self.assertIsNone(result)
+        self.assertEqual(log["capability"], "tool.unknown")
+        self.assertIn("attempted", log["detail"])
+        self.assertIn("allowed", log["detail"])
+
+
+def _price_delta_events(blocks: int = 6, steps: int = 30) -> list[dict]:
+    payloads: list[dict] = []
+    ts = 1_700_000_000_000
+    update_id = 1
+    for block in range(blocks):
+        for step in range(steps):
+            payloads.append(_event_payload(
+                update_id, "5" if step % 2 == 0 else "-3",
+                ts + block * 600_000 + step * 10_000,
+            ))
+            update_id += 1
+    return payloads
+
+
+class PriceDeltaToolTests(unittest.TestCase):
+    def test_refused_on_insufficient_fit(self):
+        result, log = _run(execute_tool(
+            _FakeStore(events=_price_delta_events(blocks=1, steps=5)),
+            "calc.price.delta",
+            {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"},
+        ))
+        self.assertIsNone(result)
+        self.assertEqual(log["result"], "ok")
+        self.assertEqual(log["detail"]["status"], "refused")
+
+    def test_route_a_derives_numeric_delta(self):
+        result, log = _run(execute_tool(
+            _FakeStore(events=_price_delta_events()),
+            "calc.price.delta",
+            {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"},
+        ))
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "derived_ok")
+        self.assertEqual(result["ofi_source"], "scenario_arg")
+        route_a = result["route_a_direct"]
+        expected = Decimal(route_a["alpha"]) + Decimal(route_a["beta"]) * Decimal(10)
+        self.assertEqual(Decimal(route_a["delta_ticks"]), expected)
+        self.assertIsNotNone(route_a["band_95_ticks"])
+        self.assertIsNotNone(route_a["delta_quote"])
+        self.assertEqual(result["route_b_depth_scaled"]["status"], "unavailable")
+        self.assertIn("variance grows", result["heteroskedasticity"]["warning"])
+
+    def test_defaults_to_latest_interval_ofi(self):
+        result, log = _run(execute_tool(
+            _FakeStore(events=_price_delta_events()),
+            "calc.price.delta",
+            {"symbol": "BTCUSDT", "venue": "spot"},
+        ))
+        self.assertIsNotNone(result)
+        self.assertEqual(result["ofi_source"], "latest_interval")
+
+    def test_legacy_name_still_dispatches_numeric(self):
+        result, log = _run(execute_tool(
+            _FakeStore(events=_price_delta_events()),
+            "calc.derived_diagnostic",
+            {"symbol": "BTCUSDT", "venue": "spot", "ofi": "5"},
+        ))
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "derived_ok")
 
 
 if __name__ == "__main__":

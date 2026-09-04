@@ -180,7 +180,7 @@ class HarnessRefreshDerivativesTests(unittest.IsolatedAsyncioTestCase):
         os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
     @patch("market_service.commands.harness.RedisRuntimeStore")
-    @patch("market_service.nooa_harness.pipeline.fetch_derivative_evidence",
+    @patch("market_service.nooa_harness.pipeline_interpretation.fetch_derivative_evidence",
            new_callable=AsyncMock)
     @patch("market_service.clients.binance.Binance")
     async def test_refresh_writes_with_correct_ttl(
@@ -220,7 +220,7 @@ class HarnessRefreshDerivativesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["ttl_s"], 300)
 
     @patch("market_service.commands.harness.RedisRuntimeStore")
-    @patch("market_service.nooa_harness.pipeline.fetch_derivative_evidence",
+    @patch("market_service.nooa_harness.pipeline_interpretation.fetch_derivative_evidence",
            new_callable=AsyncMock)
     @patch("market_service.clients.binance.Binance")
     async def test_refresh_with_cross_asset(
@@ -328,7 +328,7 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
             "source_metadata": {},
         }
 
-    @patch("market_service.nooa_harness.pipeline.run_cycle", new_callable=AsyncMock)
+    @patch("market_service.nooa_harness.pipeline_interpretation.run_cycle", new_callable=AsyncMock)
     async def test_no_persist_uses_redis_only_settings_and_skips_persist(
         self, mock_run_cycle,
     ):
@@ -359,7 +359,7 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(call_kwargs["persist"], False)
         self.assertEqual(result["persistence"], {"mode": "dry_run"})
 
-    @patch("market_service.nooa_harness.pipeline.run_cycle", new_callable=AsyncMock)
+    @patch("market_service.nooa_harness.pipeline_interpretation.run_cycle", new_callable=AsyncMock)
     async def test_persist_uses_full_settings(self, mock_run_cycle):
         """Without --no-persist we persist, so full Settings (DB required)."""
         from market_service.commands.harness import _run_analyze
@@ -383,7 +383,7 @@ class HarnessAnalyzeNoPersistTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(call_kwargs["persist"], True)
         self.assertEqual(result["persistence"], {"mode": "persisted"})
 
-    @patch("market_service.nooa_harness.pipeline.run_cycle", new_callable=AsyncMock)
+    @patch("market_service.nooa_harness.pipeline_interpretation.run_cycle", new_callable=AsyncMock)
     async def test_envelope_summary_uses_projection(self, mock_run_cycle):
         """--envelope-summary returns the compact projection, never dead lookups."""
         from market_service.commands.harness import _run_analyze

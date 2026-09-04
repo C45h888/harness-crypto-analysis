@@ -2,12 +2,17 @@
 
 Covers the full engine cycle with fakes (no Redis, no Postgres, no litellm):
 
-- Full cycle: wake → gather → gate → narrate#1 → tool round → narrate#2 →
-  artifact persisted (PG-first, Redis after) → memory proposals resolved.
+- Staged cycle: wake → gather → gate → narrate#1 → P1→P5 tool rounds
+  (phase coverage credited from executed tool families) → validated final
+  or repair-then-final → artifact persisted (PG-first, Redis after) →
+  memory proposals resolved. Thin finals are rejected for repair while
+  LLM budget (8 turns, 5 tool rounds) remains.
 - Hard gate: insufficient inputs → NULL interpretation, ZERO LLM calls,
   gate observation remembered deterministically.
-- 2-call budget: narrate#1 + narrate#2 max; narration parse failure →
-  degraded artifact with NULL interpretation and preserved deterministic state.
+- Final validation: P1/P2/P3/P5 tool coverage + H0 + ≥200-char P4
+  explanation + dual-root evidence required; failures recorded honestly.
+- Narration parse failure → degraded artifact with NULL interpretation
+  and preserved deterministic state.
 - Memory proposal resolution: fact-kind rejected, budget enforced, tags
   appended, importance clamped.
 - Runner: no-wake path returns status no_wake without fabricating a cycle.
@@ -48,6 +53,11 @@ class _FakeStore:
 
     async def read_microstructure_status(self, venue, symbol):
         return {"state": self._capture_state, "sequence_gaps": 0, "reconnects": 0}
+
+    async def read_derivative_evidence(self, symbol):
+        # Synthetic (possibly empty) derivatives cache — mirrors the
+        # production null-payload shape so market.derivatives dispatches ok.
+        return {"funding": None, "open_interest": None}
 
     def microstructure_event_stream(self, venue, symbol):
         return f"test:events:{symbol}"
@@ -163,6 +173,48 @@ def _good_narration(with_tools: bool = False) -> str:
     return json.dumps(payload)
 
 
+_STAGED_SUMMARY = (
+    "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the "
+    "P1 verdict holds. Average depth is stable across the window, giving a clean P2 "
+    "observation set with beta positive and moderate explanatory power. Market correlation "
+    "confirms taker flow aligns with the OFI sign, which is why this regime persists now: "
+    "steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402."
+)
+
+
+def _staged_narration(phase: str, tools: list[dict] | None = None, *, final: bool = False) -> str:
+    """One staged-protocol turn: declared phase, substantive summary, H0, triple-root evidence."""
+    evidence = [
+        {"path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+         "value": "0.001", "interpretation": "positive impact", "metric_name": "beta"},
+        {"path": "calc.ofi.intervals → ofi",
+         "value": "12.5", "interpretation": "sustained one-sided flow", "metric_name": "ofi"},
+        {"path": "calc.price.delta → route_a_direct.delta_ticks",
+         "value": "+0.53", "interpretation": "derived move with band", "metric_name": "delta_ticks"},
+    ] if final else []
+    payload: dict[str, Any] = {
+        "phase": "P6" if final else phase,
+        "summary": _STAGED_SUMMARY if final else f"Advancing {phase}: requesting validation tools.",
+        "evidence": evidence,
+        "confidence": "medium" if final else None,
+        "limitations": ["synthetic window"] if final else None,
+        "model_separation": "nu*OFI is heteroskedastic; never merged." if final else None,
+        "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": ["Cont 1011.6402"],
+            "evidence_refs": ["calc.ofi.intervals", "calc.depth.average"],
+        } if final else None,
+        "tool_calls": tools if tools is not None else [],
+        "memory_proposals": [
+            {"kind": "observation",
+             "content": "Beta positive on the 30m window",
+             "importance": 6.0, "tags": ["beta"]},
+        ] if final else [],
+    }
+    return json.dumps(payload)
+
+
 def _engine(*, llm_responses: list[str], capture_state: str = "running") -> tuple[
     InferenceEngine, _FakeStore, _FakePostgres, _FakeMemory,
 ]:
@@ -187,14 +239,29 @@ def _wake():
 
 
 class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_full_cycle_two_calls_with_tool_round(self):
+    async def test_staged_cycle_covers_phases_and_finalizes(self):
         engine, store, postgres, memory = _engine(llm_responses=[
-            _good_narration(with_tools=True),  # narrate#1 (commands a tool)
-            _good_narration(),                 # narrate#2 (final)
+            _staged_narration("P1", tools=[
+                {"name": "calc.ofi.intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "micro.ofi_intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+            ]),
+            _staged_narration("P2", tools=[
+                {"name": "calc.depth.average", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "market.derivatives", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+            ]),
+            _staged_narration("P5", tools=[
+                {"name": "memory.recall_paper", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "calc.price.delta", "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
+            ]),
+            _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 2)
+        self.assertEqual(meta["llm_calls"], 4)
         self.assertTrue(meta["tool_round"])
+        self.assertEqual(meta["repairs"], 0)
+        self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
+        for phase in ("P1", "P2", "P3", "P5", "P6"):
+            self.assertTrue(meta["phase_coverage"][phase], phase)
         self.assertEqual(artifact.status, "provisional")
         self.assertIsNotNone(artifact.interpretation)
         self.assertIn("beta", artifact.interpretation["summary"].lower() or "x")
@@ -221,11 +288,27 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # Deterministic quality observation remembered (engine disposes)
         self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
 
-    async def test_no_tool_round_single_call(self):
-        engine, _s, _p, _m = _engine(llm_responses=[_good_narration()])
+    async def test_thin_final_triggers_repair_then_finalizes(self):
+        # narrate#1 finalizes with zero validation → REJECTED for repair;
+        # the repair turn covers P1/P2/P3, the next covers P5, then final passes.
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _good_narration(),  # thin, no tools → repair
+            _staged_narration("P1", tools=[
+                {"name": "calc.ofi.intervals", "args": {}},
+                {"name": "calc.depth.average", "args": {}},
+                {"name": "market.derivatives", "args": {}},
+            ]),
+            _staged_narration("P5", tools=[
+                {"name": "memory.recall_paper", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "10"}},
+            ]),
+            _staged_narration("P6", final=True),
+        ])
         artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 1)
-        self.assertFalse(meta["tool_round"])
+        self.assertEqual(meta["llm_calls"], 4)
+        self.assertEqual(meta["repairs"], 1)
+        self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
+        self.assertIsNotNone(artifact.interpretation)
 
     async def test_narration_failure_produces_degraded_artifact(self):
         # LLM raises on the first call → degraded artifact, NULL interpretation,
@@ -271,7 +354,13 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             "memory_proposals": [],
         })
         engine, _s, _p, _m = _engine(llm_responses=[
-            narration, _good_narration(),
+            narration,
+            _staged_narration("P3", tools=[
+                {"name": "market.derivatives", "args": {}},
+                {"name": "memory.recall_paper", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "5"}},
+            ]),
+            _staged_narration("P6", final=True),
         ])
         _artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
         # GATHER phase contributes exactly one capture_status dispatch; the
@@ -284,6 +373,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                                    "redis.read_events")
         ]
         self.assertEqual(len(tool_round_entries), 4)  # 1 gather + 3 capped round
+        self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
 
     async def test_budget_limited_narrate2_even_when_tool_called(self):
         # narrate#1 requests tools, narrate#2 output unparseable → fall back
@@ -295,6 +385,9 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 2)
         self.assertIsNotNone(artifact.interpretation)
+        # Parse failure mid-loop falls back without repair: the record is honest.
+        self.assertFalse(meta["final_validation"]["passed"])
+        self.assertEqual(meta["repairs"], 0)
 
 
 class MemoryProposalTests(unittest.TestCase):
@@ -464,6 +557,112 @@ class RunnerOnceTests(unittest.IsolatedAsyncioTestCase):
         src = inspect.getsource(runner.run_inference_once)
         self.assertIn("acquire_manual_wake", src)
         self.assertNotIn("read_pending_wakes", src)
+
+
+class FinalValidationTests(unittest.TestCase):
+    def test_empty_coverage_fails_with_all_phases_missing(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"summary": "x", "evidence": [], "hypothesis": None},
+            {p: set() for p in ("P1", "P2", "P3", "P4", "P5")},
+        )
+        self.assertFalse(passed)
+        self.assertGreaterEqual(len(missing), 4)
+
+    def test_complete_turn_passes(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"phase": "P6",
+             "summary": _STAGED_SUMMARY,
+             "evidence": [
+                 {"path": "deterministic_state.microstructure_evidence.price_impact_fit.beta"},
+                 {"path": "calc.ofi.intervals → ofi"},
+                 {"path": "calc.price.delta → route_a_direct.delta_ticks"},
+             ],
+             "hypothesis": {"H0": "beta > 0"}},
+            {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
+             "P3": {"market.derivatives"}, "P4": set(),
+             "P5": {"calc.price.delta"}, "P6": {"declared"}},
+        )
+        self.assertTrue(passed, missing)
+
+    def test_missing_p6_and_delta_citation_fail(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"summary": _STAGED_SUMMARY,
+             "evidence": [
+                 {"path": "deterministic_state.a"},
+                 {"path": "market.read → last_price"},
+             ],
+             "hypothesis": {"H0": "beta > 0"}},
+            {"P1": {"x"}, "P2": {"x"}, "P3": {"x"}, "P4": set(),
+             "P5": {"x"}, "P6": set()},
+        )
+        self.assertFalse(passed)
+        self.assertTrue(any("P6" in m for m in missing))
+        self.assertTrue(any("calc.price.delta" in m for m in missing))
+
+    def test_deterministic_only_evidence_fails(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"summary": _STAGED_SUMMARY,
+             "evidence": [
+                 {"path": "deterministic_state.a"},
+                 {"path": "deterministic_state.b"},
+             ],
+             "hypothesis": {"H0": "beta > 0"}},
+            {"P1": {"x"}, "P2": {"x"}, "P3": {"x"}, "P4": set(),
+             "P5": {"x"}, "P6": {"declared"}},
+        )
+        self.assertFalse(passed)
+        self.assertTrue(any("fresh tool result" in m for m in missing))
+
+
+class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_error_never_kills_cycle(self):
+        # market.read has no fake backing → error payload, cycle continues;
+        # coverage still completes via the other tools and final passes.
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _staged_narration("P1", tools=[
+                {"name": "market.read", "args": {}},
+                {"name": "calc.ofi.intervals", "args": {}},
+            ]),
+            _staged_narration("P2", tools=[
+                {"name": "calc.depth.average", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "5"}},
+                {"name": "market.derivatives", "args": {}},
+            ]),
+            _staged_narration("P6", final=True),
+        ])
+        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
+        self.assertTrue(any(
+            str(e.get("capability", "")).startswith("tool.error:")
+            for e in artifact.capability_log
+        ))
+        self.assertIsNotNone(artifact.interpretation)
+
+
+class StructuredCallTests(unittest.IsolatedAsyncioTestCase):
+    async def test_output_model_content_serialized(self):
+        from market_service.nooa_harness.engine import NarrationTurn
+
+        class _Structured:
+            async def acall(self, messages, output_model=None, max_tokens=None):
+                class R:
+                    content = NarrationTurn(phase="P5", summary="structured ok")
+                    reasoning = None
+                    raw_response = None
+                return R()
+
+        engine = InferenceEngine(_FakeStore(), _FakePostgres(), None, _Structured(),
+                                 symbol="BTCUSDT", venue="spot")
+        raw = await engine._call_llm("prompt")
+        self.assertIn('"phase": "P5"', raw)
 
 
 if __name__ == "__main__":

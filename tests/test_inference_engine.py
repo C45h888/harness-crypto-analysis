@@ -206,7 +206,7 @@ class CapabilityRegistryTests(unittest.TestCase):
             with self.assertRaises(CapabilityDenied):
                 cap.validate_scope("XRPUSDT", "spot")
             with self.assertRaises(CapabilityDenied):
-                cap.validate_scope("BTCUSDT", "futures")
+                cap.validate_scope("BTCUSDT", "binance-options")
 
     def test_replay_dispatch_ok_and_denied_paths(self):
         payloads = [_synthetic_event_payload(1, "5", 100)]
