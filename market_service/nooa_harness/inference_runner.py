@@ -59,7 +59,12 @@ def _build_memory(settings: Settings):
 async def _build_engine(
     settings: Settings, *, symbol: str, venue: str = "spot",
 ) -> InferenceEngine:
-    """Assemble the engine with its stores, memory, and narration LLM."""
+    """Assemble the engine with its stores, memory, and narration LLM.
+
+    ONE Settings object (already resolved by the caller) is constructed
+    here and injected into the engine — tools never re-read the environment
+    (two-plane boundary pass).
+    """
     store = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
@@ -82,6 +87,7 @@ async def _build_engine(
         symbol=symbol, venue=venue,
         config=WakeConfig(cooldown_seconds=cooldown),
         session_id=session_id,
+        settings=settings,
     )
 
 
