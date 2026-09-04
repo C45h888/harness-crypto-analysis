@@ -3,16 +3,18 @@
 
 Paper: https://arxiv.org/pdf/1011.6402
 Tags: paper, cont1011, ofi, depth_scaling, heteroskedastic
-Session: paper-kb://cont1011 (stable UUID, recallable by agent via memory.recall_paper)
+Session: paper-kb://cont1011 — the UUID is derived through
+``market_service.nooa_harness.memory.paper_kb_session_id()``, the single
+source of truth shared with the engine's ``memory.recall_paper`` tool
+(two-plane boundary pass: no duplicated hash recipe in two places).
 """
 
 import asyncio
-import uuid
 
 from market_service.config import Settings
-from market_service.nooa_harness.memory import MemoryNode
+from market_service.nooa_harness.memory import MemoryNode, paper_kb_session_id
 
-PAPER_SESSION = str(uuid.uuid5(uuid.NAMESPACE_URL, "paper-kb://cont1011"))
+PAPER_SESSION = paper_kb_session_id()
 
 FACTS = [
     ("e_n definition: e_n = 1{PB_n >= PB_{n-1}} qB_n - 1{PB_n <= PB_{n-1}} qB_{n-1} - 1{PA_n <= PA_{n-1}} qA_n + 1{PA_n >= PA_{n-1}} qA_{n-1} — best Level I only, price change OR queue change counts", 9.0, ("paper","cont1011","ofi","e_n")),

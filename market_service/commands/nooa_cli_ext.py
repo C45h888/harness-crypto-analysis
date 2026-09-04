@@ -454,7 +454,11 @@ def micro_interpret(symbol: str, venue: str, evidence_id: str | None) -> None:
                 )
 
             backend = ModelBackendConfig.from_env()
-            from market_service.nooa_harness.agents import MicrostructureInterpretationAgent
+            # Two-plane boundary pass: the microstructure reader was absorbed
+            # from the retired ``agents`` module into the inference engine.
+            from market_service.nooa_harness.engine import (
+                MicrostructureInterpretationAgent,
+            )
 
             agent = MicrostructureInterpretationAgent(symbol, llm=backend.build_llm())
             run_id = str(evidence.get("evidence_id") or _uuid.uuid4())

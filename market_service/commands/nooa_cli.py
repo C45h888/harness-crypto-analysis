@@ -18,9 +18,9 @@ One mount point covers every runtime surface:
                              --nooa market envelope SOLUSDT --latest
 
 The ``market`` group reads/writes canonical state through the python objects
-in ``market_service/nooa_harness/`` (agents / suite / runner / memory) — one
-reasoning layer over the deterministic pipeline, never a second collection
-pipeline.
+in ``market_service/nooa_harness/`` (engine / runner / memory + the
+``pipeline_*`` planes) — one reasoning layer over the deterministic
+pipeline, never a second collection pipeline.
 """
 
 from __future__ import annotations

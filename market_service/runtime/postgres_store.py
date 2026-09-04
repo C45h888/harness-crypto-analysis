@@ -736,6 +736,65 @@ class PostgresRuntimeStore:
             result["generated_at"] = result["generated_at"].isoformat()
         return result
 
+    @staticmethod
+    def _parse_artifact_row(row: Any) -> dict[str, Any]:
+        """Parse one inference_artifact row into a JSON-safe dict."""
+        result = dict(row)
+        for col in ("deterministic_state", "capability_log", "errors",
+                    "hypothesis", "calculations"):
+            value = result.get(col)
+            if isinstance(value, str):
+                try:
+                    result[col] = json.loads(value)
+                except (ValueError, json.JSONDecodeError):
+                    result[col] = {} if col in ("deterministic_state", "hypothesis", "calculations") else []
+        interp = result.get("interpretation")
+        if isinstance(interp, str):
+            try:
+                result["interpretation"] = json.loads(interp)
+            except (ValueError, json.JSONDecodeError):
+                result["interpretation"] = None
+        if hasattr(result.get("generated_at"), "isoformat"):
+            result["generated_at"] = result["generated_at"].isoformat()
+        if hasattr(result.get("completed_at"), "isoformat"):
+            result["completed_at"] = result["completed_at"].isoformat()
+        return result
+
+    async def read_recent_inference_artifacts(
+        self, symbol: str, *, venue: str | None = None, limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Durable read: recent FULL artifacts (with deterministic_state).
+
+        Unlike ``read_inference_history`` (headline columns only), this
+        returns the complete rows newest-first so deterministic consumers
+        (e.g. prior block fits for depth scaling) can reuse them. Used by
+        the inference tool base; empty list on no rows.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        if venue is not None:
+            rows = await self.pool.fetch(
+                "SELECT deterministic_state, interpretation, status, artifact_id,"
+                " symbol, venue, generated_at, completed_at, input_hash, model_version,"
+                " window_minutes, interval_seconds, capability_log, session_id, errors,"
+                " hypothesis, hypothesis_verdict, verdict_reason, calculations"
+                " FROM inference_artifact WHERE symbol = $1 AND venue = $2"
+                " ORDER BY generated_at DESC LIMIT $3",
+                symbol.upper(), venue, limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT deterministic_state, interpretation, status, artifact_id,"
+                " symbol, venue, generated_at, completed_at, input_hash, model_version,"
+                " window_minutes, interval_seconds, capability_log, session_id, errors,"
+                " hypothesis, hypothesis_verdict, verdict_reason, calculations"
+                " FROM inference_artifact WHERE symbol = $1"
+                " ORDER BY generated_at DESC LIMIT $2",
+                symbol.upper(), limit,
+            )
+        return [self._parse_artifact_row(row) for row in rows]
+
     async def read_inference_history(
         self, symbol: str, limit: int = 50,
     ) -> list[dict[str, Any]]:

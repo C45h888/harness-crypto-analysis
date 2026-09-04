@@ -531,7 +531,7 @@ async def _refresh_derivatives(args: argparse.Namespace) -> dict[str, Any]:
     ``--analyze`` cycles can reuse the cache within ``--deriv-ttl`` seconds.
     """
     from market_service.clients.binance import Binance
-    from market_service.nooa_harness.pipeline import fetch_derivative_evidence
+    from market_service.nooa_harness.pipeline_interpretation import fetch_derivative_evidence
 
     settings = Settings.from_redis_env()
     symbol = args.symbol.upper()
@@ -579,7 +579,9 @@ async def _run_analyze(args: argparse.Namespace) -> dict[str, Any]:
     result, derivatives cache status, and either the full envelope or the
     compact envelope_summary (per ``--envelope-summary``).
     """
-    from market_service.nooa_harness.pipeline import WINDOW_MINUTES_MAP, run_cycle
+    from market_service.nooa_harness.pipeline_interpretation import (
+        WINDOW_MINUTES_MAP, run_cycle,
+    )
 
     # Postgres is only required when we actually persist. Redis-only.
     settings = Settings.from_env() if not args.no_persist else Settings.from_redis_env()
@@ -646,7 +648,7 @@ async def _run_groups(args: argparse.Namespace, groups: tuple[str, ...]) -> dict
     read interface for targeted analysis; ``--analyze`` remains for the
     canonical persisted audit record.
     """
-    from market_service.nooa_harness.pipeline import (
+    from market_service.nooa_harness.pipeline_interpretation import (
         WINDOW_MINUTES_MAP, run_group_cycle,
     )
 
@@ -681,6 +683,14 @@ async def _run_groups(args: argparse.Namespace, groups: tuple[str, ...]) -> dict
         "groups": list(groups),
         "window_minutes": window_minutes,
         "run_id": run_ids[0] if len(run_ids) == 1 else run_ids,
+        # Substrate attribution: section id → owning calculation substrate(s),
+        # merged across the requested groups. The interpretation plane uses it
+        # to explain which substrate produced each section in the envelopes.
+        "substrate_provenance": {
+            sec: tuple(prov)
+            for d in envelope_dicts.values()
+            for sec, prov in (d.get("substrate_provenance") or {}).items()
+        },
         "group_envelopes": envelope_dicts,
         # Back-compat view of the per-group sections (superseded by
         # group_envelopes; kept so existing readers don't break).
