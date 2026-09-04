@@ -11,9 +11,37 @@ input dict (the collector/analysis shape), and ``demand_verdict`` +
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
-from market_service.calculations.flow import summarize
+# Substrate-composition port: the analysis layer consumes calculation OUTPUT
+# via an injected provider — it never imports a calculation module at module
+# scope. The ``flow_provider`` is ``(trades, book) -> flow summary dict``. The
+# orchestrator (nooa_harness) injects the canonical ``summarize`` binding;
+# standalone callers fall back to the lazy canonical binding below.
+FlowSummaryFn = Callable[[list, dict | None], dict]
+
+_DEFAULT_FLOW_SUMMARY: FlowSummaryFn | None = None
+
+
+def bind_flow_summary(fn: FlowSummaryFn | None) -> None:
+    """Bind the canonical flow-summary provider (orchestrator seam)."""
+    global _DEFAULT_FLOW_SUMMARY
+    _DEFAULT_FLOW_SUMMARY = fn
+
+
+def _default_flow_summary() -> FlowSummaryFn:
+    """Resolve the canonical flow provider for standalone callers.
+
+    Lazy import so this analysis module touches the calculation layer only at
+    call time, never at module scope (keeps the analysis layer import-pure
+    with respect to calculations). Resolves to the ``tape`` substrate's
+    ``summarize``.
+    """
+    if _DEFAULT_FLOW_SUMMARY is not None:
+        return _DEFAULT_FLOW_SUMMARY
+    from market_service.calculations.substrates.tape import summarize
+    return summarize
 
 
 def _ls_row(value: Any) -> Any:
@@ -33,7 +61,7 @@ def _funding_rate(fut: dict) -> float | None:
     return None
 
 
-def decompose_demand(d: dict) -> dict:
+def decompose_demand(d: dict, *, flow_provider: FlowSummaryFn | None = None) -> dict:
     """Spot-vs-leverage decomposition of one combined pull.
 
     Expected ``d`` shape:
@@ -42,9 +70,13 @@ def decompose_demand(d: dict) -> dict:
                 global_ls, top_ls, taker_buy_sell, ticker_24h}
       latency_ms: float
     Legacy source: demand_diagnostic.decompose_demand.
+
+    ``flow_provider`` is ``(trades, book) -> summarize() output``; when omitted
+    the canonical ``tape`` substrate's ``summarize`` is used (standalone path).
     """
-    spot_flow = summarize(d["spot"]["trades"], d["spot"]["book"])
-    fut_flow = summarize(d["futures"]["trades"], d["futures"]["book"])
+    provider = flow_provider or _default_flow_summary()
+    spot_flow = provider(d["spot"]["trades"], d["spot"]["book"])
+    fut_flow = provider(d["futures"]["trades"], d["futures"]["book"])
 
     def _split_large(trades):
         buy = sell = 0.0

@@ -1,6 +1,13 @@
 """
 Combined Binance + CryptoQuant market analysis.
 
+COMPOSITION ROOT: this module is the standalone product analyzer/CLI
+(the runtime counterpart of ``nooa_harness.bedrock``). It is the one place
+in the analysis layer that legitimately imports calculation functions — it
+assembles a full snapshot from raw evidence, which is orchestration, not
+analysis-internal logic. New analysis modules must NOT follow this pattern;
+they consume calculation output via injected providers.
+
 Pulls spot + USD-M futures order flow on the same symbol via the official
 Binance SDKs, computes orderflow metrics, correlates the two venues, and
 threads in CryptoQuant on-chain metric descriptions from the MCP.
@@ -27,12 +34,12 @@ import sys
 import time
 from typing import Any
 
-from market_service.clients.binance import Binance, normalize_fut_trade, normalize_spot_trade
-from market_service.calculations.flow import bucketed_cvd, cvd_series_corr, summarize
-from market_service.calculations.signals import deterministic_signals
-from market_service.analysis.oi import analyze_open_interest
 from market_service.analysis.liquidations import analyze_liquidation_pressure
 from market_service.analysis.macro import analyze_macro
+from market_service.analysis.oi import analyze_open_interest
+from market_service.calculations.substrates.signals import deterministic_signals
+from market_service.calculations.substrates.tape import bucketed_cvd, cvd_series_corr, summarize
+from market_service.clients.binance import Binance, normalize_fut_trade, normalize_spot_trade
 
 log = logging.getLogger(__name__)
 

@@ -377,6 +377,89 @@ def fit_depth_scaling(
         return _make(c, lam, stderr_lambda, r2, n, status)
 
 
+def derive_price_delta(
+    price_fit: PriceImpactFit,
+    *,
+    ofi: Decimal,
+    tick_size: Decimal,
+    depth_fit: DepthScalingFit | None = None,
+    average_depth: Decimal | None = None,
+) -> dict[str, Any]:
+    """Derive ΔP (ticks + quote) from FITTED models for one OFI value — pure.
+
+    Route A (direct, primary): ΔP = α + β·OFI with ±1.96·SE_β·|OFI| 95% band.
+    Route B (depth-scaled): ΔP = α + (c·AD^−λ)·OFI, only when ``depth_fit``
+    is validated/provisional with non-null c/λ and a positive AD.
+    Raises ValueError on a gate-failed (``insufficient``) price fit —
+    deriving from one would be fabrication. The ν·OFI heteroskedastic
+    caveat is reported, never resolved: bands widen with |OFI|.
+    """
+    if price_fit.status not in ("validated", "provisional"):
+        raise ValueError(
+            f"cannot derive ΔP from {price_fit.status} price fit {price_fit.fit_id}"
+        )
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive")
+    with localcontext() as ctx:
+        ctx.prec = PRECISION
+        delta_a = price_fit.alpha + price_fit.beta * ofi
+        band_a = (
+            Decimal("1.96") * price_fit.stderr_beta * abs(ofi)
+            if price_fit.stderr_beta is not None else None
+        )
+        route_a = {
+            "delta_ticks": str(delta_a),
+            "delta_quote": str(delta_a * tick_size),
+            "band_95_ticks": str(band_a) if band_a is not None else None,
+            "alpha": str(price_fit.alpha),
+            "beta": str(price_fit.beta),
+            "stderr_beta": (str(price_fit.stderr_beta)
+                              if price_fit.stderr_beta is not None else None),
+            "fit_id": price_fit.fit_id,
+            "fit_status": price_fit.status,
+            "r2": str(price_fit.r2) if price_fit.r2 is not None else None,
+            "n_observations": price_fit.n_observations,
+        }
+        route_b: dict[str, Any] = {
+            "status": "unavailable",
+            "reason": "depth scaling is "
+                        f"{(depth_fit.status if depth_fit else 'missing')}",
+        }
+        agreement: str | None = None
+        if (depth_fit is not None
+                and depth_fit.status in ("validated", "provisional")
+                and depth_fit.c is not None
+                and depth_fit.lambda_ is not None):
+            ad = average_depth
+            if ad is not None and ad > 0 and depth_fit.c > 0:
+                beta_implied = depth_fit.c * (-depth_fit.lambda_ * ad.ln()).exp()
+                delta_b = price_fit.alpha + beta_implied * ofi
+                agreement = str(abs(delta_a - delta_b))
+                route_b = {
+                    "status": "derived_ok",
+                    "delta_ticks": str(delta_b),
+                    "delta_quote": str(delta_b * tick_size),
+                    "beta_implied": str(beta_implied),
+                    "c": str(depth_fit.c),
+                    "lambda": str(depth_fit.lambda_),
+                    "ad": str(ad),
+                    "fit_id": depth_fit.fit_id,
+                    "fit_status": depth_fit.status,
+                    "n_blocks": depth_fit.n_blocks,
+                }
+            else:
+                route_b = {
+                    "status": "unavailable",
+                    "reason": "non-positive c or AD: log-log undefined",
+                }
+    return {
+        "route_a_direct": route_a,
+        "route_b_depth_scaled": route_b,
+        "agreement_ticks": agreement,
+        "heteroskedasticity_flag": price_fit.heteroskedasticity_flag,
+    }
+
+
 def assemble_evidence(
     intervals: list[OFIInterval],
     *,

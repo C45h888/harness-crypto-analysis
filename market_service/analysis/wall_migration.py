@@ -7,12 +7,17 @@ scorecard — are extracted as pure functions. All price levels are parameters
 (no hardcoded SOL session prices).
 
 Boards are lists of ``(price, qty)`` pairs.
+
+Analysis-only: the tier / round-anchor primitives that used to live here were
+decomposed DOWN into the calculation substrate layer
+(``calculations.substrates.tiers`` / ``.anchors``) where they always belonged;
+this module re-exports them at the bottom as a DEPRECATED compat seam for
+historical import paths (same pattern as ``market_service/signals.py``).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 
 def depth_qty(levels: Iterable[Sequence[float]], lo: float, hi: float) -> float:
@@ -252,191 +257,15 @@ def keystone_holds_scorecard(bid_ask_qty_ratio: float, latest_tbr: float,
 
 
 # ---------------------------------------------------------------------------
-# Tier counts and round-number anchors
-# ---------------------------------------------------------------------------
-
-# Tier thresholds lifted from legacy institutional_buyers.py:100-108.
-# Mega: institutional-sized; Large: notable size; Medium: standard; Small: thin.
-#
-# Phase 1.2: these are kept as a DEPRECATED raw-qty fallback for the
-# legacy function ``compute_bid_tiers``. New code MUST use
-# ``TierConfig`` (USD-notional buckets) via ``compute_bid_tiers_usd``
-# so thresholds are price-aware: 200 SOL ≈ $30k vs 200 BTC ≈ $13M are
-# not equivalent.
-_BID_TIER_THRESHOLDS: tuple[tuple[str, float, float | None], ...] = (
-    ("mega",   5000.0, None),      # qty >= 5000
-    ("large",  1000.0, 5000.0),    # 1000 <= qty < 5000
-    ("medium", 200.0, 1000.0),     # 200 <= qty < 1000
-    ("small",  None,  200.0),      # qty < 200
-)
-
-
-@dataclass(frozen=True)
-class TierConfig:
-    """USD-notional bucket thresholds for bid / ask tier classification.
-
-    Defaults are tuned for the deep-mid-cap crypto order book (SOL, ETH,
-    majors at retail venues): a $250k notional mega bid is roughly an
-    institutional print; $50k large; $10k medium; anything below is
-    thin. Callers can override per-instrument.
-
-    The thresholds are USD-denominated so they generalize across price
-    regimes — 200 BTC at $65k is $13M (mega) while 200 SOL at $150 is
-    $30k (small). The legacy raw-qty tiers (``_BID_TIER_THRESHOLDS``)
-    conflated these into a single ladder and were hardcoded for one SOL
-    session; they remain only for backwards compatibility in the
-    ``compute_bid_tiers`` wrapper.
-    """
-
-    mega_usd: float = 250_000.0
-    large_usd: float = 50_000.0
-    medium_usd: float = 10_000.0
-    # Tier ordering is fixed: mega > large > medium > small. Anything
-    # below medium_usd falls into ``small`` by exclusion.
-
-    def thresholds(self) -> tuple[tuple[str, float, float | None], ...]:
-        """Materialize the (name, lo_usd, hi_usd) ladder used by the engine.
-
-        ``lo`` is inclusive; ``hi`` is exclusive (None for the top tier).
-        Returns the same shape as ``_BID_TIER_THRESHOLDS`` so the engine
-        is identical between the legacy and USD-aware paths.
-        """
-        return (
-            ("mega",   self.mega_usd, None),
-            ("large",  self.large_usd, self.mega_usd),
-            ("medium", self.medium_usd, self.large_usd),
-            ("small",  None, self.medium_usd),
-        )
-
-    def to_dict(self) -> dict[str, float]:
-        return {
-            "mega_usd": self.mega_usd,
-            "large_usd": self.large_usd,
-            "medium_usd": self.medium_usd,
-        }
-
-
-def _bid_tiers_impl(
-    bids: list[list[float]] | list[tuple[float, float]],
-    thresholds: tuple[tuple[str, float, float | None], ...],
-) -> dict[str, Any]:
-    """Shared engine for the legacy (raw qty) and USD-aware paths."""
-    total_qty = 0.0
-    total_notional = 0.0
-    tier_qty: dict[str, float] = {name: 0.0 for name, _, _ in thresholds}
-    tier_count: dict[str, int] = {name: 0 for name, _, _ in thresholds}
-    tier_notional: dict[str, float] = {name: 0.0 for name, _, _ in thresholds}
-
-    for row in bids:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        try:
-            p, q = float(row[0]), float(row[1])
-        except (TypeError, ValueError):
-            continue
-        if q <= 0 or p <= 0:
-            continue
-        notional = p * q
-        total_qty += q
-        total_notional += notional
-        for name, lo, hi in thresholds:
-            in_lo = (lo is None) or (notional >= lo)
-            in_hi = (hi is None) or (notional < hi)
-            if in_lo and in_hi:
-                tier_qty[name] += q
-                tier_count[name] += 1
-                tier_notional[name] += notional
-                break
-
-    out: dict[str, Any] = {
-        "total_qty": total_qty,
-        "total_notional": total_notional,
-    }
-    for name, _, _ in thresholds:
-        out[name] = {
-            "count": tier_count[name],
-            "qty": tier_qty[name],
-            "notional": tier_notional[name],
-            "pct": (tier_qty[name] / total_qty * 100.0) if total_qty > 0 else 0.0,
-        }
-    return out
-
-
-def compute_bid_tiers_usd(
-    bids: list[list[float]] | list[tuple[float, float]],
-    tier_config: TierConfig | None = None,
-) -> dict[str, Any]:
-    """Bucket bids into mega/large/medium/small tiers by USD notional.
-
-    Returns per-tier ``{count, qty, notional, pct}`` plus ``total_qty``
-    and ``total_notional``. ``pct`` is the tier's qty share of total
-    bid qty, in %.
-
-    This is the price-aware replacement for ``compute_bid_tiers``: the
-    legacy function used raw qty thresholds that were correct for one
-    SOL session and wrong for everything else. ``tier_config`` carries
-    the USD thresholds; default ``TierConfig()`` matches the
-    ``institutional_buyers`` legacy for SOL-scale venues.
-    """
-    cfg = tier_config or TierConfig()
-    out = _bid_tiers_impl(bids, cfg.thresholds())
-    out["tier_config"] = cfg.to_dict()
-    return out
-
-
-def compute_bid_tiers(bids: list[list[float]] | list[tuple[float, float]]) -> dict[str, Any]:
-    """Bucket bids into mega/large/medium/small tiers.
-
-    Returns per-tier ``{count, qty, notional, pct}`` plus ``total_qty``.
-    ``pct`` is the tier's qty share of total bid qty, in %.
-
-    Legacy source: institutional_buyers.py:100-108 (the size-tier discriminator).
-    A bid row that does not parse falls into the small tier (defensive default).
-    """
-    total_qty = 0.0
-    tier_qty: dict[str, float] = {name: 0.0 for name, _, _ in _BID_TIER_THRESHOLDS}
-    tier_count: dict[str, int] = {name: 0 for name, _, _ in _BID_TIER_THRESHOLDS}
-    tier_notional: dict[str, float] = {name: 0.0 for name, _, _ in _BID_TIER_THRESHOLDS}
-
-    for row in bids:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        try:
-            p, q = float(row[0]), float(row[1])
-        except (TypeError, ValueError):
-            continue
-        if q <= 0:
-            continue
-        total_qty += q
-        for name, lo, hi in _BID_TIER_THRESHOLDS:
-            in_lo = (lo is None) or (q >= lo)
-            in_hi = (hi is None) or (q < hi)
-            if in_lo and in_hi:
-                tier_qty[name] += q
-                tier_count[name] += 1
-                tier_notional[name] += p * q
-                break
-
-    out: dict[str, Any] = {"total_qty": total_qty}
-    for name, _, _ in _BID_TIER_THRESHOLDS:
-        out[name] = {
-            "count": tier_count[name],
-            "qty": tier_qty[name],
-            "notional": tier_notional[name],
-            "pct": (tier_qty[name] / total_qty * 100.0) if total_qty > 0 else 0.0,
-        }
-    return out
-
-
 # Phase 1.3: ATR-aware wall-band defaults.
 #
 # The legacy SOL-session defaults (``price * 0.97``, ``price * 1.03``,
 # ``price * 1.01``) were hardcoded 3%/1% bands. For instruments with
-# higher or lower volatility those bands are wrong: a 3% band on a
-# $0.01 micro-cap is enormous, and a 3% band on a $100k BTC 4h range
-# is tiny. ``default_wall_band`` scales the band widths with the
-# instrument's recent volatility (``atr_pct``) so the wall / path
-# absorption adapters use bands that match the actual trading range.
+# higher or lower volatility those bands are wrong. ``default_wall_band``
+# scales the band widths with the instrument's recent volatility
+# (``atr_pct``) so the wall / path absorption adapters use bands that match
+# the actual trading range.
+# ---------------------------------------------------------------------------
 
 _DEFAULT_BAND_FLOOR_BPS = 30     # 0.30% minimum floor band
 _DEFAULT_BAND_CEILING_BPS = 100  # 1.00% baseline ceiling band
@@ -519,232 +348,48 @@ def default_wall_band(
         "scaling_source": scaling_source,
         "atr_pct": atr_pct,
     }
-_ROUND_ANCHORS: tuple[tuple[str, float], ...] = (
-    ("anchor_75_00", 75.00),
-    ("anchor_74_50", 74.50),
-    ("anchor_75_10", 75.10),
-    ("anchor_74_80", 74.80),
-    ("anchor_75_50", 75.50),
-    ("anchor_74_00", 74.00),
-    ("anchor_75_25", 75.25),
-    ("anchor_75_20", 75.20),
-    ("anchor_74_20", 74.20),
-    ("anchor_74_30", 74.30),
-    ("anchor_73_50", 73.50),
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED re-export seam — tier / anchor primitives were decomposed DOWN
+# into the calculation substrate layer (calculations.substrates.tiers and
+# .anchors). This block exists ONLY so historical import paths
+# (``analysis.wall_migration.TierConfig`` etc.) keep working; new code must
+# import from the substrate package. Same pattern as market_service/signals.py.
+# ---------------------------------------------------------------------------
+
+from market_service.calculations.substrates.anchors import (  # noqa: F401
+    _ROUND_ANCHOR_TOL,
+    _ROUND_ANCHORS,
+    compute_round_anchors,
 )
-_ROUND_ANCHOR_TOL = 0.02
+from market_service.calculations.substrates.tiers import (  # noqa: F401
+    _BID_TIER_THRESHOLDS,
+    TierConfig,
+    _bid_tiers_impl,
+    bid_tier_balance,
+    compute_bid_tiers,
+    compute_bid_tiers_usd,
+    mega_at_keystone,
+)
 
-
-# Round-number anchors (legacy institutional_buyers.py:35). Institutional
-# buyers tend to anchor bids at psychologically round prices; scanning those
-# levels surfaces whether smart-money is concentrated around the marker.
-#
-# Phase 1.1: ``_ROUND_ANCHORS`` is DEPRECATED. The hardcoded SOL-specific
-# levels (74.00..75.50) were never correct for any other instrument.
-# New code MUST use ``derive_round_anchors`` in
-# ``calculations/orderbook.py`` to generate the anchor list from the
-# current price + tick size. This tuple is kept as a fallback when the
-# caller does not pass anchors and no price is available.
-
-
-def compute_round_anchors(
-    bids: list[list[float]] | list[tuple[float, float]],
-    anchors: Sequence[dict] | None = None,
-    tol: float = _ROUND_ANCHOR_TOL,
-) -> dict[str, Any]:
-    """Aggregate bid qty at each round-number anchor.
-
-    Returns ``{count, total_qty, anchors: [{name, level, qty, notional}]}``.
-    A bid within ±``tol`` of a level counts for that level. Bids can match
-    multiple levels (overlapping round numbers both increment) — same logic
-    as legacy institutional_buyers.py:39-46.
-
-    ``anchors`` is the dynamic anchor list produced by
-    ``calculations.orderbook.derive_round_anchors``. When omitted, the
-    legacy hardcoded SOL list is used as a fallback (DEPRECATED — new
-    callers must always pass anchors derived from the current price).
-    """
-    parsed: list[tuple[float, float, float]] = []  # (price, qty, notional)
-    for row in bids:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        try:
-            p, q = float(row[0]), float(row[1])
-        except (TypeError, ValueError):
-            continue
-        if q <= 0:
-            continue
-        parsed.append((p, q, p * q))
-
-    if anchors:
-        anchor_specs = [
-            (a.get("name") or f"anchor_{a.get('level'):.4f}",
-             float(a["level"]),
-             float(a.get("lo", a["level"] - tol)),
-             float(a.get("hi", a["level"] + tol)))
-            for a in anchors if isinstance(a, dict) and "level" in a
-        ]
-    else:
-        anchor_specs = [
-            (name, level, level - tol, level + tol)
-            for name, level in _ROUND_ANCHORS
-        ]
-
-    out_anchors: list[dict[str, Any]] = []
-    total_qty = 0.0
-    for name, level, lo, hi in anchor_specs:
-        qty = sum(q for p, q, _ in parsed if lo <= p <= hi)
-        notional = sum(n for p, _, n in parsed if lo <= p <= hi)
-        out_anchors.append({
-            "name": name,
-            "level": level,
-            "lo": lo,
-            "hi": hi,
-            "qty": qty,
-            "notional": notional,
-        })
-        total_qty += qty
-
-    return {
-        "count": len(out_anchors),
-        "total_qty": total_qty,
-        "anchors": out_anchors,
-        "anchor_source": "dynamic" if anchors else "legacy_fallback",
-        "tol": tol,
-    }
-
-
-def bid_tier_balance(
-    bids: list[list[float]] | list[tuple[float, float]],
-    asks: list[list[float]] | list[tuple[float, float]],
-    mega_threshold: float | None = None,
-    bias_threshold: float = 1.2,
-    tier_config: TierConfig | None = None,
-) -> dict[str, Any]:
-    """Compare mega-tier bid qty vs mega-tier ask qty.
-
-    Returns ``{mega_bids, mega_asks, delta, ratio, verdict, total_bids, total_asks}``.
-    ``verdict`` is INSTITUTIONAL-BID-HEAVY / -ASK-HEAVY / BALANCED based on a
-    20% bias threshold (configurable via ``bias_threshold``). When one side is
-    empty the ratio is None and the verdict is BALANCED unless the other side
-    dominates absolutely (5x).
-
-    Mega-tier classification is by USD notional when ``tier_config`` is
-    provided (price-aware: a 5 BTC bid at $65k is mega, a 5 SOL bid at
-    $150 is small). When omitted, ``mega_threshold`` defaults to the
-    legacy raw-qty value of 5000 for backwards compatibility; new
-    callers should pass a ``TierConfig``.
-
-    Legacy source: institutional_buyers.py:167-171 (institutional bid vs ask balance).
-    """
-    def _pairs(rows):
-        out = []
-        for row in rows or []:
-            if not isinstance(row, (list, tuple)) or len(row) < 2:
-                continue
-            try:
-                out.append((float(row[0]), float(row[1])))
-            except (TypeError, ValueError):
-                continue
-        return out
-
-    bids_p = _pairs(bids)
-    asks_p = _pairs(asks)
-
-    if tier_config is not None:
-        mega_usd = tier_config.mega_usd
-        threshold_used_usd = mega_usd
-        legacy_qty = None
-        mega_bids = sum(q for p, q in bids_p if p * q >= mega_usd)
-        mega_asks = sum(q for p, q in asks_p if p * q >= mega_usd)
-    else:
-        legacy_qty = 5000.0 if mega_threshold is None else float(mega_threshold)
-        mega_bids = sum(q for _, q in bids_p if q >= legacy_qty)
-        mega_asks = sum(q for _, q in asks_p if q >= legacy_qty)
-        threshold_used_usd = None
-
-    delta = mega_bids - mega_asks
-    if legacy_qty is not None:
-        one_sided_threshold = legacy_qty
-    else:
-        one_sided_threshold = float("inf")  # USD path is always bidirectional
-
-    ratio = (mega_bids / mega_asks) if mega_asks > 0 else (None if mega_bids == 0 else float("inf"))
-    if mega_asks == 0 and mega_bids > 0:
-        verdict = "INSTITUTIONAL-BID-HEAVY"
-    elif mega_bids == 0 and mega_asks > 0:
-        verdict = "INSTITUTIONAL-ASK-HEAVY"
-    elif ratio is None:
-        verdict = "BALANCED"
-    elif ratio > bias_threshold:
-        verdict = "INSTITUTIONAL-BID-HEAVY"
-    elif ratio < 1.0 / bias_threshold:
-        verdict = "INSTITUTIONAL-ASK-HEAVY"
-    else:
-        verdict = "BALANCED"
-    return {
-        "mega_threshold": legacy_qty,
-        "mega_threshold_usd": threshold_used_usd,
-        "mega_bids": mega_bids,
-        "mega_asks": mega_asks,
-        "delta": delta,
-        "ratio": ratio,
-        "verdict": verdict,
-        "total_bids": sum(q for _, q in bids_p),
-        "total_asks": sum(q for _, q in asks_p),
-        "one_sided_threshold": one_sided_threshold,
-    }
-
-
-def mega_at_keystone(
-    bids: list[list[float]] | list[tuple[float, float]],
-    keystone_price: float,
-    threshold: float | None = None,
-    tol: float = 0.10,
-    tier_config: TierConfig | None = None,
-) -> dict[str, Any]:
-    """Mega-tier bid qty within ``±tol`` of the keystone price.
-
-    Returns ``{keystone_price, threshold, threshold_usd, tol, count, qty, notional, levels}``.
-    A bid is included when both (a) it sits within ``keystone_price ± tol`` and
-    (b) its classification meets the mega threshold. With ``tier_config``
-    the classification is USD-notional-based (price-aware); without it
-    the legacy raw-qty threshold of 5000 is used for backwards
-    compatibility. The level list preserves price + qty so briefings
-    can show the institutional bid stack around the keystone.
-
-    Legacy source: institutional_buyers.py:129 (mega bids at the 75.00 zone).
-    """
-    if tol < 0:
-        raise ValueError("tol must be non-negative")
-    lo = keystone_price - tol
-    hi = keystone_price + tol
-    parsed: list[tuple[float, float]] = []
-    for row in bids or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        try:
-            p, q = float(row[0]), float(row[1])
-        except (TypeError, ValueError):
-            continue
-        if not (lo <= p <= hi):
-            continue
-        if tier_config is not None:
-            if p * q < tier_config.mega_usd:
-                continue
-        else:
-            legacy_qty = 5000.0 if threshold is None else float(threshold)
-            if q < legacy_qty:
-                continue
-        parsed.append((p, q))
-    parsed.sort(key=lambda x: x[0])
-    return {
-        "keystone_price": keystone_price,
-        "threshold": threshold,
-        "threshold_usd": tier_config.mega_usd if tier_config is not None else None,
-        "tol": tol,
-        "count": len(parsed),
-        "qty": sum(q for _, q in parsed),
-        "notional": sum(p * q for p, q in parsed),
-        "levels": [{"price": p, "qty": q} for p, q in parsed],
-    }
+# __all__ includes the DEPRECATED tier/anchor re-exports (owned by
+# calculations.substrates.tiers / .anchors) for historical import paths.
+__all__ = [
+    "TierConfig",
+    "bid_tier_balance",
+    "compute_bid_tiers",
+    "compute_bid_tiers_usd",
+    "compute_round_anchors",
+    "default_wall_band",
+    "densest_clusters",
+    "depth_qty",
+    "depth_qty_at",
+    "fuel_ratio",
+    "keystone_holds_scorecard",
+    "keystone_wall_balance",
+    "level_absorption",
+    "mega_at_keystone",
+    "wall_delta",
+    "wall_trap_assessment",
+]
