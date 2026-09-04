@@ -801,10 +801,14 @@ class WakeSupervisorConfig:
 
     @classmethod
     def from_env(cls, symbol: str | None = None) -> WakeSupervisorConfig:
-        symbol = (symbol or os.getenv("MICROSTRUCTURE_SYMBOL") or "BTCUSDT").upper()
+        symbol = (symbol or os.getenv("MICROSTRUCTURE_SYMBOL") or "SOLUSDT").upper()
+        # Venue: MICROSTRUCTURE_VENUE (futures perps) is canonical, WAKE_VENUE legacy alias
+        raw_venue = (os.getenv("MICROSTRUCTURE_VENUE") or os.getenv("WAKE_VENUE") or "futures").lower().strip()
+        if raw_venue in ("perps", "perp", "usdm"):
+            raw_venue = "futures"
         return cls(
             symbol=symbol,
-            venue=str(os.getenv("WAKE_VENUE") or "spot"),
+            venue=str(raw_venue),
             read_block_ms=int(os.getenv("WAKE_READ_BLOCK_MS") or READ_BLOCK_MS),
             tick_reset_ms=int(os.getenv("WAKE_TICK_RESET_MS") or TICK_RESET_MS),
             supervisor_ms=int(os.getenv("WAKE_SUPERVISOR_MS") or SUPERVISOR_MS),

@@ -48,8 +48,6 @@ from market_service.runtime.redis_store import RedisRuntimeStore
 log = logging.getLogger(__name__)
 
 SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
-# Perps alias normalization — SOL-USDT perps requested as primary
-VENUE_ALIASES = {"perps": "perps", "perp": "perps", "usdm": "perps", "futures": "perps", "spot": "spot"}
 
 # Narration token budget — agentic loop, not controlled generator.
 # Muse Spark 1.2 contributor is mandatory-reasoning with 1_048_576 context;
@@ -600,7 +598,7 @@ class InferenceEngine:
             "ofi_blocks": ofi_blocks[:5] if isinstance(ofi_blocks, list) else ofi_blocks,
             "ad_blocks": ad_result,
             "observations_preview": obs_preview[:5] if isinstance(obs_preview, list) else obs_preview,
-            "derived_diagnostic": derived_diag,  # ΔP = α + c·OFI/AD^λ + (ν·OFI+ε) — diagnostic only, heteroskedastic
+            "derived_diagnostic": derived_diag,
             "split_note": "AD and OFI called as separate tools; final DeltaP is derived hypothesis, not shortcut — per Cont 1011.6402"
         }
         deterministic_state: dict[str, Any] = {
@@ -800,9 +798,7 @@ class InferenceEngine:
             "model_separation": parsed_final.get("model_separation"),
         }
         # If still null after forced final, fall back to first round's interpretation
-        # so we don't persist a null artifact when gate was provisional.
         if interpretation["summary"] is None and parsed_1.get("summary") is not None:
-            log.warning("agentic FINAL still null, falling back to round-0 interpretation")
             interpretation = {
                 "summary": parsed_1.get("summary"),
                 "evidence": parsed_1.get("evidence"),
@@ -811,23 +807,18 @@ class InferenceEngine:
                 "model_separation": parsed_1.get("model_separation"),
             }
             parsed_final = parsed_1
-
-        # Pass C: hypothesis formed by agent via memory.recall_paper + calc.* tools,
-        # final calculation is validation/invalidation of that hypothesis.
-        # The combined ΔP = α + c·OFI/AD^λ + (ν·OFI+ε) stays DERIVED diagnostic.
+        # Pass C: hypothesis formed via memory.recall_paper + calc.* tools,
+        # final DeltaP is derived diagnostic heteroskedastic ν·OFI
         hypothesis = parsed_final.get("hypothesis")
         if not isinstance(hypothesis, dict) and hypothesis is not None:
             hypothesis = {"raw": hypothesis}
-        # If agent provided explicit H0/H1, validate against deterministic fits
         beta = (evidence or {}).get("price_impact_fit", {}).get("beta") if isinstance(evidence, dict) else None
         betastr = str(beta)[:12] if beta is not None else "unknown"
         if hypothesis is None:
-            # Synthesize minimal hypothesis from interpretation for backward compat
             hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "paper_refs": ["Cont 1011.6402 OFI_k, AD_i, derived ΔP diagnostic"], "evidence_refs": ["calc.ofi.intervals","calc.depth.average","memory.recall_paper"]}
             hypothesis_verdict = "inconclusive"
             verdict_reason = "Agent did not explicitly form H0/H1 via memory.recall_paper; calculations split but hypothesis implicit"
         else:
-            # Deterministic verdict: provisional/invalidated if hetero or n<60, else validated
             if gate_status == "provisional":
                 hypothesis_verdict = "inconclusive"
                 verdict_reason = f"Gate provisional ({';'.join(gate_reasons)}); hypothesis held as derived diagnostic, not shortcut — ΔP diagnostic heteroskedastic"
@@ -837,9 +828,7 @@ class InferenceEngine:
             else:
                 hypothesis_verdict = "invalidated"
                 verdict_reason = "; ".join(gate_reasons)
-            # Explicit agent hypothesis overrides to validated if they cited paper correctly
             if isinstance(hypothesis, dict) and "H0" in hypothesis:
-                # Keep verdict as above but note paper grounding
                 verdict_reason += " | H0 paper-grounded via memory.recall_paper"
         artifact = InferenceArtifact.create(
             symbol=self.symbol, venue=self.venue,

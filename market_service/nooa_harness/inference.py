@@ -1073,6 +1073,8 @@ async def _tool_fit_beta(
         intervals = fitting_mod.replay_intervals(windowed, interval_ms=interval_s * 1_000)
         if intervals and intervals[-1].end_ts_ms > end_ts:
             intervals = intervals[:-1]
+        if not intervals:
+            return None, capability_log_entry(cap.name, scope, "ok", detail={"status": "insufficient", "reason": "no closed intervals", "events": len(windowed)})
         fit_config = {
             "symbol": symbol, "venue": venue, "tick_size": str(tick),
             "interval_seconds": interval_s, "window_minutes": window_m,

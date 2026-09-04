@@ -1,8 +1,10 @@
-"""Isolated Binance Spot depth-event capture for the microstructure ledger.
+"""Isolated Binance depth-event capture for the microstructure ledger.
 
-This process never imports or changes ``market_service.poller``. It consumes
-public depth diffs, bootstraps a local book from REST, and emits raw deltas plus
-validated best-quote transitions to the dedicated Redis namespace.
+Primary venue is now **futures (SOL-USDT perps)** via fstream WS — spot is
+legacy. This process never imports or changes ``market_service.poller``. It
+consumes public depth diffs, bootstraps a local book from REST, and emits
+raw deltas plus validated best-quote transitions to the dedicated Redis
+namespace. Venue is configurable via MICROSTRUCTURE_VENUE (spot|futures|perps).
 """
 
 from __future__ import annotations
@@ -43,22 +45,35 @@ class MicrostructureSettings:
     snapshot_levels: int = 1_000
     reconnect_seconds: int = 2
     interval_seconds: int = 10
-    websocket_base: str = "wss://stream.binance.com:9443/ws"
+    websocket_base: str = "wss://fstream.binance.com/ws"
 
     @classmethod
-    def from_env(cls, symbol: str, venue: str = "spot") -> MicrostructureSettings:
-        if venue.lower() != "spot":
-            raise ValueError("Pass 2 capture supports Binance spot only")
+    def from_env(cls, symbol: str, venue: str | None = None) -> MicrostructureSettings:
+        # Venue: MICROSTRUCTURE_VENUE env wins, else arg, default now futures (perps) per user request.
+        # Spot is legacy; futures/perps is primary for SOL-USDT.
+        raw_venue = (os.getenv("MICROSTRUCTURE_VENUE") or venue or "futures").lower().strip()
+        # Normalize perps aliases
+        if raw_venue in ("perps", "perp", "usdm"):
+            raw_venue = "futures"
+        if raw_venue not in ("spot", "futures"):
+            raise ValueError(f"unsupported venue {raw_venue!r} — use spot or futures")
+        # WS base per venue
+        if raw_venue == "futures":
+            default_ws = "wss://fstream.binance.com/ws"
+            env_key = "BINANCE_FUTURES_WS_BASE"
+        else:
+            default_ws = "wss://stream.binance.com:9443/ws"
+            env_key = "BINANCE_SPOT_WS_BASE"
         return cls(
             redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
             redis_prefix=os.getenv("REDIS_KEY_PREFIX", "marketflow"),
             symbol=symbol.upper(),
-            venue="spot",
+            venue=raw_venue,
             stream_maxlen=_positive_env("MICROSTRUCTURE_STREAM_MAXLEN", 100_000),
             snapshot_levels=_positive_env("MICROSTRUCTURE_SNAPSHOT_LEVELS", 1_000),
             reconnect_seconds=_positive_env("MICROSTRUCTURE_RECONNECT_SECONDS", 2),
             interval_seconds=_positive_env("MICROSTRUCTURE_INTERVAL_SECONDS", 10),
-            websocket_base=os.getenv("BINANCE_SPOT_WS_BASE", "wss://stream.binance.com:9443/ws").rstrip("/"),
+            websocket_base=os.getenv(env_key, default_ws).rstrip("/"),
         )
 
 
@@ -102,6 +117,8 @@ class BinanceSpotDepthCapture:
             await self.close()
 
     async def _run_connection(self, session: aiohttp.ClientSession) -> None:
+        # Futures perps are high-velocity: use 100ms for spot, 100ms for futures but with larger snapshot
+        # to reduce BookGapError reconnects (futures depth 100ms is mandatory for exact_feed quality)
         stream = f"{self.settings.symbol.lower()}@depth@100ms"
         url = f"{self.settings.websocket_base}/{stream}"
         async with session.ws_connect(url, heartbeat=20, receive_timeout=60) as ws:
@@ -147,7 +164,10 @@ class BinanceSpotDepthCapture:
         first = buffered[0]
         async with Binance() as client:
             for _ in range(3):
-                snapshot = await client.spot_book(self.settings.symbol, limit=self.settings.snapshot_levels)
+                if self.settings.venue == "futures":
+                    snapshot = await client.fut_book(self.settings.symbol, limit=self.settings.snapshot_levels)
+                else:
+                    snapshot = await client.spot_book(self.settings.symbol, limit=self.settings.snapshot_levels)
                 snapshot_id = int(snapshot["lastUpdateId"])
                 if snapshot_id < first.first_update_id:
                     continue
@@ -236,9 +256,10 @@ class BinanceSpotDepthCapture:
                 pass
 
 
-async def main_async(symbol: str) -> int:
-    settings = MicrostructureSettings.from_env(symbol)
+async def main_async(symbol: str, venue: str | None = None) -> int:
+    settings = MicrostructureSettings.from_env(symbol, venue=venue)
     capture = BinanceSpotDepthCapture(settings)
+    log.info("capture venue=%s symbol=%s ws=%s", settings.venue, settings.symbol, settings.websocket_base)
     await capture.run_forever()
     return 0
 
@@ -246,11 +267,12 @@ async def main_async(symbol: str) -> int:
 def main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Isolated Binance spot microstructure capture")
-    parser.add_argument("symbol", nargs="?", default="BTCUSDT")
+    parser = argparse.ArgumentParser(description="Isolated Binance microstructure capture (spot or futures perps)")
+    parser.add_argument("symbol", nargs="?", default="SOLUSDT")
+    parser.add_argument("--venue", default=None, help="spot or futures (defaults to MICROSTRUCTURE_VENUE or futures)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    return asyncio.run(main_async(args.symbol))
+    return asyncio.run(main_async(args.symbol, venue=args.venue))
 
 
 if __name__ == "__main__":

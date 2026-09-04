@@ -29,6 +29,7 @@ from market_service.calculations.flow import (
 from market_service.calculations.orderbook import (
     absorption_ladder,
     ask_wall_ladder,
+    derive_round_anchors,
     find_keystone,
     hourly_keystone_migration,
     keystone_bid_stack,
@@ -40,9 +41,12 @@ from market_service.calculations.orderbook import (
 )
 from market_service.calculations.signals import deterministic_signals
 from market_service.calculations.technical import (
+    atr_pct_from_klines,
     ema_series,
     seller_aggression_classify,
     tiered_large_flow,
+    trend_drift,
+    trend_slope,
 )
 from market_service.calculations.delta import delta_variable, delta_state as _delta_state_fn
 
@@ -70,9 +74,11 @@ from market_service.analysis.path_absorption import (
 )
 from market_service.analysis.regime import regime_verdict
 from market_service.analysis.wall_migration import (
+    TierConfig,
     bid_tier_balance,
-    compute_bid_tiers,
+    compute_bid_tiers_usd,
     compute_round_anchors,
+    default_wall_band,
     densest_clusters,
     fuel_ratio as wall_fuel_ratio,
     keystone_holds_scorecard,
@@ -105,6 +111,34 @@ WINDOW_MINUTES_MAP: dict[str, int] = {
     "1h": 60,
     "4h": 240,
 }
+
+
+def _resolve_tier_config(settings: Settings | None) -> TierConfig | None:
+    """Translate ``Settings.wall_tier_config`` into a ``TierConfig``.
+
+    Returns ``None`` when ``settings`` is not provided (so callers like
+    the test path use the legacy raw-qty thresholds). When settings
+    carry the default USD buckets this returns a fully populated
+    ``TierConfig``; operators override via ``WALL_TIER_CONFIG``.
+    """
+    if settings is None:
+        return None
+    raw = settings.wall_tier_config or {}
+    return TierConfig(
+        mega_usd=float(raw.get("mega_usd", 250_000.0)),
+        large_usd=float(raw.get("large_usd", 50_000.0)),
+        medium_usd=float(raw.get("medium_usd", 10_000.0)),
+    )
+
+
+def _resolve_scorecard_weights(settings: Settings | None) -> dict[str, float] | None:
+    """Return the scorecard weight override dict, or ``None`` to keep defaults."""
+    if settings is None:
+        return None
+    weights = dict(settings.wall_scorecard_weights or {})
+    if not weights:
+        return None
+    return weights
 
 
 # ---------------------------------------------------------------------------
@@ -724,12 +758,19 @@ def run_analysis(
     prior_cycle_ts: str | None = None,
     depth: int | None = None,
     sections: frozenset[str] | None = None,
+    tier_config: TierConfig | None = None,
+    scorecard_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Run the same deterministic analysis as the old analysis node.
 
     ``depth`` is the centralized canonical order-book depth (defaults to the
     config resolver) and is threaded into every adapter so wall/OI/path
     analyses scan the full configured book instead of a hard-coded slice.
+
+    ``tier_config`` and ``scorecard_weights`` thread Phase 1.2 / Phase 2.4
+    configuration through to ``_adapt_wall_migration``. When omitted, the
+    legacy defaults (raw-qty tiers, equal-weight scorecard) are used so
+    every existing call site keeps its previous behavior.
 
     ``sections`` (calculation-model groups, Pass 3): when ``None`` (default)
     every analysis adapter runs. When a frozenset of section names is given,
@@ -759,6 +800,7 @@ def run_analysis(
     wall_migration = _run_section("wall_migration", lambda: _adapt_wall_migration(
         evidence, orderbook_calc.get("fut_significant_levels"), pw, prior_cycle_ts,
         orderbook=orderbook_calc, depth=depth,
+        tier_config=tier_config, scorecard_weights=scorecard_weights,
     ), errors) or {} if want("wall_migration") else {}
 
     # Path absorption
@@ -920,6 +962,8 @@ def _adapt_wall_migration(
     *,
     orderbook: dict[str, Any] | None = None,
     depth: int,
+    tier_config: TierConfig | None = None,
+    scorecard_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     fut_book = _fut_book_e(evidence)
     fut = _fut_evidence(evidence)
@@ -937,8 +981,8 @@ def _adapt_wall_migration(
             "densest_clusters": [], "trap_assessment": None,
             "prior_cycle_ts": prior_cycle_ts,
             "prior_wall_count": len(prior_walls or {}),
-            "tiers": compute_bid_tiers(bids),
-            "round_anchors": compute_round_anchors(bids),
+            "tiers": compute_bid_tiers_usd(bids, tier_config),
+            "round_anchors": compute_round_anchors(bids),  # INSUFFICIENT_DATA: legacy fallback
             "tier_balance": None, "mega_at_keystone": None,
             "keystone_wall_balance": None,
             "keystone_holds_scorecard": None,
@@ -948,29 +992,58 @@ def _adapt_wall_migration(
                             "ask_walls_eroded": 0, "fuel_ratio_value": None,
                             "reason": "no order-book mid price"},
         }
-    bid_floor = price * 0.97
-    ask_target = price * 1.03 if price else 0.0
+    # Phase 1.3: ATR-aware band replaces the hardcoded price * 0.97 /
+    # price * 1.03 magic. The 5m kline series (only available via the
+    # on-demand derivative fetch) feeds atr_pct; when absent, the band
+    # falls back to the conservative 30bps floor.
+    klines = (fut.get("klines") or [])
+    atr_pct = atr_pct_from_klines(klines, period=14)
+    band = default_wall_band(price, atr_pct=atr_pct)
+    bid_floor = band["bid_floor"]
+    ask_target = band["ask_target"]
+
+    # Phase 1.1: dynamic round anchors derived from the current price and
+    # tick size, replacing the legacy hardcoded SOL list. Tick size is
+    # approximated as ``price * 0.0001`` for non-micro instruments
+    # (matches Binance's default tick grid for majors); for sub-dollar
+    # prices we floor to 0.0001 to keep anchor resolution sensible.
+    tick_size = max(price * 0.0001, 0.0001)
+    # Step is set to a reasonable fraction of the tick size for round-
+    # anchor density: every 5 ticks for non-micro instruments (gives
+    # X.00, X.05 etc on a 0.01 tick), every 5 ticks for tick=10 BTC.
+    step = max(tick_size * 5, 0.05) if price < 1000 else max(tick_size * 5, 5.0)
+    anchors = derive_round_anchors(
+        price=price, tick_size=tick_size, step=step,
+        depth_below=4, depth_above=4, tol=0.02,
+    )
+
     delta = _strict(wall_delta, prior_walls or {}, asks, 0.02, 1.15, name="wall_delta")
     fuel = _strict(wall_fuel_ratio, bids, asks, price, bid_floor, ask_target, name="fuel_ratio")
     floors = _bid_floors_from_significant_levels(bids, calc_significant_levels, price)
     clusters = _strict(densest_clusters, bids, floors, 0.10, name="densest_clusters")
     built, eroded = _single_cycle_wall_counts(asks)
     trap = _strict(wall_trap_assessment, float(fuel.get("ratio") or 0.0), built, eroded, name="wall_trap_assessment")
-    # Tier counts + round-number anchors (legacy institutional_buyers.py work —
-    # surfaced as canonical fields so briefings can reason over institutional
-    # bid share without re-fetching the orderbook on every read).
-    tiers = compute_bid_tiers(bids)
-    round_anchors = compute_round_anchors(bids)
-    # Institutional bid vs ask balance + mega-at-keystone (the two missing
-    # legacy signals from institutional_buyers.py:129,167-171).
-    tier_balance = _strict(bid_tier_balance, bids, asks, 5000.0, 1.2, name="bid_tier_balance")
+    # Phase 1.2: USD-notional tier buckets via TierConfig (price-aware).
+    tiers = compute_bid_tiers_usd(bids, tier_config)
+    round_anchors = compute_round_anchors(bids, anchors=anchors)
+    # Institutional bid vs ask balance + mega-at-keystone now use the same
+    # TierConfig as the tier buckets (price-aware). When no TierConfig is
+    # passed, the legacy raw-qty fallback (mega=5000) is used.
+    if tier_config is not None:
+        tier_balance = _strict(bid_tier_balance, bids, asks, tier_config=tier_config,
+                               name="bid_tier_balance")
+    else:
+        tier_balance = _strict(bid_tier_balance, bids, asks, 5000.0, 1.2, name="bid_tier_balance")
     keystone_for_mega = (orderbook.get("fut_keystone") or {}).get("keystone") if isinstance(orderbook, dict) else None
-    mega_kz = (
-        _strict(mega_at_keystone, bids, float(keystone_for_mega), 5000.0, 0.10,
-                name="mega_at_keystone")
-        if keystone_for_mega is not None else {"keystone_price": None, "count": 0,
-                                              "qty": 0.0, "notional": 0.0, "levels": []}
-    )
+    if tier_config is not None and keystone_for_mega is not None:
+        mega_kz = _strict(mega_at_keystone, bids, float(keystone_for_mega),
+                          tier_config=tier_config, name="mega_at_keystone")
+    elif keystone_for_mega is not None:
+        mega_kz = _strict(mega_at_keystone, bids, float(keystone_for_mega),
+                          5000.0, 0.10, name="mega_at_keystone")
+    else:
+        mega_kz = {"keystone_price": None, "count": 0,
+                   "qty": 0.0, "notional": 0.0, "levels": []}
     return {"wall_delta": delta, "fuel_ratio": fuel, "densest_clusters": clusters,
             "trap_assessment": trap, "prior_cycle_ts": prior_cycle_ts,
             "prior_wall_count": len(prior_walls or {}),
@@ -979,13 +1052,17 @@ def _adapt_wall_migration(
             "keystone_wall_balance": _wall_keystone_balance(
                 bids, asks, keystone_for_mega, price),
             "keystone_holds_scorecard": _wall_keystone_holds(
-                fut, bids, asks, keystone_for_mega, price),
+                fut, bids, asks, keystone_for_mega, price, scorecard_weights),
             "level_absorption": _wall_level_absorption(bids, floors, price),
             "wall_break": _wall_break(fut, asks),
             "zone_ratio_grid": _wall_zone_grid(fut, keystone_for_mega, price),
             "zone_buy_sell": _wall_zone_intensity(fut, keystone_for_mega, price),
             "inputs_used": {"floors_count": len(floors), "ask_walls_built": built,
-                            "ask_walls_eroded": eroded, "fuel_ratio_value": fuel.get("ratio")}}
+                            "ask_walls_eroded": eroded, "fuel_ratio_value": fuel.get("ratio"),
+                            "band_bps": band["band_bps"],
+                            "band_source": band["scaling_source"],
+                            "atr_pct": band["atr_pct"],
+                            "anchor_count": len(anchors)}}
 
 
 # ---------------------------------------------------------------------------
@@ -1021,33 +1098,68 @@ def _wall_keystone_balance(bids, asks, keystone_for_mega: Any, price: float) -> 
                    name="keystone_wall_balance")
 
 
-def _wall_keystone_holds(fut, bids, asks, keystone_for_mega: Any, price: float) -> dict:
+def _wall_keystone_holds(fut, bids, asks, keystone_for_mega: Any, price: float,
+                         scorecard_weights: dict[str, float] | None = None) -> dict:
     """Keystone-holds 0-10 scorecard fed by the balance + on-chain/flow inputs.
 
     Inputs are derived from evidence that is already present:
-      bid_ask_qty_ratio — from keystone_wall_balance
-      latest_tbr        — latest taker buy share from taker_buy_sell
-      oi_chg_5m         — OI % change over the last two bars
-      top_long_pct      — top-trader long account proportion
-      net_buy_ratio     — latest trades buy share
+      bid_ask_qty_ratio   — from keystone_wall_balance
+      latest_tbr          — latest taker buy share from taker_buy_sell
+      oi_chg_5m           — OI % change over the last two bars
+      top_long_pct        — top-trader long account proportion
+      net_buy_ratio       — latest trades buy share
     Each is None-safe; if a source is absent the scorecard still runs with
     zero where the deterministic function tolerates it.
+
+    Phase 2.3: the scorecard inputs are now TREND-AWARE. Single-bar
+    snapshots are replaced with multi-bar helpers (see
+    ``_taker_buy_trend``, ``_oi_change_trend``, ``_top_long_drift``,
+    ``_net_buy_trend``, ``_funding_trend``, ``_funding_zscore``). The
+    legacy 0-10 scorecard still receives the LAST value for each input
+    so its threshold logic remains unchanged; the trend values are
+    surfaced in ``trend_inputs`` for the briefing to consume.
+
+    Phase 2.4: ``scorecard_weights`` (when provided) overrides the
+    equal-weight (2 / factor) default so operators can re-prioritize
+    drivers without code changes. The trend inputs and the legacy
+    probabilities remain identical regardless of weights; only the
+    weighted score changes.
     """
     balance = _wall_keystone_balance(bids, asks, keystone_for_mega, price)
     bid_ask_qty_ratio = float(balance.get("bid_ask_qty_ratio") or 0.0)
-    latest_tbr = _taker_buy_share(fut.get("taker_buy_sell"))
-    oi_chg_5m = _oi_pct_change(fut.get("oi_history"))
-    top_long_pct = _ls_last_pct(fut.get("top_ls"))
-    if top_long_pct is not None:
-        try:
-            top_long_pct = float(top_long_pct)
-        except (TypeError, ValueError):
-            top_long_pct = None
-    net_buy_ratio = _net_buy_share(fut.get("trades_normalized"))
-    return _strict(
+
+    tbr_trend = _taker_buy_trend(fut.get("taker_buy_sell"), n=3)
+    oi_trend = _oi_change_trend(fut.get("oi_history"), n=3)
+    top_long_drift = _top_long_drift(fut.get("top_ls"), n=3)
+    glb_long_drift = _global_long_drift(fut.get("global_ls"), n=3)
+    net_buy_trend = _net_buy_trend(fut.get("trades_normalized"), n=3)
+    funding = _funding_trend(fut.get("funding_history"), n=3)
+    funding_z = _funding_zscore(fut.get("funding_history"))
+
+    # Legacy scorecard still wants single-bar inputs so its thresholds
+    # remain valid: pass the LAST value of each trend.
+    latest_tbr = tbr_trend["last"] if tbr_trend["last"] is not None else 0.5
+    oi_chg_5m = oi_trend["last_pct"] if oi_trend["last_pct"] is not None else 0.0
+    top_long_pct = top_long_drift["last"] if top_long_drift["last"] is not None else 0.0
+    net_buy_ratio = net_buy_trend["last"] if net_buy_trend["last"] is not None else 0.5
+
+    score = _strict(
         keystone_holds_scorecard, bid_ask_qty_ratio, latest_tbr, oi_chg_5m,
-        top_long_pct or 0.0, net_buy_ratio, name="keystone_holds_scorecard",
+        top_long_pct, net_buy_ratio, scorecard_weights, name="keystone_holds_scorecard",
     )
+
+    # Augment the scorecard with the trend inputs so downstream briefings
+    # can reason over direction, not just magnitude.
+    score["trend_inputs"] = {
+        "tbr": tbr_trend,
+        "oi_chg": oi_trend,
+        "top_long_drift": top_long_drift,
+        "global_long_drift": glb_long_drift,
+        "net_buy": net_buy_trend,
+        "funding": funding,
+        "funding_zscore": funding_z,
+    }
+    return score
 
 
 def _wall_level_absorption(bids, floors, price: float) -> list[dict]:
@@ -1096,12 +1208,128 @@ def _taker_buy_share(taker_bs: list[dict[str, Any]] | None) -> float:
     return bv / s if s > 0 else 0.5
 
 
+def _taker_buy_series(taker_bs: list[dict[str, Any]] | None) -> list[float]:
+    """Per-bar taker-buy share (0..1) from a taker_buy_sell series.
+
+    Returns a list ordered oldest -> newest. Empty/malformed series
+    return an empty list so callers can distinguish "no signal" from
+    a fabricated neutral value.
+    """
+    out: list[float] = []
+    for row in taker_bs or []:
+        if not isinstance(row, dict):
+            continue
+        bv = row.get("buyVol") or row.get("buy_vol")
+        sv = row.get("sellVol") or row.get("sell_vol")
+        if bv is None or sv is None:
+            continue
+        try:
+            bv_f = float(bv); sv_f = float(sv)
+        except (TypeError, ValueError):
+            continue
+        s = bv_f + sv_f
+        out.append(bv_f / s if s > 0 else 0.5)
+    return out
+
+
+def _taker_buy_trend(taker_bs: list[dict[str, Any]] | None, n: int = 3) -> dict[str, Any]:
+    """Multi-bar taker-buy trend.
+
+    Returns ``{last, slope_per_bar, drift, n, n_used}`` where:
+      ``last``       — most recent bar's taker-buy share (0..1), None if no data.
+      ``slope_per_bar`` — linear slope per bar over the last ``n`` bars (None if insufficient).
+      ``drift``      — last - first of trailing ``n`` (None if insufficient).
+      ``n`` / ``n_used`` — requested vs available.
+    """
+    series = _taker_buy_series(taker_bs)
+    last = series[-1] if series else None
+    window = series[-n:] if len(series) >= n else series
+    slope = trend_slope(window, n=len(window)) if len(window) >= 2 else None
+    drift = trend_drift(window, n=len(window)) if len(window) >= 2 else None
+    return {
+        "last": last,
+        "slope_per_bar": slope,
+        "drift": drift,
+        "n": n,
+        "n_used": len(window),
+    }
+
+
 def _oi_pct_change(oi_hist: list[dict[str, Any]] | None) -> float:
     """OI % change between the last two bars; 0.0 on insufficient data."""
     series = _oi_series(oi_hist)
     if len(series) >= 2 and series[-2]:
         return (series[-1] - series[-2]) / series[-2] * 100
     return 0.0
+
+
+def _oi_change_trend(oi_hist: list[dict[str, Any]] | None, n: int = 3) -> dict[str, Any]:
+    """Multi-bar OI pct change trend.
+
+    Each value in the trend series is the per-bar pct change between
+    adjacent OI bars. Returns ``{last_pct, slope_per_bar, drift, n,
+    n_used}``. ``last_pct`` is the most recent per-bar pct change so
+    the legacy single-bar semantics survive (the scorecard's ``> 0``
+    threshold still triggers on the latest bar).
+    """
+    series = _oi_series(oi_hist)
+    if len(series) < 2:
+        return {"last_pct": None, "slope_per_bar": None, "drift": None, "n": n, "n_used": 0}
+    pcts: list[float] = []
+    for i in range(1, len(series)):
+        prev = series[i - 1]
+        if prev == 0:
+            pcts.append(0.0)
+        else:
+            pcts.append((series[i] - prev) / prev * 100.0)
+    window = pcts[-n:] if len(pcts) >= n else pcts
+    last = pcts[-1] if pcts else None
+    slope = trend_slope(window, n=len(window)) if len(window) >= 2 else None
+    drift = trend_drift(window, n=len(window)) if len(window) >= 2 else None
+    return {"last_pct": last, "slope_per_bar": slope, "drift": drift, "n": n, "n_used": len(window)}
+
+
+def _ls_series(series: list[dict[str, Any]] | None) -> list[float]:
+    """Per-bar long-account proportion (0..1) from a topL/S or globalL/S series."""
+    out: list[float] = []
+    for row in series or []:
+        if not isinstance(row, dict):
+            continue
+        v = row.get("longAccount") or row.get("long_account")
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ls_drift(series: list[dict[str, Any]] | None, n: int = 3) -> dict[str, Any]:
+    """Multi-bar drift (last - first) of long-account proportion.
+
+    Returns ``{last, drift, slope_per_bar, n, n_used}``. Drift is the
+    simplest signal: positive drift = top traders accumulating longs,
+    negative = distributing.
+    """
+    long_series = _ls_series(series)
+    if not long_series:
+        return {"last": None, "drift": None, "slope_per_bar": None, "n": n, "n_used": 0}
+    window = long_series[-n:] if len(long_series) >= n else long_series
+    last = long_series[-1]
+    drift = trend_drift(window, n=len(window)) if len(window) >= 2 else None
+    slope = trend_slope(window, n=len(window)) if len(window) >= 2 else None
+    return {"last": last, "drift": drift, "slope_per_bar": slope, "n": n, "n_used": len(window)}
+
+
+def _top_long_drift(top_ls: list[dict[str, Any]] | None, n: int = 3) -> dict[str, Any]:
+    """Drift of top-trader long-account proportion over the last ``n`` bars."""
+    return _ls_drift(top_ls, n=n)
+
+
+def _global_long_drift(glb_ls: list[dict[str, Any]] | None, n: int = 3) -> dict[str, Any]:
+    """Drift of global-trader long-account proportion over the last ``n`` bars."""
+    return _ls_drift(glb_ls, n=n)
 
 
 def _net_buy_share(trades: list[dict[str, Any]] | None) -> float:
@@ -1123,6 +1351,119 @@ def _net_buy_share(trades: list[dict[str, Any]] | None) -> float:
         elif is_maker is None and str(t.get("side", "")).lower() == "buy":
             buys += qty
     return buys / total if total > 0 else 0.5
+
+
+def _net_buy_trend(trades: list[dict[str, Any]] | None, n: int = 3,
+                   bucket_s: int = 60_000) -> dict[str, Any]:
+    """Multi-bar taker-buy share via bucketed CVD.
+
+    ``trades`` are the trade window from the poller. Buckets are 60s
+    wide by default (so ``n=3`` covers ~3 minutes of recent activity).
+    The trend's ``last`` is the most recent bucket's buy share; the
+    slope is across the bucket timeline.
+    """
+    series = _bucketed_buy_share(trades, bucket_s=bucket_s)
+    if not series:
+        return {"last": None, "drift": None, "slope_per_bar": None, "n": n, "n_used": 0}
+    window = series[-n:] if len(series) >= n else series
+    last = series[-1]
+    drift = trend_drift(window, n=len(window)) if len(window) >= 2 else None
+    slope = trend_slope(window, n=len(window)) if len(window) >= 2 else None
+    return {"last": last, "drift": drift, "slope_per_bar": slope, "n": n, "n_used": len(window)}
+
+
+def _bucketed_buy_share(trades: list[dict[str, Any]] | None, bucket_s: int) -> list[float]:
+    """Per-bucket taker-buy share (0..1) from a raw trade list.
+
+    Empty buckets are skipped (no fabrication); ``bucketed_cvd`` from
+    the calculations layer gives a richer structure but its buy_share
+    is not exposed, so we re-implement the minimal slice needed by the
+    trend helpers.
+    """
+    buckets: dict[int, dict[str, float]] = {}
+    for t in trades or []:
+        if not isinstance(t, dict):
+            continue
+        try:
+            ts = int(t.get("ts") or 0); qty = float(t.get("qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        bucket = (ts // bucket_s) * bucket_s
+        entry = buckets.setdefault(bucket, {"buy": 0.0, "sell": 0.0})
+        is_maker = t.get("is_buyer_maker")
+        if is_maker is not None and is_maker:
+            entry["sell"] += qty
+        elif is_maker is None and str(t.get("side", "")).lower() == "buy":
+            entry["buy"] += qty
+        else:
+            entry["buy"] += qty
+    out: list[float] = []
+    for k in sorted(buckets):
+        e = buckets[k]
+        s = e["buy"] + e["sell"]
+        out.append(e["buy"] / s if s > 0 else 0.5)
+    return out
+
+
+def _funding_series(funding_hist: list[dict[str, Any]] | None) -> list[float]:
+    """Per-event funding rate (raw, not bps) from a funding_history list.
+
+    Returns the rate in Binance's native units (typically a small
+    decimal like 0.0001 = 1bp/8h). Empty/malformed lists return [].
+    """
+    out: list[float] = []
+    for row in funding_hist or []:
+        if not isinstance(row, dict):
+            continue
+        v = row.get("fundingRate") or row.get("funding_rate")
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _funding_trend(funding_hist: list[dict[str, Any]] | None, n: int = 3) -> dict[str, Any]:
+    """Multi-event funding rate trend.
+
+    Returns ``{last, slope_per_event, drift, n, n_used}``. ``last`` is
+    the most recent rate. ``drift`` is last - first of trailing ``n``
+    (positive = funding has been rising = longs paying more carry).
+    """
+    series = _funding_series(funding_hist)
+    if not series:
+        return {"last": None, "slope_per_event": None, "drift": None, "n": n, "n_used": 0}
+    window = series[-n:] if len(series) >= n else series
+    last = series[-1]
+    drift = trend_drift(window, n=len(window)) if len(window) >= 2 else None
+    slope = trend_slope(window, n=len(window)) if len(window) >= 2 else None
+    return {"last": last, "slope_per_event": slope, "drift": drift, "n": n, "n_used": len(window)}
+
+
+def _funding_zscore(funding_hist: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Z-score of the most recent funding rate vs the trailing window.
+
+    Returns ``{last, mean, std, zscore, n}``. ``zscore=None`` when the
+    window has fewer than 3 events or zero variance (no signal, never
+    fabricated). Positive z = funding hotter than typical; negative =
+    cooler than typical. The scorecard can use this as a \"carry cost
+    penalty\" against an over-leveraged long side.
+    """
+    series = _funding_series(funding_hist)
+    if len(series) < 3:
+        return {"last": None, "mean": None, "std": None, "zscore": None, "n": len(series)}
+    window = series[-min(len(series), 30):]
+    last = window[-1]
+    mean = sum(window) / len(window)
+    var = sum((x - mean) ** 2 for x in window) / len(window)
+    std = var ** 0.5
+    if std == 0:
+        return {"last": last, "mean": mean, "std": 0.0, "zscore": None, "n": len(window)}
+    return {"last": last, "mean": mean, "std": std, "zscore": (last - mean) / std, "n": len(window)}
 
 
 def _buy_rates(trades: list[dict[str, Any]]) -> tuple[float, float]:
@@ -1165,15 +1506,41 @@ def _adapt_path_absorption(evidence: dict[str, Any], *, depth: int) -> dict[str,
     fut_book = _fut_book_e(evidence)
     bids, asks = _levels(fut_book, depth, function="path_absorption.*")
     price = _last_price_e(bids, asks) or 0.0
-    entry = price * 1.01 if price else 0.0
-    bid_floor = price * 0.97 if price else 0.0
-    levels = [price + i * 0.005 for i in range(1, 6)] if price else []
+    # Phase 1.3: ATR-aware band replaces the hardcoded 1% entry / 3% floor.
+    # The 5m kline series is the same source the wall adapter uses so the
+    # two paths agree on the band shape for a given cycle.
+    fut = _fut_evidence(evidence)
+    klines = (fut.get("klines") or [])
+    atr_pct = atr_pct_from_klines(klines, period=14)
+    band = default_wall_band(price, atr_pct=atr_pct) if price > 0 else {
+        "bid_floor": 0.0, "entry": 0.0, "ask_target": 0.0,
+        "band_bps": 0.0, "scaling_source": "no_price", "atr_pct": None,
+    }
+    entry = band["entry"]
+    bid_floor = band["bid_floor"]
+    # Five simulated levels spaced one bid_floor-side step apart (legacy
+    # used 0.005 absolute; here we use 1/5 of the band so the simulation
+    # range matches the band width regardless of volatility).
+    band_step = band["band_bps"] / 10000.0 / 5.0 if band["band_bps"] else 0.005
+    levels = [price + i * band_step for i in range(1, 6)] if price else []
     total_bid_fuel = sum(p * q for p, q in bids)
     total_ask_fuel = sum(p * q for p, q in asks)
     fr = _strict(path_fuel_ratio, bids, asks, entry, bid_floor, name="path_absorption.fuel_ratio")
     ascent = _strict(simulated_ascent, asks, total_bid_fuel, levels, name="simulated_ascent")
     descent = _strict(simulated_descent, bids, total_ask_fuel, total_bid_fuel, levels, name="simulated_descent")
-    return {"fuel_ratio": fr, "simulated_ascent": ascent, "simulated_descent": descent}
+    return {
+        "fuel_ratio": fr,
+        "simulated_ascent": ascent,
+        "simulated_descent": descent,
+        "band": {
+            "bid_floor": bid_floor,
+            "entry": entry,
+            "ask_target": band["ask_target"],
+            "band_bps": band["band_bps"],
+            "scaling_source": band["scaling_source"],
+            "atr_pct": band["atr_pct"],
+        },
+    }
 
 
 def _adapt_demand(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1758,9 +2125,17 @@ async def fetch_derivative_evidence(
         client.fut_long_short_ratio(symbol, period="5m", limit=12),
         client.fut_klines(symbol, interval="5m", limit=48),
         client.fut_funding(symbol),
+        # Phase 2.2: funding history for trend-aware scorecard. The funding
+        # endpoint above is the CURRENT snapshot; this is the historical
+        # fundingRate series (Binance /fapi/v1/fundingRate, ~3 events/day).
+        # 30 events covers ~10 days of 8h settlements — enough for a
+        # robust trend + z-score without bloating the cycle.
+        client.fut_funding_history(symbol, limit=30),
         return_exceptions=True,
     )
-    oi_hist, tbr, top_ls, glb_ls, klines_5m, funding_self = (_unwrap(v) for v in own)
+    oi_hist, tbr, top_ls, glb_ls, klines_5m, funding_self, funding_hist = (
+        _unwrap(v) for v in own
+    )
 
     cross: dict[str, Any] = {"tickers_24h": [], "funding": []}
     if include_cross_asset:
@@ -1789,6 +2164,7 @@ async def fetch_derivative_evidence(
             "global_ls": glb_ls,
             "klines": klines_5m,
             "funding": funding_self,
+            "funding_history": funding_hist,
         },
         "cross_asset": cross,
     }
@@ -1820,7 +2196,8 @@ def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -
     out = dict(evidence)
     out["futures"] = dict(evidence.get("futures") or {})
     deriv_fut = deriv.get("futures") or {}
-    for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines"):
+    for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines",
+                "funding_history"):
         if key in deriv_fut and deriv_fut[key] is not None:
             out["futures"][key] = deriv_fut[key]
     if "cross_asset" in deriv and deriv["cross_asset"]:
@@ -1829,14 +2206,20 @@ def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -
     # Bar-horizon metadata: every derivative series is 5-minute bars, so a
     # series of N bars covers N x 5 minutes — regardless of the requested
     # 15m/1h/4h analysis window. Making the horizon explicit stops downstream
-    # readers from misreading the series as window-aligned.
+    # readers from misreading the series as window-aligned. funding_history
+    # is 8-hour-settled and is recorded separately for downstream readers.
     deriv_fut = deriv.get("futures") or {}
     out["derivatives_meta"] = {
         "bar_period_s": 300,
+        "funding_history_period_s": 8 * 3600,
         "series": {
             key: (len(deriv_fut[key]) if isinstance(deriv_fut.get(key), list) else None)
             for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines")
         },
+        "funding_history_count": (
+            len(deriv_fut["funding_history"])
+            if isinstance(deriv_fut.get("funding_history"), list) else None
+        ),
     }
     return out
 
@@ -2002,6 +2385,8 @@ async def run_group_cycle(
         prior_cycle_ts=prior_cycle_ts,
         depth=depth,
         sections=anal_sections,
+        tier_config=_resolve_tier_config(settings),
+        scorecard_weights=_resolve_scorecard_weights(settings),
     )
 
     all_errors = list(calc_result.get("errors") or []) + list(analysis_result.get("errors") or [])
@@ -2168,7 +2553,9 @@ async def run_cycle(
         analysis_result = run_analysis(evidence, calc_result,
                                        prior_walls=prior_walls or None,
                                        prior_cycle_ts=prior_cycle_ts,
-                                       depth=depth)
+                                       depth=depth,
+                                       tier_config=_resolve_tier_config(settings),
+                                       scorecard_weights=_resolve_scorecard_weights(settings))
 
         envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
 

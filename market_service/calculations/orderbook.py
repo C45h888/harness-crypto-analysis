@@ -106,6 +106,68 @@ def zone_depth(book: dict, lo: float, hi: float) -> dict:
     }
 
 
+def derive_round_anchors(
+    price: float,
+    tick_size: float = 0.01,
+    step: float | None = None,
+    depth_below: int = 4,
+    depth_above: int = 4,
+    tol: float = 0.02,
+) -> list[dict]:
+    """Derive round-number anchor levels dynamically around ``price``.
+
+    Replaces the legacy hardcoded ``_ROUND_ANCHORS`` list
+    (``analysis/wall_migration.py``) with levels computed from the
+    current price + step. Anchors are returned at ``k * step`` for
+    ``k`` in ``[center - depth_below, center + depth_above]``, where
+    ``center = round(price / step)``.
+
+    The ``step`` is the spacing between adjacent round anchors. Common
+    choices:
+      SOL $150 with step=0.05  → 149.80, 149.85, ..., 150.20 (every 5¢)
+      SOL $150 with step=0.50  → 149.00, 149.50, 150.00, 150.50, 151.00
+      BTC $65000 with step=50  → 64850, 64900, 64950, 65000, 65050, 65100, 65150
+      BTC $65000 with step=100 → 64700, 64800, ..., 65300 (every $100)
+
+    When ``step`` is omitted it defaults to ``tick_size`` (every tick
+    is a round anchor; usually too dense but always valid).
+
+    Each entry carries ``{name, level, lo, hi, tolerance}``. ``lo``/``hi``
+    are the half-open scan band used to attribute bids to the anchor;
+    callers pass the list straight into ``compute_round_anchors``.
+    """
+    if price <= 0:
+        raise ValueError("price must be positive")
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive")
+    if step is None:
+        step = tick_size
+    if step <= 0:
+        raise ValueError("step must be positive")
+    if tol < 0:
+        raise ValueError("tol must be non-negative")
+    if depth_below < 0 or depth_above < 0:
+        raise ValueError("depth_below / depth_below must be non-negative")
+
+    # Round the price to the nearest step first so anchors align with
+    # the visible round-number lattice; otherwise micro-priced instruments
+    # drift away from the grid.
+    center = round(price / step) * step
+
+    anchors: list[dict] = []
+    for offset in range(-depth_below, depth_above + 1):
+        level = round(center + offset * step, 10)
+        name = f"anchor_{level:.4f}".rstrip("0").rstrip(".")
+        anchors.append({
+            "name": name,
+            "level": level,
+            "lo": level - tol,
+            "hi": level + tol,
+            "tolerance": tol,
+        })
+    return anchors
+
+
 def significant_levels(levels: Iterable[Sequence[float]], min_qty: float) -> list[dict]:
     """Filter book levels to significant size (e.g. >= 1500 SOL), sorted by price."""
     out = [{"price": float(p), "qty": float(q), "notional": float(p) * float(q)}

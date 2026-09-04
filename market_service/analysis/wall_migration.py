@@ -11,7 +11,8 @@ Boards are lists of ``(price, qty)`` pairs.
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Iterable, Sequence
 
 
 def depth_qty(levels: Iterable[Sequence[float]], lo: float, hi: float) -> float:
@@ -145,41 +146,108 @@ def keystone_wall_balance(bids: Iterable[Sequence[float]], asks: Iterable[Sequen
 
 def keystone_holds_scorecard(bid_ask_qty_ratio: float, latest_tbr: float,
                              oi_chg_5m: float, top_long_pct: float,
-                             net_buy_ratio: float) -> dict:
+                             net_buy_ratio: float,
+                             weights: dict[str, float] | None = None) -> dict:
     """Multi-factor 'will the keystone hold' score (0-10) with probability.
 
     Legacy source: wall_analysis probability-scorecard block. Deterministic.
+
+    Phase 2.4: weights are configurable. Each factor contributes
+    ``{0, 1, weight}`` to the score based on its threshold ladder;
+    the default ``weight`` is 2 (the legacy behavior, total ceiling
+    10). When ``weights`` is provided, the ceiling scales with the
+    weights so operators can re-prioritize drivers without changing
+    the threshold logic.
+
+    The legacy signature (positional floats only) is preserved: when
+    ``weights`` is omitted the function behaves exactly as before and
+    every existing test passes unchanged.
     """
-    score = 0
-    max_score = 10
-    if bid_ask_qty_ratio > 0.5:
-        score += 2
-    elif bid_ask_qty_ratio > 0.3:
-        score += 1
-    if latest_tbr > 0.55:
-        score += 2
-    elif latest_tbr > 0.50:
-        score += 1
-    if oi_chg_5m > 0:
-        score += 2
-    elif oi_chg_5m > -0.1:
-        score += 1
-    if top_long_pct < 0.75:
-        score += 2
-    elif top_long_pct < 0.80:
-        score += 1
-    if net_buy_ratio > 0.55:
-        score += 2
-    elif net_buy_ratio > 0.50:
-        score += 1
-    prob = score / max_score * 100
+    w = {
+        "bid_ask_qty_ratio": 1.0,
+        "taker_buy_trend": 1.0,
+        "oi_change_trend": 1.0,
+        "top_long_drift": 1.0,
+        "net_buy_trend": 1.0,
+    }
+    if weights:
+        for k, v in weights.items():
+            if k in w:
+                try:
+                    w[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
+    score = 0.0
+    factor_breakdown: dict[str, dict[str, float]] = {}
+
+    # Ladders mirror the legacy threshold ladder exactly. Each entry is
+    # ``(threshold, raw_contribution)``; the ladder is ordered tightest
+    # first. ``op`` distinguishes the comparison direction:
+    #   "gt" — value strictly greater than threshold hits
+    #   "lt" — value strictly less than threshold hits
+    # This matches the legacy ``> 0.5`` / ``< 0.75`` semantics: 0.5 hits
+    # neither, 0.5000001 hits the first ladder entry.
+    def _add(name: str, ladder: tuple[tuple[float, float], ...],
+             value: float, op: str) -> float:
+        weight = w.get(name, 0.0)
+        contributed = 0.0
+        hit_threshold: float | None = None
+        for threshold, contrib in ladder:
+            if op == "gt" and value > threshold:
+                contributed = contrib
+                hit_threshold = threshold
+                break
+            if op == "lt" and value < threshold:
+                contributed = contrib
+                hit_threshold = threshold
+                break
+        weighted = contributed * weight
+        factor_breakdown[name] = {
+            "value": value,
+            "threshold_hit": hit_threshold,
+            "raw_contribution": contributed,
+            "weight": weight,
+            "weighted_contribution": weighted,
+        }
+        return weighted
+
+    # bid_ask_qty_ratio: higher is better (more bid than ask)
+    score += _add("bid_ask_qty_ratio",
+                  ((0.5, 2.0), (0.3, 1.0)), bid_ask_qty_ratio, "gt")
+    # taker_buy_trend (latest): higher is better (taker buy pressure)
+    score += _add("taker_buy_trend",
+                  ((0.55, 2.0), (0.50, 1.0)), latest_tbr, "gt")
+    # oi_change_trend (latest pct): higher is better
+    score += _add("oi_change_trend",
+                  ((0.0, 2.0), (-0.1, 1.0)), oi_chg_5m, "gt")
+    # top_long_drift: lower is better (less crowding = less risk of long unwind)
+    score += _add("top_long_drift",
+                  ((0.75, 2.0), (0.80, 1.0)), top_long_pct, "lt")
+    # net_buy_trend (latest): higher is better
+    score += _add("net_buy_trend",
+                  ((0.55, 2.0), (0.50, 1.0)), net_buy_ratio, "gt")
+
+    # Normalize to 0-10 so the score remains a probability ceiling.
+    # ``max_weighted`` is what the score would be if every factor was
+    # maxed at its ladder top (contrib=2 for each), under the current
+    # weights. Dividing by that keeps the ceiling at 10 while letting
+    # weights change the relative importance of each driver.
+    max_weighted = sum(2.0 * w[k] for k in w) or 10.0
+    normalized_score = score / max_weighted * 10.0 if max_weighted else 0.0
+    rounded_score = round(normalized_score, 2)
+    prob = round(normalized_score / 10.0 * 100, 1)
     return {
-        "score": score, "max_score": max_score,
-        "keystone_holds_probability": round(prob, 1),
+        "score": rounded_score,
+        "raw_score": round(score, 4),
+        "max_score": 10.0,
+        "max_weighted": round(max_weighted, 4),
+        "weights_used": w,
+        "keystone_holds_probability": prob,
         "keystone_breaks_probability": round(100 - prob, 1),
         "factors": {"bid_ask_qty_ratio": bid_ask_qty_ratio, "taker_buy_ratio": latest_tbr,
                     "oi_chg_5m_pct": oi_chg_5m, "top_long_pct": top_long_pct,
                     "net_buy_ratio": net_buy_ratio},
+        "factor_breakdown": factor_breakdown,
     }
 
 
@@ -189,12 +257,131 @@ def keystone_holds_scorecard(bid_ask_qty_ratio: float, latest_tbr: float,
 
 # Tier thresholds lifted from legacy institutional_buyers.py:100-108.
 # Mega: institutional-sized; Large: notable size; Medium: standard; Small: thin.
+#
+# Phase 1.2: these are kept as a DEPRECATED raw-qty fallback for the
+# legacy function ``compute_bid_tiers``. New code MUST use
+# ``TierConfig`` (USD-notional buckets) via ``compute_bid_tiers_usd``
+# so thresholds are price-aware: 200 SOL ≈ $30k vs 200 BTC ≈ $13M are
+# not equivalent.
 _BID_TIER_THRESHOLDS: tuple[tuple[str, float, float | None], ...] = (
     ("mega",   5000.0, None),      # qty >= 5000
     ("large",  1000.0, 5000.0),    # 1000 <= qty < 5000
     ("medium", 200.0, 1000.0),     # 200 <= qty < 1000
     ("small",  None,  200.0),      # qty < 200
 )
+
+
+@dataclass(frozen=True)
+class TierConfig:
+    """USD-notional bucket thresholds for bid / ask tier classification.
+
+    Defaults are tuned for the deep-mid-cap crypto order book (SOL, ETH,
+    majors at retail venues): a $250k notional mega bid is roughly an
+    institutional print; $50k large; $10k medium; anything below is
+    thin. Callers can override per-instrument.
+
+    The thresholds are USD-denominated so they generalize across price
+    regimes — 200 BTC at $65k is $13M (mega) while 200 SOL at $150 is
+    $30k (small). The legacy raw-qty tiers (``_BID_TIER_THRESHOLDS``)
+    conflated these into a single ladder and were hardcoded for one SOL
+    session; they remain only for backwards compatibility in the
+    ``compute_bid_tiers`` wrapper.
+    """
+
+    mega_usd: float = 250_000.0
+    large_usd: float = 50_000.0
+    medium_usd: float = 10_000.0
+    # Tier ordering is fixed: mega > large > medium > small. Anything
+    # below medium_usd falls into ``small`` by exclusion.
+
+    def thresholds(self) -> tuple[tuple[str, float, float | None], ...]:
+        """Materialize the (name, lo_usd, hi_usd) ladder used by the engine.
+
+        ``lo`` is inclusive; ``hi`` is exclusive (None for the top tier).
+        Returns the same shape as ``_BID_TIER_THRESHOLDS`` so the engine
+        is identical between the legacy and USD-aware paths.
+        """
+        return (
+            ("mega",   self.mega_usd, None),
+            ("large",  self.large_usd, self.mega_usd),
+            ("medium", self.medium_usd, self.large_usd),
+            ("small",  None, self.medium_usd),
+        )
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "mega_usd": self.mega_usd,
+            "large_usd": self.large_usd,
+            "medium_usd": self.medium_usd,
+        }
+
+
+def _bid_tiers_impl(
+    bids: list[list[float]] | list[tuple[float, float]],
+    thresholds: tuple[tuple[str, float, float | None], ...],
+) -> dict[str, Any]:
+    """Shared engine for the legacy (raw qty) and USD-aware paths."""
+    total_qty = 0.0
+    total_notional = 0.0
+    tier_qty: dict[str, float] = {name: 0.0 for name, _, _ in thresholds}
+    tier_count: dict[str, int] = {name: 0 for name, _, _ in thresholds}
+    tier_notional: dict[str, float] = {name: 0.0 for name, _, _ in thresholds}
+
+    for row in bids:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        try:
+            p, q = float(row[0]), float(row[1])
+        except (TypeError, ValueError):
+            continue
+        if q <= 0 or p <= 0:
+            continue
+        notional = p * q
+        total_qty += q
+        total_notional += notional
+        for name, lo, hi in thresholds:
+            in_lo = (lo is None) or (notional >= lo)
+            in_hi = (hi is None) or (notional < hi)
+            if in_lo and in_hi:
+                tier_qty[name] += q
+                tier_count[name] += 1
+                tier_notional[name] += notional
+                break
+
+    out: dict[str, Any] = {
+        "total_qty": total_qty,
+        "total_notional": total_notional,
+    }
+    for name, _, _ in thresholds:
+        out[name] = {
+            "count": tier_count[name],
+            "qty": tier_qty[name],
+            "notional": tier_notional[name],
+            "pct": (tier_qty[name] / total_qty * 100.0) if total_qty > 0 else 0.0,
+        }
+    return out
+
+
+def compute_bid_tiers_usd(
+    bids: list[list[float]] | list[tuple[float, float]],
+    tier_config: TierConfig | None = None,
+) -> dict[str, Any]:
+    """Bucket bids into mega/large/medium/small tiers by USD notional.
+
+    Returns per-tier ``{count, qty, notional, pct}`` plus ``total_qty``
+    and ``total_notional``. ``pct`` is the tier's qty share of total
+    bid qty, in %.
+
+    This is the price-aware replacement for ``compute_bid_tiers``: the
+    legacy function used raw qty thresholds that were correct for one
+    SOL session and wrong for everything else. ``tier_config`` carries
+    the USD thresholds; default ``TierConfig()`` matches the
+    ``institutional_buyers`` legacy for SOL-scale venues.
+    """
+    cfg = tier_config or TierConfig()
+    out = _bid_tiers_impl(bids, cfg.thresholds())
+    out["tier_config"] = cfg.to_dict()
+    return out
 
 
 def compute_bid_tiers(bids: list[list[float]] | list[tuple[float, float]]) -> dict[str, Any]:
@@ -241,9 +428,97 @@ def compute_bid_tiers(bids: list[list[float]] | list[tuple[float, float]]) -> di
     return out
 
 
-# Round-number anchors (legacy institutional_buyers.py:35). Institutional
-# buyers tend to anchor bids at psychologically round prices; scanning those
-# levels surfaces whether smart-money is concentrated around the marker.
+# Phase 1.3: ATR-aware wall-band defaults.
+#
+# The legacy SOL-session defaults (``price * 0.97``, ``price * 1.03``,
+# ``price * 1.01``) were hardcoded 3%/1% bands. For instruments with
+# higher or lower volatility those bands are wrong: a 3% band on a
+# $0.01 micro-cap is enormous, and a 3% band on a $100k BTC 4h range
+# is tiny. ``default_wall_band`` scales the band widths with the
+# instrument's recent volatility (``atr_pct``) so the wall / path
+# absorption adapters use bands that match the actual trading range.
+
+_DEFAULT_BAND_FLOOR_BPS = 30     # 0.30% minimum floor band
+_DEFAULT_BAND_CEILING_BPS = 100  # 1.00% baseline ceiling band
+_DEFAULT_BAND_MAX_CEILING_BPS = 300  # 3.00% ceiling band cap
+
+# Volatility scaling: at ``atr_pct >= 2%`` we hit the ceiling cap; below
+# 0.5% we sit at the floor; in between we scale linearly. The chosen
+# thresholds reflect "calm majors" (BTC/ETH at <0.5% daily) up to
+# "high-vol alts" (>2% daily).
+_BAND_ATR_FLOOR_PCT = 0.5
+_BAND_ATR_CEILING_PCT = 2.0
+
+
+def default_wall_band(
+    price: float,
+    atr_pct: float | None = None,
+    floor_bps: int = _DEFAULT_BAND_FLOOR_BPS,
+    ceiling_bps: int = _DEFAULT_BAND_CEILING_BPS,
+    max_ceiling_bps: int = _DEFAULT_BAND_MAX_CEILING_BPS,
+) -> dict[str, float]:
+    """ATR-aware wall / path absorption band around ``price``.
+
+    Returns ``{bid_floor, entry, ask_target}`` (the three legacy
+    multipliers replaced). All three are absolute price levels — the
+    adapter passes them straight into the wall / path absorption pure
+    functions instead of computing ``price * 0.97`` etc.
+
+    Volatility scaling (when ``atr_pct`` is provided):
+      atr_pct <= 0.5%   -> use floor_bps (default 30 bps / 0.30%)
+      atr_pct >= 2.0%   -> use min(max_ceiling_bps, ceiling_bps * 3) (default 300 bps / 3.00%)
+      in between        -> linear interpolation between floor and ceiling
+    When ``atr_pct`` is None the floor_bps is used (legacy behavior
+    for adapters that do not have a 5m ATR series yet — the band is
+    the safest minimum rather than the historical SOL 3% guess).
+    """
+    if price <= 0:
+        raise ValueError("price must be positive")
+    if floor_bps <= 0 or ceiling_bps <= 0 or max_ceiling_bps <= 0:
+        raise ValueError("band bps thresholds must be positive")
+    if floor_bps > ceiling_bps:
+        raise ValueError("floor_bps must be <= ceiling_bps")
+    if ceiling_bps > max_ceiling_bps:
+        raise ValueError("ceiling_bps must be <= max_ceiling_bps")
+
+    chosen_bps = float(floor_bps)
+    scaling_source = "default_floor"
+    if atr_pct is not None:
+        try:
+            atr = float(atr_pct)
+        except (TypeError, ValueError):
+            atr = None
+        if atr is not None and atr > 0:
+            ceiling_target = min(max_ceiling_bps, ceiling_bps * 3.0)
+            if atr >= _BAND_ATR_CEILING_PCT:
+                chosen_bps = ceiling_target
+                scaling_source = "atr_ceiling"
+            elif atr <= _BAND_ATR_FLOOR_PCT:
+                chosen_bps = float(floor_bps)
+                scaling_source = "atr_floor"
+            else:
+                # Linear interpolation between the two anchors.
+                span = _BAND_ATR_CEILING_PCT - _BAND_ATR_FLOOR_PCT
+                t = (atr - _BAND_ATR_FLOOR_PCT) / span
+                chosen_bps = floor_bps + t * (ceiling_target - floor_bps)
+                scaling_source = "atr_linear"
+
+    band = chosen_bps / 10000.0  # bps -> fraction
+    # ``bid_floor`` is below price by ``band``; ``ask_target`` is above
+    # by ``band``; ``entry`` is the simple midpoint (price itself) so
+    # the path-absorption fuel ratio uses a target halfway between the
+    # two anchors — independent of band width.
+    bid_floor = price * (1.0 - band)
+    ask_target = price * (1.0 + band)
+    entry = price
+    return {
+        "bid_floor": bid_floor,
+        "entry": entry,
+        "ask_target": ask_target,
+        "band_bps": chosen_bps,
+        "scaling_source": scaling_source,
+        "atr_pct": atr_pct,
+    }
 _ROUND_ANCHORS: tuple[tuple[str, float], ...] = (
     ("anchor_75_00", 75.00),
     ("anchor_74_50", 74.50),
@@ -260,15 +535,34 @@ _ROUND_ANCHORS: tuple[tuple[str, float], ...] = (
 _ROUND_ANCHOR_TOL = 0.02
 
 
+# Round-number anchors (legacy institutional_buyers.py:35). Institutional
+# buyers tend to anchor bids at psychologically round prices; scanning those
+# levels surfaces whether smart-money is concentrated around the marker.
+#
+# Phase 1.1: ``_ROUND_ANCHORS`` is DEPRECATED. The hardcoded SOL-specific
+# levels (74.00..75.50) were never correct for any other instrument.
+# New code MUST use ``derive_round_anchors`` in
+# ``calculations/orderbook.py`` to generate the anchor list from the
+# current price + tick size. This tuple is kept as a fallback when the
+# caller does not pass anchors and no price is available.
+
+
 def compute_round_anchors(
     bids: list[list[float]] | list[tuple[float, float]],
+    anchors: Sequence[dict] | None = None,
+    tol: float = _ROUND_ANCHOR_TOL,
 ) -> dict[str, Any]:
     """Aggregate bid qty at each round-number anchor.
 
     Returns ``{count, total_qty, anchors: [{name, level, qty, notional}]}``.
-    A bid within ±0.02 of a level counts for that level. Bids can match
+    A bid within ±``tol`` of a level counts for that level. Bids can match
     multiple levels (overlapping round numbers both increment) — same logic
     as legacy institutional_buyers.py:39-46.
+
+    ``anchors`` is the dynamic anchor list produced by
+    ``calculations.orderbook.derive_round_anchors``. When omitted, the
+    legacy hardcoded SOL list is used as a fallback (DEPRECATED — new
+    callers must always pass anchors derived from the current price).
     """
     parsed: list[tuple[float, float, float]] = []  # (price, qty, notional)
     for row in bids:
@@ -282,24 +576,50 @@ def compute_round_anchors(
             continue
         parsed.append((p, q, p * q))
 
-    anchors: list[dict[str, Any]] = []
+    if anchors:
+        anchor_specs = [
+            (a.get("name") or f"anchor_{a.get('level'):.4f}",
+             float(a["level"]),
+             float(a.get("lo", a["level"] - tol)),
+             float(a.get("hi", a["level"] + tol)))
+            for a in anchors if isinstance(a, dict) and "level" in a
+        ]
+    else:
+        anchor_specs = [
+            (name, level, level - tol, level + tol)
+            for name, level in _ROUND_ANCHORS
+        ]
+
+    out_anchors: list[dict[str, Any]] = []
     total_qty = 0.0
-    for name, level in _ROUND_ANCHORS:
-        lo = level - _ROUND_ANCHOR_TOL
-        hi = level + _ROUND_ANCHOR_TOL
+    for name, level, lo, hi in anchor_specs:
         qty = sum(q for p, q, _ in parsed if lo <= p <= hi)
         notional = sum(n for p, _, n in parsed if lo <= p <= hi)
-        anchors.append({"name": name, "level": level, "qty": qty, "notional": notional})
+        out_anchors.append({
+            "name": name,
+            "level": level,
+            "lo": lo,
+            "hi": hi,
+            "qty": qty,
+            "notional": notional,
+        })
         total_qty += qty
 
-    return {"count": len(anchors), "total_qty": total_qty, "anchors": anchors}
+    return {
+        "count": len(out_anchors),
+        "total_qty": total_qty,
+        "anchors": out_anchors,
+        "anchor_source": "dynamic" if anchors else "legacy_fallback",
+        "tol": tol,
+    }
 
 
 def bid_tier_balance(
     bids: list[list[float]] | list[tuple[float, float]],
     asks: list[list[float]] | list[tuple[float, float]],
-    mega_threshold: float = 5000.0,
+    mega_threshold: float | None = None,
     bias_threshold: float = 1.2,
+    tier_config: TierConfig | None = None,
 ) -> dict[str, Any]:
     """Compare mega-tier bid qty vs mega-tier ask qty.
 
@@ -308,6 +628,12 @@ def bid_tier_balance(
     20% bias threshold (configurable via ``bias_threshold``). When one side is
     empty the ratio is None and the verdict is BALANCED unless the other side
     dominates absolutely (5x).
+
+    Mega-tier classification is by USD notional when ``tier_config`` is
+    provided (price-aware: a 5 BTC bid at $65k is mega, a 5 SOL bid at
+    $150 is small). When omitted, ``mega_threshold`` defaults to the
+    legacy raw-qty value of 5000 for backwards compatibility; new
+    callers should pass a ``TierConfig``.
 
     Legacy source: institutional_buyers.py:167-171 (institutional bid vs ask balance).
     """
@@ -324,13 +650,29 @@ def bid_tier_balance(
 
     bids_p = _pairs(bids)
     asks_p = _pairs(asks)
-    mega_bids = sum(q for _, q in bids_p if q >= mega_threshold)
-    mega_asks = sum(q for _, q in asks_p if q >= mega_threshold)
+
+    if tier_config is not None:
+        mega_usd = tier_config.mega_usd
+        threshold_used_usd = mega_usd
+        legacy_qty = None
+        mega_bids = sum(q for p, q in bids_p if p * q >= mega_usd)
+        mega_asks = sum(q for p, q in asks_p if p * q >= mega_usd)
+    else:
+        legacy_qty = 5000.0 if mega_threshold is None else float(mega_threshold)
+        mega_bids = sum(q for _, q in bids_p if q >= legacy_qty)
+        mega_asks = sum(q for _, q in asks_p if q >= legacy_qty)
+        threshold_used_usd = None
+
     delta = mega_bids - mega_asks
+    if legacy_qty is not None:
+        one_sided_threshold = legacy_qty
+    else:
+        one_sided_threshold = float("inf")  # USD path is always bidirectional
+
     ratio = (mega_bids / mega_asks) if mega_asks > 0 else (None if mega_bids == 0 else float("inf"))
-    if mega_asks == 0 and mega_bids >= mega_threshold:
+    if mega_asks == 0 and mega_bids > 0:
         verdict = "INSTITUTIONAL-BID-HEAVY"
-    elif mega_bids == 0 and mega_asks >= mega_threshold:
+    elif mega_bids == 0 and mega_asks > 0:
         verdict = "INSTITUTIONAL-ASK-HEAVY"
     elif ratio is None:
         verdict = "BALANCED"
@@ -341,7 +683,8 @@ def bid_tier_balance(
     else:
         verdict = "BALANCED"
     return {
-        "mega_threshold": mega_threshold,
+        "mega_threshold": legacy_qty,
+        "mega_threshold_usd": threshold_used_usd,
         "mega_bids": mega_bids,
         "mega_asks": mega_asks,
         "delta": delta,
@@ -349,21 +692,26 @@ def bid_tier_balance(
         "verdict": verdict,
         "total_bids": sum(q for _, q in bids_p),
         "total_asks": sum(q for _, q in asks_p),
+        "one_sided_threshold": one_sided_threshold,
     }
 
 
 def mega_at_keystone(
     bids: list[list[float]] | list[tuple[float, float]],
     keystone_price: float,
-    threshold: float = 5000.0,
+    threshold: float | None = None,
     tol: float = 0.10,
+    tier_config: TierConfig | None = None,
 ) -> dict[str, Any]:
     """Mega-tier bid qty within ``±tol`` of the keystone price.
 
-    Returns ``{keystone_price, threshold, tol, count, qty, notional, levels}``.
+    Returns ``{keystone_price, threshold, threshold_usd, tol, count, qty, notional, levels}``.
     A bid is included when both (a) it sits within ``keystone_price ± tol`` and
-    (b) its qty meets ``threshold``. The level list preserves price + qty so
-    briefings can show the institutional bid stack around the keystone.
+    (b) its classification meets the mega threshold. With ``tier_config``
+    the classification is USD-notional-based (price-aware); without it
+    the legacy raw-qty threshold of 5000 is used for backwards
+    compatibility. The level list preserves price + qty so briefings
+    can show the institutional bid stack around the keystone.
 
     Legacy source: institutional_buyers.py:129 (mega bids at the 75.00 zone).
     """
@@ -379,12 +727,21 @@ def mega_at_keystone(
             p, q = float(row[0]), float(row[1])
         except (TypeError, ValueError):
             continue
-        if lo <= p <= hi and q >= threshold:
-            parsed.append((p, q))
+        if not (lo <= p <= hi):
+            continue
+        if tier_config is not None:
+            if p * q < tier_config.mega_usd:
+                continue
+        else:
+            legacy_qty = 5000.0 if threshold is None else float(threshold)
+            if q < legacy_qty:
+                continue
+        parsed.append((p, q))
     parsed.sort(key=lambda x: x[0])
     return {
         "keystone_price": keystone_price,
         "threshold": threshold,
+        "threshold_usd": tier_config.mega_usd if tier_config is not None else None,
         "tol": tol,
         "count": len(parsed),
         "qty": sum(q for _, q in parsed),

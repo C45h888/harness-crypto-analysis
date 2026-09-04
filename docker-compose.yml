@@ -102,18 +102,20 @@ services:
   microstructure-capture:
     build: .
     user: "marketflow"
-    command: ["python", "-m", "market_service.microstructure.capture", "${MICROSTRUCTURE_SYMBOL:-BTCUSDT}"]
+    command: ["python", "-m", "market_service.microstructure.capture", "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
     env_file:
       - path: .env
         required: false
     environment:
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
       MICROSTRUCTURE_STREAM_MAXLEN: ${MICROSTRUCTURE_STREAM_MAXLEN:-100000}
       MICROSTRUCTURE_SNAPSHOT_LEVELS: ${MICROSTRUCTURE_SNAPSHOT_LEVELS:-1000}
       MICROSTRUCTURE_RECONNECT_SECONDS: ${MICROSTRUCTURE_RECONNECT_SECONDS:-2}
       MICROSTRUCTURE_INTERVAL_SECONDS: ${MICROSTRUCTURE_INTERVAL_SECONDS:-10}
       BINANCE_SPOT_WS_BASE: ${BINANCE_SPOT_WS_BASE:-wss://stream.binance.com:9443/ws}
+      BINANCE_FUTURES_WS_BASE: ${BINANCE_FUTURES_WS_BASE:-wss://fstream.binance.com/ws}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       redis:
@@ -132,7 +134,7 @@ services:
     build: .
     user: "marketflow"
     command: ["python", "-m", "market_service.nooa_harness.wake_worker",
-              "${MICROSTRUCTURE_SYMBOL:-BTCUSDT}"]
+              "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
     env_file:
       - path: .env
         required: false
@@ -140,6 +142,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
       NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-}
       NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
       NOOA_API_KEY: ${NOOA_API_KEY:-}

@@ -255,6 +255,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="read the latest persisted collated MarketRunEnvelope "
                         "(direct runtime.contracts read, NOT a nooa_harness op)")
     p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
+    p.add_argument("--read", action="store_true",
+                   help="designated read tool: Redis-first, Postgres-fallback read "
+                        "of the canonical MarketRunEnvelope. The outer-CLI read path "
+                        "that reaches both containers. Combine with --mode.")
+    p.add_argument("--mode", choices=("snapshot", "inventory", "full"), default="snapshot",
+                   help="output shape for --read: snapshot (headline scalars, default), "
+                        "inventory (section key lists + coverage), or full (raw payload)")
+    p.add_argument("--read-errors", action="store_true",
+                   help="--read: include the source_metadata errors list verbatim in the "
+                        "response (default: only the error count is surfaced)")
 
     # --- Poller control plane (dynamic symbol selection) ---
     # Redis control-key writes/reads. No Binance calls, no envelope, no
@@ -364,6 +374,16 @@ def main(argv: list[str] | None = None) -> int:
                 "elapsed_ms": result.get("elapsed_ms"),
             }
             print(json.dumps(summary, indent=2, default=str))
+        return 0
+
+    # --- Route 3: read a persisted collated run payload directly.
+    # Designated read tool: Redis-first, Postgres-fallback, source-tagged.
+    if args.read:
+        result = asyncio.run(_read_market(args, args.mode))
+        print(json.dumps(result, indent=2, default=str))
+        # Empty read (redis miss + postgres absent) exits 0 — null is a
+        # legitimate "no data" result. Schema mismatch raises out of
+        # _read_market (non-zero), never coerced to a soft failure.
         return 0
 
     # --- Route 3: read a persisted collated run payload directly.
@@ -709,6 +729,67 @@ async def _keystone_history_payload(settings: Settings, symbol: str, limit: int)
         "verdict": migration.get("verdict"),
         "net_buckets": migration.get("net_buckets"),
     }
+
+
+async def _read_market(args: argparse.Namespace, mode: str) -> dict[str, Any]:
+    """Designated outer-CLI read tool — Redis-first, Postgres fallback.
+
+    Reads the canonical collated market run payload and routes it through
+    the shared ``read_paths`` projections (snapshot / inventory / full).
+    ``source`` tags which plane served the payload. Postgres is opened only
+    when ``DATABASE_URL`` is set, so the tool stays usable on a Redis-only
+    host venv. Read-only: no writes, no agents, no nooa_harness crossing.
+    """
+    from market_service.runtime import read_paths
+    from market_service.runtime.postgres_store import PostgresRuntimeStore
+
+    settings = Settings.from_redis_env()
+    symbol = args.symbol.upper()
+
+    redis = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    postgres = None
+    if settings.database_url:
+        postgres = PostgresRuntimeStore(settings.database_url)
+    try:
+        if postgres is not None:
+            await postgres.connect()
+        payload, source = await read_paths.read_collated_with_fallback(
+            redis, postgres, symbol=symbol, run_id=args.run_id,
+        )
+    finally:
+        await redis.close()
+        if postgres is not None:
+            await postgres.close()
+
+    if payload is None:
+        return {
+            "symbol": symbol,
+            "run_id": args.run_id,
+            "source": None,
+            "mode": mode,
+            "read": None,
+            "errors": ["no run persisted (redis miss, postgres absent/empty)"],
+        }
+
+    if mode == "full":
+        read = payload
+    elif mode == "inventory":
+        read = read_paths.market_inventory(payload)
+    else:
+        read = read_paths.market_snapshot(payload)
+
+    out: dict[str, Any] = {
+        "symbol": symbol,
+        "run_id": payload.get("run_id"),
+        "source": source,
+        "mode": mode,
+        "read": read,
+    }
+    if args.read_errors:
+        out["errors"] = list(payload.get("errors") or [])
+    return out
 
 
 async def _read_keystone_history(args: argparse.Namespace) -> dict[str, Any]:

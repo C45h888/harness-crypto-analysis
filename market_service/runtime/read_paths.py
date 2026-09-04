@@ -42,7 +42,45 @@ __all__ = [
     "path_read",
     "read_collated",
     "read_collated_by_run",
+    "read_collated_with_fallback",
 ]
+
+
+async def read_collated_with_fallback(
+    redis: Any,
+    postgres: Any,
+    *,
+    symbol: str | None = None,
+    run_id: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Redis-first, Postgres-fallback read of a collated run payload.
+
+    Returns ``(payload, source)`` where ``source`` is ``"redis"``,
+    ``"postgres"``, or ``None`` when nothing is persisted (null = absent,
+    per repo discipline). ``postgres`` may be ``None`` when ``DATABASE_URL``
+    is unset — the read then degrades to Redis-only. A schema-version
+    mismatch raises on EITHER plane (never coerce a stale writer).
+
+    This is the single shared fallback+guard+provenance reader used by the
+    outer harness ``--read`` tool and the inner ``market read`` command.
+    """
+    if run_id is not None:
+        payload = await read_collated_by_run(redis, run_id) if redis else None
+        if payload is not None:
+            return payload, "redis"
+        if postgres is not None:
+            guarded = _guard_dict_payload(await postgres.read_run(run_id))
+            return guarded, ("postgres" if guarded is not None else None)
+        return None, None
+    if symbol is None:
+        raise ValueError("read_collated_with_fallback requires symbol or run_id")
+    payload = await read_collated(redis, symbol.upper()) if redis else None
+    if payload is not None:
+        return payload, "redis"
+    if postgres is not None:
+        guarded = _guard_dict_payload(await postgres.latest_run(symbol.upper()))
+        return guarded, ("postgres" if guarded is not None else None)
+    return None, None
 
 
 def path_read(value: Any, *keys: str) -> Any:
@@ -127,6 +165,19 @@ def _guard_payload(raw: Any) -> dict[str, Any] | None:
     if not raw:
         return None
     payload = json.loads(raw)
+    return _guard_dict_payload(payload)
+
+
+def _guard_dict_payload(payload: Any) -> dict[str, Any] | None:
+    """Schema-version guard over an already-parsed payload dict.
+
+    Shared by the raw-Redis path (post-``json.loads``) and the Postgres
+    durable path (``postgres_store`` reconstructs a dict, not raw bytes).
+    Raises on a stale writer's shape rather than silently coercing it —
+    the same contract the dataclass used to enforce.
+    """
+    if payload is None:
+        return None
     if not isinstance(payload, dict):
         raise ValueError("collated payload is not a JSON object")
     version = payload.get("schema_version")
