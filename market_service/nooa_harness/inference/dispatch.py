@@ -1,194 +1,36 @@
-"""Inference-engine mechanics: hard status gate + bounded capability registry.
+"""Tool base — the agent's commandable calculation surface.
 
-This module is the mechanical foundation of the agent role shift: the OO
-agent moves from passive interpretation layer to statistical inference
-engine. Two disciplines make that safe:
+Tools are named, scope-validated registry entries the LLM can COMMAND in
+its narration call (it never recomputes; it dispatches). Every dispatch is
+deterministic, produces a capability_log audit entry, and returns
+JSON-transportable output. Two families:
 
-1. HARD STATUS GATE — the trichotomy (validated / provisional /
-   insufficient) is resolved DETERMINISTICALLY from the inputs, before any
-   LLM call is even considered. ``insufficient`` forces a NULL
-   interpretation: the engine persists the refusal as durable state and
-   spends zero tokens narrating gate-failed data. Null discipline — an
-   empty interpretation means "not produced", never "nothing to say".
+  T1 micro   — the Pass-3 paper-derived microstructure stack
+  T2 market  — the canonical pipeline's calculation groups + ledger reads
 
-2. CAPABILITY REGISTRY — the engine's authority over supporting modules is
-   exercised ONLY through named, scope-validated capabilities. Every
-   dispatch produces an audit log entry that lands in the artifact's
-   ``capability_log``, so each artifact is self-documenting about how its
-   deterministic state was produced. Out-of-scope requests are denied
-   before any module runs.
+Tool dispatch may run at most ONE round per narration cycle (spec §4);
+results are cited evidence, never memory.
 
-This module is openai-free (the client is injected via
-``backends.build_llm``): it imports only runtime contracts and the
-deterministic microstructure stack, so contract tests never pay the OpenAI
-SDK import cost.
+Moved verbatim from the inference.py monolith (decomposition Phase 0).
+This module is openai-free (the client is injected via ``backends.build_llm``).
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import dataclass
 from typing import Any
 
 from market_service.microstructure import fitting
-from market_service.runtime.contracts import WAKE_ENVELOPE_SCHEMA_VERSION, WakeEnvelope
 from market_service.runtime.redis_store import RedisRuntimeStore
 
-# ---------------------------------------------------------------------------
-# Hard status gate
-# ---------------------------------------------------------------------------
-
-# Capture states that count as "established" — the capture produced a usable
-# tape. Any other state (starting, stopped, None) refuses inference.
-_ESTABLISHED_CAPTURE_STATES = frozenset({"running", "gap", "reconnecting", "connected"})
-
-
-class GateInputs:
-    """Named input bundle for the hard gate (plain object, no validation)."""
-
-
-def resolve_inference_status(
-    *,
-    n_observations: int,
-    min_observations: int,
-    fit_status: str | None,
-    capture_state: str | None,
-    events_in_window: int,
-    sequence_gaps: int = 0,
-) -> tuple[str, tuple[str, ...]]:
-    """Deterministically resolve the artifact status trichotomy.
-
-    Returns ``(status, reasons)`` where reasons is the ordered tuple of gate
-    failures/warnings that drove the decision. Identical inputs always yield
-    identical outputs — this is a pure function, safe to re-run on replay.
-
-    Rules (evaluated in order):
-    - insufficient: fewer usable observations than the minimum; the
-      underlying fit is insufficient; capture never established; or fewer
-      than 2 events in the window.
-    - provisional: the fit is provisional; sequence gaps occurred during
-      capture; or observation count is below twice the minimum.
-    - validated: none of the above.
-    """
-    reasons: list[str] = []
-
-    if n_observations < min_observations:
-        reasons.append(
-            f"observations {n_observations} < minimum {min_observations}"
-        )
-    if fit_status == "insufficient":
-        reasons.append("underlying price-impact fit is insufficient")
-    if capture_state not in _ESTABLISHED_CAPTURE_STATES:
-        reasons.append(f"capture state {capture_state!r} is not established")
-    if events_in_window < 2:
-        reasons.append(f"only {events_in_window} events in window")
-    if reasons:
-        return "insufficient", tuple(reasons)
-
-    provisional_reasons: list[str] = []
-    if fit_status == "provisional":
-        provisional_reasons.append("underlying fit is provisional")
-    if sequence_gaps > 0:
-        provisional_reasons.append(f"{sequence_gaps} sequence gap(s) during capture")
-    if n_observations < 2 * min_observations:
-        provisional_reasons.append(
-            f"observations {n_observations} < 2x minimum {2 * min_observations}"
-        )
-    if provisional_reasons:
-        return "provisional", tuple(provisional_reasons)
-
-    return "validated", ()
-
-
-def gate_interpretation(status: str, interpretation: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Enforce the NULL-interpretation discipline at the constructor boundary.
-
-    An ``insufficient`` artifact can never carry an interpretation — the hard
-    gate guarantees no LLM call happened over gate-failed data. Passing one
-    through here neutralizes it instead of raising, so engine code paths can
-    be written uniformly.
-    """
-    if status == "insufficient":
-        return None
-    return interpretation
-
+from .capability import (
+    CAPABILITIES,
+    CapabilityDenied,
+    capability_log_entry,
+)
 
 # ---------------------------------------------------------------------------
-# Capability registry — the engine's bounded authority over supporting modules
+# Pass-A dispatchers (T1 micro core)
 # ---------------------------------------------------------------------------
-
-
-class CapabilityDenied(ValueError):
-    """A capability dispatch was refused by scope or quality validation."""
-
-
-@dataclass(frozen=True)
-class Capability:
-    """One named, scope-bounded supporting-module dispatch surface."""
-
-    name: str
-    description: str
-    allowed_symbols: frozenset[str]
-    allowed_venues: frozenset[str]
-
-    def validate_scope(self, symbol: str, venue: str) -> None:
-        if symbol.upper() not in self.allowed_symbols:
-            raise CapabilityDenied(
-                f"capability {self.name!r} denied: symbol {symbol} outside "
-                f"bounded scope {sorted(self.allowed_symbols)}"
-            )
-        if venue not in self.allowed_venues:
-            raise CapabilityDenied(
-                f"capability {self.name!r} denied: venue {venue} outside "
-                f"bounded scope {sorted(self.allowed_venues)}"
-            )
-
-
-# Frozen initial scope — extended for SOL-USDT perps (per/user request).
-# Microstructure capture remains spot-only (event-level tape), but
-# calculation modules (market.group/read) are venue-agnostic via raw poller
-# which fetches spot + USD-M perps. This lets inference validate SOL perps
-# statistically even when micro evidence is spot-derived.
-_INITIAL_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
-_INITIAL_VENUES = frozenset({"spot", "perps", "perp", "usdm", "futures"})
-
-CAPABILITIES: dict[str, Capability] = {
-    "redis.read_capture_status": Capability(
-        name="redis.read_capture_status",
-        description="Read the isolated microstructure capture status object.",
-        allowed_symbols=_INITIAL_SYMBOLS,
-        allowed_venues=_INITIAL_VENUES,
-    ),
-    "redis.read_events": Capability(
-        name="redis.read_events",
-        description="Read best-quote transition events from the capture ledger.",
-        allowed_symbols=_INITIAL_SYMBOLS,
-        allowed_venues=_INITIAL_VENUES,
-    ),
-    "fitting.replay": Capability(
-        name="fitting.replay",
-        description="Deterministically replay events into OFI intervals.",
-        allowed_symbols=_INITIAL_SYMBOLS,
-        allowed_venues=_INITIAL_VENUES,
-    ),
-    "fitting.assemble_evidence": Capability(
-        name="fitting.assemble_evidence",
-        description="Run the deterministic beta/c/lambda fitter over replayed intervals.",
-        allowed_symbols=_INITIAL_SYMBOLS,
-        allowed_venues=_INITIAL_VENUES,
-    ),
-}
-
-
-def capability_log_entry(
-    name: str, scope: dict[str, Any], result: str, *, detail: Any = None,
-) -> dict[str, Any]:
-    """One audit-trail row for the artifact's ``capability_log``."""
-    entry: dict[str, Any] = {"capability": name, "scope": scope, "result": result}
-    if detail is not None:
-        entry["detail"] = detail
-    return entry
 
 
 async def dispatch_read_capture_status(
@@ -270,288 +112,7 @@ def dispatch_assemble_evidence(
 
 
 # ---------------------------------------------------------------------------
-# Wake plane — deterministic trigger evaluation + durable wake stream
-#
-# The engine is event-driven, never lazily polled. A trigger evaluation is a
-# PURE function over (current Redis counters, last artifact high-water, wake
-# config). When a predicate fires, the host materializes a typed
-# ``WakeEnvelope`` and XADDs it to the durable wake stream. The engine drains
-# pending envelopes, coalesces them into ONE cycle, dedupes by wake_id, and
-# re-validates the counters against live Redis before doing expensive work
-# (two-phase wake: envelope asserts, engine verifies).
-# ---------------------------------------------------------------------------
-
-# Default: how many new best-quote events justify a fresh inference cycle.
-DEFAULT_EVENT_DELTA_THRESHOLD = 1_800  # ~one 30-min block at ~1 event/sec
-
-# Runtime hygiene: minimum seconds between engine cycles regardless of wakes.
-DEFAULT_CYCLE_COOLDOWN_S = 60
-
-WAKE_SCHEMA_VERSION = WAKE_ENVELOPE_SCHEMA_VERSION
-
-
-@dataclass(frozen=True)
-class WakeConfig:
-    """Frozen trigger thresholds for one engine host."""
-
-    event_delta_threshold: int = DEFAULT_EVENT_DELTA_THRESHOLD
-    cooldown_seconds: int = DEFAULT_CYCLE_COOLDOWN_S
-
-
-@dataclass(frozen=True)
-class CounterSnapshot:
-    """Point-in-time Redis counter state for trigger evaluation."""
-
-    event_stream_len: int
-    capture_state: str | None
-    last_artifact_events_total: int | None
-    last_artifact_capture_state: str | None
-    last_artifact_completed_at_ms: int | None
-
-
-def evaluate_triggers(
-    snapshot: CounterSnapshot,
-    config: WakeConfig,
-    *,
-    now_ms: int,
-) -> dict[str, Any]:
-    """Pure trigger evaluation: which wake predicates fire, if any.
-
-    Returns ``{"fired": bool, "predicates": {name: detail}, "snapshot": {...}}``
-    — identical inputs always yield identical outputs (testable without Redis).
-
-    Predicates:
-    - ``event_delta``: ≥ threshold new events since the last artifact's
-      recorded ``events_total`` high-water mark. Cold start (no prior
-      artifact) with an established capture fires unconditionally — there is
-      nothing to compare against and the capture tape is usable.
-    - ``capture_recovery``: capture transitioned from a degraded state
-      (gap/reconnecting) to running — fit-ability changed, re-infer.
-    """
-    predicates: dict[str, Any] = {}
-
-    established = snapshot.capture_state in _ESTABLISHED_CAPTURE_STATES
-    prior_total = snapshot.last_artifact_events_total
-
-    if established and prior_total is None:
-        # Cold start: usable capture tape, no prior artifact to compare.
-        predicates["cold_start"] = {
-            "capture_state": snapshot.capture_state,
-            "event_stream_len": snapshot.event_stream_len,
-        }
-    elif established and prior_total is not None:
-        delta = snapshot.event_stream_len - prior_total
-        if delta >= config.event_delta_threshold:
-            predicates["event_delta"] = {
-                "new_events": delta,
-                "threshold": config.event_delta_threshold,
-                "high_water": prior_total,
-                "event_stream_len": snapshot.event_stream_len,
-            }
-
-    degraded_then_running = (
-        snapshot.last_artifact_capture_state in ("gap", "reconnecting")
-        and snapshot.capture_state == "running"
-    )
-    if degraded_then_running:
-        predicates["capture_recovery"] = {
-            "from": snapshot.last_artifact_capture_state,
-            "to": snapshot.capture_state,
-        }
-
-    return {
-        "fired": bool(predicates),
-        "predicates": predicates,
-        "snapshot": {
-            "event_stream_len": snapshot.event_stream_len,
-            "capture_state": snapshot.capture_state,
-            "last_artifact_events_total": prior_total,
-            "last_artifact_capture_state": snapshot.last_artifact_capture_state,
-            "last_artifact_completed_at_ms": snapshot.last_artifact_completed_at_ms,
-            "now_ms": now_ms,
-        },
-    }
-
-
-def wake_dedupe_id(
-    symbol: str, venue: str, predicates: dict[str, Any], high_water: dict[str, Any],
-) -> str:
-    """Deterministic wake_id: identical conditions collapse to one wake."""
-    payload = {
-        "symbol": symbol.upper(), "venue": venue,
-        "predicates": predicates, "high_water": high_water,
-        "schema_version": WAKE_SCHEMA_VERSION,
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return "wake-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
-
-
-def build_wake_envelope(
-    *,
-    symbol: str,
-    venue: str,
-    trigger_source: str,
-    evaluation: dict[str, Any],
-) -> WakeEnvelope:
-    """Materialize one typed wake envelope from a trigger evaluation."""
-    return WakeEnvelope.create(
-        symbol=symbol,
-        venue=venue,
-        trigger_source=trigger_source,
-        predicates_fired=evaluation["predicates"],
-        counter_snapshot=evaluation["snapshot"],
-        high_water={
-            "events_total": evaluation["snapshot"].get("last_artifact_events_total"),
-            "completed_at_ms": evaluation["snapshot"].get("last_artifact_completed_at_ms"),
-        },
-    )
-
-
-async def publish_wake(
-    store: RedisRuntimeStore, envelope: WakeEnvelope, *, maxlen: int | None = None,
-) -> str:
-    """XADD one wake envelope to the durable wake stream (never pub/sub)."""
-    key = store.inference_wake_stream(envelope.symbol, envelope.venue)
-    return str(await store.redis.xadd(
-        key,
-        {"payload": envelope.to_json(), "wake_id": envelope.wake_id,
-         "trigger_source": envelope.trigger_source},
-        maxlen=maxlen or store.stream_maxlen, approximate=True,
-    ))
-
-
-def coalesce_wakes(
-    envelopes: list[WakeEnvelope], *,
-    cooldown_seconds: int, now_ms: int,
-    last_cycle_completed_at_ms: int | None,
-) -> tuple[WakeEnvelope | None, dict[str, Any]]:
-    """Drain + merge pending wakes into ONE cycle decision.
-
-    Returns ``(merged_envelope_or_None, decision_meta)``. Merging keeps the
-    union of predicates; the meta records which wake_ids were consumed and
-    why the batch was accepted or deferred.
-
-    Deferral rules (never silently dropped — recorded on the meta):
-    - cooldown: last cycle completed less than ``cooldown_seconds`` ago.
-    - empty: no pending wakes at all.
-    """
-    consumed_ids = [w.wake_id for w in envelopes]
-    meta: dict[str, Any] = {
-        "pending_wake_count": len(envelopes),
-        "consumed_wake_ids": consumed_ids,
-        "cooldown_seconds": cooldown_seconds,
-    }
-    if not envelopes:
-        meta["decision"] = "no_pending_wakes"
-        return None, meta
-    if (last_cycle_completed_at_ms is not None
-            and (now_ms - last_cycle_completed_at_ms) < cooldown_seconds * 1_000):
-        meta["decision"] = "cooldown"
-        meta["last_cycle_completed_at_ms"] = last_cycle_completed_at_ms
-        return None, meta
-
-    predicates: dict[str, Any] = {}
-    sources: set[str] = set()
-    for envelope in envelopes:
-        sources.add(envelope.trigger_source)
-        for name, detail in envelope.predicates_fired.items():
-            if name not in predicates:
-                predicates[name] = detail
-            elif isinstance(detail, dict) and isinstance(predicates[name], dict):
-                # Keep the strongest detail for repeated predicates (e.g. the
-                # largest event_delta seen across the batch).
-                if "new_events" in detail and "new_events" in predicates[name]:
-                    if detail["new_events"] > predicates[name]["new_events"]:
-                        predicates[name] = detail
-                else:
-                    predicates[name] = detail
-            else:
-                predicates[name] = detail
-    merged = WakeEnvelope.create(
-        symbol=envelopes[-1].symbol,
-        venue=envelopes[-1].venue,
-        trigger_source="watcher" if len(sources) > 1 else next(iter(sources)),
-        predicates_fired=predicates,
-        counter_snapshot=envelopes[-1].counter_snapshot,
-        high_water=envelopes[-1].high_water,
-    )
-    meta["decision"] = "fire"
-    meta["merged_sources"] = sorted(sources)
-    return merged, meta
-
-
-async def read_pending_wakes(
-    store: RedisRuntimeStore, symbol: str, venue: str, *, count: int = 50,
-) -> list[WakeEnvelope]:
-    """Read pending wake envelopes from the durable wake stream."""
-    key = store.inference_wake_stream(symbol, venue)
-    rows = await store.redis.xrevrange(key, count=count)
-    envelopes: list[WakeEnvelope] = []
-    for _entry_id, fields in rows or []:
-        raw = (fields or {}).get("payload")
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        if not isinstance(raw, str):
-            continue
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(decoded, dict):
-            continue
-        try:
-            envelopes.append(WakeEnvelope.from_mapping(decoded))
-        except (KeyError, ValueError, TypeError):
-            continue
-    return envelopes
-
-
-def revalidate_wake(
-    envelope: WakeEnvelope, snapshot: CounterSnapshot,
-) -> tuple[bool, dict[str, Any]]:
-    """Two-phase wake: verify the envelope's assertion against LIVE counters.
-
-    Called at dispatch, after drain. A wake asserting ``event_delta`` must
-    still hold (the event stream has not been consumed by another cycle); a
-    ``capture_recovery``/``cold_start`` wake holds if capture is established.
-    Returns (holds, detail) — a stale wake is dropped WITHOUT running a cycle
-    and the drop is recorded.
-    """
-    detail: dict[str, Any] = {"wake_id": envelope.wake_id}
-    if snapshot.capture_state not in _ESTABLISHED_CAPTURE_STATES:
-        detail["reason"] = "capture_not_established"
-        detail["capture_state"] = snapshot.capture_state
-        return False, detail
-    if "event_delta" in envelope.predicates_fired:
-        asserted = envelope.predicates_fired["event_delta"]
-        prior_total = asserted.get("high_water")
-        if prior_total is None:
-            detail["reason"] = "event_delta_missing_high_water"
-            return False, detail
-        delta = snapshot.event_stream_len - prior_total
-        detail["revalidated_delta"] = delta
-        detail["asserted_delta"] = asserted.get("new_events")
-        if delta < DEFAULT_EVENT_DELTA_THRESHOLD // 2:
-            # Another cycle already consumed most of this delta.
-            detail["reason"] = "event_delta_consumed"
-            return False, detail
-    detail["reason"] = "holds"
-    return True, detail
-
-
-# ---------------------------------------------------------------------------
-# Tool base (Pass B2) — the agent's commandable calculation surface.
-#
-# Tools are named, scope-validated registry entries the LLM can COMMAND in
-# its narration call (it never recomputes; it dispatches). Every dispatch is
-# deterministic, produces a capability_log audit entry, and returns
-# JSON-transportable output. Two families:
-#
-#   T1 micro   — the Pass-3 paper-derived microstructure stack
-#   T2 market  — the canonical pipeline's calculation groups + ledger reads
-#
-# Tool dispatch may run at most ONE round per narration cycle (spec §4);
-# results are cited evidence, never memory.
+# Tool registry (Pass B2)
 # ---------------------------------------------------------------------------
 
 TOOL_NAMES: dict[str, str] = {
@@ -578,34 +139,6 @@ TOOL_NAMES: dict[str, str] = {
     "market.keystone_history": "market.read_keystone_history",
     "market.wall_history": "market.read_wall_history",
 }
-
-# Registry additions for the T2 read tools (T1 already registered in Pass A).
-_MARKET_TOOLS: dict[str, Capability] = {
-    name: Capability(
-        name=name,
-        description=description,
-        allowed_symbols=_INITIAL_SYMBOLS,
-        allowed_venues=_INITIAL_VENUES,
-    )
-    for name, description in {
-        "redis.read_intervals": "Read completed OFI interval rows from the capture ledger.",
-        "redis.read_evidence": "Read the latest immutable MicrostructureEvidence projection.",
-        "market.read": "Read the latest collated market run from Redis. Modes: snapshot (bounded headline view, default), inventory (section keys + snapshot), full (raw payload deep-dive).",
-        "market.run_group": "Run one calculation-model group (wall/flow/structure/positioning) fresh from the raw Redis window; never persists.",
-        "market.read_derivatives": "Read the cached derivative evidence (funding, OI, cross-asset).",
-        "market.read_keystone_history": "Read the bounded keystone cross-cycle ledger.",
-        "market.read_wall_history": "Read the bounded wall cross-cycle ledger.",
-        "calc.ofi_intervals": "Deterministic OFI per interval: sum e_n in [t_{k-1},t_k) — clock-bound, no AD. Paper Cont eq OFI_k.",
-        "calc.ad_average": "Deterministic AD per block: event-average (qB+qA)/2 — separate from OFI, needs tick_size. Paper AD_i.",
-        "calc.observation_build": "Join OFI intervals + AD blocks + mid → PriceImpactObservation[] (ΔP ticks vs OFI), quality filtered.",
-        "calc.fit_price_impact": "OLS ΔP_k = α + β·OFI_k (HC0 SE) — returns PriceImpactFit, status trichotomy. Takes observations, not raw intervals.",
-        "calc.fit_depth_scaling": "Log-log ln β = ln c - λ ln AD across blocks — needs ≥3 distinct AD_i, derived diagnostic only.",
-        "calc.derived_diagnostic": "NUMERIC derived ΔP (alias: calc.price.delta): pass ofi (else latest interval OFI) → route A ΔP=α+β·OFI with 95% band + route B depth-scaled when c/λ exist. Refuses on insufficient fits. Heteroskedastic ν·OFI — diagnostic, not prediction.",
-        "memory.recall_paper": "Recall Cont-Kukanov-Stoikov paper facts from real MemoryNode (kind=fact, paper-kb session) — not prompt.",
-    }.items()
-}
-CAPABILITIES.update(_MARKET_TOOLS)
-
 
 # Phase map for the staged inference cycle (engine drives P1→P5).
 # Credit is by TOOL FAMILY actually executed, not by the phase the model
@@ -1087,7 +620,7 @@ async def dispatch_market_group(
     interpretation plane's pipeline module, no longer opens a second Redis
     pool, and no longer runs the math with lossy defaults (depth=20, no
     tier config, no wall history). Group semantics live in
-    ``bedrock.GROUP_MAP`` — one source of truth for both planes.
+    ``composition.GROUP_MAP`` — one source of truth for both planes.
     """
     from market_service.nooa_harness import pipeline_inference
 
@@ -1095,9 +628,9 @@ async def dispatch_market_group(
     scope = {"symbol": symbol.upper(), "group": group, "window_minutes": window_minutes}
     try:
         cap.validate_scope(symbol, "spot")
-        if group not in pipeline_inference.bedrock.GROUP_MAP:
+        if group not in pipeline_inference.composition.GROUP_MAP:
             raise CapabilityDenied(
-                f"unknown group {group!r}; allowed: {sorted(pipeline_inference.bedrock.GROUP_MAP)}"
+                f"unknown group {group!r}; allowed: {sorted(pipeline_inference.composition.GROUP_MAP)}"
             )
         result = await pipeline_inference.run_inference_group(
             store, settings, symbol, group, window_minutes=window_minutes,
@@ -1415,74 +948,3 @@ async def _tool_fit_beta(
         )
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
-
-
-__all__ = [
-    "CAPABILITIES",
-    "TOOL_NAMES",
-    "TOOL_PHASE",
-    "Capability",
-    "CapabilityDenied",
-    "CounterSnapshot",
-    "WakeConfig",
-    "build_wake_envelope",
-    "capability_log_entry",
-    "coalesce_wakes",
-    "dispatch_assemble_evidence",
-    "dispatch_read_capture_status",
-    "dispatch_read_events",
-    "dispatch_replay",
-    "evaluate_triggers",
-    "execute_tool",
-    "gate_interpretation",
-    "publish_wake",
-    "read_pending_wakes",
-    "resolve_inference_status",
-    "revalidate_wake",
-    "wake_dedupe_id",
-]
-
-
-# ---------------------------------------------------------------------------
-# Wake dispatcher — the seam that CLOSES the loop (Slice 1)
-#
-# The wake worker owns the trigger plane and hands the engine a typed
-# ``WakeEnvelope``. This dispatcher is the async callable the worker invokes
-# on a fire. Slice 2 replaces the placeholder body with the full engine
-# cycle (gather -> gate -> narrate -> persist); today it records the wake
-# so the loop is observable end-to-end without an LLM.
-# ---------------------------------------------------------------------------
-
-
-async def default_wake_dispatcher(
-    envelope: WakeEnvelope,
-    *,
-    store: RedisRuntimeStore | None = None,
-) -> dict[str, Any]:
-    """Minimal deterministic wake handler (no LLM): record + return.
-
-    Called on every firing wake. Persists a structured record of the wake
-    (its predicates, high-water, and the deterministic wake_id) to the
-    inference stream so a human or an operator can audit what fired and
-    when — this is the informational journal, NOT load-bearing control flow
-    (the retired ``publish_wake``/``read_pending_wakes`` transport is gone).
-    Slice 2 swaps the body for the real engine cycle.
-    """
-    record = {
-        "schema_version": envelope.schema_version,
-        "wake_id": envelope.wake_id,
-        "symbol": envelope.symbol,
-        "venue": envelope.venue,
-        "trigger_source": envelope.trigger_source,
-        "predicates_fired": envelope.predicates_fired,
-        "high_water": envelope.high_water,
-        "created_at": envelope.created_at,
-    }
-    out = {"dispatched": True, "record": record}
-    if store is not None:
-        try:
-            await store.publish_wake_record(record)
-            out["journal"] = "ok"
-        except Exception as exc:
-            out["journal"] = f"{type(exc).__name__}: {exc}"
-    return out
