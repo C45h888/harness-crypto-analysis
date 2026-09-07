@@ -37,7 +37,7 @@ ANALYSIS_DIR = ROOT / "market_service" / "analysis"
 #    market_service/signals.py); new code must import from the substrate
 #    package.
 COMPOSITION_ROOTS = {"market.py"}
-COMPAT_SEAMS = {"wall_migration.py"}
+COMPAT_SEAMS = {"wall_migration.py", "oi.py"}
 
 _IMPORT_EXEMPT = COMPOSITION_ROOTS | COMPAT_SEAMS
 
@@ -273,6 +273,12 @@ class LegacySeamIdentityTests(unittest.TestCase):
         for attr in ("tiered_large_flow", "seller_aggression_classify"):
             self._assert_identity(f"market_service.calculations.technical.{attr}",
                                   f"market_service.calculations.substrates.large_print.{attr}")
+
+    def test_oi_positioning_seam_identity(self):
+        for attr in ("find_walls", "oi_weighted_contracts",
+                     "oi_inflow_outflow", "oi_implied_value"):
+            self._assert_identity(f"market_service.analysis.oi.{attr}",
+                                  f"market_service.calculations.substrates.positioning.{attr}")
 
     def test_wall_migration_tier_seam_identity(self):
         for attr in ("TierConfig", "compute_bid_tiers_usd", "bid_tier_balance",
