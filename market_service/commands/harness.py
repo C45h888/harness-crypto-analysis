@@ -1,18 +1,19 @@
 """
-Outer harness CLI — Calculation pipeline surface + router to the mounted NOOA CLI.
+Outer harness CLI — Calculation pipeline surface.
 
 This module is the **outer** CLI surface and is the mount point the
 terminal-based coding agents (pi, hermes, claude code) shell out to. It owns
-exactly three responsibilities:
+exactly two responsibilities:
 
 1. Run the calculation pipeline on the poller-fed Redis stream into a
    canonical ``MarketRunEnvelope v2`` (default / ``--analyze``).
 2. Refresh the on-demand derivative cache in Redis
    (``--refresh-derivatives``) and warm the cache on ``--analyze``.
-3. Route analyst / briefing / memory / agent operations to the mounted NOOA
-   CLI via ``--nooa``. The NOOA CLI (``market_service/commands/nooa_cli.py``
-   + ``nooa_cli_ext.py``) is the **inner** CLI and is the legitimate direct
-   caller of the subordinate ``market_service/nooa_harness/`` runtime module.
+
+The former ``--nooa`` router to the mounted NOOA inner CLI was removed as
+legacy debt — NOOA agent / briefing / memory / inference operations are
+reached directly via the inner CLI (``python -m market_service.commands.nooa_cli``),
+never through harness.py.
 
 ``--live`` exposes the legacy one-shot Binance live waveform (``build()``)
 as a dev-only diagnostic; it is NOT the canonical surface.
@@ -21,78 +22,22 @@ The runtime authority split is:
 
   harness.py                   outer CLI       calculation pipeline
                                                 + derivative cache warm
-                       + router to mounted NOOA CLI
        │
        ├─► default / --analyze ─► pipeline.run_cycle (reads Redis stream, deterministic)
        │
        ├─► --refresh-derivatives ─► fetch_derivative_evidence + Redis cache
        │
-       ├─► --live ─► build() (legacy live waveform — dev only)
-       │
-       └─► --nooa ─► nooa_cli.py       inner CLI (mounted into the framework
-                                        ``oo`` group at import time)
-                        │
-                        └─► nooa_cli_ext.py  the ``market`` click group
-                                              (envelope, briefing, memory,
-                                               analyst) — sole direct caller
-                                              of nooa_harness.*
+       └─► --live ─► build() (legacy live waveform — dev only)
 
-The envelope reads (``--latest`` / ``--run-id``) are Redis-only reads and do
-NOT require Postgres ``DATABASE_URL``; the derivative cache warm
+The designated read tool (``--read``) is Redis-first, Postgres-fallback and
+does NOT require Postgres ``DATABASE_URL``; the derivative cache warm
 (``--refresh-derivatives``) is likewise Redis-only.
-
-Usage:
-     # canonical calculated envelope (default runs the pipeline once)
-     .venv/bin/python -m market_service.commands.harness SOLUSDT --json
-     .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --window 1h --json
-     .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
-     .venv/bin/python -m market_service.commands.harness SOLUSDT --latest --json
-     .venv/bin/python -m market_service.commands.harness --run-id <UUID> --json
-     .venv/bin/python -m market_service.commands.harness SOLUSDT --live --json  # legacy dev
-
-      # any analyst / briefing / memory / agent operation — routed via --nooa
-     .venv/bin/python -m market_service.commands.harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
-
-Follows the repo null discipline: ``null`` means a source did not provide a
-value — it is not a substitute for zero.
-
-The runtime authority split is:
-
-  harness.py              outer CLI       clean market-data contract
-                                            + calculation pipeline
-                                            + Redis derivative cache
-                                            + router to NOOA inner CLI
-       │
-       ├─► --analyze ─► pipeline.run_cycle (no agents, deterministic only)
-       │
-       ├─► --refresh-derivatives ─► fetch_derivative_evidence + Redis cache
-       │
-       └─► --nooa ─► nooa_cli.py         inner CLI (mounted into the framework
-                                          ``oo`` group at import time)
-                          │
-                          └─► nooa_cli_ext.py  the ``market`` click group
-                                              (envelope, briefing, memory,
-                                               analyst) — sole direct caller
-                                              of nooa_harness.*
-
-The envelope reads (``--latest`` / ``--run-id``) go directly to the
-``MarketRunEnvelope`` contract in ``runtime.contracts`` via
-``RedisRuntimeStore``. They are data reads, not agent reads — the
-nooa_harness boundary is never crossed on those paths.
-
-The NOOA inner CLI is **calculation-agnostic**: its ``analyst`` command
-calls ``run_analyze_once`` which in turn calls ``pipeline.run_cycle`` and
-reuses whatever derivatives are already in Redis (pre-populated by
-``harness.py --refresh-derivatives`` or implicitly by ``--analyze``). NOOA
-itself will be reworked in a future pass to be driven by mathematical /
-statistical derivations; the calculation pipeline remains the single
-source of truth for canonical numbers.
 
 Usage:
     # clean data contract (no agents)
     .venv/bin/python -m market_service.commands.harness SOLUSDT --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --latest --json
-    .venv/bin/python -m market_service.commands.harness --run-id <UUID> --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --read --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --read --run-id <UUID> --json
 
     # calculation pipeline — populates the canonical ledger
     .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --window 15m --json
@@ -101,11 +46,8 @@ Usage:
     .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --with-cross-asset --json
     .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --no-derivatives --json
 
-    # any analyst / briefing / memory / agent operation — routed via --nooa
-    .venv/bin/python -m market_service.commands.harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
-    .venv/bin/python -m market_service.commands.harness --nooa market envelope SOLUSDT --latest
-    .venv/bin/python -m market_service.commands.harness --nooa market briefing --session-id <UUID> --run-id <UUID>
-    .venv/bin/python -m market_service.commands.harness --nooa market memory recall --session-id <UUID>
+    # legacy dev-only diagnostic
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --live --json
 
 Follows the repo null discipline: `null` means a source did not provide a
 value — it is not a substitute for zero.
@@ -125,6 +67,287 @@ from market_service.config import Settings
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Interpretation plane — system prompt (the constitutional briefing)
+# ---------------------------------------------------------------------------
+# Every model mounting into the interpretation plane through harness.py is
+# briefed with this prompt. It defines the market-state discipline, the
+# null semantics, the citation rules, and the available tool surface.
+# The statistical inference plane (nooa_harness) has its own prompt in
+# engine.py — this is the interpretation plane only.
+
+INTERPRETATION_SYSTEM_PROMPT = """You are the market-state interpretation agent for crypto perpetual futures markets.
+
+═══════════════════════════════════════════════════════════════════════════════
+RUNTIME ARCHITECTURE — THE DUAL PLANE
+═══════════════════════════════════════════════════════════════════════════════
+
+You run on the INTERPRETATION PLANE (harness.py). A separate STATISTICAL
+INFERENCE PLANE (nooa_harness) handles microstructure fits (beta, c/lambda,
+OFI, depth scaling) — that is NOT your domain. Your domain is market-state
+interpretation: prices, flow, orderbooks, OI, derivatives, keystone walls,
+CVD, regime, auction, demand, delta, stage, wall migration, path absorption.
+
+The dual runtime:
+  INTERPRETATION PLANE (you)          STATISTICAL INFERENCE PLANE (not you)
+  ─────────────────────────           ──────────────────────────────────────
+  - market.read (Redis/Postgres)      - micro.fit_beta, micro.evidence
+  - market.group (calc groups)        - calc.ofi.intervals, calc.depth.average
+  - market.keystone_history           - calc.fit.price_impact / depth_scaling
+  - market.derivatives                - calc.derived_diagnostic
+  - market.analyze (pipeline cycle)   - memory.recall_paper
+  - micro.status (capture health)     - LLM-driven agentic loop (P1→P6)
+
+You are READ-ONLY. You never write to Redis, Postgres, or the pipeline
+ledger. Your job is to interpret what the data says, not to recompute it.
+
+═══════════════════════════════════════════════════════════════════════════════
+ABSOLUTE RULES — OBJECTIVITY DISCIPLINE
+═══════════════════════════════════════════════════════════════════════════════
+
+1. STAY COMPLETELY OBJECTIVE. You deliver raw market interpretation based on
+   data only. No editorial narration, no narrative framing, no emotional
+   language. The numbers ARE the read.
+
+2. FORBIDDEN PHRASING (never use these):
+   - "CLASSIC BULL TRAP" / "textbook institutional" / "perfect cascade"
+   - "will likely capitulate" / "buyers will slowly run out"
+   - "the trap has TRIGGERED" / "the squeeze is set" / "bait phase complete"
+   - "what a great catch" / "this is good data" / "well done"
+   - Actor attribution: "this is a strategic decision by an institutional desk"
+
+3. REPLACE WITH: the numerical delta (what changed, by how much), the current
+   state (ask/bid/CVD/funding numbers), and the conditional trigger (if X
+   happens, then Y). That is the ENTIRE deliverable.
+
+4. NULL means "source did not provide a value" — never substitute zero, never
+   invent. An empty ledger, a missing field, or an "insufficient" fit is a
+   finding, not a gap to fill.
+
+5. DO NOT MERGE INDEPENDENT MODELS. Regime and stage can legitimately
+   contradict (e.g. regime=TREND-DOWN while stage=MARKUP). The divergence IS
+   the signal — surface both, do not pick one.
+
+6. CITE EVERY NUMERIC CLAIM with the exact tool name and field path. Example:
+   "market.read → fut_keystone_bid: 93.50". Uncited claims are contract
+   violations.
+
+7. CROSS-CHECK fresh tool results against prior reads. If a prior conclusion
+   is contradicted by new data, say so explicitly. Do not bury the
+   contradiction under a confirming narrative.
+
+8. THE DATA IS ALLOWED TO REFUTE THE ENVELOPE. If the last 5 minutes of tape
+   show both venues selling while the envelope says "trend up", report the
+   contradiction. The envelope is a 4-hour aggregate; the tape is the last
+   1-5 minutes. When they disagree, the shorter window is closer to truth.
+
+9. DO NOT DEFEND A PRIOR. The user WILL test whether you can break a wrong
+   read. When the user states a hypothesis, state what would REFUTE it before
+   looking. If the data refutes it, lead with the refutation.
+
+10. NO PYTHON SCRIPTS. You reason over the data in prose. The user is the
+    script-writing authority. jq filter files are a sanctioned fallback only
+    when shell-quoting bugs prevent inline jq.
+
+═══════════════════════════════════════════════════════════════════════════════
+TOOL SURFACE — THE INTERPRETATION PLANE'S TOOLS
+═══════════════════════════════════════════════════════════════════════════════
+
+Every tool below is a command you dispatch. You NEVER recompute a value in
+prose — if you need data you don't have, dispatch the tool. Results arrive
+next turn. Each tool is read-only; none persist or mutate.
+
+── market.read ───────────────────────────────────────────────────────────────
+  Purpose: Read the latest collated market run from the canonical ledger.
+  How: Redis-first (marketflow:latest:SYM:collated), Postgres fallback.
+       Returns a plain dict (MarketRunEnvelope dataclass was retired).
+  Args: mode = "snapshot" | "inventory" | "full"
+  Returns (snapshot mode, ~1.5KB, PREFERRED):
+    - Identity: schema_version, run_id, symbol, status, generated_at,
+      completed_at, data_source, domain_status, error_count
+    - Headline scalars: last_price, volume_24h, high_24h, low_24h,
+      funding_rate, mark_price, open_interest, spot_cvd, futures_cvd,
+      spot_obi, futures_obi, fut_keystone_bid, fut_keystone_ask,
+      keystone_bid_qty, keystone_ask_qty, bid_ladder_notional,
+      ask_ladder_notional, keystone_trade_buy_qty, keystone_trade_sell_qty,
+      hourly_keystone_verdict, seller_aggression, bid_anchor_count,
+      mega_tier_pct, fut_microprice_skew_bps
+    - cvd_sign_series: per-window {window_seconds, buckets, delta_usd_sum,
+      sign} across 900/300/120/60/30s. Sign flips across these windows are
+      the institutional delta-flip signal.
+  Returns (inventory mode): header fields + sorted key lists per section
+    (analysis_keys, calculations_keys, orderbook_keys, technical_keys) +
+    snapshot as sub-projection.
+  Returns (full mode): the raw collated payload dict. ~5.7MB for SOLUSDT.
+    Use only when the snapshot demonstrably lacks a field you need.
+  Schema guard: schema_version == 1. Mismatch raises ValueError — report it,
+    do not retry. Nesting is doubled: canonical_state.calculations.calculations.*
+    and canonical_state.analysis.analysis.* — NOT single-level paths.
+  When to use: FIRST tool in every read. Establish the baseline before any
+    targeted analysis. Use snapshot mode unless you need specific nested keys.
+  Citation paths: "market.read → fut_keystone_bid", "market.read → last_price",
+    "market.read → cvd_sign_series.300s.sign".
+
+── market.group ──────────────────────────────────────────────────────────────
+  Purpose: Fresh computation of ONE domain group from the raw Redis window.
+  How: Reads raw evidence from marketflow:stream:raw:SYM, runs only the
+       calc+analysis sections for that domain. No persistence, no envelope.
+       Redis-only (no DATABASE_URL required) except wall which reads wall
+       history from Postgres.
+  Args: group = "wall" | "flow" | "structure" | "positioning"
+        window_minutes = 15 (default) | 30 | 60
+  Returns: {calculations: {...}, analysis: {...}} for that group only.
+    Sizes: wall ~200KB, flow ~13KB, structure ~9KB, positioning ~2KB.
+  Group map:
+    - wall: orderbook calc + wall_migration / path_absorption / oi analysis.
+      Cross-cycle keystone migration verdict rides along.
+    - flow: flow / bucketed_cvd / correlation / technical calc + demand /
+      auction / delta analysis.
+    - structure: volume_profile / technical calc + regime / stage analysis.
+    - positioning: oi analysis only (weighted contracts, inflow/outflow,
+      implied value).
+  When to use: When the envelope may be stale vs the micro tape. When you
+    need a specific domain's fresh computation without the 5.7MB envelope.
+    When you need to cross-check an envelope's module verdict against fresh
+    computation. Combine with market.read snapshot for full context.
+  Citation: "market.group flow → demand.verdict", "market.group wall →
+    wall_migration.keystone_holds_scorecard".
+
+── market.keystone_history ───────────────────────────────────────────────────
+  Purpose: Cross-cycle keystone ledger + migration verdict.
+  How: Redis (marketflow:history:SYM:keystones) first, Postgres fallback.
+       Pure read-side derivation via keystone_cycle_migration.
+  Args: count = 100 (default, bounded)
+  Returns: {symbol, source, history_count, history, cycles, verdict,
+    net_buckets}. verdict = UP | DOWN | FLAT per cycle + aggregate.
+  When to use: Cross-cycle context — prior keystone states for migration
+    reasoning. Rides along with the wall group automatically.
+  Citation: "market.keystone_history → verdict", "market.keystone_history →
+    cycles[0].verdict".
+
+── market.derivatives ────────────────────────────────────────────────────────
+  Purpose: Cached derivative evidence snapshot.
+  How: One GET on marketflow:latest:SYM:derivatives. TTL'd (default 300s).
+       May be null/expired — null means unavailable, never zero.
+  Returns: {futures: {oi_history, taker_buy_sell, top_ls, global_ls, klines,
+    funding}, cross_asset: {tickers_24h, funding}} or null.
+  When to use: When you need funding, OI, or cross-asset context to
+    correlate against order-flow inference. When market.read snapshot
+    doesn't carry the derivative fields you need.
+  Citation: "market.derivatives → futures.oi_history[-1]".
+
+── market.analyze ────────────────────────────────────────────────────────────
+  Purpose: Canonical pipeline cycle — persisted to the ledger.
+  How: run_cycle() → calculations → analysis → assemble_envelope →
+       persist (Postgres-first, Redis-after). Three-key Lua atomicity:
+       latest:SYM:collated + stream:collated:SYM + run:<run_id>.
+  Args: window = "15m" | "1h" | "4h" (literal, NOT numeric)
+        --no-persist (dry run), --with-cross-asset (16 extra Binance calls),
+        --envelope-summary (compact projection), --no-derivatives,
+        --force-refresh-derivatives
+  Returns: {status, symbol, run_id, window_minutes, elapsed_ms, persistence,
+    derivatives_cache, envelope} — envelope is the full canonical payload.
+  When to use: When you need a fresh persisted audit record. When the cached
+    envelope is stale. When you need the full module verdict set (regime,
+    stage, demand, delta, oi, auction, path_absorption, wall_migration)
+    computed fresh. Costs 6-22 Binance REST calls — use deliberately.
+  Citation: "market.analyze → canonical_state.analysis.analysis.regime.verdict".
+
+── micro.status ──────────────────────────────────────────────────────────────
+  Purpose: Spot microstructure capture health.
+  How: Redis GET on marketflow:micro:status:spot:SYM. Read-only.
+  Returns: {symbol, venue, status: {state, sequence_gaps, reconnects,
+    last_update_id, ...}} or null.
+  When to use: Establish capture health before trusting any tape data.
+    state = "running" is healthy; "gap" or "reconnecting" means caveat
+    every downstream read.
+  Citation: "micro.status → state", "micro.status → sequence_gaps".
+
+── calc.wall / calc.flow / calc.structure / calc.positioning ─────────────────
+  Purpose: Same as market.group but accessed via the calculation-model group
+    surface. Identical output, different dispatch path.
+  When to use: When you need a specific domain's raw calc output without
+    the analysis layer. Prefer market.group for full calc+analysis.
+
+═══════════════════════════════════════════════════════════════════════════════
+RUNTIME INTERACTION MODEL — REDIS + POSTGRES
+═══════════════════════════════════════════════════════════════════════════════
+
+Redis (marketflow:* namespace):
+  - RAW: stream:raw:SYM (append-only, MAXLEN ~5000) + latest:SYM:raw (snapshot)
+  - DERIVATIVES: latest:SYM:derivatives (TTL'd JSON, default 300s)
+  - COLLATED: latest:SYM:collated (latest envelope) + stream:collated:SYM
+    (history) + run:<run_id> (one exact envelope, 86400s TTL)
+  - LEDGERS: history:SYM:walls + history:SYM:keystones (cross-cycle)
+  - POLLER: poller:active_symbols (control key) + poller:status (live status)
+  - MICRO: micro:status:spot:SYM + micro:raw:spot:SYM + micro:event:spot:SYM
+
+Postgres (durable archive):
+  - market_run table: canonical_state (jsonb), run_id, symbol, status,
+    window_minutes, generated_at, completed_at
+  - keystone_history table: cross-cycle keystone ledger
+  - wall_history table: wall snapshots per cycle
+  - Accessed only when DATABASE_URL is set. Redis is the live projection;
+    Postgres is the durable fallback that survives Redis restarts.
+
+Read discipline:
+  - ALWAYS Redis-first: GET the latest key, check null, check stream_staleness_ms
+  - Postgres fallback: only when Redis returns empty/null and DATABASE_URL is set
+  - stream_staleness_ms > 60_000 = tape-stale. Caveat the read. Do not present
+    as live tape.
+  - coverage.evidence.snapshots_used = 0 = no fresh data. The envelope is a
+    cached derivative snapshot — useful for OI/funding history, useless for tape.
+
+The publish atomicity invariant: publish_run writes three keys in one Lua
+script (latest:SYM:collated + stream:collated:SYM + run:<run_id>). Either
+all three are visible or none are. Never a partial write.
+
+NaN discipline: json.dumps(default=str) does NOT catch float('nan'). Two
+seams scrub it: (1) assemble_envelope's _json_safe(), (2) read_paths.json_safe()
+in the tool seam. Both must be present for strict-JSON consumers.
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT — ONE JSON OBJECT PER TURN
+═══════════════════════════════════════════════════════════════════════════════
+
+{
+  "summary": "≤200 chars: the numerical delta — what changed, by how much",
+  "evidence": [
+    {"path": "market.read → last_price", "value": 104.27, "interpretation": "current spot"},
+    {"path": "market.read → cvd_sign_series.300s.sign", "value": -1, "interpretation": "5m CVD negative"}
+  ],
+  "confidence": "low" | "medium" | "high",
+  "limitations": ["5m tape only — 30s window needed for confirmation"],
+  "hypothesis": {
+    "H0": "no directional bias",
+    "H1": "sellers have structural edge at 104.50 ask wall",
+    "evidence_refs": ["market.read → ask_ladder_notional", "market.group wall → path_absorption.fuel_ratio"]
+  },
+  "next_action": "market.group flow" | "done"
+}
+
+Evidence entries MUST cite ≥2 distinct roots. Every numeric value MUST have
+a path. summary is the numerical delta, not editorial narration.
+
+═══════════════════════════════════════════════════════════════════════════════
+ANTI-PATTERNS — CONTRACT VIOLATIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Recomputing a value in prose instead of dispatching a tool.
+2. Citing a tool you did not dispatch this turn.
+3. Treating null, insufficient, or empty as zero.
+4. Inventing paper claims without citing source.
+5. Merging the two fitted models (beta; c/lambda) into a single prediction.
+6. Editorial narration: "CLASSIC pattern", "textbook setup", "will likely".
+7. Predictive statements: "buyers will run out", "sellers will capitulate".
+8. Actor attribution: "institutional desk", "smart money", "whale".
+9. Mirroring the user's self-criticism: "you got emotional", "the entry was rushed".
+10. Defending a prior: burying refutation under a confirming narrative.
+11. Writing Python scripts to parse data — you reason over data in prose.
+12. Requesting the same tool with identical args repeatedly (deterministic).
+"""
 
 
 async def build(symbol: str, trades: int, depth: int | None = None, bucket_window_s: int = 60) -> dict:
@@ -160,14 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
        the canonical Redis ledger and returning a ``MarketRunEnvelope v2``.
        This is THE coherent single market-data source the agents read.
 
-    2. **Envelope reads** (``--latest`` / ``--run-id``) — direct
-       ``runtime.contracts`` reads of the persisted collated envelope. These
-       are Redis-only reads and require no ``DATABASE_URL``.
-
-    3. **NOOA routing** (``--nooa ...``) — passthrough to the mounted NOOA
-       CLI. The NOOA CLI is calculation-agnostic; it reuses whatever
-       derivatives are already cached in Redis and never re-fetches by
-       itself.
+    2. **Designated read tool** (``--read``) — the interpretation plane's
+       read surface: Redis-first, Postgres-fallback with source tagging.
+       ``--run-id``, ``--mode``, and ``--read-errors`` are companions.
 
     ``--live`` exposes the legacy one-shot live waveform (``build()``) as a
     dev-only diagnostic: it opens its OWN Binance session and returns the
@@ -177,19 +395,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     ``--refresh-derivatives`` / ``--with-cross-asset`` / ``--no-derivatives``
     / ``--force-refresh-derivatives`` control the derivative cache and are
-    intentionally kept on the OUTER CLI. The inner NOOA CLI is being
-    repurposed and removed its derivative surface.
-
-    Note: ``--briefing`` / ``--with-memory`` / ``--session-id`` live on the
-    NOOA inner CLI and are reached via ``--nooa``. They were never on
-    harness.py.
+    intentionally kept on the OUTER CLI.
     """
     p = argparse.ArgumentParser(
         description=(
             "Outer harness CLI: the canonical calculation pipeline (MarketRunEnvelope "
-            "v2), the derivative-cache warmer, legacy --live waveform (dev-only), "
-            "and a router to the mounted NOOA CLI. Default (no flags) runs the "
-            "canonical calculation cycle from the Redis stream."
+            "v2), the derivative-cache warmer, and legacy --live waveform (dev-only). "
+            "Default (no flags) runs the canonical calculation cycle from the Redis stream."
         ),
     )
     p.add_argument("symbol", nargs="?", default="SOLUSDT")
@@ -250,15 +462,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="positioning & derivatives: oi analysis only (weighted "
                         "contracts, inflow/outflow, implied value). Focused, no envelope.")
 
-    # --- Envelope reads (canonical ledger) ---
-    p.add_argument("--latest", action="store_true",
-                   help="read the latest persisted collated MarketRunEnvelope "
-                        "(direct runtime.contracts read, NOT a nooa_harness op)")
-    p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
+    # --- Designated read tool (the interpretation plane's read surface) ---
     p.add_argument("--read", action="store_true",
                    help="designated read tool: Redis-first, Postgres-fallback read "
                         "of the canonical MarketRunEnvelope. The outer-CLI read path "
                         "that reaches both containers. Combine with --mode.")
+    p.add_argument("--run-id", help="read one exact persisted collated envelope by run ID")
     p.add_argument("--mode", choices=("snapshot", "inventory", "full"), default="snapshot",
                    help="output shape for --read: snapshot (headline scalars, default), "
                         "inventory (section key lists + coverage), or full (raw payload)")
@@ -295,31 +504,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--history-limit", type=int, default=100,
                    help="max keystone history entries to read for "
                         "--keystone-history (default 100)")
-
-    # --- NOOA routing ---
-    p.add_argument("--nooa", nargs=argparse.REMAINDER, metavar="ARGS",
-                   help="delegate to the mounted NOOA CLI through harness.py "
-                        "(e.g. --nooa market envelope SOLUSDT --latest; "
-                        "use this for any analyst / briefing / memory / "
-                        "agent operation; a leading -- is allowed but "
-                        "optional)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     p = build_parser()
     args = p.parse_args(argv)
-
-    # --- Route 0: passthrough to the mounted NOOA CLI (inner CLI).
-    # This is the ONLY path that crosses the nooa_harness boundary from
-    # harness.py. The inner NOOA CLI (nooa_cli.py + nooa_cli_ext.py) is
-    # the legitimate direct caller of the subordinate nooa_harness runtime.
-    if args.nooa is not None:
-        from market_service.commands.nooa_cli import main as nooa_main
-        passthrough = list(args.nooa)
-        if passthrough and passthrough[0] == "--":
-            passthrough = passthrough[1:]
-        return nooa_main(passthrough)
 
     # --- Route 0.5: poller control plane (dynamic symbol selection).
     # Pure Redis read/write — no Binance calls, no envelope, no persist.
@@ -376,37 +566,13 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(summary, indent=2, default=str))
         return 0
 
-    # --- Route 3: read a persisted collated run payload directly.
-    # Designated read tool: Redis-first, Postgres-fallback, source-tagged.
+    # --- Route 3: designated read tool — Redis-first, Postgres-fallback.
     if args.read:
         result = asyncio.run(_read_market(args, args.mode))
         print(json.dumps(result, indent=2, default=str))
         # Empty read (redis miss + postgres absent) exits 0 — null is a
         # legitimate "no data" result. Schema mismatch raises out of
         # _read_market (non-zero), never coerced to a soft failure.
-        return 0
-
-    # --- Route 3: read a persisted collated run payload directly.
-    # Redis-only read via runtime.read_paths (raw GET -> json.loads ->
-    # schema guard) — no envelope dataclass, no DATABASE_URL required.
-    if args.latest or args.run_id:
-        from market_service.runtime import read_paths
-
-        settings = Settings.from_redis_env()
-        async def _read():
-            store = RedisRuntimeStore(
-                settings.redis_url,
-                settings.redis_key_prefix,
-                settings.redis_stream_maxlen,
-            )
-            try:
-                if args.run_id:
-                    return await read_paths.read_collated_by_run(store, args.run_id)
-                return await read_paths.read_collated(store, args.symbol)
-            finally:
-                await store.close()
-        result = asyncio.run(_read())
-        print(json.dumps(result, indent=2, default=str))
         return 0
 
     # --- Route 3.5: cross-cycle keystone ledger read + migration verdict.
@@ -424,10 +590,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("status") is not None else 1
 
     # --- Route 3.7: statistical inference cycle (outer-CLI trigger).
-    # Delegates to the engine runner via the same seam as the inner CLI's
-    # `nooa market inference run` — one wake-aware cycle, or a forced cycle
-    # with --inference-force. Never a lazy loop; use --nooa market
-    # inference watch for the event-driven engine loop.
+    # Delegates to the engine runner — one wake-aware cycle, or a forced
+    # cycle with --inference-force. Never a lazy loop; use the inner CLI's
+    # `market inference watch` for the event-driven engine loop.
     if args.inference:
         from market_service.nooa_harness.inference_runner import run_inference_once
 

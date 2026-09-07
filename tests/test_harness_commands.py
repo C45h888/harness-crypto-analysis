@@ -60,17 +60,20 @@ class HarnessParserTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             p.parse_args(["SOLUSDT", "--analyze", "--refresh-derivatives"])
 
-    def test_nooa_routing_passes_through_remainder(self):
+    def test_nooa_routing_is_removed(self):
         p = build_parser()
-        args = p.parse_args(["--nooa", "market", "envelope", "SOLUSDT", "--latest"])
-        self.assertEqual(args.nooa, ["market", "envelope", "SOLUSDT", "--latest"])
+        with self.assertRaises(SystemExit):
+            p.parse_args(["--nooa", "market", "envelope", "SOLUSDT", "--latest"])
 
-    def test_latest_and_run_id_flags(self):
+    def test_latest_flag_is_removed(self):
         p = build_parser()
-        args_a = p.parse_args(["--latest"])
-        self.assertTrue(args_a.latest)
-        args_b = p.parse_args(["--run-id", "abc-123"])
-        self.assertEqual(args_b.run_id, "abc-123")
+        with self.assertRaises(SystemExit):
+            p.parse_args(["--latest"])
+
+    def test_run_id_flag_stays_for_read_tool(self):
+        p = build_parser()
+        args = p.parse_args(["--run-id", "abc-123"])
+        self.assertEqual(args.run_id, "abc-123")
 
 
 class HarnessRouteDispatchTests(unittest.TestCase):
@@ -164,7 +167,6 @@ class HarnessRouteDispatchTests(unittest.TestCase):
         self.assertFalse(args.live)
         self.assertTrue(args.analyze is False)
         # The absence of any read/pipeline flag is the default-pipeline signal
-        self.assertFalse(args.latest)
         self.assertIsNone(args.run_id)
 
 

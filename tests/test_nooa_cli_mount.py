@@ -1,18 +1,18 @@
-"""Tests for the repo-level NOOA CLI mount and the harness ``--nooa`` passthrough.
+"""Tests for the repo-level NOOA CLI mount.
 
-The mount is the canonical harness seam: instead of writing shim modules into
-the installed ``nooa_cli/commands/`` package (site-packages mutation), the
-``market`` harness group is attached to the framework root ``oo`` group at
-import time from this repository. These tests keep the seam honest — the
-mount must register exactly the harness surface, must not write any files
-into the framework package, and the harness passthrough must forward its
-argv verbatim to the mounted CLI.
+The mount attaches the ``market`` harness group to the framework root ``oo``
+group at import time from this repository (instead of writing shim modules
+into the installed ``nooa_cli/commands/`` package). These tests keep the seam
+honest — the mount must register exactly the harness surface and must not
+write any files into the framework package.
+
+The former harness ``--nooa`` passthrough was removed as legacy debt; the
+inner CLI is invoked directly, never through harness.py.
 """
 
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 import click
 
@@ -59,30 +59,18 @@ class NooaCliMountTests(unittest.TestCase):
         self.assertEqual(market_group.name, "market")
 
 
-class HarnessNooaPassthroughTests(unittest.TestCase):
-    def test_parser_captures_nooa_args(self):
+class HarnessNooaPassthroughRemovedTests(unittest.TestCase):
+    """The --nooa router was removed as legacy debt — the outer CLI must
+    not accept or forward it again."""
+
+    def test_parser_rejects_nooa_flag(self):
         p = harness.build_parser()
-        args = p.parse_args(
-            ["SOLUSDT", "--nooa", "market", "envelope", "SOLUSDT", "--latest"]
-        )
-        self.assertEqual(args.nooa, ["market", "envelope", "SOLUSDT", "--latest"])
+        with self.assertRaises(SystemExit):
+            p.parse_args(["SOLUSDT", "--nooa", "market", "envelope"])
 
-    def test_parser_remainder_captures_flags_without_separator(self):
-        p = harness.build_parser()
-        args = p.parse_args(["--nooa", "market", "--help"])
-        self.assertEqual(args.nooa, ["market", "--help"])
-
-    @patch("market_service.commands.nooa_cli.main", return_value=0)
-    def test_main_delegates_to_mounted_cli(self, mock_main):
-        rc = harness.main(["--nooa", "market", "--help"])
-        mock_main.assert_called_once_with(["market", "--help"])
-        self.assertEqual(rc, 0)
-
-    @patch("market_service.commands.nooa_cli.main", return_value=0)
-    def test_main_forwards_verbatim_without_double_dash(self, mock_main):
-        rc = harness.main(["--nooa", "market", "refresh", "SOLUSDT", "--all"])
-        mock_main.assert_called_once_with(["market", "refresh", "SOLUSDT", "--all"])
-        self.assertEqual(rc, 0)
+    def test_main_rejects_nooa_flag(self):
+        with self.assertRaises(SystemExit):
+            harness.main(["--nooa", "market", "--help"])
 
 
 if __name__ == "__main__":
