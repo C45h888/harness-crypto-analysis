@@ -138,3 +138,62 @@ of its GroupEnvelope, so the interpretation plane can explain
 5. **Schema honesty** — if provenance becomes a hard-read field, bump
    `GROUP_ENVELOPE_SCHEMA_VERSION` to 2 with a migration note (additive today, so
    v1 readers tolerate it).
+## 7. Executed — bedrock deletion + inference package (2026-09-06)
+
+Both monoliths are gone; suite green at **535 passed, 12 subtests** plus a
+live Docker `--flow` group run.
+
+### Phase 0 — inference.py → inference/ package (move-don't-rewrite)
+
+`nooa_harness/inference.py` (1488 lines) split along its four semantic
+blocks; `inference/__init__.py` re-exports every historical name (public and
+underscored, e.g. `_REQUIRED_PHASES`, `_normalize_tool_name`) so engine.py,
+wake_worker.py, inference_runner.py and all tests import unchanged:
+
+| Module | Block |
+|---|---|
+| `inference/gate.py` | hard status gate trichotomy + null discipline |
+| `inference/capability.py` | capability registry (CAPABILITIES, scope validation, audit entries) |
+| `inference/dispatch.py` | tool base: dispatch_*, TOOL_NAMES/TOOL_PHASE, execute_tool |
+| `inference/wake.py` | wake plane: triggers, dedupe, coalesce, revalidate, default_wake_dispatcher |
+
+### Option A — calculation composition root replaces bedrock.py
+
+`nooa_harness/bedrock.py` (1935 lines) **DELETED** (no shim). The substrates
+remain the core owners of the math; composition moved next to them:
+
+| New home | Content (verbatim from bedrock) |
+|---|---|
+| `calculations/composition.py` | GROUP_MAP, SUBSTRATE_GRAPH, section resolvers, run_calculations, run_analysis, all `_adapt_*`, wall/keystone helpers, `_accumulate_prior_walls` |
+| `runtime/derivatives.py` | `_is_deriv_fresh`, `_merge_derivatives`, DERIV_TTL_S/DERIV_FRESH_MS defaults |
+| `runtime/bounds.py` | `_bound_arrays`, `_evidence_headlines`, `_GROUP_ARRAY_CAP` |
+| `runtime/raw_window.py` | `build_raw_window` (already extracted earlier; `read_raw_window` alias kept) |
+
+Rewired: `pipeline_interpretation` and `pipeline_inference` import
+`composition` directly (the `from . import bedrock` attribute style became
+`from market_service.calculations import composition`); the `pipeline.py`
+shim re-exports from the new homes; `inference/dispatch.py` reads
+`pipeline_inference.composition.GROUP_MAP`.
+
+Contract-suite note: `composition.py` sits in `calculations/` but is NOT a
+substrate — the purity AST scan only globs `calculations/substrates/*.py`,
+so rule 1 (substrates never import siblings/analysis) still holds and
+composition is the single declared orchestrator alongside `analysis/market.py`.
+
+One migration-debt find during the move: the working tree's SUBSTRATE_GRAPH
+had `oi → substrates: ("positioning",)` — no such module exists (graph
+consistency test caught it); corrected to `("analysis.oi",)`. Function-body
+AST diff against HEAD bedrock confirms every other body moved byte-identical
+(the only intentional deltas: Find-1 `"bid"` side fix and the deduped
+`substrate_for`).
+
+### Remaining forward steps (from §6, unchanged)
+
+1. GROUP_MAP amount = graph iteration (graph as runtime engine)
+2. Typed EvidenceInput per substrate
+3. Rate the seams (drop legacy re-export shims)
+4. Optional per-substrate Redis namespaces
+5. Schema honesty (GROUP_ENVELOPE_SCHEMA_VERSION bump if provenance becomes hard-read)
+
+Worker track (docs/SUBSTRATE_WORKER_SPEC.md) Phases 2–4 proceed in parallel;
+the density flag bearer (Phase 1) is done.
