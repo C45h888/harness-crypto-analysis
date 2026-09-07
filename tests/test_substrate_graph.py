@@ -4,10 +4,10 @@ Pins the invariants of the DECOMPOSED calculation layer:
 
 1. A substrate NEVER imports another substrate (or any analysis module) —
    pure-math single-responsibility modules, composed only by the
-   orchestrator (nooa_harness.bedrock).
+   orchestrator (calculations.composition).
 2. The analysis layer does NOT import calculation modules at module scope
    (the layer violation is cut); ``analysis.market`` is the documented
-   composition root (same class as ``nooa_harness.bedrock``) and is exempt.
+   composition root (same class as ``calculations.composition``) and is exempt.
 3. Every section in GROUP_MAP is declared in SUBSTRATE_GRAPH, and every
    substrate named in the graph exists as a real module.
 4. ``run_calculations`` / ``run_analysis`` emit ``substrate_provenance``
@@ -31,7 +31,7 @@ ANALYSIS_DIR = ROOT / "market_service" / "analysis"
 
 # Modules that are allowed module-scope imports from the calculation layer:
 #  - COMPOSITION_ROOTS: assemble raw evidence into a full product (same class
-#    as nooa_harness.bedrock) — currently only the standalone analyzer/CLI.
+#    as calculations.composition) — currently only the standalone analyzer/CLI.
 #  - COMPAT_SEAMS: DEPRECATED re-export seams that exist ONLY so historical
 #    import paths keep working after decomposition (same pattern as
 #    market_service/signals.py); new code must import from the substrate
@@ -121,8 +121,8 @@ class SubstrateGraphConsistencyTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from market_service.nooa_harness import bedrock
-        cls.bedrock = bedrock
+        from market_service.calculations import composition
+        cls.bedrock = composition
 
     def test_every_group_section_is_in_graph(self):
         declared_calc = set()
@@ -166,8 +166,8 @@ class SubstrateProvenanceTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from market_service.nooa_harness import bedrock
-        cls.bedrock = bedrock
+        from market_service.calculations import composition
+        cls.bedrock = composition
         cls.evidence = {
             "spot": {"trades_normalized": [], "order_book": {}},
             "futures": {"trades_normalized": [], "order_book": {},

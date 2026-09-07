@@ -2,7 +2,7 @@
 Combined Binance + CryptoQuant market analysis.
 
 COMPOSITION ROOT: this module is the standalone product analyzer/CLI
-(the runtime counterpart of ``nooa_harness.bedrock``). It is the one place
+(the runtime counterpart of ``calculations.composition``). It is the one place
 in the analysis layer that legitimately imports calculation functions — it
 assembles a full snapshot from raw evidence, which is orchestration, not
 analysis-internal logic. New analysis modules must NOT follow this pattern;

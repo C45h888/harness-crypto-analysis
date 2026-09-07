@@ -143,7 +143,7 @@ class GroupEnvelopeError(ValueError):
 class GroupEnvelope:
     """One specialized read envelope for a single calculation-model group.
 
-    ``kind`` selects the group (GROUP_MAP in nooa_harness.pipeline).
+    ``kind`` selects the group (GROUP_MAP in calculations.composition).
     ``calculations`` / ``analysis`` carry ONLY that group's sections.
     ``evidence_headlines`` is the compact shared evidence context (snake_case
     scalars read from the evidence — price, funding, OI — never raw arrays).
@@ -165,7 +165,7 @@ class GroupEnvelope:
     errors: tuple[dict[str, Any], ...] = ()
     source: str = "canonical_projection"
     # Substrate attribution for the sections in this envelope: section id →
-    # owning substrate(s) (from nooa_harness.bedrock.SUBSTRATE_GRAPH). Lets the
+    # owning substrate(s) (from calculations.composition.SUBSTRATE_GRAPH). Lets the
     # interpretation plane explain WHICH calculation substrate produced each
     # section. Additive-only; older readers ignore it (schema_version 1).
     substrate_provenance: dict[str, Any] = field(default_factory=dict)

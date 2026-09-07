@@ -4,7 +4,7 @@ Two-plane layout (semantic-debt boundary pass, 2026-09-04):
 
 INTERPRETATION PLANE — deterministic math + canonical persistence, no LLM:
 
-- ``bedrock``                    — shared deterministic core: GROUP_MAP,
+- ``calculations.composition``  — shared deterministic core: GROUP_MAP,
                                    section deps, read_raw_window,
                                    run_calculations/run_analysis, adapters.
                                    ONE source of truth for calc semantics.
@@ -25,7 +25,7 @@ INFERENCE PLANE — the OO agent, LLM narration over injected state:
                                    tool base, wake plane. Tool dispatchers use
                                    ONLY the engine's injected store/memory/
                                    settings — never env, never a second pool
-- ``pipeline_inference``         — the agent's single read seam into bedrock
+- ``pipeline_inference``         — the agent's single read seam into composition
                                    (``run_inference_group``); never imports
                                    the interpretation plane
 - ``inference_runner``           — one-shot cycle (envelope / manual / no-wake)
@@ -37,7 +37,7 @@ INFERENCE PLANE — the OO agent, LLM narration over injected state:
                                    ``paper_kb_session_id()`` contract
 - ``backends.ModelBackendConfig``— narration LLM client config
 
-Boundary rule: the inference plane imports ``bedrock`` / ``pipeline_inference``
+Boundary rule: the inference plane imports ``composition`` / ``pipeline_inference``
 only; the interpretation plane never imports the inference plane. The retired
 ``agents`` module is gone — everything the LLM narrates lives in ``engine``.
 

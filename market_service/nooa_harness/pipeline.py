@@ -2,7 +2,7 @@
 
 The monolithic pipeline module was split into a two-plane layout:
 
-    bedrock.py                  shared deterministic core (both planes build on it)
+    calculations/composition.py shared deterministic core (both planes build on it)
     pipeline_interpretation.py  INTERPRETATION PLANE — envelope + persistence +
                                 derivative fetch + run_cycle / run_group_cycle
     pipeline_inference.py       INFERENCE PLANE — the OO agent's read seam into
@@ -17,9 +17,7 @@ through ``pipeline_inference``. The inference plane importing this module
 
 from __future__ import annotations  # noqa: I001
 
-from .bedrock import (  # noqa: F401
-    DERIV_FRESH_MS_DEFAULT,
-    DERIV_TTL_S_DEFAULT,
+from market_service.calculations.composition import (  # noqa: F401
     GROUP_MAP,
     WINDOW_MINUTES_MAP,
     _ANALYSIS_CALC_DEPS,
@@ -27,20 +25,28 @@ from .bedrock import (  # noqa: F401
     _accumulate_prior_walls,
     _adapt_oi,
     _adapt_wall_migration,
-    _bound_arrays,
     _enrich_fut_keystone,
-    _evidence_headlines,
-    _is_deriv_fresh,
-    _merge_derivatives,
     _resolve_scorecard_weights,
     _resolve_tier_config,
     _utc_iso,
-    read_raw_window,
     resolve_analysis_sections,
     resolve_calc_sections,
     run_analysis,
     run_calculations,
     sections_for_groups,
+)
+from market_service.runtime.bounds import (  # noqa: F401
+    _bound_arrays,
+    _evidence_headlines,
+)
+from market_service.runtime.derivatives import (  # noqa: F401
+    DERIV_FRESH_MS_DEFAULT,
+    DERIV_TTL_S_DEFAULT,
+    _is_deriv_fresh,
+    _merge_derivatives,
+)
+from market_service.runtime.raw_window import (  # noqa: F401
+    build_raw_window as read_raw_window,
 )
 from .pipeline_inference import run_inference_group  # noqa: F401
 from .pipeline_interpretation import (  # noqa: F401

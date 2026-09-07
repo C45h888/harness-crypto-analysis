@@ -19,8 +19,8 @@ pipeline_mod`` in ``inference.dispatch_market_group``). The agent's
 
 The one-directional import rule this file encodes:
 
-    bedrock  <-  pipeline_inference   (inference plane reads the math)
-    bedrock  <-  pipeline_interpretation (interpretation plane reads the math)
+    composition  <-  pipeline_inference   (inference plane reads the math)
+    composition  <-  pipeline_interpretation (interpretation plane reads the math)
     pipeline_inference -/-X pipeline_interpretation (planes never import each other)
 """
 
@@ -31,7 +31,7 @@ from typing import Any
 from market_service.config import Settings
 from market_service.runtime.redis_store import RedisRuntimeStore
 
-from . import bedrock
+from market_service.calculations import composition
 
 __all__ = ["run_inference_group"]
 
@@ -47,29 +47,29 @@ async def run_inference_group(
     """Run one calculation-model group with the engine's own store + settings.
 
     Returns ``{"group", "window_minutes", "calculations", "analysis"}`` —
-    the same section semantics as ``bedrock.GROUP_MAP``. No persistence, no
+    the same section semantics as ``composition.GROUP_MAP``. No persistence, no
     Binance touch, no second connection pool.
     """
-    if group not in bedrock.GROUP_MAP:
+    if group not in composition.GROUP_MAP:
         raise ValueError(
             f"unknown calculation group: {group!r}; "
-            f"allowed: {sorted(bedrock.GROUP_MAP)}"
+            f"allowed: {sorted(composition.GROUP_MAP)}"
         )
 
     # The store is injected — this function NEVER constructs one. That is
     # the boundary: the engine owns the connection lifecycle, the tool owns
     # the read.
-    evidence = await bedrock.read_raw_window(store, symbol.upper(), window_minutes)
+    evidence = await composition.read_raw_window(store, symbol.upper(), window_minutes)
 
-    calc_sections, anal_sections = bedrock.sections_for_groups((group,))
-    anal_sections, calc_sections = bedrock.resolve_analysis_sections(
+    calc_sections, anal_sections = composition.sections_for_groups((group,))
+    anal_sections, calc_sections = composition.resolve_analysis_sections(
         anal_sections, calc_sections,
     )
-    calc_sections = bedrock.resolve_calc_sections(calc_sections)
+    calc_sections = composition.resolve_calc_sections(calc_sections)
 
     depth = settings.depth_levels
     window_s = window_minutes * 60
-    calculations = bedrock.run_calculations(
+    calculations = composition.run_calculations(
         evidence, depth, window_s, sections=calc_sections,
     )
 
@@ -79,16 +79,16 @@ async def run_inference_group(
         # Same live projection the interpretation plane records to; the
         # durable Postgres fallback is the interpretation plane's job.
         history = await store.read_wall_history(symbol.upper())
-        prior_walls, prior_cycle_ts = bedrock.accumulate_prior_walls(history)
+        prior_walls, prior_cycle_ts = composition.accumulate_prior_walls(history)
 
-    analysis = bedrock.run_analysis(
+    analysis = composition.run_analysis(
         evidence, calculations,
         prior_walls=prior_walls or None,
         prior_cycle_ts=prior_cycle_ts,
         depth=depth,
         sections=anal_sections,
-        tier_config=bedrock.resolve_tier_config(settings),
-        scorecard_weights=bedrock.resolve_scorecard_weights(settings),
+        tier_config=composition.resolve_tier_config(settings),
+        scorecard_weights=composition.resolve_scorecard_weights(settings),
     )
 
     return {

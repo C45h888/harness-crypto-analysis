@@ -8,7 +8,7 @@ and the two cycle runners (``run_cycle`` = canonical persisted envelope,
 
 Semantic boundary (two-plane doctrine): the INFERENCE PLANE must not import
 this module. The agent's read seam into the same deterministic math is
-``pipeline_inference.run_inference_group`` — it consumes ``bedrock`` with the
+``pipeline_inference.run_inference_group`` — it consumes ``calculations.composition`` with the
 engine's own injected store and never touches these persistence/Binance
 surfaces.
 
@@ -34,29 +34,35 @@ from market_service.runtime.contracts import (
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
-from . import bedrock
-from .bedrock import (  # noqa: F401  (re-export: stable public pipeline API)
-    DERIV_FRESH_MS_DEFAULT,
-    DERIV_TTL_S_DEFAULT,
+from market_service.calculations import composition
+from market_service.calculations.composition import (  # noqa: F401  (re-export: stable public pipeline API)
     GROUP_MAP,
     WINDOW_MINUTES_MAP,
     _accumulate_prior_walls,
     _adapt_oi,
     _adapt_wall_migration,
     _enrich_fut_keystone,
-    _evidence_headlines,
-    _is_deriv_fresh,
-    _bound_arrays,
-    _merge_derivatives,
     _resolve_scorecard_weights,
     _resolve_tier_config,
     _utc_iso,
-    read_raw_window,
     resolve_analysis_sections,
     resolve_calc_sections,
     run_analysis,
     run_calculations,
     sections_for_groups,
+)
+from market_service.runtime.bounds import (  # noqa: F401
+    _bound_arrays,
+    _evidence_headlines,
+)
+from market_service.runtime.derivatives import (  # noqa: F401
+    DERIV_FRESH_MS_DEFAULT,
+    DERIV_TTL_S_DEFAULT,
+    _is_deriv_fresh,
+    _merge_derivatives,
+)
+from market_service.runtime.raw_window import (  # noqa: F401
+    build_raw_window as read_raw_window,
 )
 from .contracts import GroupEnvelope
 
@@ -506,7 +512,7 @@ async def run_group_cycle(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
     try:
-        evidence = await bedrock.read_raw_window(store, symbol, window_minutes)
+        evidence = await composition.read_raw_window(store, symbol, window_minutes)
 
         # Warm the derivative cache for groups that need it: oi (oi_history,
         # L/S), demand (taker + cross_asset), regime (L/S), stage (klines).
@@ -517,7 +523,7 @@ async def run_group_cycle(
         deriv: dict[str, Any] | None = None
         if needs_deriv and include_derivatives:
             cached = await store.read_derivative_evidence(symbol)
-            if cached and bedrock._is_deriv_fresh(cached, int(time.time() * 1000), DERIV_FRESH_MS_DEFAULT):
+            if cached and composition._is_deriv_fresh(cached, int(time.time() * 1000), DERIV_FRESH_MS_DEFAULT):
                 deriv = cached
             else:
                 async with Binance() as client:
@@ -528,15 +534,15 @@ async def run_group_cycle(
                     await store.publish_derivative_evidence(symbol, deriv, ttl_s=deriv_ttl_s)
                 except Exception:
                     log.exception("run_group_cycle %s: failed to publish derivative cache", symbol)
-        evidence = bedrock._merge_derivatives(evidence, deriv)
+        evidence = composition._merge_derivatives(evidence, deriv)
     finally:
         await store.close()
 
-    calc_sections, anal_sections = bedrock.sections_for_groups(groups)
-    anal_sections, calc_sections = bedrock.resolve_analysis_sections(anal_sections, calc_sections)
-    calc_sections = bedrock.resolve_calc_sections(calc_sections)
+    calc_sections, anal_sections = composition.sections_for_groups(groups)
+    anal_sections, calc_sections = composition.resolve_analysis_sections(anal_sections, calc_sections)
+    calc_sections = composition.resolve_calc_sections(calc_sections)
 
-    calc_result = bedrock.run_calculations(evidence, depth, window_s, sections=calc_sections)
+    calc_result = composition.run_calculations(evidence, depth, window_s, sections=calc_sections)
 
     # Wall history only when the wall group is requested.
     prior_walls: dict[float, float] = {}
@@ -564,16 +570,16 @@ async def run_group_cycle(
         finally:
             if pg is not None:
                 await pg.close()
-        prior_walls, prior_cycle_ts = bedrock._accumulate_prior_walls(history)
+        prior_walls, prior_cycle_ts = composition._accumulate_prior_walls(history)
 
-    analysis_result = bedrock.run_analysis(
+    analysis_result = composition.run_analysis(
         evidence, calc_result,
         prior_walls=prior_walls or None,
         prior_cycle_ts=prior_cycle_ts,
         depth=depth,
         sections=anal_sections,
-        tier_config=bedrock._resolve_tier_config(settings),
-        scorecard_weights=bedrock._resolve_scorecard_weights(settings),
+        tier_config=composition._resolve_tier_config(settings),
+        scorecard_weights=composition._resolve_scorecard_weights(settings),
     )
 
     all_errors = list(calc_result.get("errors") or []) + list(analysis_result.get("errors") or [])
@@ -703,13 +709,13 @@ async def run_cycle(
         PostgresRuntimeStore(settings.database_url) if settings.database_url else None
     )
     try:
-        evidence = await bedrock.read_raw_window(redis, symbol, window_minutes)
+        evidence = await composition.read_raw_window(redis, symbol, window_minutes)
         deriv: dict[str, Any] | None = None
         if include_derivatives:
             now_ms = int(time.time() * 1000)
             if not force_refresh_derivatives:
                 cached = await redis.read_derivative_evidence(symbol)
-                if bedrock._is_deriv_fresh(cached, now_ms, deriv_fresh_ms):
+                if composition._is_deriv_fresh(cached, now_ms, deriv_fresh_ms):
                     deriv = cached
                     log.debug("run_cycle %s: derivative cache hit (age=%dms)",
                               symbol, now_ms - int(cached.get("observed_at_ms") or 0))
@@ -726,9 +732,9 @@ async def run_cycle(
                     )
                 except Exception:
                     log.exception("run_cycle %s: failed to publish derivative cache", symbol)
-        evidence = bedrock._merge_derivatives(evidence, deriv)
+        evidence = composition._merge_derivatives(evidence, deriv)
 
-        calc_result = bedrock.run_calculations(evidence, depth, window_s)
+        calc_result = composition.run_calculations(evidence, depth, window_s)
 
         # Read the FULL recorded wall history for analysis (async, done here).
         # Postgres is the durable authority; Redis is the live projection fallback.
@@ -742,21 +748,21 @@ async def run_cycle(
                 history = []
             if not history:
                 history = await redis.read_wall_history(symbol)
-            prior_walls, prior_cycle_ts = bedrock._accumulate_prior_walls(history)
+            prior_walls, prior_cycle_ts = composition._accumulate_prior_walls(history)
         else:
             # No durable ledger configured — Redis-only fallback.
             try:
-                prior_walls, prior_cycle_ts = bedrock._accumulate_prior_walls(
+                prior_walls, prior_cycle_ts = composition._accumulate_prior_walls(
                     await redis.read_wall_history(symbol))
             except Exception:
                 log.exception("run_cycle %s: failed to read wall history from redis", symbol)
 
-        analysis_result = bedrock.run_analysis(evidence, calc_result,
+        analysis_result = composition.run_analysis(evidence, calc_result,
                                        prior_walls=prior_walls or None,
                                        prior_cycle_ts=prior_cycle_ts,
                                        depth=depth,
-                                       tier_config=bedrock._resolve_tier_config(settings),
-                                       scorecard_weights=bedrock._resolve_scorecard_weights(settings))
+                                       tier_config=composition._resolve_tier_config(settings),
+                                       scorecard_weights=composition._resolve_scorecard_weights(settings))
 
         envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
 

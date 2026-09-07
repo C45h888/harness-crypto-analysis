@@ -37,7 +37,13 @@ def rolling_density(levels: Iterable[Sequence[float]], width: float, side: str) 
 
 
 def top_density_windows(book: dict, width: float, side: str, top_n: int = 10) -> list[dict]:
-    """Return the top-N densest rolling windows for one side of the book."""
+    """Return the top-N densest rolling windows for one side of the book.
+
+    ``side`` is "bid" or "ask" (the level key is derived as ``side + "s"``
+    and the window direction from the singular form).
+    """
+    if side not in ("bid", "ask"):
+        raise ValueError("side must be 'bid' or 'ask'")
     return rolling_density(book.get(side + "s", []), width, side)[:top_n]
 
 

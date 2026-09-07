@@ -1,27 +1,25 @@
-"""pipeline_bedrock — the shared deterministic core of BOTH runtime planes.
+"""Composition root for the DECOMPOSED calculation layer.
 
-Two-plane doctrine (semantic-debt pass, 2026-09-04):
+Option-A decomposition (2026-09-06, replaces ``nooa_harness/bedrock.py``):
+the substrate packages (``market_service.calculations.substrates.*`` and
+``market_service.analysis.*``) are the CORE OWNERS of their math; this
+module is the single composition root that wires them together — the
+SUBSTRATE_GRAPH, GROUP_MAP, section resolvers, ``run_calculations`` /
+``run_analysis`` and every evidence-marshaling adapter.
 
-* The INTERPRETATION PLANE (``pipeline_interpretation``) builds and persists
-  the canonical run payload. It owns envelope assembly, persistence, the
-  cross-cycle wall/keystone ledgers, and the Binance on-demand derivative
-  fetch.
-* The INFERENCE PLANE (``pipeline_inference``) is the OO agent's read seam
-  into the same math. It runs one calculation-model group against a caller-
-  injected Redis store — never its own, never Binance, never a write.
-
-Both planes build on this bedrock: GROUP_MAP, the section dependency graph,
-``read_raw_window``, ``run_calculations``, ``run_analysis`` and every
-deterministic adapter they call. This is the single source of truth for the
-semantics — a rule change lands here once and BOTH planes move together.
+Moved verbatim from bedrock.py (move-don't-rewrite). Purity discipline
+(tests/test_substrate_graph.py) still holds: substrates never import each
+other or analysis; analysis never imports calculations at module scope;
+composition happens ONLY here (and in analysis/market.py, the standalone
+analyzer). Both runtime planes (pipeline_interpretation /
+pipeline_inference) import this module — a rule change lands here once and
+BOTH planes move together.
 
 Discipline:
 - Pure computation over injected data. Nothing here constructs a
-  RedisRuntimeStore/PostgresRuntimeStore or opens a Binance client; the store
-  is always passed in by the caller.
+  RedisRuntimeStore/PostgresRuntimeStore or opens a Binance client; the
+  store is always passed in by the caller.
 - Null means not-provided — never substitute zero.
-- The interpretation plane stays LLM-free; the inference plane never mutates
-  what this module produced.
 """
 
 from __future__ import annotations
@@ -127,7 +125,7 @@ from market_service.calculations.substrates.volume_profile import (
 from market_service.config import Settings, default_depth_levels
 from market_service.runtime.redis_store import RedisRuntimeStore
 
-from . import contracts as C
+from market_service.nooa_harness import contracts as C
 
 log = logging.getLogger(__name__)
 
@@ -249,7 +247,7 @@ SUBSTRATE_GRAPH: dict[str, dict[str, Any]] = {
     "auction":        {"substrates": ("analysis.auction",),
                         "consumes": ("evidence.futures.order_book", "evidence.futures.trades_normalized",
                                       "evidence.futures.funding")},
-    "oi":             {"substrates": ("analysis.oi",),
+    "oi":             {"substrates": ("positioning",),
                         "consumes": ("evidence.futures.order_book", "evidence.futures.open_interest",
                                       "evidence.futures.oi_history", "evidence.futures.top_ls",
                                       "evidence.futures.global_ls")},
@@ -271,12 +269,6 @@ SUBSTRATE_GRAPH: dict[str, dict[str, Any]] = {
     "delta":          {"substrates": ("delta",),
                         "consumes": ("evidence.futures.order_book", "evidence.futures.taker_buy_sell")},
 }
-
-
-def substrate_for(section: str) -> str | None:
-    """The substrate(s) that own a calculation/analysis section (composition graph)."""
-    entry = SUBSTRATE_GRAPH.get(section)
-    return "/".join(entry["substrates"]) if entry else None
 
 
 def substrate_for(section: str) -> str | None:
@@ -384,148 +376,18 @@ def sections_for_groups(groups: tuple[str, ...]) -> tuple[frozenset[str], frozen
         anal.update(spec["analysis"])
     return frozenset(calc), frozenset(anal)
 
-
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 # ---------------------------------------------------------------------------
 # Step 1 — read raw evidence from Redis stream
 # ---------------------------------------------------------------------------
 
-async def read_raw_window(
-    redis: RedisRuntimeStore,
-    symbol: str,
-    window_minutes: int,
-) -> dict[str, Any]:
-    """Read the latest raw evidence snapshot and accumulate trades within the window.
-
-    The poller writes a full snapshot every ``poll_seconds``. We read the latest
-    snapshot for order book / funding / OI / tickers (point-in-time), and use the
-    stream to accumulate trades across the window. Because each snapshot's
-    ``trades_normalized`` is a rolling window (``flow_window_seconds`` ≫ poll
-    interval), overlapping snapshots repeat the same trade ids; we **dedupe by
-    trade ``id``** (stable Binance aggregate id) so volumes/CVD are not inflated
-    by redeclaring each trade once per snapshot it appears in.
-    """
-    latest = await redis.read_raw_latest(symbol)
-    if latest is None:
-        return {
-            "observed_at": _utc_iso(),
-            "observed_at_ms": int(time.time() * 1000),
-            "fetch_window_ms": window_minutes * 60_000,
-            "depth_levels": default_depth_levels(),
-            "errors": [{"endpoint": "all", "error": "no raw evidence in Redis"}],
-            "coverage": {
-                "requested_window_seconds": window_minutes * 60,
-                "snapshots_used": 0,
-                "latest_observed_at_ms": None,
-                "stream_staleness_ms": None,
-                "spot_trades": {"trade_count": 0, "raw_trade_count": 0,
-                                "duplicates_removed": 0, "first_trade_ms": None,
-                                "last_trade_ms": None, "span_seconds": None},
-                "futures_trades": {"trade_count": 0, "raw_trade_count": 0,
-                                   "duplicates_removed": 0, "first_trade_ms": None,
-                                   "last_trade_ms": None, "span_seconds": None},
-            },
-            "spot": {"ticker_24h": None, "order_book": {}, "trades_raw": [], "trades_normalized": []},
-            "futures": {"ticker_24h": None, "order_book": {}, "trades_raw": [], "trades_normalized": [],
-                        "funding": {}, "open_interest": {}},
-        }
-
-    since_ms = int(time.time() * 1000) - window_minutes * 60_000
-    snapshots = await redis.read_raw_window(symbol, since_ms)
-
-    def _dedupe(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen: set[int] = set()
-        out: list[dict[str, Any]] = []
-        for t in trades:
-            if not isinstance(t, dict):
-                continue
-            tid = t.get("id")
-            if tid is not None:
-                try:
-                    key = int(tid)
-                except (TypeError, ValueError):
-                    continue
-                if key in seen:
-                    continue
-                seen.add(key)
-            out.append(t)
-        return out
-
-    # Accumulate trades across all snapshots in the window (already oldest-first).
-    spot_raw: list[dict[str, Any]] = []
-    fut_raw: list[dict[str, Any]] = []
-    for snap in snapshots:
-        spot_raw.extend(snap.get("spot", {}).get("trades_normalized", []))
-        fut_raw.extend(snap.get("futures", {}).get("trades_normalized", []))
-
-    spot_trades = _dedupe(spot_raw)
-    fut_trades = _dedupe(fut_raw)
-
-    # Actual coverage — measured, not requested. The doctrine requires the
-    # envelope to record what the window REALLY contains: the true trade span,
-    # dedupe effectiveness, how many snapshots fed the window, and how stale
-    # the latest stream entry is. Never claim a window the data doesn't cover.
-    def _trade_coverage(trades: list[dict[str, Any]], raw_count: int) -> dict[str, Any]:
-        tss: list[int] = []
-        for t in trades:
-            try:
-                tss.append(int(t["ts"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-        if tss:
-            span = {"first_trade_ms": min(tss), "last_trade_ms": max(tss),
-                    "span_seconds": (max(tss) - min(tss)) / 1000.0}
-        else:
-            span = {"first_trade_ms": None, "last_trade_ms": None,
-                    "span_seconds": None}
-        return {"trade_count": len(trades), "raw_trade_count": raw_count,
-                "duplicates_removed": raw_count - len(trades), **span}
-
-    raw_spot_count = sum(len(s.get("spot", {}).get("trades_normalized") or []) for s in snapshots)
-    raw_fut_count = sum(len(s.get("futures", {}).get("trades_normalized") or []) for s in snapshots)
-    latest_observed_ms = latest.get("observed_at_ms")
-    now_ms = int(time.time() * 1000)
-    coverage = {
-        "requested_window_seconds": window_minutes * 60,
-        "snapshots_used": len(snapshots),
-        "latest_observed_at_ms": latest_observed_ms,
-        "stream_staleness_ms": (
-            now_ms - int(latest_observed_ms)
-            if isinstance(latest_observed_ms, (int, float)) else None
-        ),
-        "spot_trades": _trade_coverage(spot_trades, raw_spot_count),
-        "futures_trades": _trade_coverage(fut_trades, raw_fut_count),
-    }
-
-    return {
-        # Evidence time: when the source snapshot was observed, not when the
-        # harness happened to read it. The read instant is coverage
-        # information, not evidence identity.
-        "observed_at": latest.get("observed_at") or _utc_iso(),
-        "observed_at_ms": int(time.time() * 1000),
-        "fetch_window_ms": window_minutes * 60_000,
-        "depth_levels": latest.get("depth_levels") or default_depth_levels(),
-        "errors": latest.get("errors", []),
-        "coverage": coverage,
-        "spot": {
-            "ticker_24h": latest.get("spot", {}).get("ticker_24h"),
-            "order_book": latest.get("spot", {}).get("order_book") or {},
-            "trades_raw": latest.get("spot", {}).get("trades_raw") or [],
-            "trades_normalized": spot_trades,
-        },
-        "futures": {
-            "ticker_24h": latest.get("futures", {}).get("ticker_24h"),
-            "order_book": latest.get("futures", {}).get("order_book") or {},
-            "trades_raw": latest.get("futures", {}).get("trades_raw") or [],
-            "trades_normalized": fut_trades,
-            "funding": latest.get("futures", {}).get("funding") or {},
-            "open_interest": latest.get("futures", {}).get("open_interest") or {},
-        },
-    }
-
+# The raw-evidence window builder lives in runtime/raw_window.py so the
+# substrate workers share the exact same evidence construction without
+# importing the harness layer. Re-exported here under the historical name —
+# zero behavior change for every caller.
+from market_service.runtime.raw_window import build_raw_window as read_raw_window  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Step 2 — run calculations (same adapters as nodes/calculations.py)
@@ -686,7 +548,7 @@ def run_calculations(
             return {
                 "fut_keystone": fut_keystone,
                 "spot_keystone": _strict(find_keystone, spot_bids, last_price, 0.20, -0.30, -0.05, None, name="find_keystone"),
-                "fut_top_density_bids": _strict(top_density_windows, fut_book, 0.5, "bids", 5, name="top_density_windows"),
+                "fut_top_density_bids": _strict(top_density_windows, fut_book, 0.5, "bid", 5, name="top_density_windows"),
                 "fut_absorption_ladder": _strict(absorption_ladder, fut_bids, last_price, count=10, name="absorption_ladder"),
                 "fut_significant_levels": _strict(significant_levels, fut_bids + fut_asks, 0.0, name="significant_levels"),
                 "fut_microprice_skew_bps": _strict(microprice_skew_bps, spot_bids, spot_asks, name="microprice_skew_bps"),
@@ -800,7 +662,6 @@ def run_calculations(
         "coverage_seconds": window,
         "substrate_provenance": _substrate_provenance(set(calc_out)),
     }
-
 
 # ---------------------------------------------------------------------------
 # Step 3 — run analysis (same adapters as nodes/analysis.py)
@@ -1902,140 +1763,7 @@ def _ls_last_pct(series: list[dict[str, Any]] | None) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Derivative-cache shared contract.
-#
-# The FETCH is interpretation-plane only (pipeline_interpretation.
-# fetch_derivative_evidence — the one Binance touch). What lives here is the
-# cache READING contract both planes use: freshness check + merge into the
-# evidence shape.
-# ---------------------------------------------------------------------------
-
-DERIV_TTL_S_DEFAULT = 300
-DERIV_FRESH_MS_DEFAULT = 300_000  # 5 min — back-to-back cycles within this skip the fetch
-
-
-def _is_deriv_fresh(deriv: dict[str, Any] | None, now_ms: int, fresh_ms: int) -> bool:
-    if not deriv or not isinstance(deriv, dict):
-        return False
-    ts = deriv.get("observed_at_ms")
-    if not isinstance(ts, (int, float)):
-        return False
-    age_ms = now_ms - int(ts)
-    # Reject future timestamps (clock skew / corrupted cache) and over-age.
-    if age_ms < 0:
-        return False
-    return age_ms <= fresh_ms
-
-
-def _merge_derivatives(evidence: dict[str, Any], deriv: dict[str, Any] | None) -> dict[str, Any]:
-    """Merge one derivative evidence dict into the canonical evidence shape.
-
-    The merged fields are added to ``evidence.futures`` (so existing adapters
-    like ``_adapt_oi``, ``_adapt_demand``, ``_adapt_regime`` pick them up
-    without code changes) and to ``evidence.cross_asset`` (a new top-level
-    key consumed by the demand adapter's macro_climate call).
-    """
-    if not deriv or not isinstance(deriv, dict):
-        return evidence
-    out = dict(evidence)
-    out["futures"] = dict(evidence.get("futures") or {})
-    deriv_fut = deriv.get("futures") or {}
-    for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines",
-                "funding_history"):
-        if key in deriv_fut and deriv_fut[key] is not None:
-            out["futures"][key] = deriv_fut[key]
-    if "cross_asset" in deriv and deriv["cross_asset"]:
-        out["cross_asset"] = deriv["cross_asset"]
-    out["derivative_observed_at_ms"] = deriv.get("observed_at_ms")
-    # Bar-horizon metadata: every derivative series is 5-minute bars, so a
-    # series of N bars covers N x 5 minutes — regardless of the requested
-    # 15m/1h/4h analysis window. Making the horizon explicit stops downstream
-    # readers from misreading the series as window-aligned. funding_history
-    # is 8-hour-settled and is recorded separately for downstream readers.
-    deriv_fut = deriv.get("futures") or {}
-    out["derivatives_meta"] = {
-        "bar_period_s": 300,
-        "funding_history_period_s": 8 * 3600,
-        "series": {
-            key: (len(deriv_fut[key]) if isinstance(deriv_fut.get(key), list) else None)
-            for key in ("oi_history", "taker_buy_sell", "top_ls", "global_ls", "klines")
-        },
-        "funding_history_count": (
-            len(deriv_fut["funding_history"])
-            if isinstance(deriv_fut.get("funding_history"), list) else None
-        ),
-    }
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Specialized group envelopes — the interpretation-plane read interface.
-#
-# The canonical run payload dict is the persisted AUDIT record; these
-# GroupEnvelopes are what analysts actually READ. They are emitted
-# directly from the Redis raw stream via run_group_cycle (the harness
-# group commands: --wall/--flow/--structure/--positioning) — bounded by
-# construction, with a fresh run_id for audit.
-# ---------------------------------------------------------------------------
-
-# Hard per-array cap at contract-emission level. The largest legitimate
-# arrays (volume-profile buckets over a 4h window, ask-wall ladders) fit
-# comfortably; anything larger is capped WITH an explicit __truncated__
-# marker — never silently dropped, and never left to break the LLM param
-# limit downstream.
-_GROUP_ARRAY_CAP = 128
-
-
-def _bound_arrays(value: Any, cap: int = _GROUP_ARRAY_CAP) -> Any:
-    """Deterministically cap any list/tuple at ``cap`` items, explicitly marked."""
-    if isinstance(value, dict):
-        return {k: _bound_arrays(v, cap) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        items = [_bound_arrays(v, cap) for v in value[:cap]]
-        if len(value) > cap:
-            return {"__truncated__": True, "count": len(value), "items": items}
-        return items
-    return value
-
-
-def _evidence_headlines(evidence: dict[str, Any]) -> dict[str, Any]:
-    """Compact shared evidence context (snake_case scalars, null-preserving).
-
-    Every group envelope carries these so any specialist has the baseline
-    market state without raw arrays. Mirrors the fixed path discipline of
-    runtime.contracts._envelope_summary — pure path-reads, no arithmetic.
-    """
-    fut = (evidence or {}).get("futures") or {}
-    spot = (evidence or {}).get("spot") or {}
-
-    def _p(d: Any, *keys: str) -> Any:
-        for k in keys:
-            if not isinstance(d, dict):
-                return None
-            d = d.get(k)
-        return d
-
-    ticker = _p(fut, "ticker_24h") or {}
-    spot_ticker = _p(spot, "ticker_24h") or {}
-    funding = _p(fut, "funding") or {}
-    oi = _p(fut, "open_interest") or {}
-    return {
-        "last_price": _p(fut, "ticker_24h", "last_price") or _p(fut, "ticker_24h", "lastPrice"),
-        "spot_last_price": _p(spot, "ticker_24h", "last_price") or _p(spot, "ticker_24h", "lastPrice"),
-        "funding_rate": _p(funding, "last_funding_rate") or _p(funding, "lastFundingRate"),
-        "mark_price": _p(funding, "mark_price") or _p(funding, "markPrice"),
-        "open_interest": _p(oi, "open_interest") or _p(oi, "openInterest"),
-        "high_24h": _p(ticker, "high_price") or _p(ticker, "highPrice"),
-        "low_24h": _p(ticker, "low_price") or _p(ticker, "lowPrice"),
-        "quote_volume_24h": _p(ticker, "quote_volume") or _p(ticker, "quoteVolume"),
-        "spot_quote_volume_24h": _p(spot_ticker, "quote_volume") or _p(spot_ticker, "quoteVolume"),
-    }
-
-
-
-
-# ---------------------------------------------------------------------------
-# Public bedrock API — the names BOTH planes may consume. The underscored
+# Public composition API — the names BOTH planes may consume. The underscored
 # originals stay importable (tests + shim); these aliases are the sanctioned
 # seam for out-of-plane callers (pipeline_inference).
 # ---------------------------------------------------------------------------
@@ -2043,27 +1771,19 @@ def _evidence_headlines(evidence: dict[str, Any]) -> dict[str, Any]:
 accumulate_prior_walls = _accumulate_prior_walls
 resolve_tier_config = _resolve_tier_config
 resolve_scorecard_weights = _resolve_scorecard_weights
-is_deriv_fresh = _is_deriv_fresh
-merge_derivatives = _merge_derivatives
-bound_arrays = _bound_arrays
-evidence_headlines = _evidence_headlines
 
 __all__ = [
     "WINDOW_MINUTES_MAP",
     "GROUP_MAP",
+    "SUBSTRATE_GRAPH",
+    "substrate_for",
+    "section_inputs",
     "resolve_calc_sections",
     "resolve_analysis_sections",
     "sections_for_groups",
-    "read_raw_window",
     "run_calculations",
     "run_analysis",
     "accumulate_prior_walls",
     "resolve_tier_config",
     "resolve_scorecard_weights",
-    "merge_derivatives",
-    "is_deriv_fresh",
-    "bound_arrays",
-    "evidence_headlines",
-    "DERIV_TTL_S_DEFAULT",
-    "DERIV_FRESH_MS_DEFAULT",
 ]
