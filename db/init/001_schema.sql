@@ -262,3 +262,26 @@ CREATE INDEX IF NOT EXISTS agent_memory_run_id_idx
 
 CREATE INDEX IF NOT EXISTS agent_memory_kind_idx
     ON agent_memory (session_id, kind, created_at DESC);
+
+-- Durable ledger for substrate-worker calculation fires (Phase 3 PG-first
+-- path: PostgresRuntimeStore.record_substrate_state). Every worker fire
+-- inserts its SubstrateStatePayload here BEFORE the Redis projection is
+-- published, so substrate state survives Redis restarts. No retention
+-- policy initially (revisit at volume).
+CREATE TABLE IF NOT EXISTS substrate_calculation (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    substrate TEXT NOT NULL,
+    status TEXT NOT NULL,
+    observed_at TIMESTAMPTZ,
+    computed_at TIMESTAMPTZ NOT NULL,
+    trigger JSONB NOT NULL DEFAULT '{}'::jsonb,
+    freshness JSONB NOT NULL DEFAULT '{}'::jsonb,
+    missing_inputs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    payload JSONB NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS substrate_calculation_symbol_substrate_idx
+    ON substrate_calculation (symbol, substrate, computed_at DESC);
