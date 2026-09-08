@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
@@ -815,4 +815,87 @@ class PostgresRuntimeStore:
             if hasattr(entry.get("generated_at"), "isoformat"):
                 entry["generated_at"] = entry["generated_at"].isoformat()
             out.append(entry)
+        return out
+
+    # ------------------------------------------------------------------
+    # Substrate calculation ledger — Phase 3 PG-first write path
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ms_to_ts(value: Any) -> Any:
+        """Coerce epoch-millis to a TZ-aware datetime (None stays None)."""
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
+            except (TypeError, ValueError, OverflowError, OSError):
+                return None
+        return None
+
+    async def record_substrate_state(
+        self, symbol: str, substrate: str, payload: dict[str, Any],
+    ) -> int:
+        """Durable write of one substrate worker fire.
+
+        PG-first: the worker calls this BEFORE publishing the Redis
+        projection. Returns the inserted row id. ``payload`` is the
+        ``SubstrateStatePayload`` dict (trigger/freshness/missing_inputs
+        map 1:1 onto columns; the full dict is retained in ``payload``).
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO substrate_calculation
+               (symbol, substrate, status, observed_at, computed_at,
+                trigger, freshness, missing_inputs, payload, schema_version)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               RETURNING id""",
+            symbol.upper(), substrate.lower(),
+            str(payload.get("status") or "healthy"),
+            self._ms_to_ts(payload.get("observed_at_ms")),
+            self._ms_to_ts(payload.get("computed_at_ms")) or datetime.now(tz=UTC),
+            json.dumps(payload.get("trigger") or {}),
+            json.dumps(payload.get("freshness") or {}),
+            json.dumps(payload.get("missing_inputs") or []),
+            json.dumps(payload),
+            int(payload.get("schema_version") or 1),
+        )
+        return int(row["id"])
+
+    async def read_substrate_history(
+        self, symbol: str, substrate: str, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Durable read: substrate calculation rows, newest first.
+
+        Rehydrates each row to the stored payload dict with its ledger
+        identity (``ledger_id``, ``ledger_created_at``) attached.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            """SELECT id, symbol, substrate, status, observed_at, computed_at,
+                      trigger, freshness, missing_inputs, payload,
+                      schema_version, created_at
+               FROM substrate_calculation
+               WHERE symbol = $1 AND substrate = $2
+               ORDER BY computed_at DESC LIMIT $3""",
+            symbol.upper(), substrate.lower(), limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            result = dict(row)
+            for col in ("trigger", "freshness", "missing_inputs", "payload"):
+                v = result.get(col)
+                if isinstance(v, str):
+                    try:
+                        result[col] = json.loads(v)
+                    except (ValueError, json.JSONDecodeError):
+                        result[col] = {} if col != "missing_inputs" else []
+            for col in ("observed_at", "computed_at", "created_at"):
+                if col in result and hasattr(result[col], "isoformat"):
+                    result[col] = result[col].isoformat()
+            result["ledger_id"] = result.pop("id")
+            result["ledger_created_at"] = result.pop("created_at")
+            out.append(result)
         return out

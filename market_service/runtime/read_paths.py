@@ -43,6 +43,8 @@ __all__ = [
     "read_collated",
     "read_collated_by_run",
     "read_collated_with_fallback",
+    "read_substrate_latest",
+    "read_substrate_snapshot",
 ]
 
 
@@ -361,3 +363,46 @@ def market_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     }
     inventory["snapshot"] = market_snapshot(payload)
     return inventory
+
+
+# ---------------------------------------------------------------------------
+# Substrate worker plane reads (Phase 2, Task 4) — the always-fresh
+# projections each substrate worker aggregates. The harness reads these
+# instead of computing (Phase 4 cutover); until then they are the warm
+# standby alongside the pull path.
+# ---------------------------------------------------------------------------
+
+async def read_substrate_latest(store: Any, substrate: str, symbol: str) -> dict[str, Any] | None:
+    """Read one substrate's latest projection plus its derived age.
+
+    Returns ``{"payload": ..., "age_ms": ...}`` or ``None`` when nothing has
+    been aggregated yet (null = absent). ``age_ms`` is measured (now minus
+    ``computed_at_ms``), never stored — freshness is read-time truth.
+    """
+    import time as _time
+
+    payload = await store.read_substrate_latest(substrate, symbol.upper())
+    if payload is None:
+        return None
+    computed_at = payload.get("computed_at_ms") if isinstance(payload, dict) else None
+    age_ms = (
+        int(_time.time() * 1000) - int(computed_at)
+        if isinstance(computed_at, (int, float)) else None
+    )
+    return {"payload": payload, "age_ms": age_ms}
+
+
+async def read_substrate_snapshot(store: Any, symbol: str) -> dict[str, Any]:
+    """Read every registered substrate's latest projection for a symbol.
+
+    Returns ``{substrate: {"payload", "age_ms"}}``. A substrate with nothing
+    aggregated appears as ``{"available": False}`` — never silently omitted,
+    so readers can distinguish "worker quiet" from "worker missing".
+    """
+    from market_service.substrate_worker import WORKER_REGISTRY
+
+    snapshot: dict[str, Any] = {}
+    for name in sorted(WORKER_REGISTRY):
+        entry = await read_substrate_latest(store, name, symbol.upper())
+        snapshot[name] = entry if entry is not None else {"available": False}
+    return snapshot

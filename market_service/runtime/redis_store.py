@@ -905,3 +905,87 @@ class RedisRuntimeStore:
         except (ValueError, json.JSONDecodeError):
             return None
         return decoded if isinstance(decoded, dict) else None
+
+    # ------------------------------------------------------------------
+    # Substrate worker state — the always-fresh calculation projections
+    # (spec: docs/SUBSTRATE_WORKER_SPEC.md). Each substrate worker owns:
+    #   latest STRING  — the always-fresh projection the harness reads
+    #   stream         — bounded history (replay/audit)
+    #   supervisor     — TTL heartbeat + dedupe state (observability)
+    # ------------------------------------------------------------------
+
+    def substrate_stream(self, substrate: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:substrate:{substrate.lower()}:{symbol.upper()}"
+
+    def substrate_latest_key(self, substrate: str, symbol: str) -> str:
+        return f"{self.prefix}:latest:substrate:{substrate.lower()}:{symbol.upper()}"
+
+    def substrate_supervisor_key(self, substrate: str, symbol: str) -> str:
+        return f"{self.prefix}:substrate:{substrate.lower()}:{symbol.upper()}:supervisor"
+
+    async def publish_substrate_state(
+        self, substrate: str, symbol: str, payload: dict[str, Any],
+    ) -> str:
+        """Atomically write one substrate calculation state to Redis.
+
+        A single Lua script SETs the ``latest`` projection AND XADDs the
+        state stream in one step (same ordering-hole closure as
+        ``publish_raw_evidence``): no reader can observe a latest projection
+        whose stream entry is missing. Stream length is bounded by
+        ``self.stream_maxlen``.
+        """
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        ts = str(payload.get("computed_at_ms") or payload.get("observed_at_ms") or "")
+        maxlen = str(int(self.stream_maxlen))
+        script = """
+        redis.call('SET', KEYS[1], ARGV[1])
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[4], '*',
+            'substrate', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[5], 'payload', ARGV[1])
+        """
+        return str(await self.redis.eval(
+            script, 2,
+            self.substrate_latest_key(substrate, symbol),
+            self.substrate_stream(substrate, symbol),
+            substrate.lower(), symbol.upper(), body, ts, maxlen,
+        ))
+
+    async def read_substrate_latest(
+        self, substrate: str, symbol: str,
+    ) -> dict[str, Any] | None:
+        """Read the latest substrate state projection.
+
+        Returns ``None`` when nothing has been aggregated yet (legitimate
+        "cold start" state — not a fabricated empty payload).
+        """
+        raw = await self.redis.get(self.substrate_latest_key(substrate, symbol))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def read_substrate_history(
+        self, substrate: str, symbol: str, count: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read recorded substrate states, newest first."""
+        rows = await self.redis.xrevrange(
+            self.substrate_stream(substrate, symbol), count=count,
+        )
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    async def read_substrate_history_count(self, substrate: str, symbol: str) -> int:
+        """Return XLEN of the substrate state stream for diagnostics."""
+        return int(await self.redis.xlen(self.substrate_stream(substrate, symbol)))
