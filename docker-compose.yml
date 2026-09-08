@@ -229,6 +229,49 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
+  # SUBSTRATE WORKER PLANE — deterministic, substrate-bounded calculation
+  # workers (spec: docs/SUBSTRATE_WORKER_SPEC.md). Each worker consumes the
+  # raw evidence stream with its own consumer group, fires on market-semantic
+  # conditions defined in its worker file, computes its ONE substrate's math
+  # (imported from calculations.substrates.*), and aggregates the result into
+  # the substrate:latest projection + bounded state stream. Workers never
+  # touch Binance. Phase 3 adds Postgres-first persistence + multi-symbol.
+  substrate-workers:
+    build: .
+    user: "marketflow"
+    command: ["python", "-m", "market_service.substrate_worker.runner"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      SUBSTRATE_WORKERS: ${SUBSTRATE_WORKERS:-all}
+      SUBSTRATE_SYMBOLS: ${SUBSTRATE_SYMBOLS:-${MICROSTRUCTURE_SYMBOL:-SOLUSDT}}
+      SUBSTRATE_WINDOW_MINUTES: ${SUBSTRATE_WINDOW_MINUTES:-15}
+      SUBSTRATE_COOLDOWN_S: ${SUBSTRATE_COOLDOWN_S:-30}
+      SUBSTRATE_STALENESS_S: ${SUBSTRATE_STALENESS_S:-120}
+      SUBSTRATE_PG_STRICT: ${SUBSTRATE_PG_STRICT:-1}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-500}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "market_service.substrate_worker.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    profiles: ["substrates"]
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
