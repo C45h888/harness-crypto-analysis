@@ -178,6 +178,15 @@ any `substrate.*` family execution.
   Cooldowns still gate inside the core; `invoked:false` is a structured report, never an error.
 - Workflow: invoke `substrate.tape`/`density`/`delta`/… then `substrate.read`;
   name agreements AND contradictions vs P1/P2 explicitly.
+- Ordering: dispatches run sequentially in the listed order — put invoke BEFORE
+  read in the same `tool_calls` array so the read sees the fresh projection.
+  Never request the same worker twice in one cycle (deterministic — anti-pattern 5).
+- Freshness: compact projections carry `age_ms` — judge staleness from it.
+  `available:false`, `fired:0`, or `invoked:false` (cooldown-dormant) are FINDINGS:
+  cite them (`substrate.read → substrates.<name>.available`) and move on.
+- Empty upstream (no projections at all — capture down) is itself the finding:
+  report `substrate.read → substrates.*.available:false` as the P3 verdict
+  instead of forcing correlation against absent data.
 
 ## Anti-patterns (contract violations)
 

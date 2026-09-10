@@ -737,5 +737,26 @@ class StructuredCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"phase": "P5"', raw)
 
 
+class P3PromptContractTests(unittest.TestCase):
+    """Pin the tooling-base prompt contract: substrate.read primary P3,
+    invoke-before-read two-beat, freshness/dormant findings discipline."""
+    def test_p3_guidance_teaches_two_beat(self):
+        from market_service.nooa_harness.engine import _PHASE_GUIDANCE
+        p3 = _PHASE_GUIDANCE["P3"]
+        self.assertIn("substrate.read", p3)
+        self.assertIn("BEFORE", p3)  # invoke listed before read
+        self.assertIn("age_ms", p3)
+        self.assertIn("FINDINGS", p3)
+        self.assertIn("PRIMARY", p3)
+
+    def test_output_format_names_substrate_primary(self):
+        from market_service.nooa_harness.engine import InferenceEngine
+        fmt = InferenceEngine._output_format()
+        self.assertIn("substrate.read PRIMARY", fmt)
+        self.assertIn("TWO-BEAT", fmt)
+        self.assertIn("substrate.invoke", fmt)
+        self.assertIn("age_ms", fmt)
+
+
 if __name__ == "__main__":
     unittest.main()
