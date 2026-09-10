@@ -134,10 +134,24 @@ TOOL_NAMES: dict[str, str] = {
     "memory.recall_paper": "memory.recall_paper",
     # T2 — market correlation (canonical pipeline seams)
     "market.read": "market.read",
-    "market.group": "market.run_group",
     "market.derivatives": "market.read_derivatives",
     "market.keystone_history": "market.read_keystone_history",
     "market.wall_history": "market.read_wall_history",
+    # T3 — substrate worker plane (tool-first invocation; replaces run_cycle)
+    "substrate.read": "substrate.read",
+    "substrate.invoke": "substrate.invoke",
+    "substrate.anchors": "substrate.anchors",
+    "substrate.density": "substrate.density",
+    "substrate.delta": "substrate.delta",
+    "substrate.ladders": "substrate.ladders",
+    "substrate.large_print": "substrate.large_print",
+    "substrate.migration": "substrate.migration",
+    "substrate.oi": "substrate.oi",
+    "substrate.signals": "substrate.signals",
+    "substrate.tape": "substrate.tape",
+    "substrate.technicals": "substrate.technicals",
+    "substrate.tiers": "substrate.tiers",
+    "substrate.volume_profile": "substrate.volume_profile",
 }
 
 # Phase map for the staged inference cycle (engine drives P1→P5).
@@ -160,10 +174,24 @@ TOOL_PHASE: dict[str, str] = {
     "calc.fit.depth_scaling": "P2",
     # P3 — market correlation (Redis plane)
     "market.read": "P3",
-    "market.group": "P3",
     "market.derivatives": "P3",
     "market.keystone_history": "P3",
     "market.wall_history": "P3",
+    # P3 — substrate worker plane (tool-first; replaces run_cycle)
+    "substrate.read": "P3",
+    "substrate.invoke": "P3",
+    "substrate.anchors": "P3",
+    "substrate.density": "P3",
+    "substrate.delta": "P3",
+    "substrate.ladders": "P3",
+    "substrate.large_print": "P3",
+    "substrate.migration": "P3",
+    "substrate.oi": "P3",
+    "substrate.signals": "P3",
+    "substrate.tape": "P3",
+    "substrate.technicals": "P3",
+    "substrate.tiers": "P3",
+    "substrate.volume_profile": "P3",
     # P5 — paper grounding + derived ΔP
     "memory.recall_paper": "P5",
     "calc.derived_diagnostic": "P5",
@@ -212,6 +240,7 @@ async def dispatch_read_evidence(
 
 async def dispatch_market_read(
     store: RedisRuntimeStore, symbol: str, *, mode: str = "snapshot",
+    venue: str = "spot",
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: market.read — latest collated market run, raw from Redis.
 
@@ -231,9 +260,9 @@ async def dispatch_market_read(
     from market_service.runtime import read_paths
 
     cap = CAPABILITIES["market.read"]
-    scope = {"symbol": symbol.upper(), "mode": mode}
+    scope = {"symbol": symbol.upper(), "venue": venue, "mode": mode}
     try:
-        cap.validate_scope(symbol, "spot")
+        cap.validate_scope(symbol, venue)
         if mode not in ("snapshot", "inventory", "full"):
             raise CapabilityDenied(f"unknown market.read mode: {mode!r}")
         payload = await read_paths.read_collated(store, symbol.upper())
@@ -264,13 +293,13 @@ async def dispatch_market_read(
 
 
 async def dispatch_read_derivatives(
-    store: RedisRuntimeStore, symbol: str,
+    store: RedisRuntimeStore, symbol: str, *, venue: str = "spot",
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: market.derivatives — cached funding/OI/cross-asset evidence."""
     cap = CAPABILITIES["market.read_derivatives"]
-    scope = {"symbol": symbol.upper()}
+    scope = {"symbol": symbol.upper(), "venue": venue}
     try:
-        cap.validate_scope(symbol, "spot")
+        cap.validate_scope(symbol, venue)
         payload = await store.read_derivative_evidence(symbol.upper())
         return payload, capability_log_entry(cap.name, scope, "ok")
     except CapabilityDenied as exc:
@@ -279,12 +308,13 @@ async def dispatch_read_derivatives(
 
 async def dispatch_read_keystone_history(
     store: RedisRuntimeStore, symbol: str, *, count: int = 100,
+    venue: str = "spot",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Tool: market.keystone_history — bounded cross-cycle keystone series."""
     cap = CAPABILITIES["market.read_keystone_history"]
-    scope = {"symbol": symbol.upper(), "count": count}
+    scope = {"symbol": symbol.upper(), "venue": venue, "count": count}
     try:
-        cap.validate_scope(symbol, "spot")
+        cap.validate_scope(symbol, venue)
         rows = await store.read_keystone_history(symbol.upper(), count=count)
         return _bounded(rows, count), capability_log_entry(
             cap.name, scope, "ok", detail={"rows": len(rows)},
@@ -295,18 +325,98 @@ async def dispatch_read_keystone_history(
 
 async def dispatch_read_wall_history(
     store: RedisRuntimeStore, symbol: str, *, count: int = 100,
+    venue: str = "spot",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Tool: market.wall_history — bounded cross-cycle wall series."""
     cap = CAPABILITIES["market.read_wall_history"]
-    scope = {"symbol": symbol.upper(), "count": count}
+    scope = {"symbol": symbol.upper(), "venue": venue, "count": count}
     try:
-        cap.validate_scope(symbol, "spot")
+        cap.validate_scope(symbol, venue)
         rows = await store.read_wall_history(symbol.upper(), count=count)
         return _bounded(rows, count), capability_log_entry(
             cap.name, scope, "ok", detail={"rows": len(rows)},
         )
     except CapabilityDenied as exc:
         return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+
+
+# ------------------------------------------------------------------
+# T3 — substrate worker plane (tool-first invocation; replaces run_cycle)
+# ------------------------------------------------------------------
+
+async def dispatch_substrate_read(
+    store: RedisRuntimeStore, symbol: str, *, substrate: str | None = None,
+    mode: str = "compact", venue: str = "spot",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: substrate.read — always-fresh worker projections.
+
+    The warm-plane companion of ``market.read``: same compact-by-default
+    discipline, ``available:false`` for missing workers (never errors),
+    ``json_safe`` at the seam, schema mismatch as structured error.
+    """
+    from market_service.runtime import read_paths
+    from market_service.substrate_worker import tools as substrate_tools
+
+    cap = CAPABILITIES["substrate.read"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "substrate": substrate, "mode": mode}
+    try:
+        cap.validate_scope(symbol, venue)
+        if mode not in ("compact", "full"):
+            raise CapabilityDenied(f"unknown substrate.read mode: {mode!r}")
+        result = await substrate_tools.read_state(
+            store, symbol.upper(),
+            substrates=[substrate] if substrate else None, mode=mode)
+        result = read_paths.json_safe(result)
+        return result, capability_log_entry(cap.name, scope, "ok")
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except ValueError as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=str(exc))
+
+
+async def dispatch_substrate_invoke(
+    store: RedisRuntimeStore, symbol: str, substrate: str | None,
+    *, postgres: Any | None = None, venue: str = "spot",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: substrate.<name> / substrate.invoke — bounded worker ticks.
+
+    The tool-first replacement for ``run_cycle``: agents invoke workers
+    directly instead of the cycle computing everything. A named worker
+    gets one fire-tick (loops stay compose-owned); ``substrate.invoke``
+    with no substrate invokes all registered workers. The core's
+    cooldowns still gate; the engine's durable store rides the worker's
+    own PG-first path. Each invocation audits under its own capability.
+    """
+    from market_service.substrate_worker import tools as substrate_tools
+
+    target = (substrate or "").lower() or None
+    cap_name = f"substrate.{target}" if target else "substrate.invoke"
+    if cap_name not in CAPABILITIES:
+        return None, capability_log_entry(
+            "substrate.invoke", {"symbol": symbol.upper(), "substrate": substrate},
+            "denied", detail=f"unknown substrate worker {substrate!r}")
+    cap = CAPABILITIES[cap_name]
+    scope = {"symbol": symbol.upper(), "venue": venue, "substrate": target}
+    try:
+        cap.validate_scope(symbol, venue)
+        if target is None:
+            result = await substrate_tools.invoke_many(
+                store, symbol.upper(), None, pg_store=postgres, pg_strict=True)
+            return result, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"invoked": result.get("invoked"),
+                        "fired": result.get("fired")})
+        result = await substrate_tools.invoke(
+            store, symbol.upper(), target, pg_store=postgres, pg_strict=True)
+        if not result.get("invoked"):
+            return None, capability_log_entry(
+                cap.name, scope, "denied", detail=result.get("error"))
+        return result, capability_log_entry(
+            cap.name, scope, "ok",
+            detail={"fired": result.get("fired"),
+                    "trigger_source": result.get("trigger_source")})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
 
 
 # ------------------------------------------------------------------
@@ -319,7 +429,6 @@ async def dispatch_calc_ofi_intervals(
     store: RedisRuntimeStore, symbol: str, venue: str, *, interval_ms: int = 10_000, window_minutes: int = 30,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Tool: calc.ofi.intervals — deterministic OFI per interval (no AD)."""
-    from decimal import Decimal
     from market_service.microstructure import fitting as fm
     cap = CAPABILITIES["calc.ofi_intervals"]
     scope = {"symbol": symbol.upper(), "venue": venue, "interval_ms": interval_ms, "window_minutes": window_minutes}
@@ -344,6 +453,7 @@ async def dispatch_calc_ad_average(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.depth.average — AD per block, separate from OFI (paper AD_i)."""
     from decimal import Decimal
+
     from market_service.microstructure import fitting as fm
     cap = CAPABILITIES["calc.ad_average"]
     scope = {"symbol": symbol.upper(), "venue": venue, "window_minutes": window_minutes}
@@ -371,6 +481,7 @@ async def dispatch_calc_observation_build(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Tool: calc.observation.build — join OFI+AD+ΔP → observations (ΔP ticks vs OFI)."""
     from decimal import Decimal
+
     from market_service.microstructure import fitting as fm
     cap = CAPABILITIES["calc.observation_build"]
     scope = {"symbol": symbol.upper(), "venue": venue, "interval_seconds": interval_seconds, "window_minutes": window_minutes}
@@ -395,6 +506,7 @@ async def dispatch_calc_fit_price_impact(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.fit.price_impact — OLS ΔP=α+β·OFI (HC0), takes split observations."""
     from decimal import Decimal
+
     from market_service.microstructure import fitting as fm
     cap = CAPABILITIES["calc.fit_price_impact"]
     scope = {"symbol": symbol.upper(), "venue": venue, "interval_seconds": interval_seconds}
@@ -608,43 +720,6 @@ async def dispatch_memory_recall_paper(
         return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
 
 
-async def dispatch_market_group(
-    store: RedisRuntimeStore, settings: Any, symbol: str, group: str,
-    *, window_minutes: int = 15,
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Tool: market.group — run one calculation-model group through the
-    INFERENCE PLANE seam (two-plane boundary pass, 2026-09-04).
-
-    Routes to ``pipeline_inference.run_inference_group`` with the engine's
-    own injected store + settings. This dispatcher no longer imports the
-    interpretation plane's pipeline module, no longer opens a second Redis
-    pool, and no longer runs the math with lossy defaults (depth=20, no
-    tier config, no wall history). Group semantics live in
-    ``composition.GROUP_MAP`` — one source of truth for both planes.
-    """
-    from market_service.nooa_harness import pipeline_inference
-
-    cap = CAPABILITIES["market.run_group"]
-    scope = {"symbol": symbol.upper(), "group": group, "window_minutes": window_minutes}
-    try:
-        cap.validate_scope(symbol, "spot")
-        if group not in pipeline_inference.composition.GROUP_MAP:
-            raise CapabilityDenied(
-                f"unknown group {group!r}; allowed: {sorted(pipeline_inference.composition.GROUP_MAP)}"
-            )
-        result = await pipeline_inference.run_inference_group(
-            store, settings, symbol, group, window_minutes=window_minutes,
-        )
-        return result, capability_log_entry(
-            cap.name, scope, "ok",
-            detail={"seam": "pipeline_inference", "depth_levels": settings.depth_levels},
-        )
-    except CapabilityDenied as exc:
-        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
-    except Exception as exc:
-        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
-
-
 async def execute_tool(
     store: RedisRuntimeStore, name: str, args: dict[str, Any],
     *, postgres: Any | None = None, memory: Any | None = None,
@@ -660,8 +735,7 @@ async def execute_tool(
     - ``store``    — the engine's own Redis connection (shared, never rebuilt)
     - ``postgres`` — the engine's durable store, for fit tools' prior cycles
     - ``memory``   — the engine's MemoryNode, for memory.recall_paper
-    - ``settings`` — the operator Settings, for market.group (depth/tiers/
-                     weights). ``None`` is tolerated by every other tool.
+    - ``settings`` — the operator Settings (tolerated by every tool).
     """
     canonical = _normalize_tool_name(name)
     if canonical is None:
@@ -699,26 +773,30 @@ async def execute_tool(
     if name == "market.read":
         return await dispatch_market_read(
             store, symbol, mode=str(args.get("mode") or "snapshot"),
-        )
-    if name == "market.group":
-        if settings is None:
-            return None, capability_log_entry(
-                "market.run_group", {"name": name}, "denied",
-                detail="settings_not_injected; market.group needs the engine's operator config",
-            )
-        return await dispatch_market_group(
-            store, settings, symbol, str(args.get("group") or "flow"),
-            window_minutes=int(args.get("window_minutes") or 15),
+            venue=venue,
         )
     if name == "market.derivatives":
-        return await dispatch_read_derivatives(store, symbol)
+        return await dispatch_read_derivatives(store, symbol, venue=venue)
     if name == "market.keystone_history":
         return await dispatch_read_keystone_history(
-            store, symbol, count=int(args.get("count") or 100),
+            store, symbol, count=int(args.get("count") or 100), venue=venue,
         )
     if name == "market.wall_history":
         return await dispatch_read_wall_history(
-            store, symbol, count=int(args.get("count") or 100),
+            store, symbol, count=int(args.get("count") or 100), venue=venue,
+        )
+    if name == "substrate.read":
+        return await dispatch_substrate_read(
+            store, symbol,
+            substrate=args.get("substrate"),
+            mode=str(args.get("mode") or "compact"), venue=venue,
+        )
+    if name == "substrate.invoke" or (
+        name.startswith("substrate.") and name not in ("substrate.read",)
+    ):
+        target = str(args.get("substrate") or name.split(".", 1)[1])
+        return await dispatch_substrate_invoke(
+            store, symbol, target, postgres=postgres, venue=venue,
         )
     if name == "calc.ofi.intervals":
         return await dispatch_calc_ofi_intervals(store, symbol, venue, interval_ms=int(args.get("interval_ms") or args.get("interval_seconds", 10)*1000 if "interval_seconds" in args else 10_000), window_minutes=int(args.get("window_minutes") or 30))

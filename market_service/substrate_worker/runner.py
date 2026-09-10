@@ -96,6 +96,11 @@ def _pg_store() -> Any | None:
     ``DATABASE_URL`` lives only at this boundary: Redis-only operation
     stays possible by simply not exporting it.
     """
+    return pg_store_from_env()
+
+
+def pg_store_from_env() -> Any | None:
+    """Public seam: Phase-3 ledger handle from ``DATABASE_URL`` (None unset)."""
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         return None
@@ -105,6 +110,11 @@ def _pg_store() -> Any | None:
 
 def _pg_strict() -> bool:
     """PG strict mode (default on): PG failure aborts the fire."""
+    return pg_strict_from_env()
+
+
+def pg_strict_from_env() -> bool:
+    """Public seam: strict mode from ``SUBSTRATE_PG_STRICT`` (default on)."""
     return (os.getenv("SUBSTRATE_PG_STRICT") or "1").strip() != "0"
 
 

@@ -20,7 +20,7 @@ from market_service.commands import harness
 from market_service.commands.nooa_cli_ext import command as market_group
 
 try:  # nooa-cli present (dev venv / docker image)
-    from market_service.commands.nooa_cli import make_cli, main as mount_main
+    from market_service.commands.nooa_cli import make_cli
 
     _MOUNTED = make_cli()
 except Exception as exc:  # pragma: no cover - framework absent
@@ -42,7 +42,8 @@ class NooaCliMountTests(unittest.TestCase):
         names = set(_MOUNTED.commands["market"].commands)
         self.assertEqual(
             names,
-            {"read", "memory", "microstructure", "inference"},
+            {"read", "memory", "microstructure", "inference",
+             "substrate-read", "substrate"},
         )
 
     def test_mount_does_not_write_into_framework_package(self):

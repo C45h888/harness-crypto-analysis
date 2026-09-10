@@ -93,7 +93,7 @@ async def _build_engine(
 
 async def run_inference_once(
     symbol: str, *, venue: str = "spot", force: bool = False,
-    envelope: "WakeEnvelope | None" = None,
+    envelope: WakeEnvelope | None = None,
 ) -> dict[str, Any]:
     """One engine cycle: wake → run → return artifact + meta.
 
@@ -161,7 +161,7 @@ async def run_inference_loop(
     supervisor = WakeSupervisor(
         store,
         symbol=config.symbol, venue=config.venue,
-        read_block_ms=config.read_block_ms, tick_reset_ms=config.tick_reset_ms,
+        read_block_ms=config.read_block_ms,
         supervisor_ms=config.supervisor_ms,
         status_stream_maxlen=config.status_stream_maxlen,
         dispatcher=dispatch,

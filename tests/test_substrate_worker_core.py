@@ -75,6 +75,10 @@ class _FakeRedis:
     async def setex(self, key, ttl, value):
         self.supervisor[key.decode() if isinstance(key, bytes) else key] = value
 
+    async def get(self, key):
+        key = key.decode() if isinstance(key, bytes) else key
+        return self.supervisor.get(key)
+
     async def eval(self, script, numkeys, *keys_and_args):
         # publish_substrate_state: SET latest + XADD stream
         latest_key, stream_key = keys_and_args[0], keys_and_args[1]

@@ -53,7 +53,6 @@ from market_service.substrate_worker.contracts import (
 log = logging.getLogger(__name__)
 
 READ_BLOCK_MS = 1_000          # XREADGROUP blocking wait (ms)
-TICK_RESET_MS = 5_000          # supervisor heartbeat cadence (ms)
 SUPERVISOR_MS = 5_000          # supervisor heartbeat TTL (ms)
 DEFAULT_COOLDOWN_S = 30        # min seconds between fires (per worker)
 DEFAULT_STALENESS_S = 120      # max age of the latest projection before a
@@ -146,7 +145,8 @@ class SubstrateWorkerCore:
         staleness_s: int | None = None,
         ws_venue: str | None = None,
         read_block_ms: int = READ_BLOCK_MS,
-        tick_reset_ms: int = TICK_RESET_MS,
+        # supervisor heartbeat TTL (ms) — refreshed per completed read cycle,
+        # never by a timer task.
         supervisor_ms: int = SUPERVISOR_MS,
         dispatcher: Callable[[SubstrateStatePayload], Awaitable[dict[str, Any]]] | None = None,
         pg_store: Any | None = None,
@@ -178,7 +178,6 @@ class SubstrateWorkerCore:
         ).lower()
         self.ws_input = bool(profile.ws_input) if profile is not None else False
         self.read_block_ms = read_block_ms
-        self.tick_reset_ms = tick_reset_ms
         self.supervisor_ms = supervisor_ms
         self.dispatcher = dispatcher
         # Phase 3 PG-first ledger: when set, every fire inserts Postgres
@@ -279,19 +278,28 @@ class SubstrateWorkerCore:
     # ------------------------------------------------------------------
 
     async def run_forever(self) -> int:
-        """Async supervisor loop — never exits except on fatal config error."""
+        """Async supervisor loop — data-driven, never timer-driven.
+
+        No ticker task exists: the blocking XREADGROUP reads are the only
+        cadence. The loop is idle-stuck on Redis until data arrives; on
+        every completed read cycle (fired or quiet) the supervisor
+        heartbeat is refreshed as an activity stamp, and ``now_ms`` is
+        read only as an input to age/boundary predicates, never to drive
+        work (staleness/rollover are evaluated at dispatch time inside
+        ``_handle_rows``).
+        """
         await self.start()
-        last_tick = _now_ms()
         self._running = True
         while self._running:
-            now = _now_ms()
-            if now - last_tick >= self.tick_reset_ms:
-                await self._tick(now)
-                last_tick = now
             try:
                 rows = await self._read_once()
                 ws_rows, recovery = await self._read_ws_once()
+                now = _now_ms()
                 await self._handle_rows(rows, now, ws_rows=ws_rows, recovery=recovery)
+                # Activity heartbeat: refreshed once per completed read
+                # cycle (fired or quiet). The blocking-read return IS the
+                # liveness signal — no separate timer task exists.
+                await self._tick(now)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

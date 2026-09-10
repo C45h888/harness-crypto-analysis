@@ -70,7 +70,6 @@ log = logging.getLogger(__name__)
 
 # Runtime durations --------------------------------------------------------
 READ_BLOCK_MS = 1_000          # XREADGROUP blocking wait (ms)
-TICK_RESET_MS = 5_000          # supervisor tick cadence (ms)
 SUPERVISOR_MS = 5_000          # supervisor heartbeat TTL (ms)
 _EVT_READ_LIMIT = 500          # max event entries pulled per XREADGROUP burst
 _STREAM_MAXLEN = 1_000         # status-transition stream retention
@@ -272,7 +271,6 @@ class WakeSupervisor:
         symbol: str = "BTCUSDT",
         venue: str = "spot",
         read_block_ms: int = READ_BLOCK_MS,
-        tick_reset_ms: int = TICK_RESET_MS,
         supervisor_ms: int = SUPERVISOR_MS,
         status_stream_maxlen: int = STATUS_STREAM_MAXLEN,
         dispatcher: Callable[[WakeEnvelope], Awaitable[dict[str, Any]]] | None = None,
@@ -283,7 +281,6 @@ class WakeSupervisor:
         self.symbol = symbol.upper()
         self.venue = venue
         self.read_block_ms = read_block_ms
-        self.tick_reset_ms = tick_reset_ms
         self.supervisor_ms = supervisor_ms
         self.status_stream_maxlen = status_stream_maxlen
         self.dispatcher = dispatcher
@@ -456,21 +453,24 @@ class WakeSupervisor:
         return _StatusPayload.from_dict(decoded if isinstance(decoded, dict) else None)
 
     async def run_forever(self) -> int:
-        """The async supervisor loop — never exits except on fatal config error.
+        """The async supervisor loop — data-driven, never timer-driven.
+
+        No ticker task exists: the blocking XREADs are the only cadence.
+        The loop is idle-stuck on Redis until data arrives; on every
+        completed read cycle (fired or quiet) the supervisor heartbeat is
+        refreshed as an activity stamp, and ``now_ms`` is read only as an
+        input to age/boundary predicates, never to drive work.
 
         Structure per iteration:
-          1. supervisor tick (every ``tick_reset_ms``): heartbeat + dedupe
-             script registration.
-          2. blocking read of the event stream (``read_block_ms``).
-          3. optional status-transition read (blocking ``$`` tail).
-          4. collect live counters; evaluate the deterministic trigger matrix.
-          5. on fire: dedupe-check vs the dedupe script, then dispatch the
-             engine cycle as a task (never awaited here).
-          6. on any Redis-level error: back off, log, keep the loop alive.
+          1. blocking reads of the event + status-transition streams.
+          2. on ANY arrival: evaluate the deterministic trigger matrix;
+             on fire: dedupe-check then dispatch the engine cycle as a task
+             (never awaited here), then activity-heartbeat.
+          3. on no arrival: activity-heartbeat (proves the reader task is
+             alive), return to the blocking read.
+          4. on any Redis-level error: exponential backoff, keep alive.
         """
         await self.start()
-        last_tick = self._now()
-        last_event_water = self._last_event_water_ms
         self._running = True
 
         # Initial trigger evaluation: fire cold_start / capture_recovery on
@@ -484,19 +484,19 @@ class WakeSupervisor:
             log.warning("wake initial trigger evaluation failed: %s", exc)
 
         while self._running:
-            now = self._now()
-            if now - last_tick >= self.tick_reset_ms:
-                await self._tick()
-                last_tick = now
-
             try:
                 event_rows = await self._read_once()
                 status_rows = await self._read_status_once()
+                now = self._now()
                 if event_rows or status_rows:
                     await self._handle_delta(status_rows, event_rows, now)
-                elif now - last_tick >= self.tick_reset_ms:
+                # Activity heartbeat: refreshed once per completed read
+                # cycle (fired or quiet). The blocking-read return IS the
+                # liveness signal — no separate timer task exists.
+                try:
                     await self._tick()
-                    last_tick = now
+                except Exception as exc:
+                    log.warning("wake activity heartbeat failed: %s", exc)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -612,7 +612,7 @@ class WakeSupervisor:
         if needs_water and water_age_ms is None:
             return
         if predicates.get("event_delta"):
-            if water_age_ms is not None and water_age_ms > TICK_RESET_MS * 3:
+            if water_age_ms is not None and water_age_ms > SUPERVISOR_MS * 3:
                 # Stale (older than ~15s): not a fresh data arrival.
                 return
         # Cooldown vs artifact completion: never fire before the previous
@@ -791,7 +791,6 @@ class WakeSupervisorConfig:
     symbol: str
     venue: str = "spot"
     read_block_ms: int = READ_BLOCK_MS
-    tick_reset_ms: int = TICK_RESET_MS
     supervisor_ms: int = SUPERVISOR_MS
     cooldown_seconds: int = 60
     event_delta_threshold: int = 1_800
@@ -810,7 +809,6 @@ class WakeSupervisorConfig:
             symbol=symbol,
             venue=str(raw_venue),
             read_block_ms=int(os.getenv("WAKE_READ_BLOCK_MS") or READ_BLOCK_MS),
-            tick_reset_ms=int(os.getenv("WAKE_TICK_RESET_MS") or TICK_RESET_MS),
             supervisor_ms=int(os.getenv("WAKE_SUPERVISOR_MS") or SUPERVISOR_MS),
             cooldown_seconds=int(os.getenv("WAKE_COOLDOWN_S") or 60),
             event_delta_threshold=int(os.getenv("WAKE_EVENT_DELTA_THRESHOLD") or 1_800),
@@ -848,7 +846,7 @@ async def _build_supervisor(
     return WakeSupervisor(
         store,
         symbol=config.symbol, venue=config.venue,
-        read_block_ms=config.read_block_ms, tick_reset_ms=config.tick_reset_ms,
+        read_block_ms=config.read_block_ms,
         supervisor_ms=config.supervisor_ms,
         status_stream_maxlen=config.status_stream_maxlen,
         dispatcher=dispatcher,

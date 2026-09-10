@@ -26,7 +26,6 @@ from market_service.nooa_harness.wake_worker import (
     _STREAM_MAXLEN,
     READ_BLOCK_MS,
     SUPERVISOR_MS,
-    TICK_RESET_MS,
     WakeSupervisor,
     WakeSupervisorConfig,
     _StatusPayload,

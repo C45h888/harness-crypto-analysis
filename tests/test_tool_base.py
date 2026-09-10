@@ -2,7 +2,7 @@
 
 Covers the agent's commandable calculation surface, all nooa-free:
 
-- Registry: 19 tools, every tool name maps to a registered capability,
+- Registry: 32 tools, every tool name maps to a registered capability,
   frozen scope (SOL/BTC/ETH × spot/futures/perps).
 - ``execute_tool``: unknown tool denied, out-of-scope denied, pure T1
   dispatches (replay) execute and log, output bounds respected.
@@ -73,8 +73,9 @@ class _FakeStore:
 
 class ToolRegistryTests(unittest.TestCase):
     def test_nineteen_tools_registered(self):
-        # 6 micro + 6 Pass-C split calc + calc.price.delta + memory.recall_paper + 5 market.
-        self.assertEqual(len(TOOL_NAMES), 19)
+        # 6 micro + 6 Pass-C split calc + calc.price.delta + memory.recall_paper
+        # + 4 market (group removed with run_cycle) + 14 substrate.
+        self.assertEqual(len(TOOL_NAMES), 32)
 
     def test_every_tool_backed_by_a_capability(self):
         for tool, capability in TOOL_NAMES.items():

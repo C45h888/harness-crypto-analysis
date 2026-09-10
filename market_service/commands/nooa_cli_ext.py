@@ -102,6 +102,71 @@ def read_cmd(symbol: str, run_id: str | None, mode: str) -> None:
         _emit(read_paths.market_snapshot(payload))
 
 
+@command.command("substrate-read")
+@click.argument("symbol", default="SOLUSDT")
+@click.option("--substrate", default=None,
+              help="single substrate name (default: all → snapshot)")
+@click.option("--mode", default="compact",
+              type=click.Choice(["compact", "full"]),
+              help="output shape (same discipline as the agent's substrate.read tool)")
+def substrate_read_cmd(symbol: str, substrate: str | None, mode: str) -> None:
+    """Read worker state — the warm-plane companion of ``market read``."""
+    from market_service.substrate_worker import tools as substrate_tools
+
+    async def _op() -> dict:
+        settings = _settings()
+        redis = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            return await substrate_tools.read_state(
+                redis, symbol.upper(),
+                substrates=[substrate] if substrate else None, mode=mode)
+        finally:
+            await redis.close()
+
+    _emit(asyncio.run(_op()))
+
+
+@command.group("substrate", help="Substrate worker plane: invoke workers as tools.")
+def substrate_group() -> None:
+    """Worker invocation tools (tool-first; replaces run_cycle)."""
+
+
+@substrate_group.command("read")
+@click.argument("symbol", default="SOLUSDT")
+@click.option("--substrate", default=None,
+              help="single substrate name (default: all → snapshot)")
+@click.option("--mode", default="compact",
+              type=click.Choice(["compact", "full"]))
+def substrate_group_read(symbol: str, substrate: str | None, mode: str) -> None:
+    """Read worker state (same seam as ``market substrate-read``)."""
+    substrate_read_cmd(symbol, substrate, mode)
+
+
+@substrate_group.command("invoke")
+@click.argument("symbol", default="SOLUSDT")
+@click.argument("substrates", nargs=-1)
+def substrate_group_invoke(symbol: str, substrates: tuple[str, ...]) -> None:
+    """Invoke substrate workers as tools — one bounded fire-tick each."""
+    from market_service.substrate_worker import tools as substrate_tools
+
+    async def _op() -> dict:
+        settings = _settings()
+        redis = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            return await substrate_tools.invoke_many(
+                redis, symbol.upper(), list(substrates) or None)
+        finally:
+            await redis.close()
+
+    _emit(asyncio.run(_op()))
+
+
 # --------------------------------------------------------------------------
 # memory — MemoryNode over the runtime stores
 # --------------------------------------------------------------------------

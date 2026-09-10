@@ -11,9 +11,8 @@ Moved verbatim from bedrock.py (move-don't-rewrite). Purity discipline
 (tests/test_substrate_graph.py) still holds: substrates never import each
 other or analysis; analysis never imports calculations at module scope;
 composition happens ONLY here (and in analysis/market.py, the standalone
-analyzer). Both runtime planes (pipeline_interpretation /
-pipeline_inference) import this module — a rule change lands here once and
-BOTH planes move together.
+analyzer). The interpretation plane and the agent's substrate tools import
+this module — a rule change lands here once and BOTH planes move together.
 
 Discipline:
 - Pure computation over injected data. Nothing here constructs a
@@ -25,8 +24,7 @@ Discipline:
 from __future__ import annotations
 
 import logging
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from market_service.analysis.auction import (
@@ -122,9 +120,7 @@ from market_service.calculations.substrates.volume_profile import (
     build_volume_profile,
     volume_profile_summary,
 )
-from market_service.config import Settings, default_depth_levels
-from market_service.runtime.redis_store import RedisRuntimeStore
-
+from market_service.config import Settings
 from market_service.nooa_harness import contracts as C
 
 log = logging.getLogger(__name__)
@@ -377,7 +373,7 @@ def sections_for_groups(groups: tuple[str, ...]) -> tuple[frozenset[str], frozen
     return frozenset(calc), frozenset(anal)
 
 def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 # ---------------------------------------------------------------------------
 # Step 1 — read raw evidence from Redis stream
@@ -387,7 +383,6 @@ def _utc_iso() -> str:
 # substrate workers share the exact same evidence construction without
 # importing the harness layer. Re-exported here under the historical name —
 # zero behavior change for every caller.
-from market_service.runtime.raw_window import build_raw_window as read_raw_window  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Step 2 — run calculations (same adapters as nodes/calculations.py)
@@ -1348,9 +1343,7 @@ def _net_buy_share(trades: list[dict[str, Any]] | None) -> float:
             continue
         total += qty
         is_maker = t.get("is_buyer_maker")
-        if is_maker is not None and not is_maker:
-            buys += qty
-        elif is_maker is None and str(t.get("side", "")).lower() == "buy":
+        if is_maker is not None and not is_maker or is_maker is None and str(t.get("side", "")).lower() == "buy":
             buys += qty
     return buys / total if total > 0 else 0.5
 
@@ -1765,7 +1758,7 @@ def _ls_last_pct(series: list[dict[str, Any]] | None) -> float | None:
 # ---------------------------------------------------------------------------
 # Public composition API — the names BOTH planes may consume. The underscored
 # originals stay importable (tests + shim); these aliases are the sanctioned
-# seam for out-of-plane callers (pipeline_inference).
+# seam for out-of-plane callers (substrate_worker.tools, dispatch).
 # ---------------------------------------------------------------------------
 
 accumulate_prior_walls = _accumulate_prior_walls
@@ -1773,17 +1766,17 @@ resolve_tier_config = _resolve_tier_config
 resolve_scorecard_weights = _resolve_scorecard_weights
 
 __all__ = [
-    "WINDOW_MINUTES_MAP",
     "GROUP_MAP",
     "SUBSTRATE_GRAPH",
-    "substrate_for",
-    "section_inputs",
-    "resolve_calc_sections",
-    "resolve_analysis_sections",
-    "sections_for_groups",
-    "run_calculations",
-    "run_analysis",
+    "WINDOW_MINUTES_MAP",
     "accumulate_prior_walls",
-    "resolve_tier_config",
+    "resolve_analysis_sections",
+    "resolve_calc_sections",
     "resolve_scorecard_weights",
+    "resolve_tier_config",
+    "run_analysis",
+    "run_calculations",
+    "section_inputs",
+    "sections_for_groups",
+    "substrate_for",
 ]

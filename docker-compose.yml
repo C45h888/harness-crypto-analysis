@@ -123,17 +123,15 @@ services:
     profiles: ["microstructure"]
     restart: unless-stopped
 
-  # EVENT-DRIVEN wake worker — the single inference runtime surface.
-  # Bounded on the Redis plane: XREADGROUP BLOCK on the microstructure event
-  # stream + status-transition stream, deterministic predicate evaluation,
-  # in-memory WakeEnvelope, async engine dispatch via the dispatcher seam.
-  # WAKE_ENGINE_DISPATCH=1 closes the loop: a fire runs the full engine
-  # cycle (hard gate, narration, Postgres-first persist, memory proposals).
-  # Set it to 0 for a no-LLM journal-only worker.
-  wake-worker:
+  # EVENT-DRIVEN wake + inference runtime — NOW the NOOA container's main
+  # command (wake-worker sidecar collapsed per the container directive).
+  # Data-driven: blocking XREAD "$" on the micro event + status streams,
+  # deterministic trigger matrix, lazy engine dispatch on fire. No timer.
+  nooa:
     build: .
+    image: crypto-ai-anal-nooa:latest
     user: "marketflow"
-    command: ["python", "-m", "market_service.nooa_harness.wake_worker",
+    command: ["python", "-m", "market_service.nooa_harness.nooa_container",
               "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
     env_file:
       - path: .env
@@ -151,17 +149,22 @@ services:
       WAKE_COOLDOWN_S: ${WAKE_COOLDOWN_S:-60}
       WAKE_EVENT_DELTA_THRESHOLD: ${WAKE_EVENT_DELTA_THRESHOLD:-1800}
       WAKE_READ_BLOCK_MS: ${WAKE_READ_BLOCK_MS:-1000}
-      WAKE_TICK_RESET_MS: ${WAKE_TICK_RESET_MS:-5000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "market_service.nooa_harness.nooa_healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     profiles: ["inference"]
     restart: unless-stopped
 
-  # One-shot harness. Reads raw evidence from Redis, runs the pipeline
-  # (calc + analysis + collate), then invokes NOOA agents. Use via:
-  #   docker compose --profile tools run --rm harness SOLUSDT --analyze --window 15m --json
+  # One-shot harness. Reads worker state / invokes workers by default;
+  # the tool-first surface replaces the removed run_cycle pipeline. Use via:
+  #   docker compose --profile tools run --rm harness SOLUSDT --invoke tape,density --json
   harness:
     build: .
     user: "marketflow"
@@ -194,52 +197,18 @@ services:
     profiles: ["tools"]
     restart: "no"
 
-  # NOOA CLI host. On-demand only (profiles: ["tools"]) — running it
-  # always-on would burn LLM tokens every cycle for no reason. Invoke with:
-  #   docker compose --profile tools run --rm nooa \
-  #       market envelope SOLUSDT --latest
-  #   docker compose --profile tools run --rm nooa \
-  #       market analyst SOLUSDT --cycles 1 --with-memory
-  nooa:
+  # CALCULATION CONTAINER — the substrate worker plane as ONE service (per
+  # the container directive: every worker + the shared control plane live in
+  # this process). Data-driven: each worker task is a blocking XREADGROUP wait;
+  # no timer loops exist in this process. The harness / NOOA containers and
+  # operators invoke workers through Redis (tools) or the localhost control
+  # plane (GET /health, GET /status, POST /invoke). Spec:
+  # docs/SUBSTRATE_WORKER_SPEC.md.
+  calculation:
     build: .
+    image: crypto-ai-anal-calculation:latest
     user: "marketflow"
-    profiles: ["tools"]
-    entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
-      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
-      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
-      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
-      NOOA_API_KEY: ${NOOA_API_KEY:-}
-      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-    restart: "no"
-
-  # SUBSTRATE WORKER PLANE — deterministic, substrate-bounded calculation
-  # workers (spec: docs/SUBSTRATE_WORKER_SPEC.md). Each worker consumes the
-  # raw evidence stream with its own consumer group, fires on market-semantic
-  # conditions defined in its worker file, computes its ONE substrate's math
-  # (imported from calculations.substrates.*), and aggregates the result into
-  # the substrate:latest projection + bounded state stream. Workers never
-  # touch Binance. Phase 3 adds Postgres-first persistence + multi-symbol.
-  substrate-workers:
-    build: .
-    user: "marketflow"
-    command: ["python", "-m", "market_service.substrate_worker.runner"]
+    command: ["python", "-m", "market_service.substrate_worker.dain_container"]
     env_file:
       - path: .env
         required: false
@@ -253,6 +222,7 @@ services:
       SUBSTRATE_COOLDOWN_S: ${SUBSTRATE_COOLDOWN_S:-30}
       SUBSTRATE_STALENESS_S: ${SUBSTRATE_STALENESS_S:-120}
       SUBSTRATE_PG_STRICT: ${SUBSTRATE_PG_STRICT:-1}
+      CALC_CONTROL_PORT: ${CALC_CONTROL_PORT:-8041}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       DEPTH_LEVELS: ${DEPTH_LEVELS:-500}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -264,7 +234,7 @@ services:
       db-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "python", "-m", "market_service.substrate_worker.healthcheck"]
+      test: ["CMD", "python", "-m", "market_service.substrate_worker.calc_healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3

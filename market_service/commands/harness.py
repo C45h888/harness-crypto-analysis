@@ -1,14 +1,16 @@
 """
-Outer harness CLI — Calculation pipeline surface.
+Outer harness CLI — substrate worker tool surface.
 
 This module is the **outer** CLI surface and is the mount point the
 terminal-based coding agents (pi, hermes, claude code) shell out to. It owns
-exactly two responsibilities:
+exactly three responsibilities:
 
-1. Run the calculation pipeline on the poller-fed Redis stream into a
-   canonical ``MarketRunEnvelope v2`` (default / ``--analyze``).
-2. Refresh the on-demand derivative cache in Redis
-   (``--refresh-derivatives``) and warm the cache on ``--analyze``.
+1. Invoke substrate workers as tools (``--invoke``) — one bounded fire-tick
+   per worker. The tool-first replacement for the removed run_cycle.
+2. Read worker state (default / ``--substrate-read``) — the always-fresh
+   projections from the warm plane.
+3. Refresh the on-demand derivative cache in Redis
+   (``--refresh-derivatives``) that derivative-dependent workers read.
 
 The former ``--nooa`` router to the mounted NOOA inner CLI was removed as
 legacy debt — NOOA agent / briefing / memory / inference operations are
@@ -20,10 +22,12 @@ as a dev-only diagnostic; it is NOT the canonical surface.
 
 The runtime authority split is:
 
-  harness.py                   outer CLI       calculation pipeline
+  harness.py                   outer CLI       worker invocation + reads
                                                 + derivative cache warm
        │
-       ├─► default / --analyze ─► pipeline.run_cycle (reads Redis stream, deterministic)
+       ├─► default / --substrate-read ─► substrate_worker.tools.read_state
+       │
+       ├─► --invoke ─► substrate_worker.tools.invoke_many (bounded ticks)
        │
        ├─► --refresh-derivatives ─► fetch_derivative_evidence + Redis cache
        │
@@ -34,17 +38,18 @@ does NOT require Postgres ``DATABASE_URL``; the derivative cache warm
 (``--refresh-derivatives``) is likewise Redis-only.
 
 Usage:
-    # clean data contract (no agents)
+    # worker state (warm plane reads; default needs no flags)
     .venv/bin/python -m market_service.commands.harness SOLUSDT --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --read --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --read --run-id <UUID> --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --substrate-read --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --substrate-read --substrate tape --json
 
-    # calculation pipeline — populates the canonical ledger
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --window 15m --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --envelope-summary --json
+    # invoke workers as tools (bounded fire-ticks, then reports)
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --invoke tape,density --json
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --invoke --json
+
+    # derivative cache warm (worker inputs for delta/technicals/oi)
     .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
     .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --with-cross-asset --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --analyze --no-derivatives --json
 
     # legacy dev-only diagnostic
     .venv/bin/python -m market_service.commands.harness SOLUSDT --live --json
@@ -78,277 +83,6 @@ log = logging.getLogger(__name__)
 # The statistical inference plane (nooa_harness) has its own prompt in
 # engine.py — this is the interpretation plane only.
 
-INTERPRETATION_SYSTEM_PROMPT = """You are the market-state interpretation agent for crypto perpetual futures markets.
-
-═══════════════════════════════════════════════════════════════════════════════
-RUNTIME ARCHITECTURE — THE DUAL PLANE
-═══════════════════════════════════════════════════════════════════════════════
-
-You run on the INTERPRETATION PLANE (harness.py). A separate STATISTICAL
-INFERENCE PLANE (nooa_harness) handles microstructure fits (beta, c/lambda,
-OFI, depth scaling) — that is NOT your domain. Your domain is market-state
-interpretation: prices, flow, orderbooks, OI, derivatives, keystone walls,
-CVD, regime, auction, demand, delta, stage, wall migration, path absorption.
-
-The dual runtime:
-  INTERPRETATION PLANE (you)          STATISTICAL INFERENCE PLANE (not you)
-  ─────────────────────────           ──────────────────────────────────────
-  - market.read (Redis/Postgres)      - micro.fit_beta, micro.evidence
-  - market.group (calc groups)        - calc.ofi.intervals, calc.depth.average
-  - market.keystone_history           - calc.fit.price_impact / depth_scaling
-  - market.derivatives                - calc.derived_diagnostic
-  - market.analyze (pipeline cycle)   - memory.recall_paper
-  - micro.status (capture health)     - LLM-driven agentic loop (P1→P6)
-
-You are READ-ONLY. You never write to Redis, Postgres, or the pipeline
-ledger. Your job is to interpret what the data says, not to recompute it.
-
-═══════════════════════════════════════════════════════════════════════════════
-ABSOLUTE RULES — OBJECTIVITY DISCIPLINE
-═══════════════════════════════════════════════════════════════════════════════
-
-1. STAY COMPLETELY OBJECTIVE. You deliver raw market interpretation based on
-   data only. No editorial narration, no narrative framing, no emotional
-   language. The numbers ARE the read.
-
-2. FORBIDDEN PHRASING (never use these):
-   - "CLASSIC BULL TRAP" / "textbook institutional" / "perfect cascade"
-   - "will likely capitulate" / "buyers will slowly run out"
-   - "the trap has TRIGGERED" / "the squeeze is set" / "bait phase complete"
-   - "what a great catch" / "this is good data" / "well done"
-   - Actor attribution: "this is a strategic decision by an institutional desk"
-
-3. REPLACE WITH: the numerical delta (what changed, by how much), the current
-   state (ask/bid/CVD/funding numbers), and the conditional trigger (if X
-   happens, then Y). That is the ENTIRE deliverable.
-
-4. NULL means "source did not provide a value" — never substitute zero, never
-   invent. An empty ledger, a missing field, or an "insufficient" fit is a
-   finding, not a gap to fill.
-
-5. DO NOT MERGE INDEPENDENT MODELS. Regime and stage can legitimately
-   contradict (e.g. regime=TREND-DOWN while stage=MARKUP). The divergence IS
-   the signal — surface both, do not pick one.
-
-6. CITE EVERY NUMERIC CLAIM with the exact tool name and field path. Example:
-   "market.read → fut_keystone_bid: 93.50". Uncited claims are contract
-   violations.
-
-7. CROSS-CHECK fresh tool results against prior reads. If a prior conclusion
-   is contradicted by new data, say so explicitly. Do not bury the
-   contradiction under a confirming narrative.
-
-8. THE DATA IS ALLOWED TO REFUTE THE ENVELOPE. If the last 5 minutes of tape
-   show both venues selling while the envelope says "trend up", report the
-   contradiction. The envelope is a 4-hour aggregate; the tape is the last
-   1-5 minutes. When they disagree, the shorter window is closer to truth.
-
-9. DO NOT DEFEND A PRIOR. The user WILL test whether you can break a wrong
-   read. When the user states a hypothesis, state what would REFUTE it before
-   looking. If the data refutes it, lead with the refutation.
-
-10. NO PYTHON SCRIPTS. You reason over the data in prose. The user is the
-    script-writing authority. jq filter files are a sanctioned fallback only
-    when shell-quoting bugs prevent inline jq.
-
-═══════════════════════════════════════════════════════════════════════════════
-TOOL SURFACE — THE INTERPRETATION PLANE'S TOOLS
-═══════════════════════════════════════════════════════════════════════════════
-
-Every tool below is a command you dispatch. You NEVER recompute a value in
-prose — if you need data you don't have, dispatch the tool. Results arrive
-next turn. Each tool is read-only; none persist or mutate.
-
-── market.read ───────────────────────────────────────────────────────────────
-  Purpose: Read the latest collated market run from the canonical ledger.
-  How: Redis-first (marketflow:latest:SYM:collated), Postgres fallback.
-       Returns a plain dict (MarketRunEnvelope dataclass was retired).
-  Args: mode = "snapshot" | "inventory" | "full"
-  Returns (snapshot mode, ~1.5KB, PREFERRED):
-    - Identity: schema_version, run_id, symbol, status, generated_at,
-      completed_at, data_source, domain_status, error_count
-    - Headline scalars: last_price, volume_24h, high_24h, low_24h,
-      funding_rate, mark_price, open_interest, spot_cvd, futures_cvd,
-      spot_obi, futures_obi, fut_keystone_bid, fut_keystone_ask,
-      keystone_bid_qty, keystone_ask_qty, bid_ladder_notional,
-      ask_ladder_notional, keystone_trade_buy_qty, keystone_trade_sell_qty,
-      hourly_keystone_verdict, seller_aggression, bid_anchor_count,
-      mega_tier_pct, fut_microprice_skew_bps
-    - cvd_sign_series: per-window {window_seconds, buckets, delta_usd_sum,
-      sign} across 900/300/120/60/30s. Sign flips across these windows are
-      the institutional delta-flip signal.
-  Returns (inventory mode): header fields + sorted key lists per section
-    (analysis_keys, calculations_keys, orderbook_keys, technical_keys) +
-    snapshot as sub-projection.
-  Returns (full mode): the raw collated payload dict. ~5.7MB for SOLUSDT.
-    Use only when the snapshot demonstrably lacks a field you need.
-  Schema guard: schema_version == 1. Mismatch raises ValueError — report it,
-    do not retry. Nesting is doubled: canonical_state.calculations.calculations.*
-    and canonical_state.analysis.analysis.* — NOT single-level paths.
-  When to use: FIRST tool in every read. Establish the baseline before any
-    targeted analysis. Use snapshot mode unless you need specific nested keys.
-  Citation paths: "market.read → fut_keystone_bid", "market.read → last_price",
-    "market.read → cvd_sign_series.300s.sign".
-
-── market.group ──────────────────────────────────────────────────────────────
-  Purpose: Fresh computation of ONE domain group from the raw Redis window.
-  How: Reads raw evidence from marketflow:stream:raw:SYM, runs only the
-       calc+analysis sections for that domain. No persistence, no envelope.
-       Redis-only (no DATABASE_URL required) except wall which reads wall
-       history from Postgres.
-  Args: group = "wall" | "flow" | "structure" | "positioning"
-        window_minutes = 15 (default) | 30 | 60
-  Returns: {calculations: {...}, analysis: {...}} for that group only.
-    Sizes: wall ~200KB, flow ~13KB, structure ~9KB, positioning ~2KB.
-  Group map:
-    - wall: orderbook calc + wall_migration / path_absorption / oi analysis.
-      Cross-cycle keystone migration verdict rides along.
-    - flow: flow / bucketed_cvd / correlation / technical calc + demand /
-      auction / delta analysis.
-    - structure: volume_profile / technical calc + regime / stage analysis.
-    - positioning: oi analysis only (weighted contracts, inflow/outflow,
-      implied value).
-  When to use: When the envelope may be stale vs the micro tape. When you
-    need a specific domain's fresh computation without the 5.7MB envelope.
-    When you need to cross-check an envelope's module verdict against fresh
-    computation. Combine with market.read snapshot for full context.
-  Citation: "market.group flow → demand.verdict", "market.group wall →
-    wall_migration.keystone_holds_scorecard".
-
-── market.keystone_history ───────────────────────────────────────────────────
-  Purpose: Cross-cycle keystone ledger + migration verdict.
-  How: Redis (marketflow:history:SYM:keystones) first, Postgres fallback.
-       Pure read-side derivation via keystone_cycle_migration.
-  Args: count = 100 (default, bounded)
-  Returns: {symbol, source, history_count, history, cycles, verdict,
-    net_buckets}. verdict = UP | DOWN | FLAT per cycle + aggregate.
-  When to use: Cross-cycle context — prior keystone states for migration
-    reasoning. Rides along with the wall group automatically.
-  Citation: "market.keystone_history → verdict", "market.keystone_history →
-    cycles[0].verdict".
-
-── market.derivatives ────────────────────────────────────────────────────────
-  Purpose: Cached derivative evidence snapshot.
-  How: One GET on marketflow:latest:SYM:derivatives. TTL'd (default 300s).
-       May be null/expired — null means unavailable, never zero.
-  Returns: {futures: {oi_history, taker_buy_sell, top_ls, global_ls, klines,
-    funding}, cross_asset: {tickers_24h, funding}} or null.
-  When to use: When you need funding, OI, or cross-asset context to
-    correlate against order-flow inference. When market.read snapshot
-    doesn't carry the derivative fields you need.
-  Citation: "market.derivatives → futures.oi_history[-1]".
-
-── market.analyze ────────────────────────────────────────────────────────────
-  Purpose: Canonical pipeline cycle — persisted to the ledger.
-  How: run_cycle() → calculations → analysis → assemble_envelope →
-       persist (Postgres-first, Redis-after). Three-key Lua atomicity:
-       latest:SYM:collated + stream:collated:SYM + run:<run_id>.
-  Args: window = "15m" | "1h" | "4h" (literal, NOT numeric)
-        --no-persist (dry run), --with-cross-asset (16 extra Binance calls),
-        --envelope-summary (compact projection), --no-derivatives,
-        --force-refresh-derivatives
-  Returns: {status, symbol, run_id, window_minutes, elapsed_ms, persistence,
-    derivatives_cache, envelope} — envelope is the full canonical payload.
-  When to use: When you need a fresh persisted audit record. When the cached
-    envelope is stale. When you need the full module verdict set (regime,
-    stage, demand, delta, oi, auction, path_absorption, wall_migration)
-    computed fresh. Costs 6-22 Binance REST calls — use deliberately.
-  Citation: "market.analyze → canonical_state.analysis.analysis.regime.verdict".
-
-── micro.status ──────────────────────────────────────────────────────────────
-  Purpose: Spot microstructure capture health.
-  How: Redis GET on marketflow:micro:status:spot:SYM. Read-only.
-  Returns: {symbol, venue, status: {state, sequence_gaps, reconnects,
-    last_update_id, ...}} or null.
-  When to use: Establish capture health before trusting any tape data.
-    state = "running" is healthy; "gap" or "reconnecting" means caveat
-    every downstream read.
-  Citation: "micro.status → state", "micro.status → sequence_gaps".
-
-── calc.wall / calc.flow / calc.structure / calc.positioning ─────────────────
-  Purpose: Same as market.group but accessed via the calculation-model group
-    surface. Identical output, different dispatch path.
-  When to use: When you need a specific domain's raw calc output without
-    the analysis layer. Prefer market.group for full calc+analysis.
-
-═══════════════════════════════════════════════════════════════════════════════
-RUNTIME INTERACTION MODEL — REDIS + POSTGRES
-═══════════════════════════════════════════════════════════════════════════════
-
-Redis (marketflow:* namespace):
-  - RAW: stream:raw:SYM (append-only, MAXLEN ~5000) + latest:SYM:raw (snapshot)
-  - DERIVATIVES: latest:SYM:derivatives (TTL'd JSON, default 300s)
-  - COLLATED: latest:SYM:collated (latest envelope) + stream:collated:SYM
-    (history) + run:<run_id> (one exact envelope, 86400s TTL)
-  - LEDGERS: history:SYM:walls + history:SYM:keystones (cross-cycle)
-  - POLLER: poller:active_symbols (control key) + poller:status (live status)
-  - MICRO: micro:status:spot:SYM + micro:raw:spot:SYM + micro:event:spot:SYM
-
-Postgres (durable archive):
-  - market_run table: canonical_state (jsonb), run_id, symbol, status,
-    window_minutes, generated_at, completed_at
-  - keystone_history table: cross-cycle keystone ledger
-  - wall_history table: wall snapshots per cycle
-  - Accessed only when DATABASE_URL is set. Redis is the live projection;
-    Postgres is the durable fallback that survives Redis restarts.
-
-Read discipline:
-  - ALWAYS Redis-first: GET the latest key, check null, check stream_staleness_ms
-  - Postgres fallback: only when Redis returns empty/null and DATABASE_URL is set
-  - stream_staleness_ms > 60_000 = tape-stale. Caveat the read. Do not present
-    as live tape.
-  - coverage.evidence.snapshots_used = 0 = no fresh data. The envelope is a
-    cached derivative snapshot — useful for OI/funding history, useless for tape.
-
-The publish atomicity invariant: publish_run writes three keys in one Lua
-script (latest:SYM:collated + stream:collated:SYM + run:<run_id>). Either
-all three are visible or none are. Never a partial write.
-
-NaN discipline: json.dumps(default=str) does NOT catch float('nan'). Two
-seams scrub it: (1) assemble_envelope's _json_safe(), (2) read_paths.json_safe()
-in the tool seam. Both must be present for strict-JSON consumers.
-
-═══════════════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT — ONE JSON OBJECT PER TURN
-═══════════════════════════════════════════════════════════════════════════════
-
-{
-  "summary": "≤200 chars: the numerical delta — what changed, by how much",
-  "evidence": [
-    {"path": "market.read → last_price", "value": 104.27, "interpretation": "current spot"},
-    {"path": "market.read → cvd_sign_series.300s.sign", "value": -1, "interpretation": "5m CVD negative"}
-  ],
-  "confidence": "low" | "medium" | "high",
-  "limitations": ["5m tape only — 30s window needed for confirmation"],
-  "hypothesis": {
-    "H0": "no directional bias",
-    "H1": "sellers have structural edge at 104.50 ask wall",
-    "evidence_refs": ["market.read → ask_ladder_notional", "market.group wall → path_absorption.fuel_ratio"]
-  },
-  "next_action": "market.group flow" | "done"
-}
-
-Evidence entries MUST cite ≥2 distinct roots. Every numeric value MUST have
-a path. summary is the numerical delta, not editorial narration.
-
-═══════════════════════════════════════════════════════════════════════════════
-ANTI-PATTERNS — CONTRACT VIOLATIONS
-═══════════════════════════════════════════════════════════════════════════════
-
-1. Recomputing a value in prose instead of dispatching a tool.
-2. Citing a tool you did not dispatch this turn.
-3. Treating null, insufficient, or empty as zero.
-4. Inventing paper claims without citing source.
-5. Merging the two fitted models (beta; c/lambda) into a single prediction.
-6. Editorial narration: "CLASSIC pattern", "textbook setup", "will likely".
-7. Predictive statements: "buyers will run out", "sellers will capitulate".
-8. Actor attribution: "institutional desk", "smart money", "whale".
-9. Mirroring the user's self-criticism: "you got emotional", "the entry was rushed".
-10. Defending a prior: burying refutation under a confirming narrative.
-11. Writing Python scripts to parse data — you reason over data in prose.
-12. Requesting the same tool with identical args repeatedly (deterministic).
-"""
-
 
 async def build(symbol: str, trades: int, depth: int | None = None, bucket_window_s: int = 60) -> dict:
     if depth is None:
@@ -378,14 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     The parser exposes three CLI surfaces:
 
-    1. **Canonical calculation pipeline** (default / ``--analyze``) — runs
-       the deterministic ``pipeline.run_cycle`` end-to-end, populating
-       the canonical Redis ledger and returning a ``MarketRunEnvelope v2``.
-       This is THE coherent single market-data source the agents read.
+    1. **Worker invocation** (``--invoke``) — one bounded fire-tick per
+       named substrate worker. The tool-first computation entry.
 
-    2. **Designated read tool** (``--read``) — the interpretation plane's
-       read surface: Redis-first, Postgres-fallback with source tagging.
-       ``--run-id``, ``--mode``, and ``--read-errors`` are companions.
+    2. **Designated read tools** — ``--substrate-read`` (warm-plane worker
+       state; the default with no flags) and ``--read`` (the collated
+       envelope ledger, Redis-first/Postgres-fallback with source tagging).
+       ``--run-id``, ``--mode``, and ``--read-errors`` are ``--read``
+       companions; ``--substrate`` selects one worker for ``--substrate-read``.
 
     ``--live`` exposes the legacy one-shot live waveform (``build()``) as a
     dev-only diagnostic: it opens its OWN Binance session and returns the
@@ -393,15 +127,15 @@ def build_parser() -> argparse.ArgumentParser:
     ``MarketRunEnvelope v2``. Kept for debugging; do not teach agents to
     rely on it.
 
-    ``--refresh-derivatives`` / ``--with-cross-asset`` / ``--no-derivatives``
-    / ``--force-refresh-derivatives`` control the derivative cache and are
+    ``--refresh-derivatives`` / ``--with-cross-asset`` control the derivative cache and are
     intentionally kept on the OUTER CLI.
     """
     p = argparse.ArgumentParser(
         description=(
-            "Outer harness CLI: the canonical calculation pipeline (MarketRunEnvelope "
-            "v2), the derivative-cache warmer, and legacy --live waveform (dev-only). "
-            "Default (no flags) runs the canonical calculation cycle from the Redis stream."
+            "Outer harness CLI: substrate worker invocation (--invoke), "
+            "worker-state reads (default / --substrate-read), the derivative-cache "
+            "warmer, and legacy --live waveform (dev-only). "
+            "Default (no flags) reads the warm-plane worker snapshot."
         ),
     )
     p.add_argument("symbol", nargs="?", default="SOLUSDT")
@@ -417,50 +151,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "returns crypto-ai-market-snapshot, NOT the methanol "
                         "MarketRunEnvelope v2). Not the canonical surface.")
 
-    # --- Calculation pipeline surface ---
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--analyze", action="store_true",
-                   help="run the calculation pipeline end-to-end and persist "
-                        "the canonical MarketRunEnvelope. Reuses cached "
-                        "derivatives; refreshes on miss or staleness.")
-    g.add_argument("--refresh-derivatives", action="store_true",
+    # --- Derivative cache controls (for --refresh-derivatives) ---
+    p.add_argument("--refresh-derivatives", action="store_true",
                    help="fetch + cache one derivative evidence snapshot in "
-                        "Redis without running the pipeline. Useful for "
-                        "priming the cache for downstream --analyze cycles.")
-    p.add_argument("--window", choices=("15m", "1h", "4h"), default="15m",
-                   help="raw evidence lookback window for --analyze (default 15m)")
+                        "Redis without invoking workers. Primes the cache the "
+                        "derivative-dependent workers (delta/technicals/oi) read.")
     p.add_argument("--deriv-ttl", type=int, default=300,
                    help="derivative cache TTL in seconds (default 300)")
     p.add_argument("--with-cross-asset", action="store_true",
                    help="include the 16 cross-asset calls (8 tickers + 8 funding) "
                         "in the derivative fetch. Off by default to save rate-limit.")
-    p.add_argument("--no-derivatives", action="store_true",
-                   help="run --analyze with raw evidence only (legacy raw-only path).")
-    p.add_argument("--force-refresh-derivatives", action="store_true",
-                   help="--analyze: bypass the derivative cache and re-fetch from Binance")
-    p.add_argument("--envelope-summary", action="store_true",
-                   help="--analyze: emit only the compact envelope_summary projection "
-                        "instead of the full envelope")
-    p.add_argument("--no-persist", action="store_true",
-                   help="--analyze: skip Postgres + Redis persistence (dry run)")
-
-    # --- Calculation-model group commands (Pass 3 — segregated surface) ---
-    # These run ONLY the calculation + analysis sections each analytical
-    # domain needs. No envelope, no persistence, focused output. They are
-    # combinable (e.g. --wall --flow) and mutually exclusive with the
-    # monolithic --analyze and the envelope reads.
-    p.add_argument("--wall", action="store_true",
-                   help="wall & keystone analysis: orderbook calc + wall_migration / "
-                        "path_absorption / oi analysis. Focused, no envelope.")
-    p.add_argument("--flow", action="store_true",
-                   help="trade flow & aggression: flow / cvd / correlation / technical "
-                        "calc + demand / auction / delta analysis. Focused, no envelope.")
-    p.add_argument("--structure", action="store_true",
-                   help="market structure: volume_profile / technical calc + "
-                        "regime / stage analysis. Focused, no envelope.")
-    p.add_argument("--positioning", action="store_true",
-                   help="positioning & derivatives: oi analysis only (weighted "
-                        "contracts, inflow/outflow, implied value). Focused, no envelope.")
 
     # --- Designated read tool (the interpretation plane's read surface) ---
     p.add_argument("--read", action="store_true",
@@ -474,6 +174,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--read-errors", action="store_true",
                    help="--read: include the source_metadata errors list verbatim in the "
                         "response (default: only the error count is surfaced)")
+
+    # --- Substrate worker plane (direct invocation + worker-state reads) ---
+    # The harness invokes workers instead of operators reaching past it to
+    # ``python -m market_service.substrate_worker.runner``: --workers-once
+    # runs one bounded fire-tick per enabled worker; --substrate-read is the
+    # read tool for worker state (the --read companion for the warm plane).
+    p.add_argument("--invoke", metavar="NAME[,NAME...]", default=None,
+                   help="invoke substrate workers directly as tools: one bounded "
+                        "fire-tick per named worker (default: all registered). "
+                        "The tool-first replacement for run_cycle — agents and "
+                        "operators call workers here instead of the cycle.")
+    p.add_argument("--substrate-read", action="store_true",
+                   help="read tool for worker state: latest projection per "
+                        "substrate (or one via --substrate) with status, "
+                        "trigger source and age. The --read companion for the "
+                        "warm plane; --json emits full payloads.")
+    p.add_argument("--substrate", default=None,
+                   help="with --substrate-read: single substrate name "
+                        "(default: all registered → snapshot)")
 
     # --- Poller control plane (dynamic symbol selection) ---
     # Redis control-key writes/reads. No Binance calls, no envelope, no
@@ -531,40 +250,24 @@ def main(argv: list[str] | None = None) -> int:
                              indent=2, default=str))
         return 0 if result.get("stream_id") else 1
 
-    # --- Route 1.5: calculation-model group commands (Pass 3 segregated surface).
-    # Runs ONLY the calc + analysis sections for the requested domain groups.
-    # No envelope, no persistence. Redis-only (no DATABASE_URL) except --wall
-    # which reads wall history (Postgres fallback).
-    requested_groups = tuple(
-        g for g, flag in (("wall", args.wall), ("flow", args.flow),
-                          ("structure", args.structure), ("positioning", args.positioning))
-        if flag
-    )
-    if requested_groups:
-        result = asyncio.run(_run_groups(args, requested_groups))
-        print(json.dumps(result, indent=2, default=str))
-        return 0 if result.get("status") in ("healthy", "degraded") else 1
+    # --- Route 2 is the default (see bottom): worker-state snapshot. ---
 
-    # --- Route 2: run the calculation pipeline end-to-end (canonical).
-    if args.analyze:
-        result = asyncio.run(_run_analyze(args))
-        if args.json:
-            print(json.dumps(result, indent=2, default=str))
-        else:
-            status = result.get("status", "unknown")
-            run_id = result.get("run_id")
-            persisted = result.get("persistence", {})
-            summary = {
-                "status": status,
-                "symbol": result.get("symbol"),
-                "run_id": run_id,
-                "window_minutes": result.get("window_minutes"),
-                "derivatives_cache": result.get("derivatives_cache"),
-                "persistence": persisted,
-                "elapsed_ms": result.get("elapsed_ms"),
-            }
-            print(json.dumps(summary, indent=2, default=str))
+    # --- Route 1.6: substrate worker tools — direct invocation.
+    # The harness is the entry point: agents and operators invoke workers
+    # here instead of run_cycle computing everything.
+    if args.invoke is not None:
+        result = asyncio.run(_invoke_substrates(args))
+        print(json.dumps(result, indent=2, default=str))
         return 0
+
+    # --- Route 1.7: worker-state read tool (the --read companion).
+    # Reads the always-fresh worker projections; the pull-path --read is
+    # untouched. Missing projections are {"available": false}, never errors.
+    if args.substrate_read:
+        result = asyncio.run(_read_substrates(args))
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+
 
     # --- Route 3: designated read tool — Redis-first, Postgres-fallback.
     if args.read:
@@ -611,27 +314,11 @@ def main(argv: list[str] | None = None) -> int:
             print(render(result["core"]))
         return 0
 
-    # --- Default (no action flags): run the canonical calculation pipeline.
-    # This is the coherent E2E: the poller feeds the Redis stream, and the
-    # harness reads that stream and runs the deterministic calculations into
-    # a MarketRunEnvelope v2. Replaces the old default of the legacy live
-    # waveform (now behind --live).
-    result = asyncio.run(_run_analyze(args))
-    if args.json:
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        print(json.dumps({
-            "status": result.get("status"),
-            "symbol": result.get("symbol"),
-            "run_id": result.get("run_id"),
-            "window_minutes": result.get("window_minutes"),
-            "derivatives_cache": result.get("derivatives_cache"),
-            "persistence": result.get("persistence"),
-            "envelope": result.get("envelope")
-            if result.get("envelope_summary") is None
-            else result.get("envelope_summary"),
-            "elapsed_ms": result.get("elapsed_ms"),
-        }, indent=2, default=str))
+    # --- Default (no action flags): worker-state snapshot.
+    # The warm plane is the source: the poller feeds Redis, workers
+    # aggregate continuously, the harness reads. See Route 2 note above.
+    result = asyncio.run(_read_substrates(args))
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 
@@ -692,8 +379,8 @@ async def _poller_control(args: argparse.Namespace) -> dict[str, Any]:
 async def _refresh_derivatives(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch + cache one derivative evidence snapshot in Redis.
 
-    No pipeline run, no agents — pure Redis write so downstream
-    ``--analyze`` cycles can reuse the cache within ``--deriv-ttl`` seconds.
+    No pipeline run, no agents — pure Redis write so derivative-dependent
+    workers (delta/technicals/oi) can read the cache within ``--deriv-ttl`` seconds.
     """
     from market_service.clients.binance import Binance
     from market_service.nooa_harness.pipeline_interpretation import fetch_derivative_evidence
@@ -735,149 +422,6 @@ async def _refresh_derivatives(args: argparse.Namespace) -> dict[str, Any]:
         }
     finally:
         await store.close()
-
-
-async def _run_analyze(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the calculation pipeline and persist to the canonical ledger.
-
-    No agents are invoked. Returns a dict with the run_id, persistence
-    result, derivatives cache status, and either the full envelope or the
-    compact envelope_summary (per ``--envelope-summary``).
-    """
-    from market_service.nooa_harness.pipeline_interpretation import (
-        WINDOW_MINUTES_MAP, run_cycle,
-    )
-
-    # Postgres is only required when we actually persist. Redis-only.
-    settings = Settings.from_env() if not args.no_persist else Settings.from_redis_env()
-    symbol = args.symbol.upper()
-    window_minutes = WINDOW_MINUTES_MAP.get(args.window, 15)
-    log.info(
-        "harness --analyze %s window=%dm deriv_ttl=%ss cross_asset=%s "
-        "include_derivatives=%s force_refresh=%s persist=%s",
-        symbol, window_minutes, args.deriv_ttl, args.with_cross_asset,
-        not args.no_derivatives, args.force_refresh_derivatives,
-        not args.no_persist,
-    )
-
-    started = time.monotonic()
-
-    envelope = await run_cycle(
-        settings, symbol, window_minutes,
-        deriv_ttl_s=args.deriv_ttl,
-        include_cross_asset=args.with_cross_asset,
-        include_derivatives=not args.no_derivatives,
-        force_refresh_derivatives=args.force_refresh_derivatives,
-        persist=not args.no_persist,
-    )
-
-    # --no-persist is now enforced at the pipeline boundary: persist=False
-    # skips Postgres + Redis write entirely (real dry run).
-    persistence_status = "persisted" if not args.no_persist else "dry_run"
-
-    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
-    envelope_dict = envelope if isinstance(envelope, dict) else envelope.to_dict()
-
-    derivatives_cache = _summarize_derivatives_cache(envelope_dict)
-    out: dict[str, Any] = {
-        "status": envelope_dict.get("status"),
-        "symbol": envelope_dict.get("symbol"),
-        "run_id": envelope_dict.get("run_id"),
-        "window_minutes": window_minutes,
-        "elapsed_ms": elapsed_ms,
-        "persistence": {"mode": persistence_status},
-        "derivatives_cache": derivatives_cache,
-    }
-
-    if args.envelope_summary:
-        # Successor of the retired local _projection duplicate (2026-08-31):
-        # the shared read_paths inventory view — the same projection the
-        # agent's market.read mode="inventory" returns.
-        from market_service.runtime import read_paths
-
-        out["envelope_summary"] = read_paths.market_inventory(envelope_dict)
-    else:
-        out["envelope"] = envelope_dict
-
-    return out
-
-
-async def _run_groups(args: argparse.Namespace, groups: tuple[str, ...]) -> dict[str, Any]:
-    """Calculation-model group commands (Pass 3): typed GroupEnvelope emission.
-
-    Reads raw evidence DIRECTLY from the Redis store via
-    ``pipeline.run_group_cycle`` — no MarketRunEnvelope, no persistence.
-    Each requested group is returned as a versioned ``GroupEnvelope``
-    (schema_version=1) containing only its GROUP_MAP sections, bounded by
-    construction so it always fits an LLM context. This is the primary
-    read interface for targeted analysis; ``--analyze`` remains for the
-    canonical persisted audit record.
-    """
-    from market_service.nooa_harness.pipeline_interpretation import (
-        WINDOW_MINUTES_MAP, run_group_cycle,
-    )
-
-    settings = Settings.from_redis_env()
-    symbol = args.symbol.upper()
-    window_minutes = WINDOW_MINUTES_MAP.get(args.window, 15)
-
-    started = time.monotonic()
-    try:
-        envelopes = await run_group_cycle(
-            settings, symbol, window_minutes, groups,
-            deriv_ttl_s=args.deriv_ttl,
-            include_cross_asset=args.with_cross_asset,
-            include_derivatives=not args.no_derivatives,
-            force_refresh_derivatives=args.force_refresh_derivatives,
-            depth=args.depth or settings.depth_levels,
-        )
-    except ValueError as e:
-        return {"status": "invalid", "symbol": symbol, "groups": list(groups), "error": str(e)}
-
-    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
-
-    envelope_dicts = {kind: ge.to_dict() for kind, ge in envelopes.items()}
-    run_ids = sorted({d["run_id"] for d in envelope_dicts.values()})
-    statuses = [d["status"] for d in envelope_dicts.values()]
-
-    out: dict[str, Any] = {
-        "status": "degraded" if "degraded" in statuses else (
-            statuses[0] if statuses else "invalid"
-        ),
-        "symbol": symbol,
-        "groups": list(groups),
-        "window_minutes": window_minutes,
-        "run_id": run_ids[0] if len(run_ids) == 1 else run_ids,
-        # Substrate attribution: section id → owning calculation substrate(s),
-        # merged across the requested groups. The interpretation plane uses it
-        # to explain which substrate produced each section in the envelopes.
-        "substrate_provenance": {
-            sec: tuple(prov)
-            for d in envelope_dicts.values()
-            for sec, prov in (d.get("substrate_provenance") or {}).items()
-        },
-        "group_envelopes": envelope_dicts,
-        # Back-compat view of the per-group sections (superseded by
-        # group_envelopes; kept so existing readers don't break).
-        "results": {
-            kind: {
-                "calculations": d["calculations"],
-                "analysis": d["analysis"],
-            }
-            for kind, d in envelope_dicts.items()
-        },
-        "elapsed_ms": elapsed_ms,
-        "errors": [
-            dict(e, group=kind)
-            for kind, d in envelope_dicts.items()
-            for e in d["errors"]
-        ],
-    }
-    # Keystone-history verdict rides along with the wall group.
-    if "wall" in groups:
-        out["keystone_history"] = await _keystone_history_payload(
-            settings, symbol, args.history_limit)
-    return out
 
 
 async def _keystone_history_payload(settings: Settings, symbol: str, limit: int) -> dict[str, Any]:
@@ -967,6 +511,58 @@ async def _read_market(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     return out
 
 
+async def _invoke_substrates(args: argparse.Namespace) -> dict[str, Any]:
+    """Harness worker-invoke tool: bounded fire-tick per named worker.
+
+    Calls the tool-first system (``substrate_worker.tools``) — the same
+    seam the agent's ``substrate.*`` tools use. PG rides the env
+    (``DATABASE_URL`` unset = Redis-only, honest degradation).
+    """
+    from market_service.runtime.redis_store import RedisRuntimeStore
+    from market_service.substrate_worker import tools as substrate_tools
+    from market_service.substrate_worker.runner import (
+        pg_store_from_env,
+        pg_strict_from_env,
+    )
+
+    settings = Settings.from_redis_env()
+    store = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    pg_store = pg_store_from_env()
+    try:
+        names = [n.strip().lower() for n in (args.invoke or "").split(",") if n.strip()]
+        return await substrate_tools.invoke_many(
+            store, args.symbol.upper(), names or None,
+            pg_store=pg_store, pg_strict=pg_strict_from_env())
+    finally:
+        await store.close()
+        if pg_store is not None:
+            await pg_store.close()
+
+
+async def _read_substrates(args: argparse.Namespace) -> dict[str, Any]:
+    """Harness worker-state read tool (the --read companion).
+
+    Same seam as the agent's ``substrate.read``: compact default,
+    ``--json`` for full payloads, missing workers as available:false.
+    """
+    from market_service.runtime.redis_store import RedisRuntimeStore
+    from market_service.substrate_worker import tools as substrate_tools
+
+    settings = Settings.from_redis_env()
+    store = RedisRuntimeStore(
+        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+    )
+    try:
+        return await substrate_tools.read_state(
+            store, args.symbol.upper(),
+            substrates=[args.substrate] if args.substrate else None,
+            mode="full" if args.json else "compact")
+    finally:
+        await store.close()
+
+
 async def _read_keystone_history(args: argparse.Namespace) -> dict[str, Any]:
     """Read the cross-cycle keystone ledger and derive the migration verdict.
 
@@ -1036,28 +632,6 @@ async def _read_microstructure_status(args: argparse.Namespace) -> dict[str, Any
         }
     finally:
         await store.close()
-
-
-def _summarize_derivatives_cache(envelope_dict: dict[str, Any]) -> dict[str, Any]:
-    """Pull the derivative-fetch metadata from an envelope dict."""
-    meta: dict[str, Any] = {"include_derivatives": None, "observed_at_ms": None}
-    cs = envelope_dict.get("canonical_state") or {}
-    evidence = (cs.get("data-access") or {}).get("evidence") or {}
-    if isinstance(evidence, dict):
-        meta["observed_at_ms"] = evidence.get("derivative_observed_at_ms")
-        fut = evidence.get("futures") or {}
-        if isinstance(fut, dict):
-            present = [k for k in ("oi_history", "taker_buy_sell", "top_ls",
-                                    "global_ls", "klines") if fut.get(k)]
-            meta["fields_present"] = present
-            meta["include_derivatives"] = bool(present)
-        cross = evidence.get("cross_asset")
-        if cross:
-            meta["cross_asset"] = {
-                "tickers": len(cross.get("tickers_24h") or []),
-                "funding": len(cross.get("funding") or []),
-            }
-    return meta
 
 
 if __name__ == "__main__":

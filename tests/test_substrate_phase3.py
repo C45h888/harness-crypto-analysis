@@ -325,5 +325,48 @@ class ParityGateTests(unittest.TestCase):
         self.assertEqual(out["signals"], self.calc["calculations"]["signals"])
 
 
+class PgJsonSanitizationTests(unittest.TestCase):
+    """Non-finite floats (inf one-sided ratios) must not break the PG insert."""
+
+    def test_inf_ratio_sanitized_to_null(self):
+        import json as _json
+
+        from market_service.runtime.postgres_store import PostgresRuntimeStore
+
+        captured: dict[str, Any] = {}
+
+        class _Pool:
+            async def fetchrow(self, _query, *args):
+                captured["args"] = args
+                return {"id": 7}
+
+        async def _run():
+            pg = PostgresRuntimeStore.__new__(PostgresRuntimeStore)
+            pg.pool = _Pool()
+            payload = {
+                "substrate": "tiers", "symbol": "SOLUSDT", "status": "healthy",
+                "observed_at_ms": 1_700_000_000_000,
+                "computed_at_ms": 1_700_000_001_000,
+                "trigger": {"source": "probe", "predicates": {}},
+                "freshness": {}, "missing_inputs": [],
+                "output": {"tier_balance": {"ratio": float("inf")}},
+                "schema_version": 1,
+            }
+            row_id = await pg.record_substrate_state("SOLUSDT", "tiers", payload)
+            return row_id
+
+        loop = asyncio.new_event_loop()
+        try:
+            row_id = loop.run_until_complete(_run())
+        finally:
+            loop.close()
+        self.assertEqual(row_id, 7)
+        for blob in (captured["args"][5], captured["args"][6],
+                     captured["args"][7], captured["args"][8]):
+            parsed = _json.loads(blob)  # strict JSON must parse
+            self.assertNotIn("Infinity", blob)
+        self.assertIsNone(parsed["output"]["tier_balance"]["ratio"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

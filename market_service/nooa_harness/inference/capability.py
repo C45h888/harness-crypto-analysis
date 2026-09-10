@@ -43,7 +43,7 @@ class Capability:
 
 # Frozen initial scope — extended for SOL-USDT perps (per/user request).
 # Microstructure capture remains spot-only (event-level tape), but
-# calculation modules (market.group/read) are venue-agnostic via raw poller
+# calculation modules (substrate tools/market.read) are venue-agnostic via raw poller
 # which fetches spot + USD-M perps. This lets inference validate SOL perps
 # statistically even when micro evidence is spot-derived.
 _INITIAL_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
@@ -99,10 +99,11 @@ _MARKET_TOOLS: dict[str, Capability] = {
         "redis.read_intervals": "Read completed OFI interval rows from the capture ledger.",
         "redis.read_evidence": "Read the latest immutable MicrostructureEvidence projection.",
         "market.read": "Read the latest collated market run from Redis. Modes: snapshot (bounded headline view, default), inventory (section keys + snapshot), full (raw payload deep-dive).",
-        "market.run_group": "Run one calculation-model group (wall/flow/structure/positioning) fresh from the raw Redis window; never persists.",
         "market.read_derivatives": "Read the cached derivative evidence (funding, OI, cross-asset).",
         "market.read_keystone_history": "Read the bounded keystone cross-cycle ledger.",
         "market.read_wall_history": "Read the bounded wall cross-cycle ledger.",
+        "substrate.read": "Read the always-fresh substrate worker projections (snapshot over all workers, or one substrate). Compact by default, full payloads on mode=full. Missing workers are available:false, never errors.",
+        "substrate.invoke": "Invoke one substrate worker for a single bounded fire-tick (never a loop). Cooldowns still gate inside the core; reports fired/trigger/dormant per worker.",
         "calc.ofi_intervals": "Deterministic OFI per interval: sum e_n in [t_{k-1},t_k) — clock-bound, no AD. Paper Cont eq OFI_k.",
         "calc.ad_average": "Deterministic AD per block: event-average (qB+qA)/2 — separate from OFI, needs tick_size. Paper AD_i.",
         "calc.observation_build": "Join OFI intervals + AD blocks + mid → PriceImpactObservation[] (ΔP ticks vs OFI), quality filtered.",
@@ -113,3 +114,22 @@ _MARKET_TOOLS: dict[str, Capability] = {
     }.items()
 }
 CAPABILITIES.update(_MARKET_TOOLS)
+
+# T3 — substrate worker plane: one capability per worker tool plus the
+# snapshot reader and the generic invoker (explicit registry, same frozen
+# scope as market.* — each worker invocation audits under its own name).
+_SUBSTRATE_WORKERS = (
+    "anchors", "density", "delta", "ladders", "large_print",
+    "migration", "oi", "signals", "tape", "technicals", "tiers",
+    "volume_profile",
+)
+CAPABILITIES.update({
+    f"substrate.{worker}": Capability(
+        name=f"substrate.{worker}",
+        description=f"Invoke the {worker} substrate worker for a single "
+                    f"bounded fire-tick (never a loop); reports fired/trigger.",
+        allowed_symbols=_INITIAL_SYMBOLS,
+        allowed_venues=_INITIAL_VENUES,
+    )
+    for worker in _SUBSTRATE_WORKERS
+})

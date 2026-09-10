@@ -939,14 +939,14 @@ class RedisRuntimeStore:
         maxlen = str(int(self.stream_maxlen))
         script = """
         redis.call('SET', KEYS[1], ARGV[1])
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[4], '*',
-            'substrate', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[5], 'payload', ARGV[1])
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'substrate', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[4], 'payload', ARGV[1])
         """
         return str(await self.redis.eval(
             script, 2,
             self.substrate_latest_key(substrate, symbol),
             self.substrate_stream(substrate, symbol),
-            substrate.lower(), symbol.upper(), body, ts, maxlen,
+            body, substrate.lower(), symbol.upper(), ts, maxlen,
         ))
 
     async def read_substrate_latest(

@@ -844,6 +844,12 @@ class PostgresRuntimeStore:
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
+        # PG's JSONB is strict JSON: sanitize non-finite floats (inf from
+        # one-sided books, NaN from empty math) to null before insert.
+        trigger = _json_safe(payload.get("trigger") or {})
+        freshness = _json_safe(payload.get("freshness") or {})
+        missing = _json_safe(payload.get("missing_inputs") or [])
+        body = _json_safe(payload)
         row = await self.pool.fetchrow(
             """INSERT INTO substrate_calculation
                (symbol, substrate, status, observed_at, computed_at,
@@ -854,10 +860,10 @@ class PostgresRuntimeStore:
             str(payload.get("status") or "healthy"),
             self._ms_to_ts(payload.get("observed_at_ms")),
             self._ms_to_ts(payload.get("computed_at_ms")) or datetime.now(tz=UTC),
-            json.dumps(payload.get("trigger") or {}),
-            json.dumps(payload.get("freshness") or {}),
-            json.dumps(payload.get("missing_inputs") or []),
-            json.dumps(payload),
+            json.dumps(trigger),
+            json.dumps(freshness),
+            json.dumps(missing),
+            json.dumps(body),
             int(payload.get("schema_version") or 1),
         )
         return int(row["id"])

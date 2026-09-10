@@ -1,16 +1,16 @@
-"""INTERPRETATION PLANE — canonical run pipeline + durable persistence.
+"""INTERPRETATION PLANE — envelope assembly + durable fetch surfaces.
 
 This module owns the interpretation-plane surface that used to live in
-``pipeline.py``: envelope assembly, Postgres-first persistence, the cross-
-cycle wall/keystone ledger writes, the on-demand Binance derivative fetch,
-and the two cycle runners (``run_cycle`` = canonical persisted envelope,
-``run_group_cycle`` = typed GroupEnvelope command surface).
+``pipeline.py``: envelope assembly, the on-demand Binance derivative fetch,
+and the cross-cycle wall/keystone payload builders. Computation cycles
+(``run_cycle`` / ``run_group_cycle``) were removed with the tool-first
+migration: agents and operators invoke substrate workers as tools
+(``substrate_worker.tools``) instead of running cycles.
 
 Semantic boundary (two-plane doctrine): the INFERENCE PLANE must not import
-this module. The agent's read seam into the same deterministic math is
-``pipeline_inference.run_inference_group`` — it consumes ``calculations.composition`` with the
-engine's own injected store and never touches these persistence/Binance
-surfaces.
+this module. The agent's tool base consumes ``calculations.composition``
+and ``substrate_worker.tools`` with the engine's own injected store and
+never touches these persistence/Binance surfaces.
 
 Backward-compat: ``market_service.nooa_harness.pipeline`` remains as a thin
 re-export shim of this module for consumers outside the runtime wiring
@@ -25,16 +25,6 @@ import time
 import uuid
 from typing import Any
 
-from market_service.clients.binance import Binance
-from market_service.config import Settings
-from market_service.runtime.contracts import (
-    MARKET_RUN_SCHEMA_VERSION,
-    _json_safe,
-)
-from market_service.runtime.postgres_store import PostgresRuntimeStore
-from market_service.runtime.redis_store import RedisRuntimeStore
-
-from market_service.calculations import composition
 from market_service.calculations.composition import (  # noqa: F401  (re-export: stable public pipeline API)
     GROUP_MAP,
     WINDOW_MINUTES_MAP,
@@ -51,9 +41,14 @@ from market_service.calculations.composition import (  # noqa: F401  (re-export:
     run_calculations,
     sections_for_groups,
 )
+from market_service.clients.binance import Binance
 from market_service.runtime.bounds import (  # noqa: F401
     _bound_arrays,
     _evidence_headlines,
+)
+from market_service.runtime.contracts import (
+    MARKET_RUN_SCHEMA_VERSION,
+    _json_safe,
 )
 from market_service.runtime.derivatives import (  # noqa: F401
     DERIV_FRESH_MS_DEFAULT,
@@ -61,10 +56,9 @@ from market_service.runtime.derivatives import (  # noqa: F401
     _is_deriv_fresh,
     _merge_derivatives,
 )
-from market_service.runtime.raw_window import (  # noqa: F401
+from market_service.runtime.raw_window import (
     build_raw_window as read_raw_window,
 )
-from .contracts import GroupEnvelope
 
 log = logging.getLogger(__name__)
 
@@ -173,42 +167,6 @@ def assemble_envelope(
 # Persistence — Postgres first, then Redis
 # ---------------------------------------------------------------------------
 
-async def persist_envelope(
-    envelope: dict[str, Any],
-    settings: Settings,
-    *,
-    postgres: PostgresRuntimeStore | None = None,
-    redis: RedisRuntimeStore | None = None,
-) -> dict[str, Any]:
-    """Persist one canonical run payload dict — Postgres first, then Redis.
-
-    Callers that already hold open stores (``run_cycle``) pass them via
-    ``postgres``/``redis`` to avoid opening a second connection pair per
-    cycle; standalone callers get fresh stores that are closed on exit.
-    """
-    own_pg = postgres is None
-    own_redis = redis is None
-    postgres = postgres or PostgresRuntimeStore(settings.database_url)
-    redis = redis or RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        inserted = await postgres.insert_run(envelope)
-        redis_stream_id = await redis.publish_run(envelope)
-        return {
-            "run_id": envelope["run_id"],
-            "postgres_inserted": inserted,
-            "redis_stream_id": redis_stream_id,
-            "redis_key": redis.collated_latest_key(envelope["symbol"]),
-            "schema_version": envelope["schema_version"],
-            "status": envelope["status"],
-        }
-    finally:
-        if own_pg:
-            await postgres.close()
-        if own_redis:
-            await redis.close()
-
 # ---------------------------------------------------------------------------
 # Wall-snapshot seam — read the FULL recorded wall history into the migration
 # analysis, and WRITE the current cycle's wall state so the next cycle sees it.
@@ -258,49 +216,6 @@ def _wall_snapshot_payload(
     }
 
 
-async def _record_wall_snapshot(
-    settings: Settings,
-    symbol: str,
-    run_id: str,
-    evidence: dict[str, Any],
-    analysis_result: dict[str, Any],
-    *,
-    postgres: PostgresRuntimeStore | None = None,
-    redis: RedisRuntimeStore | None = None,
-) -> dict[str, Any]:
-    """WRITE the current cycle's wall snapshot (Postgres first, then Redis).
-
-    This closes the write seam: every cycle appends its wall state to the
-    durable ledger so subsequent cycles can call ALL recorded walls, not
-    just the one that happened to be written last.
-
-    Callers that already hold open stores (``run_cycle``) pass them via
-    ``postgres``/``redis`` to avoid connection churn; standalone callers get
-    fresh stores that are closed on exit.
-    """
-    payload = _wall_snapshot_payload(symbol, run_id, evidence, analysis_result)
-    own_pg = postgres is None
-    own_redis = redis is None
-    postgres = postgres or PostgresRuntimeStore(settings.database_url)
-    redis = redis or RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        pg_ok = await postgres.record_wall_snapshot(symbol, run_id, payload)
-        redis_id = await redis.record_wall_snapshot(symbol, run_id, payload)
-        return {
-            "postgres_written": pg_ok,
-            "redis_stream_id": redis_id,
-            "cycle_ts": payload["cycle_ts"],
-            "wall_levels_recorded": len(payload.get("asks") or []),
-        }
-    finally:
-        if own_pg:
-            await postgres.close()
-        if own_redis:
-            await redis.close()
-
-
 def _keystone_snapshot_payload(
     symbol: str,
     run_id: str,
@@ -344,48 +259,6 @@ def _keystone_snapshot_payload(
         "keystone_bid_qty": _f((stack.get("tight") or {}).get("total_qty")),
         "ask_ladder_notional": _f(ladder.get("total_notional")),
     }
-
-
-async def _record_keystone_snapshot(
-    settings: Settings,
-    symbol: str,
-    run_id: str,
-    calc_result: dict[str, Any],
-    *,
-    postgres: PostgresRuntimeStore | None = None,
-    redis: RedisRuntimeStore | None = None,
-) -> dict[str, Any]:
-    """WRITE the current cycle's keystone snapshot (Postgres first, then Redis).
-
-    Cross-cycle companion to ``_record_wall_snapshot``: every cycle appends
-    its keystone state to the durable ledger so the migration verdict can
-    probe ALL recorded keystones, not just the most recent pull.
-
-    Shared-store discipline mirrors ``_record_wall_snapshot``.
-    """
-    payload = _keystone_snapshot_payload(symbol, run_id, calc_result)
-    own_pg = postgres is None
-    own_redis = redis is None
-    postgres = postgres or PostgresRuntimeStore(settings.database_url)
-    redis = redis or RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        pg_ok = await postgres.record_keystone_snapshot(symbol, run_id, payload)
-        redis_id = await redis.record_keystone_snapshot(symbol, run_id, payload)
-        return {
-            "postgres_written": pg_ok,
-            "redis_stream_id": redis_id,
-            "cycle_ts": payload["cycle_ts"],
-            "keystone_price": payload.get("keystone_price"),
-        }
-    finally:
-        if own_pg:
-            await postgres.close()
-        if own_redis:
-            await redis.close()
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -481,334 +354,15 @@ async def fetch_derivative_evidence(
 
 
 
-async def run_group_cycle(
-    settings: Settings,
-    symbol: str,
-    window_minutes: int,
-    groups: tuple[str, ...],
-    *,
-    deriv_ttl_s: int = DERIV_TTL_S_DEFAULT,
-    include_cross_asset: bool = False,
-    include_derivatives: bool = True,
-    force_refresh_derivatives: bool = False,
-    depth: int | None = None,
-) -> dict[str, GroupEnvelope]:
-    """Read raw evidence DIRECTLY from the Redis store and emit typed GroupEnvelopes.
-
-    This is the harness group-command plane: no MarketRunEnvelope, no
-    persistence. Each requested group gets its own GroupEnvelope containing
-    only its GROUP_MAP sections. Redis is the single data source (the 5s
-    poller feeds it); the on-demand derivative fetch is the only Binance
-    touch and is cache-first. Wall history is read from Postgres (Redis
-    fallback) only when the wall group needs it.
-    """
-    unknown = [g for g in groups if g not in GROUP_MAP]
-    if unknown:
-        raise ValueError(f"unknown calculation group(s): {unknown!r}")
-
-    depth = depth or settings.depth_levels
-    window_s = window_minutes * 60
-    store = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    try:
-        evidence = await composition.read_raw_window(store, symbol, window_minutes)
-
-        # Warm the derivative cache for groups that need it: oi (oi_history,
-        # L/S), demand (taker + cross_asset), regime (L/S), stage (klines).
-        requested_analysis: set[str] = set()
-        for g in groups:
-            requested_analysis.update(GROUP_MAP[g]["analysis"])
-        needs_deriv = bool({"oi", "demand", "regime", "stage"} & requested_analysis)
-        deriv: dict[str, Any] | None = None
-        if needs_deriv and include_derivatives:
-            cached = await store.read_derivative_evidence(symbol)
-            if cached and composition._is_deriv_fresh(cached, int(time.time() * 1000), DERIV_FRESH_MS_DEFAULT):
-                deriv = cached
-            else:
-                async with Binance() as client:
-                    deriv = await fetch_derivative_evidence(
-                        client, symbol, include_cross_asset=include_cross_asset,
-                    )
-                try:
-                    await store.publish_derivative_evidence(symbol, deriv, ttl_s=deriv_ttl_s)
-                except Exception:
-                    log.exception("run_group_cycle %s: failed to publish derivative cache", symbol)
-        evidence = composition._merge_derivatives(evidence, deriv)
-    finally:
-        await store.close()
-
-    calc_sections, anal_sections = composition.sections_for_groups(groups)
-    anal_sections, calc_sections = composition.resolve_analysis_sections(anal_sections, calc_sections)
-    calc_sections = composition.resolve_calc_sections(calc_sections)
-
-    calc_result = composition.run_calculations(evidence, depth, window_s, sections=calc_sections)
-
-    # Wall history only when the wall group is requested.
-    prior_walls: dict[float, float] = {}
-    prior_cycle_ts: str | None = None
-    if "wall_migration" in (anal_sections or set()):
-        pg: PostgresRuntimeStore | None = (
-            PostgresRuntimeStore(settings.database_url) if settings.database_url else None
-        )
-        history: list[dict[str, Any]] = []
-        try:
-            if pg is not None:
-                try:
-                    history = await pg.read_wall_history(symbol)
-                except Exception:
-                    log.warning(
-                        "run_group_cycle %s: postgres wall-history read failed; falling back to redis",
-                        symbol)
-                    history = []
-            if not history:
-                history = await RedisRuntimeStore(
-                    settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-                ).read_wall_history(symbol)
-        except Exception:
-            log.exception("run_group_cycle %s: failed to read wall history", symbol)
-        finally:
-            if pg is not None:
-                await pg.close()
-        prior_walls, prior_cycle_ts = composition._accumulate_prior_walls(history)
-
-    analysis_result = composition.run_analysis(
-        evidence, calc_result,
-        prior_walls=prior_walls or None,
-        prior_cycle_ts=prior_cycle_ts,
-        depth=depth,
-        sections=anal_sections,
-        tier_config=composition._resolve_tier_config(settings),
-        scorecard_weights=composition._resolve_scorecard_weights(settings),
-    )
-
-    all_errors = list(calc_result.get("errors") or []) + list(analysis_result.get("errors") or [])
-    status = "degraded" if all_errors else "healthy"
-    run_id = str(uuid.uuid4())
-    generated_at = _utc_iso()
-    calc_by_section = calc_result.get("calculations") or {}
-    anal_by_section = analysis_result.get("analysis") or {}
-
-    out: dict[str, GroupEnvelope] = {}
-    calc_prov = calc_result.get("substrate_provenance") or {}
-    anal_prov = analysis_result.get("substrate_provenance") or {}
-    for kind in groups:
-        spec = GROUP_MAP[kind]
-        calc_payload = {
-            k: _bound_arrays(calc_by_section.get(k))
-            for k in spec["calculations"]
-        }
-        anal_payload = {}
-        for k in spec["analysis"]:
-            out_key = "open_interest" if k == "oi" else k
-            anal_payload[out_key] = _bound_arrays(anal_by_section.get(out_key))
-
-        # Substrate attribution: which decomposition substrate owns each section
-        # in THIS group's envelope (only sections that actually ran appear).
-        provenance: dict[str, Any] = {}
-        for k in spec["calculations"]:
-            if k in calc_prov:
-                provenance[k] = calc_prov[k]
-        for k in spec["analysis"]:
-            if k in anal_prov:
-                provenance[k] = anal_prov[k]
-
-        group_errors = [
-            e for e in all_errors
-            if not isinstance(e, dict)
-            or (e.get("function") or "").split(".")[0] in _kind_function_prefixes(kind)
-        ]
-        out[kind] = GroupEnvelope(
-            kind=kind,
-            symbol=symbol.upper(),
-            status="degraded" if group_errors else status,
-            generated_at=generated_at,
-            run_id=run_id,
-            window_minutes=window_minutes,
-            coverage={
-                "requested_window_seconds": window_s,
-                "analysis_sections": sorted(anal_payload.keys()),
-                "calculation_sections": sorted(calc_payload.keys()),
-            },
-            calculations=calc_payload,
-            analysis=anal_payload,
-            evidence_headlines=_evidence_headlines(evidence),
-            errors=tuple(group_errors),
-            source="group_cycle",
-            substrate_provenance=provenance,
-        )
-    return out
-
-
-def _kind_function_prefixes(kind: str) -> tuple[str, ...]:
-    """strict_call function-name prefixes that belong to a group's adapters."""
-    prefixes: dict[str, tuple[str, ...]] = {
-        "wall": ("orderbook", "find_keystone", "top_density", "absorption",
-                 "significant", "microprice_skew", "keystone", "ask_wall",
-                 "hourly", "wall_delta", "fuel_ratio", "densest", "wall_trap",
-                 "bid_tier", "mega_at", "level_absorption", "wall_break",
-                 "zone", "oi.find_walls", "oi_weighted", "oi_inflow",
-                 "oi_implied", "path_absorption", "simulated"),
-        "flow": ("summarize", "bucketed_cvd", "cvd_series_corr", "ema_series",
-                 "tiered_large", "seller_aggression", "spot_turnover",
-                 "decompose_demand", "demand_verdict", "macro_climate",
-                 "auction_verdict", "microprice", "initiated_flow",
-                 "flow_persistence", "delta_variable", "deterministic_signals"),
-        "structure": ("build_volume_profile", "volume_profile_summary",
-                      "ema_series", "tiered_large", "seller_aggression",
-                      "regime_verdict", "stage"),
-        "positioning": ("oi.find_walls", "oi_weighted", "oi_inflow", "oi_implied"),
-    }
-    return prefixes.get(kind, ())
-
-
-
-
-
-async def run_cycle(
-    settings: Settings,
-    symbol: str,
-    window_minutes: int,
-    depth: int | None = None,
-    *,
-    deriv_ttl_s: int = DERIV_TTL_S_DEFAULT,
-    deriv_fresh_ms: int = DERIV_FRESH_MS_DEFAULT,
-    include_cross_asset: bool = False,
-    include_derivatives: bool = True,
-    force_refresh_derivatives: bool = False,
-    persist: bool = True,
-) -> dict[str, Any]:
-    """Run one complete pipeline cycle and return the canonical run payload dict.
-
-    New keyword args (all backward compatible — defaults preserve old behavior):
-      deriv_ttl_s           — TTL of derivative cache in Redis (default 300s)
-      deriv_fresh_ms        — how old the cache can be before re-fetching (default 300_000ms)
-      include_cross_asset   — when True, also fetch 16 cross-asset calls (off by default)
-      include_derivatives   — master switch; False = behave exactly like the pre-change pipeline
-      force_refresh_derivatives — bypass cache and always re-fetch
-      persist               — when False, skip Postgres + Redis persistence entirely
-                             (real dry-run; the run payload is computed but not written)
-
-    This module is a stream-fed calculation object: ``read_raw_window`` reads
-    the poller-written Redis stream (the single coherent Binance source) — it
-    never opens a live Binance session for core data. On-demand derivative
-    fetch (``fetch_derivative_evidence``) is the only Binance touch and is
-    cache-first.
-    """
-    depth = depth or settings.depth_levels
-    window_s = window_minutes * 60
-
-    # One Redis + one Postgres pair for the WHOLE cycle. The previous flow
-    # opened/closed Redis twice and Postgres twice (wall-history read,
-    # wall/keystone ledger writes, persist_envelope) — every one of those
-    # seams now shares these two store instances.
-    redis = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    pg: PostgresRuntimeStore | None = (
-        PostgresRuntimeStore(settings.database_url) if settings.database_url else None
-    )
-    try:
-        evidence = await composition.read_raw_window(redis, symbol, window_minutes)
-        deriv: dict[str, Any] | None = None
-        if include_derivatives:
-            now_ms = int(time.time() * 1000)
-            if not force_refresh_derivatives:
-                cached = await redis.read_derivative_evidence(symbol)
-                if composition._is_deriv_fresh(cached, now_ms, deriv_fresh_ms):
-                    deriv = cached
-                    log.debug("run_cycle %s: derivative cache hit (age=%dms)",
-                              symbol, now_ms - int(cached.get("observed_at_ms") or 0))
-            if deriv is None:
-                log.info("run_cycle %s: fetching derivative evidence (cross_asset=%s)",
-                         symbol, include_cross_asset)
-                async with Binance() as client:
-                    deriv = await fetch_derivative_evidence(
-                        client, symbol, include_cross_asset=include_cross_asset,
-                    )
-                try:
-                    await redis.publish_derivative_evidence(
-                        symbol, deriv, ttl_s=deriv_ttl_s,
-                    )
-                except Exception:
-                    log.exception("run_cycle %s: failed to publish derivative cache", symbol)
-        evidence = composition._merge_derivatives(evidence, deriv)
-
-        calc_result = composition.run_calculations(evidence, depth, window_s)
-
-        # Read the FULL recorded wall history for analysis (async, done here).
-        # Postgres is the durable authority; Redis is the live projection fallback.
-        prior_walls: dict[float, float] = {}
-        prior_cycle_ts: str | None = None
-        if pg is not None:
-            try:
-                history = await pg.read_wall_history(symbol)
-            except Exception:
-                log.warning("run_cycle %s: postgres wall-history read failed; falling back to redis", symbol)
-                history = []
-            if not history:
-                history = await redis.read_wall_history(symbol)
-            prior_walls, prior_cycle_ts = composition._accumulate_prior_walls(history)
-        else:
-            # No durable ledger configured — Redis-only fallback.
-            try:
-                prior_walls, prior_cycle_ts = composition._accumulate_prior_walls(
-                    await redis.read_wall_history(symbol))
-            except Exception:
-                log.exception("run_cycle %s: failed to read wall history from redis", symbol)
-
-        analysis_result = composition.run_analysis(evidence, calc_result,
-                                       prior_walls=prior_walls or None,
-                                       prior_cycle_ts=prior_cycle_ts,
-                                       depth=depth,
-                                       tier_config=composition._resolve_tier_config(settings),
-                                       scorecard_weights=composition._resolve_scorecard_weights(settings))
-
-        envelope = assemble_envelope(symbol, evidence, calc_result, analysis_result)
-
-        if persist:
-            # WRITE the current cycle's wall snapshot so the ledger records it and
-            # later cycles can call ALL recorded walls (not just the last pull).
-            try:
-                await _record_wall_snapshot(settings, symbol, envelope["run_id"], evidence,
-                                            analysis_result, postgres=pg, redis=redis)
-            except Exception:
-                log.exception("run_cycle %s: failed to record wall snapshot", symbol)
-            # WRITE the current cycle's keystone snapshot (cross-cycle keystone
-            # migration ledger — clean separation from the wall ledger).
-            try:
-                await _record_keystone_snapshot(settings, symbol, envelope["run_id"],
-                                                calc_result, postgres=pg, redis=redis)
-            except Exception:
-                log.exception("run_cycle %s: failed to record keystone snapshot", symbol)
-            try:
-                await persist_envelope(envelope, settings, postgres=pg, redis=redis)
-            except Exception:
-                log.exception("failed to persist run payload for %s run_id=%s",
-                              symbol, envelope["run_id"])
-        else:
-            log.info("run_cycle %s: dry-run (persist=False) — run_id=%s not written",
-                     symbol, envelope["run_id"])
-
-        return envelope
-    finally:
-        await redis.close()
-        if pg is not None:
-            await pg.close()
-
-
 __all__ = [
-    "WINDOW_MINUTES_MAP",
-    "GROUP_MAP",
-    "read_raw_window",
-    "run_calculations",
-    "run_analysis",
-    "assemble_envelope",
-    "persist_envelope",
-    "run_cycle",
-    "run_group_cycle",
-    "fetch_derivative_evidence",
-    "MACRO_SYMBOLS",
-    "DERIV_TTL_S_DEFAULT",
     "DERIV_FRESH_MS_DEFAULT",
+    "DERIV_TTL_S_DEFAULT",
+    "GROUP_MAP",
+    "MACRO_SYMBOLS",
+    "WINDOW_MINUTES_MAP",
+    "assemble_envelope",
+    "fetch_derivative_evidence",
+    "read_raw_window",
+    "run_analysis",
+    "run_calculations",
 ]
