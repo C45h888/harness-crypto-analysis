@@ -1,15 +1,17 @@
-"""Inference-engine runner — one-shot cycle and the long-running loop.
+"""Inference-engine runner — the CLI invocation seam for one-shot cycles.
 
 The runner is the engine's only sanctioned host seam:
 
-- ``run_inference_once``: run ONE cycle. An event-driven ``WakeEnvelope``
-  may be injected (the wake worker's in-memory assertion — no drain);
-  ``force=True`` synthesizes a manual wake; otherwise returns ``no_wake``
-  without fabricating a cycle.
-- ``run_inference_loop``: EVENT-DRIVEN long-running mode — drives the
-  ``WakeSupervisor`` (blocking reads, deterministic trigger matrix) with
-  the engine as its dispatcher. The lazy ``interval_s`` poller is retired:
-  a fire happens when the DATA crosses a predicate, never on a clock.
+- ``run_inference_once``: run ONE task-directed cycle. ``force=True``
+  synthesizes a manual invocation (the CLI trigger); a caller-constructed
+  ``WakeEnvelope`` may be injected directly; otherwise returns ``no_wake``
+  without fabricating a cycle. ``task`` carries the interactive-plane
+  directive (trade hypothesis / question) into prompt steering + artifact
+  persistence.
+
+There is no loop, no worker, no trigger matrix: the autonomous wake plane
+was removed, and the CLI surfaces (``harness --inference`` /
+``nooa market inference run``) are the only trigger.
 
 Store lifecycle mirrors the analyst runner: Redis-only reads never construct
 Postgres; the durable ledger is contacted only when DATABASE_URL is set.
@@ -25,6 +27,7 @@ from typing import Any
 
 from market_service.config import Settings
 from market_service.nooa_harness.engine import InferenceEngine
+from market_service.runtime.contracts import WakeEnvelope
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
@@ -73,19 +76,12 @@ async def _build_engine(
         await postgres.connect()
     memory = _build_memory(settings)
     llm = _build_llm()
-    from market_service.nooa_harness.inference import (
-        DEFAULT_CYCLE_COOLDOWN_S,
-        WakeConfig,
-    )
-
-    cooldown = int(os.getenv("INFERENCE_COOLDOWN_S", str(DEFAULT_CYCLE_COOLDOWN_S)))
     # Operator-pinned session id (NOOA_SESSION_ID) wins; otherwise the engine
     # derives a stable UUID per (symbol, venue) so memory stays coherent.
     session_id = os.getenv("NOOA_SESSION_ID") or None
     return InferenceEngine(
         store, postgres, memory, llm,
         symbol=symbol, venue=venue,
-        config=WakeConfig(cooldown_seconds=cooldown),
         session_id=session_id,
         settings=settings,
     )
@@ -94,25 +90,35 @@ async def _build_engine(
 async def run_inference_once(
     symbol: str, *, venue: str = "spot", force: bool = False,
     envelope: WakeEnvelope | None = None,
+    task: str | None = None,
+    scenario: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """One engine cycle: wake → run → return artifact + meta.
+    """One engine cycle: invoke → run → return artifact + meta.
 
-    ``envelope`` — an event-driven in-memory ``WakeEnvelope`` from the wake
-    worker (dispatched straight to ``run_cycle``; no stream drain).
-    ``force`` — synthesize a manual wake (outer-CLI --force).
-    Neither → ``{"status": "no_wake"}`` — nothing computed, nothing
-    persisted, never a fabricated cycle.
+    ``envelope`` — a caller-constructed ``WakeEnvelope`` dispatched straight
+    to ``run_cycle`` (no stream, no worker).
+    ``force`` — synthesize a manual invocation (CLI ``--force`` trigger).
+    ``task`` — interactive-plane directive (``harness.py --task``): the trade
+    hypothesis / question the cycle must answer. Threaded into
+    ``acquire_manual_wake`` (predicate preview) and ``run_cycle`` (full
+    prompt steering + ``deterministic_state["task"]`` persistence).
+    ``scenario`` — ``{"target_price": str, "horizon": "15m|1h|4h"}``
+    (CLI ``--target/--horizon``): the 'can price hit X?' level evaluated
+    via ``calc.scenario.evaluate``; persists on
+    ``deterministic_state["scenario"]``.
+    Neither envelope nor force → ``{"status": "no_wake"}`` — nothing
+    computed, nothing persisted, never a fabricated cycle.
     """
     settings = Settings.from_env()
     engine = await _build_engine(settings, symbol=symbol.upper(), venue=venue)
     try:
         if envelope is not None:
             wake, wake_meta = envelope, {
-                "decision": "fire", "source": "event_driven",
+                "decision": "fire", "source": "direct",
                 "consumed_wake_ids": [envelope.wake_id],
             }
         elif force:
-            wake, wake_meta = await engine.acquire_manual_wake()
+            wake, wake_meta = await engine.acquire_manual_wake(task=task)
         else:
             return {
                 "status": "no_wake",
@@ -120,11 +126,14 @@ async def run_inference_once(
                 "venue": venue,
                 "decision": {"source": "none", "reason": "no envelope and not forced"},
             }
-        artifact, cycle_meta = await engine.run_cycle(wake, wake_meta)
+        artifact, cycle_meta = await engine.run_cycle(
+            wake, wake_meta, task=task, scenario=scenario)
         return {
             "status": artifact.status,
             "symbol": artifact.symbol,
             "venue": artifact.venue,
+            "task": task[:200] if task else None,
+            "scenario": scenario,
             "artifact_id": artifact.artifact_id,
             "artifact": artifact.to_dict(),
             "cycle": cycle_meta,
@@ -133,57 +142,4 @@ async def run_inference_once(
         await engine.close()
 
 
-async def run_inference_loop(
-    symbol: str, *, venue: str = "spot", interval_s: float = 30.0, forever: bool = True,
-) -> None:
-    """Event-driven engine loop: wake worker with the engine as dispatcher.
-
-    Drives ``wake_worker.WakeSupervisor`` — XREADGROUP BLOCK on the
-    microstructure event + status-transition streams, deterministic trigger
-    matrix, in-memory WakeEnvelope, then ``engine.run_cycle`` as an async
-    task. ``interval_s`` is retained for CLI compatibility but the loop is
-    now fire-by-data: a wake fires the instant a predicate crosses, never
-    on a polling clock. ``forever=False`` runs one bounded drain pass
-    (used by tests).
-    """
-    from market_service.nooa_harness.wake_worker import (
-        WakeSupervisorConfig,
-        _engine_dispatcher_factory,
-    )
-
-    settings = Settings.from_env()
-    config = WakeSupervisorConfig.from_env(symbol)
-    config.venue = venue
-    store = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    dispatch, engine_close = _engine_dispatcher_factory(store, settings)
-    supervisor = WakeSupervisor(
-        store,
-        symbol=config.symbol, venue=config.venue,
-        read_block_ms=config.read_block_ms,
-        supervisor_ms=config.supervisor_ms,
-        status_stream_maxlen=config.status_stream_maxlen,
-        dispatcher=dispatch,
-        on_stop=engine_close,
-    )
-    try:
-        if forever:
-            await supervisor.run_forever()
-        else:
-            await supervisor.start()
-            try:
-                await supervisor._tick()
-                event_rows = await supervisor._read_once(block_ms=100)
-                status_rows = await supervisor._read_status_once(block_ms=100)
-                if event_rows or status_rows:
-                    await supervisor._handle_delta(status_rows, event_rows, supervisor._now())
-                for task in list(supervisor._tasks):
-                    await task
-            finally:
-                await supervisor.stop()
-    finally:
-        await store.close()
-
-
-__all__ = ["run_inference_loop", "run_inference_once"]
+__all__ = ["run_inference_once"]

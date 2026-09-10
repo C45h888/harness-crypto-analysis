@@ -122,18 +122,27 @@ class OiWorker(SubstrateWorkerCore):
         fut = window.get("futures") or {}
         oi_raw = fut.get("open_interest") or {}
         oi_value = oi_raw.get("open_interest") if isinstance(oi_raw, dict) else None
-        try:
-            current = float(oi_value) if isinstance(oi_value, (int, float)) else None
-        except (TypeError, ValueError):
-            current = None
+        # Binance REST returns open_interest as a JSON STRING ("7923049.05");
+        # the raw stream preserves that shape. Coerce here so the arithmetic
+        # below never sees a string (null discipline on parse failure).
+        if isinstance(oi_value, str):
+            try:
+                oi_value = float(oi_value)
+            except (TypeError, ValueError):
+                oi_value = None
+        current = oi_value if isinstance(oi_value, (int, float)) else None
         if current is None:
             return TriggerDecision(fired=False, source="probe",
                                    predicates={"reason": "no_open_interest"})
         prev = ((last_state or {}).get("output") or {}).get("raw_open_interest")
-        try:
-            prev_f = float(prev) if isinstance(prev, (int, float)) else None
-        except (TypeError, ValueError):
-            prev_f = None
+        # Same string→float coercion as current OI (the stored projection
+        # may carry a stale string from before the boundary fix).
+        if isinstance(prev, str):
+            try:
+                prev = float(prev)
+            except (TypeError, ValueError):
+                prev = None
+        prev_f = prev if isinstance(prev, (int, float)) else None
         if not prev_f:
             return TriggerDecision(fired=False, source="probe", predicates={})
         move_pct = abs(current - prev_f) / abs(prev_f) * 100.0
@@ -157,7 +166,13 @@ class OiWorker(SubstrateWorkerCore):
         last_price = _mid(bids, asks)
         oi_raw = fut.get("open_interest") or {}
         oi_value = oi_raw.get("open_interest") if isinstance(oi_raw, dict) else None
-        oi_float = float(oi_value) if isinstance(oi_value, (int, float)) else None
+        # String-to-number coercion for the same Binance shape as the probe.
+        if isinstance(oi_value, str):
+            try:
+                oi_value = float(oi_value)
+            except (TypeError, ValueError):
+                oi_value = None
+        oi_float = oi_value if isinstance(oi_value, (int, float)) else None
         oi_hist = fut.get("oi_history") or []
         if (last_price is None or last_price <= 0) and oi_float is None and not oi_hist:
             # Null discipline: no price, no OI, no history — nothing to say.

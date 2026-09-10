@@ -162,17 +162,5 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertFalse(missing)
 
 
-class NooaContainerTests(unittest.TestCase):
-    def test_entrypoint_uses_data_driven_supervisor(self):
-        """nooa_container's main command is the wake supervisor loop."""
-        from market_service.nooa_harness import nooa_container
-        self.assertEqual(
-            nooa_container.run_until_stopped.__module__,
-            "market_service.nooa_harness.wake_worker",
-        )
-        from market_service.nooa_harness.nooa_container import main
-        self.assertIsNotNone(main)
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)

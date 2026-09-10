@@ -131,6 +131,7 @@ TOOL_NAMES: dict[str, str] = {
     "calc.fit.depth_scaling": "calc.fit_depth_scaling",
     "calc.derived_diagnostic": "calc.derived_diagnostic",
     "calc.price.delta": "calc.derived_diagnostic",
+    "calc.scenario.evaluate": "calc.scenario.evaluate",
     "memory.recall_paper": "memory.recall_paper",
     # T2 — market correlation (canonical pipeline seams)
     "market.read": "market.read",
@@ -196,6 +197,7 @@ TOOL_PHASE: dict[str, str] = {
     "memory.recall_paper": "P5",
     "calc.derived_diagnostic": "P5",
     "calc.price.delta": "P5",
+    "calc.scenario.evaluate": "P5",
 }
 _PHASE_ORDER = ("P1", "P2", "P3", "P4", "P5")
 _REQUIRED_PHASES = ("P1", "P2", "P3", "P5")
@@ -380,14 +382,29 @@ async def dispatch_substrate_invoke(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: substrate.<name> / substrate.invoke — bounded worker ticks.
 
-    The tool-first replacement for ``run_cycle``: agents invoke workers
-    directly instead of the cycle computing everything. A named worker
-    gets one fire-tick (loops stay compose-owned); ``substrate.invoke``
-    with no substrate invokes all registered workers. The core's
-    cooldowns still gate; the engine's durable store rides the worker's
-    own PG-first path. Each invocation audits under its own capability.
+    The engine decides WHEN a calculation must run; this dispatches that
+    decision to the calculation container, which decides whether the tick
+    actually fires (its cooldown gates are unchanged) and owns the durable
+    ledger write. A named worker gets one fire-tick; ``substrate.invoke``
+    with no substrate covers every registered worker. Each invocation audits
+    under its own capability, exactly as before.
+
+    The request goes over the control plane rather than building a worker
+    here: worker identity is ``(substrate, symbol)`` and never the process,
+    so an in-process fire would overwrite the live container's supervisor
+    heartbeat (and the fire-dedupe high-water state sharing that key) and
+    consume its raw-stream entries with ``noack=True``. ``postgres`` is
+    accepted for signature compatibility but unused — the calculation
+    container holds its own ledger handle.
+
+    An unreachable plane is an ``error`` audit the engine reports as a
+    finding; it never falls back to in-process invocation.
     """
-    from market_service.substrate_worker import tools as substrate_tools
+    from market_service.substrate_worker.control_client import (
+        CalcPlaneRejected,
+        CalcPlaneUnreachable,
+        request_invoke,
+    )
 
     target = (substrate or "").lower() or None
     cap_name = f"substrate.{target}" if target else "substrate.invoke"
@@ -399,15 +416,14 @@ async def dispatch_substrate_invoke(
     scope = {"symbol": symbol.upper(), "venue": venue, "substrate": target}
     try:
         cap.validate_scope(symbol, venue)
+        report = await request_invoke(
+            symbol.upper(), [target] if target else None)
         if target is None:
-            result = await substrate_tools.invoke_many(
-                store, symbol.upper(), None, pg_store=postgres, pg_strict=True)
-            return result, capability_log_entry(
+            return report, capability_log_entry(
                 cap.name, scope, "ok",
-                detail={"invoked": result.get("invoked"),
-                        "fired": result.get("fired")})
-        result = await substrate_tools.invoke(
-            store, symbol.upper(), target, pg_store=postgres, pg_strict=True)
+                detail={"invoked": report.get("invoked"),
+                        "fired": report.get("fired")})
+        result = _single_report(report, target)
         if not result.get("invoked"):
             return None, capability_log_entry(
                 cap.name, scope, "denied", detail=result.get("error"))
@@ -417,6 +433,25 @@ async def dispatch_substrate_invoke(
                     "trigger_source": result.get("trigger_source")})
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except CalcPlaneRejected as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except CalcPlaneUnreachable as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=str(exc))
+
+
+def _single_report(report: dict[str, Any], target: str) -> dict[str, Any]:
+    """Unwrap the plane's per-worker report so the tool shape is unchanged.
+
+    ``POST /invoke`` always answers in the ``invoke_many`` shape; a single
+    named worker's caller expects the ``invoke`` shape it got in-process.
+    """
+    for entry in report.get("reports") or []:
+        if isinstance(entry, dict) and entry.get("substrate") == target:
+            return entry
+    return {
+        "substrate": target, "symbol": report.get("symbol"), "invoked": False,
+        "error": f"calculation plane returned no report for {target!r}",
+    }
 
 
 # ------------------------------------------------------------------
@@ -681,6 +716,121 @@ async def dispatch_calc_derived_diagnostic(
             cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}",
         )
 
+async def dispatch_calc_scenario_evaluate(
+    store: RedisRuntimeStore, symbol: str, venue: str,
+    *, target_price: Any | None = None, horizon: str = "1h",
+    interval_seconds: int = 10, window_minutes: int = 30,
+    tick_size: str = "0.01", postgres: Any | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.scenario.evaluate — price-target scenario vs tape — NUMERIC.
+
+    Interaction-plane endpoint: a target price plus a horizon (15m|1h|4h)
+    is run through the FITTED models (`fitting.evaluate_scenario`) —
+    required horizon flow vs the empirical rolling-sum OFI distribution at
+    that horizon, direction-matched exceedance, SE-band range, route-B
+    cross-check. The current price is resolved INSIDE the tool from the
+    market.read snapshot (mark ?? last) — never agent-supplied, never
+    recomputed in-prompt. Refuses (result None, never zero) on gate-failed
+    fits, β≈0, missing price, unparseable inputs, or thin tapes.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from market_service.microstructure import fitting as fm
+    from market_service.runtime import read_paths
+
+    cap = CAPABILITIES["calc.scenario.evaluate"]
+    scope = {"symbol": symbol.upper(), "venue": venue,
+              "interval_seconds": interval_seconds,
+              "window_minutes": window_minutes, "target_price": target_price,
+              "horizon": horizon}
+    try:
+        cap.validate_scope(symbol, venue)
+        try:
+            target_dec = Decimal(str(target_price))
+        except (InvalidOperation, ValueError, TypeError):
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused",
+                        "reason": f"unparseable target_price: {target_price!r}"},
+            )
+        if target_dec <= 0:
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "target_price must be positive"},
+            )
+        evidence_dict, _fit_log = await _tool_fit_beta(
+            store, symbol, venue,
+            {"interval_seconds": interval_seconds,
+             "window_minutes": window_minutes, "tick_size": tick_size},
+            postgres=postgres,
+        )
+        if not isinstance(evidence_dict, dict):
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no evidence window"},
+            )
+        price_fit = _price_fit_from_dict(evidence_dict.get("price_impact_fit") or {})
+        if price_fit is None:
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "unparseable price fit"},
+            )
+        dsf_dict = evidence_dict.get("depth_scaling_fit")
+        depth_fit = (_depth_fit_from_dict(dsf_dict)
+                     if isinstance(dsf_dict, dict) else None)
+        # Current price: tool-resolved from the collated snapshot.
+        payload = await read_paths.read_collated(store, symbol.upper())
+        snap = read_paths.market_snapshot(payload) if payload is not None else {}
+        current_raw = snap.get("mark_price") or snap.get("last_price")
+        try:
+            current_dec = Decimal(str(current_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused",
+                        "reason": "no_market_price: snapshot carries no mark/last price"},
+            )
+        if current_dec <= 0:
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "snapshot price non-positive"},
+            )
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _dropped = fm.replay_events_from_payloads(payloads)
+        intervals = fm.replay_intervals(events, interval_ms=interval_seconds * 1_000)
+        tick_dec = Decimal(str(tick_size or "0.01"))
+        try:
+            result = fm.evaluate_scenario(
+                target_dec, current_dec, tick_dec, price_fit, intervals,
+                interval_seconds=interval_seconds, horizon=horizon,
+                depth_fit=depth_fit, average_depth=price_fit.mean_ad,
+            )
+        except ValueError as vex:
+            return None, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "refused", "reason": str(vex),
+                        "fit_id": price_fit.fit_id},
+            )
+        result["price_source"] = ("mark_price" if snap.get("mark_price") else "last_price")
+        result["units"] = {"price_unit": "ticks", "tick_size": str(tick_dec)}
+        result["status"] = "evaluated_ok"
+        result["paper"] = "Cont 1011.6402 §3"
+        return result, capability_log_entry(
+            cap.name, scope, "ok",
+            detail={"status": "evaluated_ok",
+                    "direction": result["direction"],
+                    "required_ofi": result["required_ofi"],
+                    "exceedance": result["exceedance"],
+                    "route_b": (result.get("route_b") or {}).get("status")},
+        )
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(
+            cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}",
+        )
+
+
 async def dispatch_memory_recall_paper(
     symbol: str, venue: str, *, query: str = "Cont OFI AD beta",
     memory: Any | None = None,
@@ -794,7 +944,14 @@ async def execute_tool(
     if name == "substrate.invoke" or (
         name.startswith("substrate.") and name not in ("substrate.read",)
     ):
-        target = str(args.get("substrate") or name.split(".", 1)[1])
+        # ``substrate.invoke`` means "every registered worker" — target stays
+        # None unless the caller names one. Deriving it from the tool name
+        # would yield the literal "invoke", which is not a registered worker
+        # and gets denied.
+        if name == "substrate.invoke":
+            target = str(args["substrate"]) if args.get("substrate") else None
+        else:
+            target = str(args.get("substrate") or name.split(".", 1)[1])
         return await dispatch_substrate_invoke(
             store, symbol, target, postgres=postgres, venue=venue,
         )
@@ -814,6 +971,16 @@ async def execute_tool(
             interval_seconds=int(args.get("interval_seconds") or 10),
             window_minutes=int(args.get("window_minutes") or 30),
             ofi=args.get("ofi"), postgres=postgres,
+        )
+    if name == "calc.scenario.evaluate":
+        return await dispatch_calc_scenario_evaluate(
+            store, symbol, venue,
+            target_price=args.get("target_price"),
+            horizon=str(args.get("horizon") or "1h"),
+            interval_seconds=int(args.get("interval_seconds") or 10),
+            window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"),
+            postgres=postgres,
         )
     if name == "memory.recall_paper":
         return await dispatch_memory_recall_paper(

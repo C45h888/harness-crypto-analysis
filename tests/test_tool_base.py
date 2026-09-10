@@ -73,9 +73,9 @@ class _FakeStore:
 
 class ToolRegistryTests(unittest.TestCase):
     def test_nineteen_tools_registered(self):
-        # 6 micro + 6 Pass-C split calc + calc.price.delta + memory.recall_paper
-        # + 4 market (group removed with run_cycle) + 14 substrate.
-        self.assertEqual(len(TOOL_NAMES), 32)
+        # 6 micro + 6 Pass-C split calc + calc.price.delta + calc.scenario.evaluate
+        # + memory.recall_paper + 4 market (group removed with run_cycle) + 14 substrate.
+        self.assertEqual(len(TOOL_NAMES), 33)
 
     def test_every_tool_backed_by_a_capability(self):
         for tool, capability in TOOL_NAMES.items():

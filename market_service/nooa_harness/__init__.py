@@ -16,13 +16,14 @@ INTERPRETATION PLANE — deterministic math + canonical persistence, no LLM:
 
 INFERENCE PLANE — the OO agent, LLM narration over injected state:
 
-- ``engine.InferenceEngine``     — the OO inference agent (receive in-memory
-                                   wake → compute → narrate → persist → remember);
+- ``engine.InferenceEngine``     — the OO inference agent (CLI invocation
+                                   with task → compute → narrate → persist →
+                                   remember);
                                    now also owns the absorbed microstructure
                                    reader (``MicrostructureInterpretationAgent``,
                                    ``bounded_envelope_view``, ``response_text``)
 - ``inference``                  — mechanics: hard gate, capability registry,
-                                   tool base, wake plane. Tool dispatchers use
+                                   tool base. Tool dispatchers use
                                    ONLY the engine's injected store/memory/
                                    settings — never env, never a second pool
 - ``pipeline_inference``         — REMOVED with the tool-first migration.
@@ -30,11 +31,9 @@ INFERENCE PLANE — the OO agent, LLM narration over injected state:
                                    ``substrate_worker.tools`` (dispatch
                                    ``substrate.*``); it never imports the
                                    interpretation plane.
-- ``inference_runner``           — one-shot cycle (envelope / manual / no-wake)
-                                   + event-driven engine loop
-- ``wake_worker``                — the event-driven wake worker (blocking reads,
-                                   deterministic trigger matrix, in-memory
-                                   WakeEnvelope → engine dispatch)
+- ``inference_runner``           — task-directed one-shot cycle (manual +
+                                   ``task`` / direct envelope / no-wake; the
+                                   interaction plane's only seam)
 - ``memory.MemoryNode``          — the engine's episodic memory + the shared
                                    ``paper_kb_session_id()`` contract
 - ``backends.ModelBackendConfig``— narration LLM client config
@@ -44,8 +43,9 @@ Boundary rule: the inference plane imports ``composition`` /
 the inference plane. The retired ``agents`` module is gone — everything
 the LLM narrates lives in ``engine``.
 
-CLI surfaces (``nooa market inference run/read/history/watch/wake``, outer
-``harness --inference [--inference-force]``) are the sanctioned triggers.
+CLI surfaces (``nooa market inference run --force --task "..."`` / ``read`` /
+``history``, outer ``harness --inference --inference-force --task "..."``)
+are the ONLY triggers. There is no worker, no loop, no trigger matrix.
 """
 
 from __future__ import annotations

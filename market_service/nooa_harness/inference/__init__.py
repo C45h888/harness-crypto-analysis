@@ -9,8 +9,11 @@ semantic blocks (move-don't-rewrite; every body is verbatim):
                    surfaces + audit entries (CAPABILITIES dict)
     dispatch.py    TOOL BASE — dispatch_* implementations, TOOL_NAMES /
                    TOOL_PHASE registries, execute_tool, name normalization
-    wake.py        WAKE PLANE — trigger evaluation, dedupe, coalescing,
-                   revalidation, default_wake_dispatcher
+
+The autonomous wake plane (``wake.py``: trigger evaluation, dedupe,
+coalescing, revalidation) was REMOVED — inference is invoked only with an
+explicit task from the CLI surfaces (``harness --inference`` /
+``nooa market inference run``). No trigger matrix, no loop, no worker.
 
 All historical import paths keep working through this re-export shim:
 ``from market_service.nooa_harness.inference import X`` resolves exactly as
@@ -68,21 +71,6 @@ from .gate import (
     gate_interpretation,
     resolve_inference_status,
 )
-from .wake import (
-    DEFAULT_CYCLE_COOLDOWN_S,
-    DEFAULT_EVENT_DELTA_THRESHOLD,
-    WAKE_SCHEMA_VERSION,
-    CounterSnapshot,
-    WakeConfig,
-    build_wake_envelope,
-    coalesce_wakes,
-    default_wake_dispatcher,
-    evaluate_triggers,
-    publish_wake,
-    read_pending_wakes,
-    revalidate_wake,
-    wake_dedupe_id,
-)
 
 __all__ = [
     "CAPABILITIES",
@@ -90,23 +78,14 @@ __all__ = [
     "TOOL_PHASE",
     "Capability",
     "CapabilityDenied",
-    "CounterSnapshot",
-    "WakeConfig",
-    "build_wake_envelope",
     "capability_log_entry",
-    "coalesce_wakes",
     "dispatch_assemble_evidence",
     "dispatch_read_capture_status",
     "dispatch_read_events",
     "dispatch_replay",
     "dispatch_substrate_invoke",
     "dispatch_substrate_read",
-    "evaluate_triggers",
     "execute_tool",
     "gate_interpretation",
-    "publish_wake",
-    "read_pending_wakes",
     "resolve_inference_status",
-    "revalidate_wake",
-    "wake_dedupe_id",
 ]

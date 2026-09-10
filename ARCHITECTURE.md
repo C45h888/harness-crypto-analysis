@@ -151,40 +151,23 @@ by a harness-owned pipeline**:
   ``marketflow:stream:microstructure:status:{venue}:{SYMBOL}`` ONLY on
   state change (running -> gap -> reconnecting -> ...), the event-driven
   companion to its latest-key status payload.
-* `market_service.nooa_harness.wake_worker` — the EVENT-DRIVEN wake worker
-  (Slice 1). Bounded ENTIRELY on the Redis plane: it blocks on the
-  microstructure event stream (XREADGROUP, one consumer per scope) +
-  status-transition stream, evaluates the deterministic trigger matrix
-  (``inference.evaluate_triggers``) against the artifact high-water
-  (``deterministic_state.coverage.events_total``), and on a fire
-  materializes a typed ``WakeEnvelope`` IN MEMORY and dispatches the engine
-  cycle as an async task. The retired ``publish_wake``/``read_pending_wakes``
-  envelope transport is gone — the envelope is an assertion object, never
-  a transported artifact. Dedupe is a supervisor-lua script on
-  ``marketflow:state:inference:wake:...:supervisor``; liveness is a
-  TTL-bounded heartbeat on the same key.
+* `market_service.nooa_harness.inference_runner` — the ONLY invocation seam
+  (interaction plane). ``run_inference_once(force/task/envelope)`` runs ONE
+  task-directed cycle: the CLI ``--force`` trigger synthesizes a manual
+  ``WakeEnvelope`` via ``engine.acquire_manual_wake`` (or the caller injects
+  one directly), the ``--task`` hypothesis steers narration and persists on
+  ``deterministic_state.task``. No worker, no loop, no trigger matrix — the
+  autonomous wake plane was removed and the CLI surfaces are the only trigger.
 
-### Wake plane (deterministic trigger -> engine dispatch)
+### Invocation plane (CLI trigger -> engine cycle)
 
-The inference engine is event-driven, never lazily polled. Durable
-position lives on the consumer group's advanced `>` marker (crash-resume
-for free); the artifact ledger (``coverage.events_total``) is the
-restart-safe high-water. Predicates: ``event_delta`` (≥ threshold new
-events since the last artifact), ``cold_start`` (established capture, no
-artifact yet), ``capture_recovery`` (status stream records a
-gap/reconnecting -> running transition). Every fire passes: status-
-established, artifact cooldown (60s default), timestamp-water (fresh data
-only), then the atomic dedupe (identical conditions collapse). Fires log
-and, by default, record an informational journal entry on the inference
-stream; the engine loop (``inference_runner.run_inference_loop``, or
-``WAKE_ENGINE_DISPATCH=1`` in the worker) routes the envelope straight to
-``engine.run_cycle`` — the closed loop. ``engine.acquire_manual_wake`` is
-the only manual wake factory (outer-CLI force trigger); the retired
-stream-drain path (``engine.acquire_wake`` -> ``read_pending_wakes`` /
-``coalesce_wakes`` / ``revalidate_wake``) is gone from the engine: the
-in-memory envelope IS the wake, never a transported artifact. Engine-side``run_cycle`` keeps the identical discipline: gather (capabilities) -> hard
-gate (NULL interpretation on insufficient, zero tokens) -> narrate (ONE
-tool round) -> Postgres-first persist -> memory proposals (LLM proposes,
+The inference engine runs ONE task-directed cycle per CLI invocation — never
+autonomously. ``engine.acquire_manual_wake`` is the only envelope factory
+(CLI ``--force`` trigger); the in-memory envelope plus the ``--task``
+hypothesis go straight to ``engine.run_cycle``. Engine-side ``run_cycle``
+keeps the identical discipline: gather (capabilities) -> hard
+gate (NULL interpretation on insufficient, zero tokens) -> narrate (staged
+P1→P6 tool rounds) -> Postgres-first persist -> memory proposals (LLM proposes,
 engine disposes).
 
 ### Calculation-model groups (Pass 3 pivot)

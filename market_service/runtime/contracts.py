@@ -78,18 +78,14 @@ ValidInferenceStatus: tuple[str, ...] = ("validated", "provisional", "insufficie
 
 @dataclass(frozen=True)
 class WakeEnvelope:
-    """Typed wake assertion for the statistical inference engine.
+    """Typed invocation envelope for the statistical inference engine.
 
     One envelope is a DETERMINISTIC ASSERTION that the inference engine
-    should run a cycle, produced by a pure trigger evaluation over Redis
-    counter state (never by an LLM). The engine treats it as an assertion,
-    not a command: at dispatch it re-validates the counters against live
-    Redis (two-phase wake) before doing expensive work.
-
-    Delivery: XADDed to ``marketflow:stream:inference:wake:<venue>:<SYMBOL>``
-    (durable, replayable, survives engine downtime — never pub/sub).
-    ``wake_id`` is a deterministic dedupe hash (predicate-set + high-water
-    counters) so identical wake conditions collapse to one cycle.
+    should run a cycle: either synthesized by ``acquire_manual_wake`` (the
+    CLI ``--force`` trigger) or constructed directly by a caller. The engine
+    treats it as an assertion, not a command, and runs exactly one cycle
+    per envelope. There is no worker, no stream transport, no trigger
+    matrix — the CLI surfaces are the only producer.
     """
 
     symbol: str
@@ -146,11 +142,9 @@ class WakeEnvelope:
         return created
 
     def _replace_wake_id(self, wake_id: str) -> "WakeEnvelope":
-        """Return a copy with the deterministic dedupe ``wake_id``.
+        """Return a copy with the given ``wake_id``.
 
-        The deterministic condition hash (``wake_dedupe_id``) replaces the
-        random UUID so identical wake conditions collapse to one wake. The
-        envelope has already been validated by ``create``; only the id and
+        The envelope has already been validated by ``create``; only the id and
         created-at stamps change.
         """
         return WakeEnvelope(

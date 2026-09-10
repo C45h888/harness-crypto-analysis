@@ -129,7 +129,8 @@ def substrate_read_cmd(symbol: str, substrate: str | None, mode: str) -> None:
     _emit(asyncio.run(_op()))
 
 
-@command.group("substrate", help="Substrate worker plane: invoke workers as tools.")
+@command.group("substrate", help="Substrate worker plane: read state, or "
+                                 "request a fire-tick from the calculation plane.")
 def substrate_group() -> None:
     """Worker invocation tools (tool-first; replaces run_cycle)."""
 
@@ -149,22 +150,25 @@ def substrate_group_read(symbol: str, substrate: str | None, mode: str) -> None:
 @click.argument("symbol", default="SOLUSDT")
 @click.argument("substrates", nargs=-1)
 def substrate_group_invoke(symbol: str, substrates: tuple[str, ...]) -> None:
-    """Invoke substrate workers as tools — one bounded fire-tick each."""
-    from market_service.substrate_worker import tools as substrate_tools
+    """Request bounded fire-ticks from the calculation plane.
+
+    The fire runs inside the calculation container — the only process that
+    constructs workers — so a CLI invocation cannot overwrite the live
+    workers' supervisor heartbeats or steal their stream entries. An
+    unreachable plane is reported, never worked around by computing here.
+    """
+    from market_service.substrate_worker.control_client import (
+        CalcPlaneError,
+        request_invoke,
+    )
 
     async def _op() -> dict:
-        settings = _settings()
-        redis = RedisRuntimeStore(
-            settings.redis_url, settings.redis_key_prefix,
-            settings.redis_stream_maxlen,
-        )
-        try:
-            return await substrate_tools.invoke_many(
-                redis, symbol.upper(), list(substrates) or None)
-        finally:
-            await redis.close()
+        return await request_invoke(symbol.upper(), list(substrates) or None)
 
-    _emit(asyncio.run(_op()))
+    try:
+        _emit(asyncio.run(_op()))
+    except CalcPlaneError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +273,7 @@ def memory_forget(session_id, memory_id) -> None:
 
 # --------------------------------------------------------------------------
 # (analyst command REMOVED — the specialist/controller plane was deleted in
-# the inference-engine pass; `nooa market inference run/watch` is the engine
+# the inference-engine pass; `nooa market inference run` is the engine
 # surface now.)
 # --------------------------------------------------------------------------
 
@@ -545,18 +549,17 @@ def micro_interpret(symbol: str, venue: str, evidence_id: str | None) -> None:
 # --------------------------------------------------------------------------
 # inference — the statistical inference engine's user-facing surfaces
 #
-# This is the OUTER-trigger plane: a human (or terminal agent) fires the
-# engine explicitly. Bounded by the same capability registry as every other
-# dispatch (BTCUSDT/spot frozen). Autonomous operation runs through the
-# event-driven wake worker (`market_service.nooa_harness.wake_worker` or
-# `nooa market inference wake/watch`), never a lazy compute loop.
+# This is the INTERACTION plane: a human (or terminal agent) supplies a
+# trade hypothesis via --task and fires ONE task-directed cycle explicitly.
+# There is no worker, no loop, no trigger matrix — the autonomous wake plane
+# was removed and these CLI surfaces are the only invocation model.
 # --------------------------------------------------------------------------
 
 
 @command.group("inference",
-               help="Statistical inference engine: trigger, read artifacts, wake/watch.")
+               help="Statistical inference engine: task-directed runs + artifact reads.")
 def inference_group() -> None:
-    """Wake, read, watch, and fire the statistical inference engine."""
+    """Task-directed inference runs and artifact reads (the interaction plane)."""
 
 
 @inference_group.command("run")
@@ -564,12 +567,34 @@ def inference_group() -> None:
 @click.option("--venue", default="spot")
 @click.option("--force", is_flag=True,
               help="synthesize a manual wake (the human trigger IS the wake)")
-def inference_run(symbol: str, venue: str, force: bool) -> None:
-    """Run ONE inference cycle now (event-driven envelope or manual force)."""
+@click.option("--task", default=None,
+              help="interactive-plane directive: free-text trade hypothesis / "
+                   "question the cycle must answer (frames H0/H1, persists on "
+                   "deterministic_state.task)")
+@click.option("--target", default=None,
+              help="scenario price target (quote currency): the 'can price hit X?' "
+                   "level evaluated at --horizon (persists on deterministic_state.scenario)")
+@click.option("--horizon", default="1h", type=click.Choice(["15m", "1h", "4h"]),
+              help="scenario horizon for the OFI exceedance distribution (default 1h)")
+def inference_run(symbol: str, venue: str, force: bool, task: str | None,
+                  target: str | None, horizon: str) -> None:
+    """Run ONE task-directed inference cycle now (canonical trigger)."""
     from market_service.nooa_harness.inference_runner import run_inference_once
 
+    scenario = None
+    if target is not None:
+        try:
+            from decimal import Decimal
+            target_dec = Decimal(str(target))
+        except Exception:
+            target_dec = None
+        if target_dec is None or target_dec <= 0:
+            raise click.ClickException(f"unparseable --target: {target!r}")
+        scenario = {"target_price": str(target_dec), "horizon": horizon}
+
     async def _run() -> dict[str, Any]:
-        return await run_inference_once(symbol, venue=venue, force=force)
+        return await run_inference_once(symbol, venue=venue, force=force,
+                                        task=task, scenario=scenario)
 
     _emit(asyncio.run(_run()))
 
@@ -631,77 +656,6 @@ def inference_history(symbol: str, venue: str, limit: int) -> None:
             await postgres.close()
 
     _emit(asyncio.run(_run()))
-
-
-@inference_group.command("watch")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
-@click.option("--interval", "interval_s", type=float, default=30.0,
-              help="kept for CLI compatibility; the loop is now event-driven (fire-by-data)")
-@click.option("--cycles", type=int, default=0,
-              help="number of wake cycles (0 = forever; -1 = one bounded pass)")
-def inference_watch(symbol: str, venue: str, interval_s: float, cycles: int) -> None:
-    """Event-driven engine loop: wake worker with the engine as dispatcher.
-
-    Drives the WakeSupervisor (blocking reads + deterministic trigger
-    matrix) and runs the engine cycle on every firing wake — includes the
-    hard gate, narration (0 tokens on insufficient), Postgres-first
-    persistence, memory proposals. Never a lazy compute loop.
-    """
-    from market_service.nooa_harness.inference_runner import run_inference_loop
-
-    async def _run() -> None:
-        await run_inference_loop(
-            symbol, venue=venue, interval_s=interval_s,
-            forever=(cycles != -1),
-        )
-
-    asyncio.run(_run())
-
-
-@inference_group.command("wake")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
-@click.option("--once", is_flag=True,
-              help="run a single bounded tick (smoke test) instead of the loop")
-@click.option("--read-block-ms", type=int, default=None,
-              help="blocking read wait per iteration")
-def inference_wake(symbol: str, venue: str, once: bool, read_block_ms: int | None) -> None:
-    """Event-driven wake worker: fires the engine on deterministic conditions.
-
-    Replaces the lazy drain loop with the blocker-only, clock-free wake
-    plane: XREADGROUP BLOCK on the microstructure event stream + status
-    transition stream, deterministic predicate evaluation, in-memory
-    WakeEnvelope, async engine dispatch. ``--once`` runs one bounded tick.
-    """
-    from market_service.nooa_harness.wake_worker import (
-        WakeSupervisorConfig,
-        _build_supervisor,
-    )
-
-    config = WakeSupervisorConfig.from_env(symbol)
-    config.venue = venue
-    if read_block_ms is not None:
-        config.read_block_ms = read_block_ms
-
-    async def _run() -> None:
-        supervisor = await _build_supervisor(config)
-        if once:
-            await supervisor.start()
-            try:
-                await supervisor._tick()
-                await supervisor._read_once(block_ms=10)
-                await supervisor._read_status_once(block_ms=10)
-            finally:
-                await supervisor.stop()
-            _emit({"mode": "once", "symbol": symbol.upper(),
-                   "venue": venue, "fired": supervisor.fired_count})
-        else:
-            fired = await supervisor.run_forever()
-            _emit({"mode": "loop", "symbol": symbol.upper(),
-                   "venue": venue, "fired": fired})
-
-    asyncio.run(_run())
 
 
 __all__ = ["command"]

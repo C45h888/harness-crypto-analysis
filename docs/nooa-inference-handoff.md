@@ -21,8 +21,7 @@
 | `market_service/nooa_harness/inference.py` | `resolve_inference_status` (hard gate) + `TOOL_NAMES` (**19 tools**) + `execute_tool` (sole dispatch) + `TOOL_PHASE` map + alias normalization | Numeric ΔP live; see §3 |
 | `market_service/nooa_harness/backends.py` | `NOOA_MODEL_*` → litellm routing; only nooa import site | Working |
 | `market_service/nooa_harness/memory.py` | `MemoryNode` over `agent_memory` (PG durable → Redis stream); exports `paper_kb_session_id()` | Working; paper KB seeded (10 facts) |
-| `market_service/nooa_harness/wake_worker.py` | XREADGROUP BLOCK event/status streams → `evaluate_triggers` (event_delta 1800 / cold_start / recovery) → dispatches `run_cycle` as task | Working |
-| `market_service/nooa_harness/inference_runner.py` | `run_inference_once(force/envelope)` + event loop; lazy LLM/memory builds | Working |
+| `market_service/nooa_harness/inference_runner.py` | `run_inference_once(force/task/envelope)` — the ONLY invocation seam; lazy LLM/memory builds | Working |
 
 ### Deterministic stack (agent must CALL, never recompute)
 
@@ -102,7 +101,6 @@ Open design defaults currently in force (reconfirm if revisiting): OFI = arg-els
 ```bash
 set -a; source .env; set +a; source .venv/bin/activate
 python3 -m pytest tests/ -q -p no:cacheprovider --ignore=tests/test_calculation_groups.py --ignore=tests/test_pipeline_formatting.py --ignore=tests/test_keystone_history.py
-./nooa market inference run SOLUSDT --venue futures --force
+./nooa market inference run SOLUSDT --venue futures --force --task "is short-term sell pressure exhausting?"
 docker exec crypto-ai-anal-postgres-1 psql -U marketflow -d marketflow -c "select artifact_id,status,hypothesis_verdict,completed_at from inference_artifact order by completed_at desc limit 3;"
-docker logs crypto-ai-anal-wake-worker-1 --tail 5
 ```

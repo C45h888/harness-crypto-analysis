@@ -41,19 +41,28 @@ class MarketReadValidationTests(unittest.IsolatedAsyncioTestCase):
     """Full-chain validation: pipeline dict → Redis → read_paths → agent tool."""
 
     async def asyncSetUp(self):
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        try:
-            import redis.asyncio as aioredis
-            client = aioredis.from_url(redis_url)
-            await client.ping()
-            await client.aclose()
-        except Exception as exc:
-            self.skipTest(f"Redis not available at {redis_url}: {exc}")
+        from unittest.mock import patch
 
         from market_service.config import Settings
         from market_service.runtime.redis_store import RedisRuntimeStore
 
-        self.settings = Settings.from_redis_env()
+        # Probe the SAME url the store will use. Probing a different default
+        # (localhost) than Settings resolves (redis:6379 in-compose) makes the
+        # skip guard useless: it passes, then the store fails to connect.
+        # This module declares its own host-venv default rather than relying
+        # on another test module happening to export REDIS_URL first.
+        redis_url = os.getenv("REDIS_URL") or "redis://localhost:6379/0"
+        with patch.dict(os.environ, {"REDIS_URL": redis_url}):
+            self.settings = Settings.from_redis_env()
+
+        try:
+            import redis.asyncio as aioredis
+            client = aioredis.from_url(self.settings.redis_url)
+            await client.ping()
+            await client.aclose()
+        except Exception as exc:
+            self.skipTest(f"Redis not available at {self.settings.redis_url}: {exc}")
+
         self.store = RedisRuntimeStore(
             self.settings.redis_url,
             self.settings.redis_key_prefix,

@@ -1,8 +1,8 @@
 """InferenceEngine — the statistical inference agent (Pass B3).
 
-One cycle of the engine, from wake to durable artifact:
+One cycle of the engine, from invocation to durable artifact:
 
-    receive in-memory WakeEnvelope (event-driven worker → run_cycle)
+    CLI invocation (task + manual WakeEnvelope → run_cycle)
     → gather (capabilities) → recall memory (MemoryNode)
     → HARD GATE (resolve_inference_status, deterministic, pre-LLM)
         ├─ insufficient → artifact w/ NULL interpretation, 0 LLM tokens,
@@ -13,11 +13,11 @@ One cycle of the engine, from wake to durable artifact:
     → assemble InferenceArtifact → Postgres-first → Redis projection
     → resolve memory proposals (LLM proposes, MemoryNode disposes)
 
-The wake arrives as an IN-MEMORY ``WakeEnvelope`` handed over by the
-wake worker (``wake_worker.WakeSupervisor``) — never by draining a
-stream. The retired ``publish_wake``/``read_pending_wakes`` transport is
-gone; ``run_cycle`` takes the assertion object directly. The only manual
-wake factory kept is ``acquire_manual_wake`` (outer-CLI force trigger).
+The invocation arrives as an IN-MEMORY ``WakeEnvelope`` built by
+``acquire_manual_wake`` (the CLI ``--force`` trigger) or injected directly
+by the caller — ``run_cycle`` takes the envelope plus the interactive-plane
+``task`` directly. There is no worker, no loop, no trigger matrix: the
+wake plane was removed and the CLI surfaces are the only trigger.
 
 The narration LLM call budget is TWO per cycle (narrate + one tool round).
 Gate-failed cycles spend ZERO tokens. The LLM client is INJECTED (built by
@@ -36,8 +36,6 @@ from pathlib import Path
 from typing import Any
 
 from market_service.nooa_harness.inference import (
-    CounterSnapshot,
-    WakeConfig,
     execute_tool,
     resolve_inference_status,
 )
@@ -130,8 +128,12 @@ You also receive recalled memory (priors + paper KB) and a deterministic diff vs
 YOUR JOB — VALID inference, not predefined addition:
 1. VALIDATE the deterministic fits by invoking calculation modules via tools — do not accept the formula output as final.
    Call market.read plus substrate.* worker tools (tape/density/delta/ladders/…)
-   to read the always-fresh worker projections and invoke bounded fire-ticks,
-   call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
+   to read the always-fresh worker projections and request bounded fire-ticks.
+   A substrate.* invoke is a REQUEST to the calculation plane — the process that
+   owns the workers — which applies its own cooldown gates and may decline, and
+   may be unreachable. A granted call is not a guaranteed fresh compute: always
+   confirm what you actually got via substrate.read age_ms.
+   Call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
 2. Interpret fitted models — sign, magnitude, r2, stderr, and status of price_impact_fit; depth-scaling (c, lambda) with its own status; what changed vs prior cycle. Be specific, numeric, grounded.
 3. Run the agentic loop: you have up to {max_rounds} tool rounds. Use them. Cite every numeric claim with exact paths.
 
@@ -296,6 +298,7 @@ def _coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
 def _validate_final_turn(
     parsed: dict[str, Any],
     coverage: dict[str, set[str]],
+    scenario: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
     """Phase-aware final gate: depth is structural, not advisory.
 
@@ -372,7 +375,109 @@ def _validate_final_turn(
         missing.append(
             "evidence must cite the derived ΔP via a calc.price.delta → … path"
         )
+    if scenario is not None:
+        scen = parsed.get("scenario")
+        if not isinstance(scen, dict):
+            missing.append(
+                "scenario block required: a scenario was given — return the "
+                "scenario{target_price,horizon,direction,required_ofi,exceedance,"
+                "probability,verdict,rationale} object evaluated via calc.scenario.evaluate"
+            )
+        else:
+            if str(scen.get("verdict") or "") not in (
+                    "reachable", "not_reachable", "unevaluable"):
+                missing.append(
+                    "scenario.verdict required: reachable|not_reachable|unevaluable"
+                )
+            if normalize_confidence(scen.get("probability")) is None:
+                missing.append(
+                    "scenario.probability required: low|medium|high "
+                    "(qualitative read of the exceedance + band + tape quality)"
+                )
+            for field in ("required_ofi", "exceedance"):
+                if not str(scen.get(field) or "").strip():
+                    missing.append(
+                        f"scenario.{field} required: echo the calc.scenario.evaluate "
+                        f"→ … value, never compute it yourself"
+                    )
+        if not any(
+            head == "calc.scenario.evaluate"
+            for path in delta_paths
+            for head in [path.split("→")[0].strip()]
+        ):
+            missing.append(
+                "evidence must cite the scenario evaluation via a "
+                "calc.scenario.evaluate → … path"
+            )
+        hypothesis_sc = parsed.get("hypothesis")
+        if (not isinstance(hypothesis_sc, dict)
+                or not str(hypothesis_sc.get("H0") or "").strip()
+                or not str(hypothesis_sc.get("H1") or "").strip()):
+            missing.append(
+                "scenario cycles frame TWO hypotheses: H0 (target NOT reachable) "
+                "and H1 (target reachable), both non-empty"
+            )
     return (not missing), missing
+
+
+def _scenario_verdict(
+    scenario_result: dict[str, Any] | None,
+    capability_log: list[dict[str, Any]],
+    gate_status: str,
+    gate_reasons: list[str],
+) -> tuple[str, str]:
+    """Deterministic reachability verdict from the scenario tool payload.
+
+    Decided from the accumulated ``calc.scenario.evaluate`` result — never
+    from LLM text. Band-aware cut points: max exceedance across the band
+    == 0 → invalidated (unreachable even on the friendly edge); min
+    exceedance ≥ 0.5 → validated (preponderance through the full band);
+    anything between → inconclusive. The provisional gate always ceilings
+    at inconclusive (reason carries the directional read); refusals and
+    missing evaluations are inconclusive with the cause named.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    entry: dict[str, Any] | None = None
+    for row in reversed(capability_log):
+        if isinstance(row, dict) and row.get("capability") == "calc.scenario.evaluate":
+            entry = row
+            break
+    if not isinstance(scenario_result, dict):
+        detail = (entry or {}).get("detail") or {}
+        cause = detail.get("reason", "scenario tool never called") \
+            if isinstance(detail, dict) else "scenario tool never called"
+        return ("inconclusive",
+                f"scenario unevaluated ({cause}); reachability undecided")
+    direction = str(scenario_result.get("direction") or "?")
+    target = str(scenario_result.get("target_price") or "?")
+    windows = scenario_result.get("n_windows_usable")
+    horizon = str(scenario_result.get("horizon") or "?")
+    context = (f"{direction} {target} at {horizon} over {windows} usable windows")
+    if gate_status == "provisional":
+        exc = str(scenario_result.get("exceedance") or "?")
+        return ("inconclusive",
+                f"Gate provisional ({';'.join(gate_reasons)}); scenario reads "
+                f"{context} at {exc} exceedance but held inconclusive — "
+                f"promotion waits for a validated fit")
+    if gate_status != "validated":
+        return ("inconclusive", "; ".join(gate_reasons) or "gate not validated")
+    rng = scenario_result.get("exceedance_range")
+    try:
+        edges = [Decimal(str(v)) for v in rng] if isinstance(rng, list) and len(rng) == 2 \
+            else [Decimal(str(scenario_result.get("exceedance")))]
+    except (InvalidOperation, ValueError, TypeError):
+        return ("inconclusive", f"scenario exceedance unparseable ({context})")
+    if max(edges) == 0:
+        return ("invalidated",
+                f"H0 holds: {context} at 0 exceedance across the full band — "
+                f"required flow outside the observed regime")
+    if min(edges) >= Decimal("0.5"):
+        return ("validated",
+                f"H1 holds: {context} at ≥0.5 exceedance through the full band")
+    return ("inconclusive",
+            f"flow regime straddles the requirement ({context}); "
+            f"band-range exceedance undecided")
 
 
 # Per-phase steering fragments — appended to follow-up prompts so each
@@ -393,8 +498,15 @@ _PHASE_GUIDANCE: dict[str, str] = {
            "first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded "
            "fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read "
            "(dispatches run sequentially in order, so the read sees the fresh projection). "
-           "Judge freshness from age_ms in the compact projection; available:false, fired:0, or invoked:false "
+           "An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane "
+           "applies its own cooldown gates and may decline. "
+           "Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE — "
+           "large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, "
+           "migration ~900s — never one global threshold, or you will mislabel the slow workers as stale. "
+           "available:false, fired:0, or invoked:false "
            "(cooldown-dormant) are FINDINGS — report them, never re-invoke the same worker in one cycle. "
+           "An unreachable calculation plane is a FINDING of the same kind: report it and continue from "
+           "substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. "
            "An empty upstream (no projections — capture down) is itself the finding: cite "
            "substrate.read -> substrates.<name>.available. "
            "Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. "
@@ -448,7 +560,6 @@ class InferenceEngine:
         *,
         symbol: str = "BTCUSDT",
         venue: str = "spot",
-        config: WakeConfig | None = None,
         session_id: str | None = None,
         settings: Any | None = None,
     ) -> None:
@@ -458,17 +569,16 @@ class InferenceEngine:
         self.llm = llm
         self.symbol = symbol.upper()
         self.venue = venue
-        self.config = config or WakeConfig()
         self.session_id = session_id or _stable_session_id(self.symbol, self.venue)
         # Operator settings (one read at construction, threaded to tools).
         # Tools NEVER re-read the environment (two-plane boundary pass).
         self.settings = settings
 
     # ------------------------------------------------------------------
-    # Wake plane adapters (Redis counter collection + two-phase gate)
+    # Invocation adapters (Redis counter collection for the manual wake)
     # ------------------------------------------------------------------
 
-    async def collect_snapshot(self) -> CounterSnapshot:
+    async def collect_snapshot(self) -> dict[str, Any]:
         """Live counters + last-artifact high-water marks (pure reads)."""
         status = await self.store.read_microstructure_status(self.venue, self.symbol)
         stream_len = int(
@@ -483,34 +593,41 @@ class InferenceEngine:
             except Exception:
                 log.exception("collect_snapshot: prior-artifact read failed")
         prior_state = self._prior_headline(prior)
-        return CounterSnapshot(
-            event_stream_len=stream_len,
-            capture_state=(status or {}).get("state"),
-            last_artifact_events_total=prior_state.get("events_total"),
-            last_artifact_capture_state=prior_state.get("capture_state"),
-            last_artifact_completed_at_ms=prior_state.get("completed_at_ms"),
-        )
+        return {
+            "event_stream_len": stream_len,
+            "capture_state": (status or {}).get("state"),
+            "last_artifact_events_total": prior_state.get("events_total"),
+            "last_artifact_capture_state": prior_state.get("capture_state"),
+            "last_artifact_completed_at_ms": prior_state.get("completed_at_ms"),
+        }
 
-    async def acquire_manual_wake(self) -> tuple[WakeEnvelope, dict[str, Any]]:
-        """Synthesize a MANUAL wake (the outer-CLI ``--force`` trigger).
+    async def acquire_manual_wake(self, task: str | None = None) -> tuple[WakeEnvelope, dict[str, Any]]:
+        """Synthesize a MANUAL wake (the CLI ``--force`` trigger — the only trigger).
 
-        The human trigger IS the wake — no stream drain, no predicate
-        evaluation, no two-phase revalidation. Event-driven wakes arrive as
-        in-memory envelopes directly from the worker and never pass through
-        here.
+        The human trigger IS the invocation — no predicate evaluation, no
+        loop, no worker. A directly-injected envelope (caller-constructed)
+        bypasses this entirely and goes straight to ``run_cycle``.
+
+        ``task`` is the interactive-plane directive (trade hypothesis prompt
+        from ``harness.py --task``). It is carried on the manual predicates
+        (truncated preview) so the firing is attributable, and threaded
+        separately into ``run_cycle`` for full prompt steering.
         """
         snapshot = await self.collect_snapshot()
+        predicates: dict[str, Any] = {"manual": {}}
+        if task:
+            predicates["manual"] = {"task_preview": task[:200]}
         envelope = WakeEnvelope.create(
             symbol=self.symbol, venue=self.venue, trigger_source="manual",
-            predicates_fired={"manual": {}},
+            predicates_fired=predicates,
             counter_snapshot={
-                "event_stream_len": snapshot.event_stream_len,
-                "capture_state": snapshot.capture_state,
-                "last_artifact_events_total": snapshot.last_artifact_events_total,
+                "event_stream_len": snapshot["event_stream_len"],
+                "capture_state": snapshot["capture_state"],
+                "last_artifact_events_total": snapshot["last_artifact_events_total"],
             },
             high_water={
-                "events_total": snapshot.last_artifact_events_total,
-                "completed_at_ms": snapshot.last_artifact_completed_at_ms,
+                "events_total": snapshot["last_artifact_events_total"],
+                "completed_at_ms": snapshot["last_artifact_completed_at_ms"],
             },
         )
         return envelope, {"decision": "fire", "forced": True,
@@ -622,6 +739,7 @@ class InferenceEngine:
             '  "limitations": ["…"] or null,\n'
             '  "model_separation": "one sentence on why beta and c/lambda are read separately" or null,\n'
             '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], "evidence_refs": ["calc.ofi.intervals", …]} or null (REQUIRED at final),\n'
+            '  "scenario": {"target_price": "…", "horizon": "15m|1h|4h", "direction": "up|down", "required_ofi": "…", "required_ofi_range": […] or null, "exceedance": "…", "exceedance_range": […] or null, "probability": "low|medium|high", "verdict": "reachable|not_reachable|unevaluable", "rationale": "…"} or null (REQUIRED at final ONLY when a SCENARIO block was given — echo numerics from calc.scenario.evaluate → … paths, never compute),\n'
             '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
             '  KEY RULE: the tool-name key is EXACTLY "name" — never "tool", "tool_name", or any other key. Entries under any other key are dropped unread.\n'
             '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "…", "importance": 5.0, "tags": ["…"]}] or null\n'
@@ -630,7 +748,7 @@ class InferenceEngine:
             "  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n"
             "  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
             "  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n"
-            "  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic);\n"
+            "  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n"
             "  P6 output: no tools — synthesis only.\n"
             "STAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n"
             "  P1 OFI inference → P2 AD inference (split — never merged) → P3 warm-plane correlation "
@@ -802,8 +920,24 @@ class InferenceEngine:
 
     async def run_cycle(
         self, wake: WakeEnvelope, wake_meta: dict[str, Any],
+        task: str | None = None,
+        scenario: dict[str, Any] | None = None,
     ) -> tuple[InferenceArtifact, dict[str, Any]]:
-        """One full inference cycle. Returns (artifact, cycle_meta)."""
+        """One full inference cycle. Returns (artifact, cycle_meta).
+
+        ``task`` is the interactive-plane directive: a free-text trade
+        hypothesis / question from the harness caller (``harness.py --task``
+        or ``nooa market inference run --task``). It steers narration — the
+        TASK block opens user_prompt_1 and is repeated on follow-up/repair
+        turns so every phase answers it — and is persisted on
+        ``deterministic_state["task"]`` plus the wake capability detail.
+        ``None`` preserves the legacy autonomous behaviour (agent frames its
+        own generic H0/H1, as seen in pre-task artifacts).
+        ``scenario`` is ``{"target_price": str, "horizon": "15m|1h|4h"}``
+        (CLI ``--target/--horizon``): the 'can price hit X?' level, persisted
+        on ``deterministic_state["scenario"]`` and echoed in the prompt so
+        Phase 3 semantics can evaluate it via ``calc.scenario.evaluate``.
+        """
         generated_at = _utc_now_iso()
         capability_log: list[dict[str, Any]] = [{
             "capability": "engine.wake",
@@ -814,6 +948,8 @@ class InferenceEngine:
                 "predicates_fired": wake.predicates_fired,
                 "decision": wake_meta.get("decision"),
                 "consumed_wake_ids": wake_meta.get("consumed_wake_ids", []),
+                "task": task[:200] if task else None,
+                "scenario": scenario,
             },
         }]
 
@@ -870,6 +1006,8 @@ class InferenceEngine:
             "split_note": "AD and OFI called as separate tools; final DeltaP is derived hypothesis, not shortcut — per Cont 1011.6402"
         }
         deterministic_state: dict[str, Any] = {
+            "task": task,
+            "scenario": scenario,
             "wake": {
                 "trigger_source": wake.trigger_source,
                 "predicates_fired": wake.predicates_fired,
@@ -918,7 +1056,9 @@ class InferenceEngine:
                     )
                 except Exception:
                     log.exception("gate-cycle memory write failed")
-            return artifact, {"llm_calls": 0, "gate": gate_status,
+            return artifact, {"task": task[:200] if task else None,
+                              "scenario": scenario,
+                              "llm_calls": 0, "gate": gate_status,
                               "reasons": list(gate_reasons)}
 
         # --- CONTEXT: memory + prior diff ---
@@ -930,7 +1070,21 @@ class InferenceEngine:
              "predicates": wake.predicates_fired},
             default=str,
         )
+        task_block = (
+            f"TASK (interactive-plane directive — frame H0/H1 to ANSWER this; "
+            f"cite it in hypothesis.evidence_refs as 'task'):\n{task[:4_000]}\n\n"
+            if task else ""
+        )
+        scenario_block = (
+            f"SCENARIO (price-target question — evaluate with the "
+            f"calc.scenario.evaluate tool at the given horizon; cite its "
+            f"→ … paths, never compute the requirement yourself):\n"
+            f"{json.dumps(scenario)}\n\n"
+            if scenario else ""
+        )
         user_prompt_1 = (
+            f"{task_block}"
+            f"{scenario_block}"
             f"WAKE: {wake_block}\n\n"
             "DETERMINISTIC STATE (computed; never recomputed by you):\n"
             f"{json.dumps(deterministic_state, default=str)[:60_000]}\n\n"
@@ -988,6 +1142,24 @@ class InferenceEngine:
 
         _mark_declared(parsed_1)
         parsed_current = parsed_1
+        task_reminder = (
+            f"TASK reminder (answer this): {task[:500]}\n"
+            if task else ""
+        )
+        scenario_reminder = (
+            f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
+            f"given horizon; frame H0/H1 as not-reachable/reachable): "
+            f"{json.dumps(scenario)}\n"
+            if scenario else ""
+        )
+        phase_guidance = dict(_PHASE_GUIDANCE)
+        if scenario:
+            phase_guidance["P5"] = (
+                phase_guidance["P5"]
+                + f" SCENARIO GIVEN ({json.dumps(scenario)}): call "
+                "calc.scenario.evaluate with that target_price/horizon IN ADDITION "
+                "to recall_paper + price.delta — the scenario verdict is the primary output."
+            )
         tool_rounds_used = 0
         repairs_sent = 0
         finalize_now = False
@@ -1050,12 +1222,14 @@ class InferenceEngine:
                 tool_results.update(round_results)
                 next_phase = _next_uncovered_phase(phase_coverage)
                 user_prompt_next = (
+                    f"{task_reminder}"
+                    f"{scenario_reminder}"
                     f"TOOL RESULTS ROUND {tool_rounds_used}/{AGENTIC_MAX_TOOL_ROUNDS} (deterministic; cite paths):\n"
                     f"{json.dumps(round_results, default=str)[:40_000]}\n\n"
                     f"ACCUMULATED TOOL RESULTS SO FAR:\n{json.dumps(accumulated_tool_results, default=str)[:40_000]}\n\n"
                     "PHASE COVERAGE (families with ≥1 ok tool): "
                     f"{json.dumps({p: sorted(s) for p, s in phase_coverage.items()})}\n"
-                    f"{_PHASE_GUIDANCE[next_phase]}\n"
+                    f"{phase_guidance[next_phase]}\n"
                     f"Tool rounds remaining: {AGENTIC_MAX_TOOL_ROUNDS - tool_rounds_used}. "
                     "Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
                 )
@@ -1073,18 +1247,30 @@ class InferenceEngine:
                 _mark_declared(parsed_current)
                 continue
             # No (more) tool calls this turn → validate the final.
-            passed, missing = _validate_final_turn(parsed_current, phase_coverage)
+            passed, missing = _validate_final_turn(
+                parsed_current, phase_coverage, scenario=scenario)
             if passed:
                 final_validation = {"passed": True, "missing": []}
                 finalize_now = True
             else:
                 repairs_sent += 1
+                scenario_steer = ""
+                if scenario and "calc.scenario.evaluate" not in accumulated_tool_results:
+                    scenario_steer = (
+                        "SCENARIO UNEVALUATED: call calc.scenario.evaluate with the "
+                        f"SCENARIO target_price/horizon ({json.dumps(scenario)}) "
+                        "before finalizing — the final is rejected without its "
+                        "→ … evidence root.\n"
+                    )
                 repair_prompt = (
+                    f"{task_reminder if task else ''}"
+                    f"{scenario_reminder if scenario else ''}"
+                    f"{scenario_steer}"
                     "FINAL REJECTED — staged inference incomplete. Missing:\n"
                     + "\n".join(f"- {item}" for item in missing)
                     + f"\n\nACCUMULATED TOOL RESULTS:\n{json.dumps(accumulated_tool_results, default=str)[:40_000]}\n\n"
                     f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in phase_coverage.items()})}\n"
-                    f"{_PHASE_GUIDANCE[_next_uncovered_phase(phase_coverage)]}\n"
+                    f"{phase_guidance[_next_uncovered_phase(phase_coverage)]}\n"
                     "Return the next turn now: declare \"phase\", include the missing tool_calls, "
                     "and finalize (tool_calls=[]) only when every missing item is addressed."
                 )
@@ -1104,7 +1290,8 @@ class InferenceEngine:
         # Honest record when the loop exited via break (exception/parse fail
         # or LLM budget spent): validate whatever we finalize with.
         if not finalize_now:
-            passed, missing = _validate_final_turn(parsed_final, phase_coverage)
+            passed, missing = _validate_final_turn(
+                parsed_final, phase_coverage, scenario=scenario)
             final_validation = {"passed": passed, "missing": missing}
         # ensure tool_results reflects all rounds for cycle_meta
         if accumulated_tool_results:
@@ -1145,6 +1332,10 @@ class InferenceEngine:
                 interpretation["confidence"] = _coerced2
         except Exception:
             pass
+        # Scenario block rides the interpretation JSON (no migration): the agent's
+        # verdict/probability/rationale over the deterministic requirement.
+        if scenario is not None and isinstance(parsed_final.get("scenario"), dict):
+            interpretation["scenario"] = parsed_final["scenario"]
         # Pass C: hypothesis formed via memory.recall_paper + calc.* tools,
         # final DeltaP is derived diagnostic heteroskedastic ν·OFI
         hypothesis = parsed_final.get("hypothesis")
@@ -1156,6 +1347,15 @@ class InferenceEngine:
             hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "paper_refs": ["Cont 1011.6402 OFI_k, AD_i, derived ΔP diagnostic"], "evidence_refs": ["calc.ofi.intervals","calc.depth.average","memory.recall_paper"]}
             hypothesis_verdict = "inconclusive"
             verdict_reason = "Agent did not explicitly form H0/H1 via memory.recall_paper; calculations split but hypothesis implicit"
+        elif scenario is not None:
+            # Scenario cycles: reachability verdict computed deterministically
+            # from the accumulated scenario tool payload — never from LLM text.
+            hypothesis_verdict, verdict_reason = _scenario_verdict(
+                tool_results.get("calc.scenario.evaluate"), capability_log,
+                gate_status, list(gate_reasons),
+            )
+            if isinstance(hypothesis, dict) and "H0" in hypothesis:
+                verdict_reason += " ; H0/H1 reachability pair via calc.scenario.evaluate"
         else:
             if gate_status == "provisional":
                 hypothesis_verdict = "inconclusive"
@@ -1193,6 +1393,8 @@ class InferenceEngine:
             accepted, {"artifact_id": artifact.artifact_id},
         )
         cycle_meta = {
+            "task": task[:200] if task else None,
+            "scenario": scenario,
             "llm_calls": llm_calls,
             "gate": gate_status,
             "tool_round": bool(tool_results),

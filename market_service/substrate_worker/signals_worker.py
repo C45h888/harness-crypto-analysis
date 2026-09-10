@@ -42,6 +42,19 @@ def _snapshot_from(window: dict[str, Any]) -> dict[str, Any] | None:
         return None
     oi_raw = (window.get("futures") or {}).get("open_interest") or {}
     oi_value = oi_raw.get("open_interest") if isinstance(oi_raw, dict) else None
+    # Binance REST returns open_interest as a JSON STRING (the value is a
+    # Decimal in source-of-truth but the wire shape is "7923049.05"); the
+    # raw stream preserves that shape. The signals substrate does
+    # arithmetic on the value (current_oi - previous_oi), so a string here
+    # becomes TypeError on every fire after the cold_start. Coerce at the
+    # snapshot boundary — every downstream substrate sees a consistent
+    # numeric type. A failed parse drops the field (null discipline: never
+    # fabricate an OI value).
+    if isinstance(oi_value, str):
+        try:
+            oi_value = float(oi_value)
+        except (TypeError, ValueError):
+            oi_value = None
     return {
         "spot_buy_share": spot_flow.get("buy_share"),
         "futures_buy_share": fut_flow.get("buy_share"),

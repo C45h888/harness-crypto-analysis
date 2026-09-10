@@ -4,7 +4,7 @@ One worker per substrate (spec: docs/SUBSTRATE_WORKER_SPEC.md). The core owns
 ALL of the transport and fire orchestration and NONE of the market semantics:
 
 * consumer group per (substrate, symbol) on the raw evidence stream
-  (``XREADGROUP BLOCK``, ``noack=True`` — at-most-once like wake_worker;
+  (``XREADGROUP BLOCK``, ``noack=True`` — at-most-once fire semantics;
   compute is idempotent, the next event re-triggers);
 * L1 arrival gate, L3 time guards (cooldown + staleness heartbeat), L4
   liveness guards (cold start; recovery wired in Phase 2 with the WS plane);

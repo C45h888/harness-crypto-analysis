@@ -107,10 +107,23 @@ class DispatchToolTests(unittest.TestCase):
         self.assertIn("tape", result["substrates"])
 
     def test_per_worker_invoke_tool(self):
+        """Same outcome contract as the in-process era, over the control plane.
+
+        The engine's tool surface is unchanged; only the execution site moved
+        into the calculation container (see tests/test_dispatch_control_transport.py).
+        """
         from market_service.nooa_harness.inference.dispatch import execute_tool
         store = _FakeStore(_FakeRedis(rows=_rows()))
-        result, audit = _run(execute_tool(store, "substrate.density",
-                                          {"symbol": "SOLUSDT"}))
+        with patch("market_service.substrate_worker.control_client.request_invoke",
+                   new_callable=AsyncMock) as plane:
+            plane.return_value = {
+                "symbol": "SOLUSDT", "invoked": 1, "fired": 1,
+                "reports": [{"substrate": "density", "symbol": "SOLUSDT",
+                             "invoked": True, "fired": 1,
+                             "trigger_source": "cold_start", "available": True}],
+            }
+            result, audit = _run(execute_tool(store, "substrate.density",
+                                              {"symbol": "SOLUSDT"}))
         self.assertEqual(audit["result"], "ok")
         self.assertTrue(result["invoked"])
         self.assertEqual(result["substrate"], "density")
@@ -132,16 +145,15 @@ class DispatchToolTests(unittest.TestCase):
 
 
 class HarnessRoutingTests(unittest.TestCase):
-    @patch("market_service.commands.harness._invoke_substrates",
-           new_callable=AsyncMock)
-    def test_invoke_routes_to_handler(self, mock_invoke):
-        from market_service.commands.harness import main
-        mock_invoke.return_value = {"symbol": "SOLUSDT", "invoked": 12, "fired": 3,
-                                    "reports": []}
-        rc = main(["SOLUSDT", "--invoke", "tape,density"])
-        self.assertEqual(rc, 0)
-        mock_invoke.assert_awaited_once()
-        self.assertEqual(mock_invoke.await_args.args[0].invoke, "tape,density")
+    def test_invoke_flag_is_gone_from_the_harness(self):
+        """The harness reads; it has no authority to fire a calculation.
+
+        Invocation lives with the inference plane, which requests it from the
+        calculation container (tests/test_dispatch_control_transport.py).
+        """
+        from market_service.commands.harness import build_parser
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["SOLUSDT", "--invoke", "tape,density"])
 
     @patch("market_service.commands.harness._read_substrates",
            new_callable=AsyncMock)

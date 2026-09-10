@@ -55,15 +55,42 @@ def deterministic_signals(snapshot: dict[str, Any], previous: dict[str, Any] | N
 
     current_oi = snapshot.get("open_interest")
     previous_oi = previous.get("open_interest") if previous else None
-    if current_oi is not None and previous_oi:
-        oi_change = (current_oi - previous_oi) / previous_oi
+
+    def _to_float(value: Any) -> float | None:
+        """Defensive coercion for Binance string-number OI values.
+
+        Binance REST returns ``openInterest`` as a JSON string; the
+        signals-worker boundary coerces to float on write, but a stale
+        projection written before that fix would still carry a string
+        here. Tolerate both shapes — arithmetic on a string is the
+        original TypeError that put the worker into a fire-fail loop.
+        A failed parse returns None and the field is skipped (null
+        discipline: never fabricate an OI value).
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    current_oi_f = _to_float(current_oi)
+    previous_oi_f = _to_float(previous_oi)
+    if current_oi_f is not None and previous_oi_f:
+        oi_change = (current_oi_f - previous_oi_f) / previous_oi_f
         if abs(oi_change) >= 0.01:
             signals.append({
                 "signal_type": "open_interest_shift", "severity": 2,
                 "summary": "Open interest moved by at least 1% between collection intervals.",
                 "evidence": {
                     "rule": "abs(current_oi - previous_oi) / previous_oi >= 0.01",
-                    "oi_change": oi_change, "previous_oi": previous_oi, "current_oi": current_oi,
+                    "oi_change": oi_change,
+                    "previous_oi": previous_oi_f,
+                    "current_oi": current_oi_f,
                 },
             })
     return signals

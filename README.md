@@ -45,51 +45,37 @@ The following Docker command is the canonical analyst entrypoint:
 
 ```bash
 docker compose --profile tools run --rm harness SOLUSDT \
-  --analyst-loop --latest --cycles 1
+  --inference --inference-force --task "is short-term sell pressure exhausting?" --json
 ```
 
-The harness reads an existing immutable canonical envelope. It does not start
-another market cycle. Canonical refresh remains an explicit harness command
-using `--trigger`, outside the analyst path.
+The harness reads canonical state and triggers inference. **It never computes
+and never invokes workers.** The calculation container owns every fire-tick
+(see "Authority split" below); the poller owns exchange egress.
 
 ```bash
-# Start the canonical runtime
+# Start the canonical runtime (poller + calculation workers)
 docker compose up -d
+docker compose --profile substrates up -d calculation
 
-# Live harness snapshot (JSON contract with raw evidence + derived metrics)
-uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.commands.snapshot SOLUSDT --json
-
-# Same data, pretty text
-uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.analysis.market SOLUSDT
-
-# CLEAN AGGREGATED MARKET DATA for the model — the single harness surface.
-# All clean data for a symbol in one contract (core snapshot + signals + OI +
-# liquidation + macro). The model reads THIS, not scattered scripts.
+# WORKER STATE — the warm plane the calculation container keeps fresh.
+# This is the default surface for the terminal-based agents.
 uv run --python 3.12 --with-requirements requirements.txt \
   python -m market_service.commands.harness SOLUSDT --json
 
-# Canonical calculation pipeline: reads the poller-fed Redis stream, runs the
-# deterministic calcs, returns a MarketRunEnvelope v2. This is the default and
-# the coherent single market-data source for the terminal-based agents.
+# One substrate only, full payload
 uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.commands.harness SOLUSDT --analyze --window 15m --json
+  python -m market_service.commands.harness SOLUSDT --substrate-read --substrate tape --json
 
-# Warm the on-demand derivative cache in Redis (no pipeline, Redis-only).
+# Read the canonical collated envelope (Redis-first, Postgres fallback)
 uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
+  python -m market_service.commands.harness SOLUSDT --read --mode snapshot --json
 
-# Read the latest persisted canonical envelope (Redis-only read, no DATABASE_URL).
-uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.commands.harness SOLUSDT --latest --json
-
-# Read an exact immutable run by run_id (Redis-only, no DATABASE_URL).
+# Read an exact immutable run by run_id
 docker compose --profile tools run --rm harness --run-id <RUN_ID> --json
 
-# Legacy dev-only live waveform (opens its own Binance session; NOT canonical)
+# Capture health, keyed on MICROSTRUCTURE_VENUE (default futures)
 uv run --python 3.12 --with-requirements requirements.txt \
-  python -m market_service.commands.harness SOLUSDT --live --json
+  python -m market_service.commands.harness SOLUSDT --microstructure-status
 
 # Verify every canonical runtime module imports cleanly
 uv run --python 3.12 --with-requirements requirements.txt \
@@ -109,51 +95,59 @@ The NOOA CLI is mounted at the repo root without touching the installed
 repo's `market` harness group to the framework root `oo` group at import
 time.
 
-**Runtime authority split** (terminal-based coding agents — pi, hermes,
-claude code — mount through the outer harness, never directly through the
-subordinate `nooa_harness` runtime module):
+**Runtime authority split** — three planes, one rule each:
 
 ```text
-harness.py                            OUTER CLI
-├── clean market-data contract        (no direct nooa_harness.* imports)
-└── --nooa ─► nooa_cli.py             INNER CLI (mounted at import time)
-            │
-            └─► nooa_cli_ext.py       the ``market`` click group
-                                      ─── sole direct caller of
-                                          market_service/nooa_harness/*
+poller / microstructure-capture       EGRESS
+└── the only processes that call Binance
+
+calculation container                 COMPUTATION
+├── the only process that constructs substrate workers
+├── fires on its own data cadence (blocking XREADGROUP, no timer)
+└── control plane: GET /health, GET /status, POST /invoke
+        ▲
+        │  substrate_worker/control_client.py — the one sanctioned seam
+        │
+inference plane (nooa_harness)        SEMANTIC AUTHORITY
+├── decides WHEN a calculation must run; requests it over the plane above
+└── reached one-shot: harness --inference --task, or nooa market inference run
+
+harness.py                            READ / INTERPRET
+├── worker state, canonical envelope, Redis projections, poller control
+└── never computes, never invokes, never touches an exchange
 ```
 
-**One mount point covers host shell, Docker, and the harness CLI:**
+Worker identity on the Redis plane is `(substrate, symbol)` and never the
+process, so a second process that builds a `SubstrateWorkerCore` overwrites
+the live container's supervisor heartbeat (and the fire-dedupe state sharing
+that key) and consumes its stream entries with `noack=True`. That is why
+invocation is centralised — enforced by
+`tests/test_worker_construction_boundary.py`.
+
+**CLI mount points:**
 
 ```bash
 # VSCode shell (uses .venv; repo .env is loaded non-clobbering)
-./nooa market envelope SOLUSDT --latest            # inner CLI direct
-./nooa market envelope SOLUSDT --run-id <UUID>     # exact immutable run
+./nooa market read SOLUSDT                         # canonical envelope
+./nooa market substrate-read SOLUSDT               # warm-plane worker state
 ./nooa market memory recall --session-id <UUID>    # MemoryNode recall
-./nooa market analyst SOLUSDT --cycles 1 --with-memory  # ControllerAgent + 4 specialists
 
-# Console-script equivalent (installed into the venv)
-nooa-market market envelope SOLUSDT --latest
+# Task-directed inference — the only trigger; there is no autonomous firing
+./nooa market inference run SOLUSDT --force --task "is sell pressure exhausting?"
 
-# Docker runtime (tools profile, same image/env as the harness)
-docker compose --profile tools run --rm nooa market envelope SOLUSDT --latest
+# Docker runtime (tools profile, one-shot)
+docker compose --profile tools run --rm nooa market read SOLUSDT
+docker compose --profile tools run --rm harness SOLUSDT --substrate-read --json
 
-# Outer harness → inner CLI: terminal-based agents (pi, hermes, claude code)
-# reach the subordinate nooa_harness runtime module ONLY through --nooa
-python -m market_service.commands.harness --nooa market envelope SOLUSDT --latest
-docker compose --profile tools run --rm harness --nooa market envelope SOLUSDT --latest
-docker compose --profile tools run --rm harness --nooa market analyst SOLUSDT --cycles 1 --with-memory
-docker compose --profile tools run --rm harness --nooa market briefing --session-id <UUID> --run-id <UUID>
+# Request a fire-tick from the calculation plane (operator escape hatch).
+# Needs `--profile substrates up -d calculation`; CALC_CONTROL_URL points at it.
+./nooa market substrate invoke SOLUSDT density
 ```
 
 The `market` group is the **sole direct caller** of the python objects in
-`market_service/nooa_harness/` — `agents.py` defines the ControllerAgent
-+ specialist nodes, `suite.py`/`runner.py` compose them, `memory.py`
-persists MemoryNode. The CLI stays read-only against canonical state;
-only the `analyst` command runs bounded cycles and produces advisory
-briefings. The outer `harness.py` never imports anything from
-`market_service/nooa_harness/` — every analyst operation is reached
-through the `--nooa` bridge into the inner CLI.
+`market_service/nooa_harness/`. The outer `harness.py` never imports anything
+from `market_service/nooa_harness/` except the one-shot inference runner
+behind `--inference`.
 
 ## Analyst contract objects (schema v2)
 

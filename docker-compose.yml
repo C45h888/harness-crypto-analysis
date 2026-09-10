@@ -123,50 +123,20 @@ services:
     profiles: ["microstructure"]
     restart: unless-stopped
 
-  # EVENT-DRIVEN wake + inference runtime — NOW the NOOA container's main
-  # command (wake-worker sidecar collapsed per the container directive).
-  # Data-driven: blocking XREAD "$" on the micro event + status streams,
-  # deterministic trigger matrix, lazy engine dispatch on fire. No timer.
-  nooa:
-    build: .
-    image: crypto-ai-anal-nooa:latest
-    user: "marketflow"
-    command: ["python", "-m", "market_service.nooa_harness.nooa_container",
-              "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
-      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-}
-      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
-      NOOA_API_KEY: ${NOOA_API_KEY:-}
-      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
-      WAKE_ENGINE_DISPATCH: ${WAKE_ENGINE_DISPATCH:-1}
-      WAKE_COOLDOWN_S: ${WAKE_COOLDOWN_S:-60}
-      WAKE_EVENT_DELTA_THRESHOLD: ${WAKE_EVENT_DELTA_THRESHOLD:-1800}
-      WAKE_READ_BLOCK_MS: ${WAKE_READ_BLOCK_MS:-1000}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-m", "market_service.nooa_harness.nooa_healthcheck"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    profiles: ["inference"]
-    restart: unless-stopped
-
-  # One-shot harness. Reads worker state / invokes workers by default;
-  # the tool-first surface replaces the removed run_cycle pipeline. Use via:
-  #   docker compose --profile tools run --rm harness SOLUSDT --invoke tape,density --json
+  # Inference is invoked ONLY from the CLI surfaces (the interaction plane):
+  #   docker compose --profile tools run --rm harness SOLUSDT --inference --inference-force --task "..." --json
+  #   docker compose --profile tools run --rm nooa market inference run SOLUSDT --force --task "..."
+  # The autonomous wake-worker `nooa` service was removed: it fired on data
+  # predicates with no directing question, so task-directed one-shots are
+  # the only invocation model.
+  # One-shot outer harness — the READ/INTERPRET surface. It reads worker
+  # state and the canonical ledger; it never computes and never invokes
+  # workers (the calculation container owns every fire — see below). Use via:
+  #   docker compose --profile tools run --rm harness SOLUSDT --substrate-read --json
+  #   docker compose --profile tools run --rm harness SOLUSDT --inference --inference-force --task "..." --json
   harness:
     build: .
+    image: crypto-ai-anal-harness:latest
     user: "marketflow"
     entrypoint: ["python", "-m", "market_service.commands.harness"]
     env_file:
@@ -177,6 +147,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
+      # --inference dispatches substrate.* tools to the calculation plane.
+      # Requires `--profile substrates up -d calculation`.
+      CALC_CONTROL_URL: ${CALC_CONTROL_URL:-http://calculation:8041}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
       NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
@@ -197,18 +171,63 @@ services:
     profiles: ["tools"]
     restart: "no"
 
-  # CALCULATION CONTAINER — the substrate worker plane as ONE service (per
-  # the container directive: every worker + the shared control plane live in
-  # this process). Data-driven: each worker task is a blocking XREADGROUP wait;
-  # no timer loops exist in this process. The harness / NOOA containers and
-  # operators invoke workers through Redis (tools) or the localhost control
-  # plane (GET /health, GET /status, POST /invoke). Spec:
-  # docs/SUBSTRATE_WORKER_SPEC.md.
+  # One-shot NOOA CLI — the interaction plane inside docker. Task-directed
+  # inference + artifact/memory/microstructure reads. Use via:
+  #   docker compose --profile tools run --rm nooa market inference run SOLUSDT --force --task "..."
+  #   docker compose --profile tools run --rm nooa market read SOLUSDT
+  nooa:
+    build: .
+    image: crypto-ai-anal-nooa:latest
+    user: "marketflow"
+    entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
+      # Worker fire-ticks are requested from the calculation plane, never run
+      # here. Requires `--profile substrates up -d calculation`.
+      CALC_CONTROL_URL: ${CALC_CONTROL_URL:-http://calculation:8041}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
+      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
+      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
+      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
+      NOOA_API_KEY: ${NOOA_API_KEY:-}
+      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    profiles: ["tools"]
+    restart: "no"
+
+  # CALCULATION CONTAINER — the substrate worker plane as ONE service, and the
+  # ONLY process that constructs workers. Data-driven: each worker task is a
+  # blocking XREADGROUP wait; no timer loops exist here.
+  #
+  # Its control plane (GET /health, GET /status, POST /invoke) is the single
+  # sanctioned way for any other process to request a fire-tick. Worker
+  # identity is (substrate, symbol) and never the process, so a caller that
+  # built its own worker would overwrite this container's supervisor heartbeat
+  # (and the fire-dedupe state sharing that key) and steal its stream entries.
+  # The port is published to host loopback only, for the host-venv CLI; other
+  # containers reach it over the compose network via CALC_CONTROL_URL.
+  # Spec: docs/SUBSTRATE_WORKER_SPEC.md.
   calculation:
     build: .
     image: crypto-ai-anal-calculation:latest
     user: "marketflow"
     command: ["python", "-m", "market_service.substrate_worker.dain_container"]
+    ports:
+      - "127.0.0.1:${CALC_CONTROL_PORT:-8041}:${CALC_CONTROL_PORT:-8041}"
     env_file:
       - path: .env
         required: false

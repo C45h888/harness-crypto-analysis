@@ -1,6 +1,6 @@
 """SubstrateWorkerCore contract tests — transport, fire orchestration, dedupe.
 
-Uses the same FakeRedis pattern as test_wake_worker.py: the core is driven
+Uses a FakeRedis pattern: the core is driven
 through its loop with scripted stream reads, and every fire decision is
 verified against the four-layer matrix:
 

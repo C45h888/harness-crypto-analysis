@@ -1,41 +1,47 @@
 """
-Outer harness CLI — substrate worker tool surface.
+Outer harness CLI — the read / interpret surface.
 
 This module is the **outer** CLI surface and is the mount point the
-terminal-based coding agents (pi, hermes, claude code) shell out to. It owns
-exactly three responsibilities:
+terminal-based coding agents (pi, hermes, claude code) shell out to. It reads
+canonical state and triggers task-directed inference. **It never computes and
+never invokes workers.**
 
-1. Invoke substrate workers as tools (``--invoke``) — one bounded fire-tick
-   per worker. The tool-first replacement for the removed run_cycle.
-2. Read worker state (default / ``--substrate-read``) — the always-fresh
-   projections from the warm plane.
-3. Refresh the on-demand derivative cache in Redis
-   (``--refresh-derivatives``) that derivative-dependent workers read.
+Worker identity on the Redis plane is ``(substrate, symbol)`` and never the
+process, so a second process that builds a ``SubstrateWorkerCore`` collides
+with the live calculation container three ways: it overwrites the supervisor
+heartbeat (and with it the fire-dedupe high-water state, which shares that
+key), and it consumes raw-stream entries from the shared consumer group with
+``noack=True`` — unrecoverably. The harness therefore carries no trigger: it
+has no semantic authority to decide a calculation must run. That authority
+belongs to the inference plane, which exercises it through the calculation
+container's control plane (see ``substrate_worker/control_client.py``).
 
-The former ``--nooa`` router to the mounted NOOA inner CLI was removed as
-legacy debt — NOOA agent / briefing / memory / inference operations are
-reached directly via the inner CLI (``python -m market_service.commands.nooa_cli``),
-never through harness.py.
+Removed as part of that boundary:
 
-``--live`` exposes the legacy one-shot Binance live waveform (``build()``)
-as a dev-only diagnostic; it is NOT the canonical surface.
+* ``--invoke``              the calculation container owns every fire-tick.
+* ``--refresh-derivatives`` the poller's warm loop owns the derivative cache
+                            (``poller._derivative_warm_loop``); egress belongs
+                            to the poller and capture containers.
+* ``--live``                opened its own Binance session and computed.
 
 The runtime authority split is:
 
-  harness.py                   outer CLI       worker invocation + reads
-                                                + derivative cache warm
+  harness.py                   outer CLI       reads + inference trigger
        │
        ├─► default / --substrate-read ─► substrate_worker.tools.read_state
        │
-       ├─► --invoke ─► substrate_worker.tools.invoke_many (bounded ticks)
+       ├─► --read ─► collated envelope (Redis-first, Postgres fallback)
        │
-       ├─► --refresh-derivatives ─► fetch_derivative_evidence + Redis cache
+       ├─► --keystone-history / --microstructure-status ─► Redis projections
        │
-       └─► --live ─► build() (legacy live waveform — dev only)
+       ├─► --poller-* ─► Redis control keys (no compute, no egress)
+       │
+       └─► --inference --task ─► the statistical inference plane, which may
+                                 request worker fire-ticks from the
+                                 calculation container
 
-The designated read tool (``--read``) is Redis-first, Postgres-fallback and
-does NOT require Postgres ``DATABASE_URL``; the derivative cache warm
-(``--refresh-derivatives``) is likewise Redis-only.
+Reads are Redis-first with a Postgres fallback and do NOT require
+``DATABASE_URL``; only ``--inference`` needs the durable ledger.
 
 Usage:
     # worker state (warm plane reads; default needs no flags)
@@ -43,16 +49,11 @@ Usage:
     .venv/bin/python -m market_service.commands.harness SOLUSDT --substrate-read --json
     .venv/bin/python -m market_service.commands.harness SOLUSDT --substrate-read --substrate tape --json
 
-    # invoke workers as tools (bounded fire-ticks, then reports)
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --invoke tape,density --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --invoke --json
+    # canonical envelope ledger
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --read --mode snapshot --json
 
-    # derivative cache warm (worker inputs for delta/technicals/oi)
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --json
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --refresh-derivatives --with-cross-asset --json
-
-    # legacy dev-only diagnostic
-    .venv/bin/python -m market_service.commands.harness SOLUSDT --live --json
+    # task-directed inference (interactive plane — the canonical trigger)
+    .venv/bin/python -m market_service.commands.harness SOLUSDT --inference --inference-force --task "is short-term sell pressure exhausting?" --json
 
 Follows the repo null discipline: `null` means a source did not provide a
 value — it is not a substitute for zero.
@@ -64,103 +65,54 @@ import argparse
 import asyncio
 import json
 import logging
-import time
+import os
 from typing import Any
 
-from market_service.analysis.market import analyze, render
 from market_service.config import Settings
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Interpretation plane — system prompt (the constitutional briefing)
-# ---------------------------------------------------------------------------
-# Every model mounting into the interpretation plane through harness.py is
-# briefed with this prompt. It defines the market-state discipline, the
-# null semantics, the citation rules, and the available tool surface.
-# The statistical inference plane (nooa_harness) has its own prompt in
-# engine.py — this is the interpretation plane only.
+DEFAULT_VENUE = "futures"
 
 
-async def build(symbol: str, trades: int, depth: int | None = None, bucket_window_s: int = 60) -> dict:
-    if depth is None:
-        from market_service.config import default_depth_levels
-        depth = default_depth_levels()
-    started = int(time.time() * 1000)
-    core = await analyze(symbol, trade_limit=trades, depth_limit=depth, bucket_window_s=bucket_window_s)
-    return {
-        "contract": {
-            "name": "crypto-ai-market-harness",
-            "version": 2,
-            "null_semantics": "null means the source did not provide a value; it is not zero",
-            "clean_sources": ["market_service.clients", "market_service.calculations", "market_service.analysis"],
-        },
-        "symbol": symbol,
-        "requested": {"trade_limit": trades, "depth_limit": depth, "bucket_window_s": bucket_window_s},
-        "generated_at_ms": started,
-        "core": core,
-        "status": core.get("status", "degraded"),
-        "errors": list(core.get("errors") or []),
-        "latency_ms": round((time.time() * 1000) - started, 1),
-    }
+def _venue() -> str:
+    """Resolve the runtime venue the rest of the system is running on.
+
+    ``MICROSTRUCTURE_VENUE`` is canonical — capture writes it, the substrate
+    core reads it, and the inference plane keys its artifacts on it. The
+    harness must agree or it reads empty keys and reasons about the wrong book.
+    """
+    return (os.getenv("MICROSTRUCTURE_VENUE") or DEFAULT_VENUE).lower().strip()
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the outer harness parser.
 
-    The parser exposes three CLI surfaces:
+    Every flag is a read, a Redis control write, or the inference trigger —
+    no flag computes, fetches from an exchange, or fires a worker.
 
-    1. **Worker invocation** (``--invoke``) — one bounded fire-tick per
-       named substrate worker. The tool-first computation entry.
+    **Designated read tools** — ``--substrate-read`` (warm-plane worker state;
+    the default with no flags) and ``--read`` (the collated envelope ledger,
+    Redis-first/Postgres-fallback with source tagging). ``--run-id``,
+    ``--mode``, and ``--read-errors`` are ``--read`` companions;
+    ``--substrate`` selects one worker for ``--substrate-read``.
 
-    2. **Designated read tools** — ``--substrate-read`` (warm-plane worker
-       state; the default with no flags) and ``--read`` (the collated
-       envelope ledger, Redis-first/Postgres-fallback with source tagging).
-       ``--run-id``, ``--mode``, and ``--read-errors`` are ``--read``
-       companions; ``--substrate`` selects one worker for ``--substrate-read``.
-
-    ``--live`` exposes the legacy one-shot live waveform (``build()``) as a
-    dev-only diagnostic: it opens its OWN Binance session and returns the
-    legacy ``crypto-ai-market-snapshot`` shape, NOT the methanol
-    ``MarketRunEnvelope v2``. Kept for debugging; do not teach agents to
-    rely on it.
-
-    ``--refresh-derivatives`` / ``--with-cross-asset`` control the derivative cache and are
-    intentionally kept on the OUTER CLI.
+    **Inference trigger** — ``--inference --inference-force --task "..."``
+    fires ONE task-directed cycle in the statistical inference plane.
     """
     p = argparse.ArgumentParser(
         description=(
-            "Outer harness CLI: substrate worker invocation (--invoke), "
-            "worker-state reads (default / --substrate-read), the derivative-cache "
-            "warmer, and legacy --live waveform (dev-only). "
-            "Default (no flags) reads the warm-plane worker snapshot."
+            "Outer harness CLI: worker-state reads (default / --substrate-read), "
+            "the canonical envelope ledger (--read), Redis projections, and the "
+            "task-directed inference trigger. Reads and interprets; never "
+            "computes. Default (no flags) reads the warm-plane worker snapshot."
         ),
     )
     p.add_argument("symbol", nargs="?", default="SOLUSDT")
-    p.add_argument("--trades", type=int, default=500,
-                   help="legacy --live waveform: recent trades per venue")
     p.add_argument("--depth", type=int, default=None,
                    help="order book depth (default: centralized DEPTH_LEVELS)")
-    p.add_argument("--bucket-window", type=int, default=60,
-                   help="legacy --live waveform: bucket window in seconds")
     p.add_argument("--json", action="store_true", help="emit the full JSON contract")
-    p.add_argument("--live", action="store_true",
-                   help="legacy dev-only live waveform (opens its own Binance session; "
-                        "returns crypto-ai-market-snapshot, NOT the methanol "
-                        "MarketRunEnvelope v2). Not the canonical surface.")
-
-    # --- Derivative cache controls (for --refresh-derivatives) ---
-    p.add_argument("--refresh-derivatives", action="store_true",
-                   help="fetch + cache one derivative evidence snapshot in "
-                        "Redis without invoking workers. Primes the cache the "
-                        "derivative-dependent workers (delta/technicals/oi) read.")
-    p.add_argument("--deriv-ttl", type=int, default=300,
-                   help="derivative cache TTL in seconds (default 300)")
-    p.add_argument("--with-cross-asset", action="store_true",
-                   help="include the 16 cross-asset calls (8 tickers + 8 funding) "
-                        "in the derivative fetch. Off by default to save rate-limit.")
 
     # --- Designated read tool (the interpretation plane's read surface) ---
     p.add_argument("--read", action="store_true",
@@ -175,16 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--read: include the source_metadata errors list verbatim in the "
                         "response (default: only the error count is surfaced)")
 
-    # --- Substrate worker plane (direct invocation + worker-state reads) ---
-    # The harness invokes workers instead of operators reaching past it to
-    # ``python -m market_service.substrate_worker.runner``: --workers-once
-    # runs one bounded fire-tick per enabled worker; --substrate-read is the
-    # read tool for worker state (the --read companion for the warm plane).
-    p.add_argument("--invoke", metavar="NAME[,NAME...]", default=None,
-                   help="invoke substrate workers directly as tools: one bounded "
-                        "fire-tick per named worker (default: all registered). "
-                        "The tool-first replacement for run_cycle — agents and "
-                        "operators call workers here instead of the cycle.")
+    # --- Substrate worker plane (READ ONLY) ---
+    # There is deliberately no invocation flag here. The calculation
+    # container is the only process that constructs workers; it fires on its
+    # own data cadence and self-refreshes stale projections. Judge freshness
+    # from the returned age_ms rather than forcing a fire.
     p.add_argument("--substrate-read", action="store_true",
                    help="read tool for worker state: latest projection per "
                         "substrate (or one via --substrate) with status, "
@@ -216,10 +163,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="read the isolated Binance spot microstructure capture status from Redis; "
                         "does not start capture, run calculations, or invoke NOOA")
     p.add_argument("--inference", action="store_true",
-                   help="trigger ONE statistical inference cycle (manual trigger; "
-                        "combine with --inference-force — the manual wake IS the trigger)")
+                   help="trigger ONE statistical inference cycle (interactive plane: "
+                        "combine with --inference-force and --task — the manual wake "
+                        "IS the trigger, the task IS the direction)")
     p.add_argument("--inference-force", action="store_true",
                    help="with --inference: bypass wake predicates — the manual trigger IS the wake")
+    p.add_argument("--task", default=None,
+                   help="interactive-plane directive: free-text trade hypothesis / "
+                        "question the inference cycle must answer "
+                        "(e.g. --task 'is short-term sell pressure exhausting on SOLUSDT?'). "
+                        "Steers narration (H0/H1 frames the task) and persists on "
+                        "deterministic_state.task. Requires --inference --inference-force.")
+    p.add_argument("--target", default=None,
+                   help="scenario price target (quote currency, e.g. --target 245.30): "
+                        "the 'can price hit X?' level evaluated at --horizon via "
+                        "calc.scenario.evaluate. Persists on deterministic_state.scenario. "
+                        "Requires --inference --inference-force.")
+    p.add_argument("--horizon", default="1h", choices=("15m", "1h", "4h"),
+                   help="scenario horizon for the OFI exceedance distribution "
+                        "(default 1h). Only meaningful with --target.")
     p.add_argument("--history-limit", type=int, default=100,
                    help="max keystone history entries to read for "
                         "--keystone-history (default 100)")
@@ -237,37 +199,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("status") == "ok" else 1
 
-    # --- Route 1: refresh derivative evidence (write-only to Redis cache).
-    if args.refresh_derivatives:
-        result = asyncio.run(_refresh_derivatives(args))
-        if args.json:
-            print(json.dumps(result, indent=2, default=str))
-        else:
-            print(json.dumps({"status": "ok" if result.get("stream_id") else "failed",
-                              "symbol": result.get("symbol"),
-                              "cache_ttl_seconds": result.get("cache_ttl_seconds"),
-                              "with_cross_asset": result.get("with_cross_asset")},
-                             indent=2, default=str))
-        return 0 if result.get("stream_id") else 1
-
-    # --- Route 2 is the default (see bottom): worker-state snapshot. ---
-
-    # --- Route 1.6: substrate worker tools — direct invocation.
-    # The harness is the entry point: agents and operators invoke workers
-    # here instead of run_cycle computing everything.
-    if args.invoke is not None:
-        result = asyncio.run(_invoke_substrates(args))
-        print(json.dumps(result, indent=2, default=str))
-        return 0
-
-    # --- Route 1.7: worker-state read tool (the --read companion).
-    # Reads the always-fresh worker projections; the pull-path --read is
-    # untouched. Missing projections are {"available": false}, never errors.
+    # --- Route 1: worker-state read tool (the --read companion).
+    # Reads the always-fresh worker projections the calculation container
+    # publishes. Missing projections are {"available": false}, never errors.
     if args.substrate_read:
         result = asyncio.run(_read_substrates(args))
         print(json.dumps(result, indent=2, default=str))
         return 0
 
+    # --- Route 2 is the default (see bottom): worker-state snapshot. ---
 
     # --- Route 3: designated read tool — Redis-first, Postgres-fallback.
     if args.read:
@@ -292,38 +232,48 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("status") is not None else 1
 
-    # --- Route 3.7: statistical inference cycle (outer-CLI trigger).
-    # Delegates to the engine runner — one wake-aware cycle, or a forced
-    # cycle with --inference-force. Never a lazy loop; use the inner CLI's
-    # `market inference watch` for the event-driven engine loop.
+    # --- Route 3.7: statistical inference cycle (interaction plane).
+    # The ONLY trigger: a human (or terminal agent) supplies --task
+    # (the trade hypothesis) and fires ONE task-directed cycle via
+    # run_inference_once(force=True, task=...). The wake worker / loop was
+    # removed — there is no autonomous firing path.
+    #
+    # The cycle runs on the SAME venue the rest of the runtime is on; the
+    # engine may request worker fire-ticks from the calculation container,
+    # which is the only process that constructs workers.
     if args.inference:
         from market_service.nooa_harness.inference_runner import run_inference_once
 
+        scenario = None
+        if args.target is not None:
+            try:
+                from decimal import Decimal
+                target_dec = Decimal(str(args.target))
+            except Exception:
+                target_dec = None
+            if target_dec is None or target_dec <= 0:
+                print(json.dumps({"status": "error",
+                                  "error": f"unparseable --target: {args.target!r}"},
+                                 indent=2, default=str))
+                return 1
+            scenario = {"target_price": str(target_dec), "horizon": args.horizon}
         result = asyncio.run(run_inference_once(
-            args.symbol, force=args.inference_force,
+            args.symbol, venue=_venue(),
+            force=args.inference_force, task=args.task, scenario=scenario,
         ))
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("status") != "no_wake" else 1
 
-    # --- Route 4: legacy dev-only live waveform (explicit --live).
-    if args.live:
-        result = asyncio.run(build(args.symbol, args.trades, args.depth, args.bucket_window))
-        if args.json:
-            print(json.dumps(result, indent=2, default=str))
-        else:
-            print(render(result["core"]))
-        return 0
-
     # --- Default (no action flags): worker-state snapshot.
-    # The warm plane is the source: the poller feeds Redis, workers
-    # aggregate continuously, the harness reads. See Route 2 note above.
+    # The warm plane is the source: the poller feeds Redis, the calculation
+    # container's workers aggregate continuously, the harness reads.
     result = asyncio.run(_read_substrates(args))
     print(json.dumps(result, indent=2, default=str))
     return 0
 
 
 # ---------------------------------------------------------------------------
-# Calculation-pipeline route handlers
+# Read + control route handlers
 # ---------------------------------------------------------------------------
 
 
@@ -372,54 +322,6 @@ async def _poller_control(args: argparse.Namespace) -> dict[str, Any]:
                 "error": "no poller status found — is the poller container running?",
             }
         return {"status": "ok", "action": "status", **status}
-    finally:
-        await store.close()
-
-
-async def _refresh_derivatives(args: argparse.Namespace) -> dict[str, Any]:
-    """Fetch + cache one derivative evidence snapshot in Redis.
-
-    No pipeline run, no agents — pure Redis write so derivative-dependent
-    workers (delta/technicals/oi) can read the cache within ``--deriv-ttl`` seconds.
-    """
-    from market_service.clients.binance import Binance
-    from market_service.nooa_harness.pipeline_interpretation import fetch_derivative_evidence
-
-    settings = Settings.from_redis_env()
-    symbol = args.symbol.upper()
-    log.info("harness --refresh-derivatives %s (cross_asset=%s ttl=%ss)",
-             symbol, args.with_cross_asset, args.deriv_ttl)
-
-    store = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix,
-        settings.redis_stream_maxlen,
-    )
-    try:
-        async with Binance() as client:
-            deriv = await fetch_derivative_evidence(
-                client, symbol,
-                include_cross_asset=args.with_cross_asset,
-            )
-        stream_id = await store.publish_derivative_evidence(
-            symbol, deriv, ttl_s=args.deriv_ttl,
-        )
-        remaining_ttl = await store.derivative_cache_ttl(symbol)
-        return {
-            "status": "ok",
-            "symbol": symbol,
-            "stream_id": stream_id,
-            "cache_key": store.derivatives_key(symbol),
-            "cache_ttl_seconds": remaining_ttl,
-            "with_cross_asset": args.with_cross_asset,
-            "deriv_ttl_seconds": args.deriv_ttl,
-            "observed_at_ms": deriv.get("observed_at_ms"),
-            "futures_keys_present": sorted(
-                k for k, v in (deriv.get("futures") or {}).items() if v is not None
-            ),
-            "cross_asset_keys_present": sorted(
-                k for k, v in (deriv.get("cross_asset") or {}).items() if v
-            ),
-        }
     finally:
         await store.close()
 
@@ -511,36 +413,6 @@ async def _read_market(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     return out
 
 
-async def _invoke_substrates(args: argparse.Namespace) -> dict[str, Any]:
-    """Harness worker-invoke tool: bounded fire-tick per named worker.
-
-    Calls the tool-first system (``substrate_worker.tools``) — the same
-    seam the agent's ``substrate.*`` tools use. PG rides the env
-    (``DATABASE_URL`` unset = Redis-only, honest degradation).
-    """
-    from market_service.runtime.redis_store import RedisRuntimeStore
-    from market_service.substrate_worker import tools as substrate_tools
-    from market_service.substrate_worker.runner import (
-        pg_store_from_env,
-        pg_strict_from_env,
-    )
-
-    settings = Settings.from_redis_env()
-    store = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    pg_store = pg_store_from_env()
-    try:
-        names = [n.strip().lower() for n in (args.invoke or "").split(",") if n.strip()]
-        return await substrate_tools.invoke_many(
-            store, args.symbol.upper(), names or None,
-            pg_store=pg_store, pg_strict=pg_strict_from_env())
-    finally:
-        await store.close()
-        if pg_store is not None:
-            await pg_store.close()
-
-
 async def _read_substrates(args: argparse.Namespace) -> dict[str, Any]:
     """Harness worker-state read tool (the --read companion).
 
@@ -615,19 +487,25 @@ async def _read_keystone_history(args: argparse.Namespace) -> dict[str, Any]:
 
 
 async def _read_microstructure_status(args: argparse.Namespace) -> dict[str, Any]:
-    """Read the separate spot-capture health projection, Redis-only."""
+    """Read the isolated capture health projection, Redis-only.
+
+    Keyed on the runtime venue (``MICROSTRUCTURE_VENUE``, default ``futures``)
+    — the same one ``microstructure.capture`` writes under. Hardcoding a venue
+    here reads keys nothing populates and reports a healthy-looking null.
+    """
     settings = Settings.from_redis_env()
     symbol = args.symbol.upper()
+    venue = _venue()
     store = RedisRuntimeStore(settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen)
     try:
-        status = await store.read_microstructure_status("spot", symbol)
+        status = await store.read_microstructure_status(venue, symbol)
         return {
             "symbol": symbol,
-            "venue": "spot",
-            "status_key": store.microstructure_status_key("spot", symbol),
-            "raw_stream": store.microstructure_raw_stream("spot", symbol),
-            "event_stream": store.microstructure_event_stream("spot", symbol),
-            "ofi_stream": store.microstructure_ofi_stream("spot", symbol),
+            "venue": venue,
+            "status_key": store.microstructure_status_key(venue, symbol),
+            "raw_stream": store.microstructure_raw_stream(venue, symbol),
+            "event_stream": store.microstructure_event_stream(venue, symbol),
+            "ofi_stream": store.microstructure_ofi_stream(venue, symbol),
             "status": status,
         }
     finally:

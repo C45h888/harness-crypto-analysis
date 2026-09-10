@@ -96,22 +96,19 @@ inference engine (`nooa_harness.engine.InferenceEngine`). The engine:
   observations/hypotheses per cycle; the engine disposes; `fact` kind is
   LLM-forbidden).
 
-Triggers (the engine is event-driven, never lazily polled):
+Triggers (the ONLY invocation model — task-directed CLI one-shots; the
+autonomous wake worker/loop was removed):
 
 ```bash
-python -m market_service.commands.harness BTCUSDT --inference            # manual cycle (no pending-wake drain)
-python -m market_service.commands.harness BTCUSDT --inference --inference-force  # manual override
-python -m market_service.commands.nooa_cli market inference run BTCUSDT  # inner-CLI trigger
+python -m market_service.commands.harness BTCUSDT --inference --inference-force --task "is short-term sell pressure exhausting?"  # interaction plane
+python -m market_service.commands.nooa_cli market inference run BTCUSDT --force --task "..."  # inner-CLI trigger
 python -m market_service.commands.nooa_cli market inference read BTCUSDT  # read artifacts
 python -m market_service.commands.nooa_cli market inference history BTCUSDT
-python -m market_service.commands.nooa_cli market inference wake BTCUSDT  # event-driven wake worker (journal)
-python -m market_service.commands.nooa_cli market inference watch BTCUSDT  # event-driven engine loop
 ```
 
 Durable surfaces:
 
 ```text
-marketflow:stream:inference:wake:spot:<SYMBOL>   (wake envelopes)
 marketflow:latest:inference:spot:<SYMBOL>        (latest artifact projection)
 marketflow:stream:inference:spot:<SYMBOL>        (artifact history stream)
 postgres inference_artifact                      (durable ledger, PG-first)

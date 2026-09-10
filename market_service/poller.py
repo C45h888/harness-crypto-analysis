@@ -270,6 +270,24 @@ async def main() -> int:
             active_symbols, source = await resolve_active_symbols(redis, settings)
             log.info("poller starting (symbols=%s poll=%ss source=%s)",
                      active_symbols, settings.poll_seconds, source)
+            # Derivative cache warm-up task: refreshes the derivative
+            # evidence cache (taker_buy_sell, oi_history, top_ls,
+            # global_ls, klines, funding) on a slower cadence than the
+            # 5s evidence poll. Without this, the delta/oi/technicals
+            # substrate workers report "derivative_cache_missing_or_stale"
+            # forever because the cache was previously warmed only by an
+            # out-of-band CLI invocation (``harness --refresh-derivatives``)
+            # that nothing scheduled. The poller is the natural owner of
+            # this: it already fetches the underlying REST endpoints on
+            # every cycle.
+            refresh_task = asyncio.create_task(
+                _derivative_warm_loop(client, redis, settings, active_symbols),
+                name="derivative-warm-loop",
+            )
+            try:
+                _run_derivative_warm_loop = refresh_task  # noqa: F841 — naming clarity
+            except NameError:
+                pass
             # Backoff ladder state: 0 = healthy; escalates on rate errors,
             # resets to 0 on a clean cycle.
             current_backoff_s = 0.0
@@ -347,8 +365,95 @@ async def main() -> int:
                 sleep_s = max(0.0, settings.poll_seconds - elapsed)
                 await asyncio.sleep(sleep_s)
     finally:
+        # Cancel the derivative warm task before closing the store/client.
+        try:
+            refresh_task  # noqa: F823 — bound only inside the `try` above
+        except (NameError, UnboundLocalError):
+            pass
+        else:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await redis.close()
     return 0
+
+
+def _derivative_refresh_seconds() -> int:
+    """Seconds between derivative cache warm-ups (env: POLLER_DERIV_REFRESH_S).
+
+    Defaults to 60s: long enough to stay well under Binance weight
+    limits for the derivative endpoints (the poller's 5s cycle already
+    calls some of these), short enough that DERIV_FRESH_MS (5 min) is
+    never breached by a single missed refresh.
+    """
+    raw = os.getenv("POLLER_DERIV_REFRESH_S", "60")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 60
+    return value if value > 0 else 60
+
+
+async def _warm_one_symbol(
+    client: Binance,
+    redis: RedisRuntimeStore,
+    symbol: str,
+    *,
+    cross_asset: bool,
+) -> None:
+    """One derivative cache refresh for one symbol. Errors are logged, not raised.
+
+    Null discipline: a failed refresh is a logging event, not a fatal
+    error — the cache will be retried on the next tick. Workers reading
+    the cache will report stale/missing and stay dormant, which is the
+    correct behaviour under partial failure.
+    """
+    try:
+        from market_service.nooa_harness.pipeline_interpretation import (
+            fetch_derivative_evidence,
+        )
+        deriv = await fetch_derivative_evidence(
+            client, symbol, include_cross_asset=cross_asset,
+        )
+        ttl_s = int(os.getenv("POLLER_DERIV_TTL_S", "300"))
+        await redis.publish_derivative_evidence(symbol, deriv, ttl_s=ttl_s)
+        log.info("poller derivative cache refreshed: %s (ttl=%ss)", symbol, ttl_s)
+    except Exception as exc:
+        log.warning("poller derivative cache refresh failed for %s: %r", symbol, exc)
+
+
+async def _derivative_warm_loop(
+    client: Binance,
+    redis: RedisRuntimeStore,
+    settings: Settings,
+    initial_symbols: tuple[str, ...],
+) -> None:
+    """Background task: refresh derivative cache for every active symbol.
+
+    Runs alongside the main poll loop. First refresh happens after one
+    full refresh interval (so the main loop has settled); subsequent
+    refreshes happen on each interval tick. The task is cancelled when
+    the poller shuts down.
+    """
+    refresh_s = _derivative_refresh_seconds()
+    log.info("derivative warm loop starting (refresh=%ss, symbols=%s)",
+             refresh_s, initial_symbols)
+    cross_asset = (os.getenv("POLLER_DERIV_CROSS_ASSET", "0").strip() != "0")
+    while True:
+        # Re-resolve symbols so a Redis control-key update takes effect
+        # without restarting the poller (same discipline as the main loop).
+        try:
+            symbols, _source = await resolve_active_symbols(redis, settings)
+        except Exception as exc:
+            log.warning("derivative warm: symbol resolve failed: %r", exc)
+            symbols = initial_symbols
+        await asyncio.gather(
+            *(_warm_one_symbol(client, redis, s, cross_asset=cross_asset) for s in symbols),
+            return_exceptions=True,
+        )
+        await asyncio.sleep(refresh_s)
 
 
 if __name__ == "__main__":

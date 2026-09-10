@@ -460,6 +460,186 @@ def derive_price_delta(
     }
 
 
+# Scenario evaluation — the interaction-plane question "can price hit X?".
+# The fitted model supplies the REQUIREMENT (required horizon flow); the
+# tape supplies the PROBABILITY (empirical exceedance over horizon-length
+# OFI sums). Horizons live where the question lives (15m/1h/4h) — a 10s
+# distribution is rejected by design: required flow for a real target always
+# sits far outside 10s flow. β is fitted per base interval and applied
+# linearly over the horizon (Δ_req = n·α + β·OFI_total) — scale-invariance
+# is a stated assumption, recorded on every output.
+SCENARIO_HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400}
+MIN_SCENARIO_WINDOWS = 30
+MAX_SCENARIO_INTERVALS = 50_000
+_BETA_ZERO_EPS = Decimal("1e-18")
+
+
+def _s(value: Decimal) -> str:
+    """Fixed-point string for scenario outputs (no exponent form in prompts)."""
+    return format(value, "f")
+
+
+def _scenario_required_ofi(delta_req: Decimal, drift: Decimal, beta: Decimal) -> Decimal | None:
+    """Required total horizon OFI, or None when β is indistinguishable from zero."""
+    if abs(beta) < _BETA_ZERO_EPS:
+        return None
+    try:
+        return (delta_req - drift) / beta
+    except Exception:
+        return None
+
+
+def evaluate_scenario(
+    target_price: Decimal,
+    current_price: Decimal,
+    tick_size: Decimal,
+    price_fit: PriceImpactFit,
+    intervals: list[OFIInterval],
+    *,
+    interval_seconds: int,
+    horizon: str,
+    depth_fit: DepthScalingFit | None = None,
+    average_depth: Decimal | None = None,
+) -> dict[str, Any]:
+    """Evaluate a price-target scenario against FITTED models + tape — pure.
+
+    Requirement from the fit, probability from the tape: required horizon
+    flow ``OFI_req = (Δ_req − n·α)/β`` vs the empirical distribution of
+    rolling ``n``-interval OFI sums (``n = horizon/interval_seconds``).
+    Exceedance is one-sided on the target's direction. The 95% band
+    (β±1.96·SE) yields a requirement range + exceedance range, never a point.
+    Raises ValueError on gate-failed fits, degenerate inputs, or thin
+    tapes — deriving from those would be fabrication.
+    """
+    if price_fit.status not in ("validated", "provisional"):
+        raise ValueError(
+            f"cannot evaluate scenario from {price_fit.status} price fit {price_fit.fit_id}"
+        )
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive")
+    if horizon not in SCENARIO_HORIZONS:
+        raise ValueError(
+            f"bad_horizon: {horizon!r}; expected one of {sorted(SCENARIO_HORIZONS)}"
+        )
+    horizon_s = SCENARIO_HORIZONS[horizon]
+    if horizon_s % interval_seconds != 0:
+        raise ValueError(
+            f"horizon {horizon} is not a multiple of {interval_seconds}s intervals"
+        )
+    if not intervals:
+        raise ValueError("no_intervals: empty OFI tape")
+    with localcontext() as ctx:
+        ctx.prec = PRECISION
+        delta_req = (target_price - current_price) / tick_size
+        if delta_req == 0:
+            raise ValueError("target_eq_current: target price equals current price")
+        direction = "up" if delta_req > 0 else "down"
+        n = horizon_s // interval_seconds
+        drift = Decimal(n) * price_fit.alpha
+        required = _scenario_required_ofi(delta_req, drift, price_fit.beta)
+        if required is None:
+            raise ValueError(
+                "beta_zero: fitted β indistinguishable from zero — "
+                "no finite flow reaches the target (H0 holds)"
+            )
+        # Empirical distribution: rolling n-interval OFI sums, step 1.
+        # Only all-exact_feed windows score; degraded windows are counted.
+        bounded = intervals[-MAX_SCENARIO_INTERVALS:]
+        ofis = [iv.ofi for iv in bounded]
+        quals = [iv.quality for iv in bounded]
+        usable: list[Decimal] = []
+        degraded = 0
+        for start in range(len(ofis) - n + 1):
+            window_q = quals[start:start + n]
+            if all(q == "exact_feed" for q in window_q):
+                usable.append(sum(ofis[start:start + n], Decimal(0)))
+            else:
+                degraded += 1
+        if len(usable) < MIN_SCENARIO_WINDOWS:
+            raise ValueError(
+                f"insufficient_windows: {len(usable)} usable horizon windows "
+                f"(need ≥{MIN_SCENARIO_WINDOWS}, {degraded} degraded excluded)"
+            )
+        total = Decimal(len(usable))
+        if direction == "up":
+            hits = sum(1 for s in usable if s >= required)
+        else:
+            hits = sum(1 for s in usable if s <= required)
+        exceedance = Decimal(hits) / total
+        # Band: requirement + exceedance at each β±1.96·SE edge.
+        required_range: list[str] | None = None
+        exceedance_range: list[str] | None = None
+        band_note: str | None = None
+        if price_fit.stderr_beta is not None:
+            half = Decimal("1.96") * price_fit.stderr_beta
+            edges: list[Decimal] = []
+            for beta_edge in (price_fit.beta - half, price_fit.beta + half):
+                req_edge = _scenario_required_ofi(delta_req, drift, beta_edge)
+                if req_edge is not None:
+                    edges.append(req_edge)
+            if len(edges) == 2:
+                lo, hi = (edges[0], edges[1]) if edges[0] <= edges[1] else (edges[1], edges[0])
+                required_range = [_s(lo), _s(hi)]
+                exc_lo = sum(1 for s in usable if (s >= lo if direction == "up" else s <= lo))
+                exc_hi = sum(1 for s in usable if (s >= hi if direction == "up" else s <= hi))
+                exceedance_range = [_s(Decimal(exc_lo) / total), _s(Decimal(exc_hi) / total)]
+            else:
+                band_note = "band edge crosses β=0: requirement range undefined on one side"
+        else:
+            band_note = "stderr_beta null: no band range"
+        # Route B cross-check on the same distribution.
+        route_b: dict[str, Any] = {"status": "unavailable", "reason": "depth scaling insufficient"}
+        if (depth_fit is not None
+                and depth_fit.status in ("validated", "provisional")
+                and depth_fit.c is not None
+                and depth_fit.lambda_ is not None):
+            ad = average_depth
+            if ad is not None and ad > 0 and depth_fit.c > 0:
+                beta_implied = depth_fit.c * (-depth_fit.lambda_ * ad.ln()).exp()
+                required_b = _scenario_required_ofi(delta_req, drift, beta_implied)
+                if required_b is not None:
+                    hits_b = sum(1 for s in usable
+                                 if (s >= required_b if direction == "up" else s <= required_b))
+                    route_b = {
+                        "status": "derived_ok",
+                        "beta_implied": _s(beta_implied),
+                        "required_ofi": _s(required_b),
+                        "exceedance": _s(Decimal(hits_b) / total),
+                        "fit_id": depth_fit.fit_id,
+                        "fit_status": depth_fit.status,
+                    }
+                else:
+                    route_b = {"status": "unavailable", "reason": "implied β indistinguishable from zero"}
+            else:
+                route_b = {"status": "unavailable", "reason": "non-positive c or AD: log-log undefined"}
+        return {
+            "direction": direction,
+            "current_price": str(current_price),
+            "target_price": str(target_price),
+            "delta_req_ticks": _s(delta_req),
+            "horizon": horizon,
+            "n_intervals": n,
+            "drift_ticks": _s(drift),
+            "required_ofi": _s(required),
+            "required_ofi_range": required_range,
+            "exceedance": _s(exceedance),
+            "exceedance_range": exceedance_range,
+            "exceedance_hits": hits,
+            "n_windows_usable": len(usable),
+            "n_windows_degraded": degraded,
+            "band_note": band_note,
+            "route_b": route_b,
+            "fit_id": price_fit.fit_id,
+            "fit_status": price_fit.status,
+            "r2": str(price_fit.r2) if price_fit.r2 is not None else None,
+            "heteroskedasticity_flag": price_fit.heteroskedasticity_flag,
+            "tick_size": str(tick_size),
+            "scale_assumption": ("β fitted per base interval applied linearly "
+                                   "over the horizon (Δ_req = n·α + β·OFI_total); "
+                                   "impact scale-invariance assumed, not proven"),
+        }
+
+
 def assemble_evidence(
     intervals: list[OFIInterval],
     *,

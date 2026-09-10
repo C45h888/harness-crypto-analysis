@@ -288,6 +288,44 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # Deterministic quality observation remembered (engine disposes)
         self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
 
+    async def test_task_directive_persists_on_gate_refused_cycle(self):
+        # The interaction-plane directive steers + persists even when the
+        # gate refuses narration: deterministic_state.task, cycle_meta.task,
+        # and the wake capability detail all carry it (zero LLM calls).
+        engine, _s, _p, _m = _engine(
+            llm_responses=[], capture_state="starting",
+        )
+        task = "is short-term sell pressure exhausting on BTCUSDT?"
+        artifact, meta = await engine.run_cycle(
+            _wake(), {"decision": "fire"}, task=task)
+        self.assertEqual(meta["llm_calls"], 0)
+        self.assertEqual(meta["task"], task[:200])
+        self.assertEqual(artifact.deterministic_state.get("task"), task)
+        wake_detail = artifact.capability_log[0]["detail"]
+        self.assertEqual(wake_detail["task"], task[:200])
+        # Manual wake carries the task preview on its predicates.
+        wake, _ = await engine.acquire_manual_wake(task=task)
+        self.assertEqual(
+            wake.predicates_fired["manual"], {"task_preview": task[:200]})
+
+    async def test_scenario_directive_persists_on_gate_refused_cycle(self):
+        # Phase 2 plumbing: scenario echoes into state/meta/detail with zero
+        # LLM calls; absent scenario leaves no keys behind (parity).
+        engine, _s, _p, _m = _engine(
+            llm_responses=[], capture_state="starting",
+        )
+        scenario = {"target_price": "245.30", "horizon": "1h"}
+        artifact, meta = await engine.run_cycle(
+            _wake(), {"decision": "fire"}, task="can price hit 245.30?",
+            scenario=scenario)
+        self.assertEqual(meta["llm_calls"], 0)
+        self.assertEqual(meta["scenario"], scenario)
+        self.assertEqual(artifact.deterministic_state.get("scenario"), scenario)
+        self.assertEqual(
+            artifact.capability_log[0]["detail"]["scenario"], scenario)
+        plain, _ = await engine.run_cycle(_wake(), {"decision": "fire"})
+        self.assertIsNone(plain.deterministic_state.get("scenario"))
+
     async def test_thin_final_triggers_repair_then_finalizes(self):
         # narrate#1 finalizes with zero validation → REJECTED for repair;
         # the repair turn covers P1/P2/P3, the next covers P5, then final passes.
@@ -515,21 +553,20 @@ class ExtractJsonTests(unittest.TestCase):
 
 
 class RunnerOnceTests(unittest.IsolatedAsyncioTestCase):
-    """run_inference_once: event-driven envelope direct path, manual force,
+    """run_inference_once: direct envelope path, manual force + task,
     and the no-wake (nothing fabricated) path."""
 
     async def test_event_driven_envelope_runs_cycle_directly(self):
-        from market_service.nooa_harness.inference import default_wake_dispatcher
         from market_service.nooa_harness.inference_runner import run_inference_once
         from market_service.runtime.contracts import WakeEnvelope
 
         envelope = WakeEnvelope.create(
-            symbol="BTCUSDT", venue="spot", trigger_source="watcher",
-            predicates_fired={"event_delta": {"new_events": 2_000}},
+            symbol="BTCUSDT", venue="spot", trigger_source="manual",
+            predicates_fired={"manual": {}},
             counter_snapshot={"event_stream_len": 3_000},
             high_water={"events_total": 1_000},
         )
-        # Inject the envelope -> run_cycle directly; no stream drain.
+        # Inject the envelope -> run_cycle directly; no worker, no stream.
         async def _fake_dispatch(_env):
             return {"dispatched": True, "wake_id": _env.wake_id}
 
@@ -538,17 +575,19 @@ class RunnerOnceTests(unittest.IsolatedAsyncioTestCase):
         # envelope path never touches acquire_manual_wake.
         import market_service.nooa_harness.inference_runner as runner
 
-        # The function constructs stores from Settings; we can't run it
-        # without Redis. So test the branch contract via a harness seam:
-        # run_inference_once(envelope=...) is the ONLY caller of run_cycle
-        # in the event-driven path; verify the runner no longer imports the
-        # retired wake functions.
+        # run_inference_once(envelope=...) dispatches straight to run_cycle;
+        # verify the runner carries no wake-plane machinery.
         import inspect
         src = inspect.getsource(runner.run_inference_once)
         self.assertIn("envelope", src)
         self.assertNotIn("acquire_wake", src)
         self.assertNotIn("read_pending_wakes", src)
         self.assertNotIn("coalesce_wakes", src)
+        self.assertNotIn("evaluate_triggers", src)
+        self.assertNotIn("wake_worker", src)
+        runner_src = inspect.getsource(runner)
+        self.assertNotIn("run_inference_loop", runner_src)
+        self.assertNotIn("WakeSupervisor", runner_src)
 
     async def test_manual_force_path_uses_acquire_manual_wake(self):
         import inspect
@@ -791,7 +830,13 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
 class P3PromptContractTests(unittest.TestCase):
     """Pin the tooling-base prompt contract: substrate.read primary P3,
-    invoke-before-read two-beat, freshness/dormant findings discipline."""
+    invoke-before-read two-beat, freshness/dormant findings discipline.
+
+    The engine keeps its invoke authority — the two-beat stays. What the
+    prompt must also teach is that invocation is a REQUEST to the calculation
+    plane (which applies its own cooldown gates), that an unreachable plane is
+    a finding, and that age_ms is judged against each worker's own cadence.
+    """
     def test_p3_guidance_teaches_two_beat(self):
         from market_service.nooa_harness.engine import _PHASE_GUIDANCE
         p3 = _PHASE_GUIDANCE["P3"]
@@ -800,6 +845,23 @@ class P3PromptContractTests(unittest.TestCase):
         self.assertIn("age_ms", p3)
         self.assertIn("FINDINGS", p3)
         self.assertIn("PRIMARY", p3)
+
+    def test_p3_guidance_teaches_cadence_relative_freshness(self):
+        """One global staleness threshold mislabels the slow workers."""
+        from market_service.nooa_harness.engine import _PHASE_GUIDANCE
+        p3 = _PHASE_GUIDANCE["P3"]
+        self.assertIn("cadence", p3.lower())
+        self.assertIn("migration", p3)  # the ~900s outlier is named
+
+    def test_p3_guidance_makes_an_unreachable_plane_a_finding(self):
+        from market_service.nooa_harness.engine import _PHASE_GUIDANCE
+        p3 = _PHASE_GUIDANCE["P3"]
+        self.assertIn("unreachable", p3.lower())
+
+    def test_system_prompt_frames_invoke_as_a_request(self):
+        """A granted tool call is not a guaranteed fresh compute."""
+        from market_service.nooa_harness.engine import _SYSTEM_PROMPT_TEMPLATE
+        self.assertIn("calculation plane", _SYSTEM_PROMPT_TEMPLATE.lower())
 
     def test_output_format_names_substrate_primary(self):
         from market_service.nooa_harness.engine import InferenceEngine
