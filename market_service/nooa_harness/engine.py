@@ -96,7 +96,7 @@ SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
 DEFAULT_NARRATION_MAX_TOKENS = 50_000
 NARRATION_MAX_TOKENS_ENV = "NOOA_MODEL_MAX_TOKENS"
 DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
-AGENTIC_MAX_TOOL_ROUNDS = 5  # one per phase + spare; phased P1→P5 cycle
+AGENTIC_MAX_TOOL_ROUNDS = 5  # one per phase + spare; staged P1→P6 cycle (P4 needs no tools, P6 is synthesis-only)
 AGENTIC_MAX_LLM_TURNS = 8  # narrate#1 + tool follow-ups + repair + forced-final
 AGENTIC_PER_ROUND_CALL_CAP = 3  # unchanged: max dispatches per tool round
 SUMMARY_MIN_CHARS = 200  # P4 explanation floor — thinner finals are repaired
@@ -129,7 +129,8 @@ You also receive recalled memory (priors + paper KB) and a deterministic diff vs
 
 YOUR JOB — VALID inference, not predefined addition:
 1. VALIDATE the deterministic fits by invoking calculation modules via tools — do not accept the formula output as final.
-   Call market.read / market.group (wall/flow/structure/positioning) to recompute from the raw Redis window,
+   Call market.read plus substrate.* worker tools (tape/density/delta/ladders/…)
+   to read the always-fresh worker projections and invoke bounded fire-ticks,
    call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
 2. Interpret fitted models — sign, magnitude, r2, stderr, and status of price_impact_fit; depth-scaling (c, lambda) with its own status; what changed vs prior cycle. Be specific, numeric, grounded.
 3. Run the agentic loop: you have up to {max_rounds} tool rounds. Use them. Cite every numeric claim with exact paths.
@@ -292,11 +293,14 @@ def _validate_final_turn(
     A FINAL turn passes only when every required phase family has at least
     one executed tool (P1 OFI, P2 AD/fits, P3 market correlation, P5 paper
     + derived ΔP), the hypothesis carries H0, the P4 explanation meets the
-    length floor, and evidence cites at least two distinct roots with at
-    least one fresh tool result (not just deterministic_state). Returns
-    (passed, missing[]) — missing drives the repair prompt.
+    length floor, confidence is the contract enum, every evidence entry
+    carries a non-empty interpretation, and evidence cites at least two
+    distinct roots with at least one fresh tool result (not just
+    deterministic_state). Returns (passed, missing[]) — missing drives
+    the repair prompt.
     """
     from market_service.nooa_harness.inference import _REQUIRED_PHASES
+    from market_service.runtime.contracts import normalize_confidence
 
     missing: list[str] = []
     for phase in _REQUIRED_PHASES:
@@ -319,12 +323,24 @@ def _validate_final_turn(
             f"P4 explanation too thin ({len(summary.strip())}/{SUMMARY_MIN_CHARS} chars): "
             "say what the fits show AND why it is happening now"
         )
+    confidence = parsed.get("confidence")
+    if confidence is not None and normalize_confidence(confidence) is None:
+        missing.append(
+            f"confidence must be one of low|medium|high (got {confidence!r}); "
+            "hyphenated blends coerce conservatively (low-medium → low)"
+        )
     roots: set[str] = set()
     evidence = parsed.get("evidence")
     if isinstance(evidence, list):
-        for entry in evidence:
+        for idx, entry in enumerate(evidence):
             if not isinstance(entry, dict):
+                missing.append(f"evidence[{idx}] must be an object with path + interpretation")
                 continue
+            if not str(entry.get("interpretation") or "").strip():
+                missing.append(
+                    f"evidence[{idx}] missing interpretation: say what "
+                    f"{entry.get('path')!r} shows (paths+values cited, readings empty is a violation)"
+                )
             path = str(entry.get("path") or "")
             head = path.split("→")[0].strip().split(".")[0].strip()
             if head:
@@ -365,8 +381,9 @@ _PHASE_GUIDANCE: dict[str, str] = {
            "Judge AD stability and observation count separately from OFI — never merge. "
            "You may vary interval_seconds/window_minutes in tool args."),
     "P3": ("PHASE P3 — CORRELATE: call market.read (snapshot, or full only if a field is missing) "
-           "plus at least one market.group (flow/wall/structure/positioning, window_minutes of your choice) "
-           "to cross-validate P1/P2 against the Redis plane. Name agreements AND contradictions explicitly. "
+           "plus at least one substrate.* worker tool (invoke tape/density/delta/… for a bounded "
+           "fire-tick, then substrate.read) "
+           "to cross-validate P1/P2 against the warm worker plane. Name agreements AND contradictions explicitly. "
            "Derivatives/keystone/wall histories are available for regime context."),
     "P4": ("PHASE P4 — EXPLAIN: no new tools required. Write the synthesis: what the fits show "
            f"(≥{SUMMARY_MIN_CHARS} chars in summary) AND why it is happening now — regime, capture quality, "
@@ -430,8 +447,7 @@ class InferenceEngine:
         self.config = config or WakeConfig()
         self.session_id = session_id or _stable_session_id(self.symbol, self.venue)
         # Operator settings (one read at construction, threaded to tools).
-        # dispatch_market_group needs depth/tier/scorecard config through
-        # this — tools NEVER re-read the environment (two-plane boundary pass).
+        # Tools NEVER re-read the environment (two-plane boundary pass).
         self.settings = settings
 
     # ------------------------------------------------------------------
@@ -598,12 +614,12 @@ class InferenceEngine:
             "REGISTRY TOOL NAMES (use EXACTLY — any other name is denied):\n"
             "  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n"
             "  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
-            "  P3 market: market.read, market.group, market.derivatives, market.keystone_history, market.wall_history;\n"
+            "  P3 market: market.read, substrate.read, substrate.invoke, substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, market.derivatives, market.keystone_history, market.wall_history;\n"
             "  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic);\n"
             "  P6 output: no tools — synthesis only.\n"
             "STAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n"
             "  P1 OFI inference → P2 AD inference (split — never merged) → P3 Redis correlation "
-            "(market.read + ≥1 market.group; name agreements AND contradictions) → "
+            "(market.read + ≥1 substrate.* invoke/read; name agreements AND contradictions) → "
             "P4 explanation (the why-now synthesis) → P5 derivation (memory.recall_paper FIRST, then "
             "calc.price.delta with an OFI value for the NUMERIC ΔP + band) → "
             "P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\n"
@@ -612,7 +628,8 @@ class InferenceEngine:
             f"Rules: tool_calls max {AGENTIC_PER_ROUND_CALL_CAP} per round, max {rounds} rounds. "
             "Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn "
             "(phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, "
-            "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, "
+            "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, confidence low|medium|high, "
+            "every evidence entry carries a non-empty interpretation, "
             "and evidence cites ≥2 distinct roots incl. a calc.price.delta → … ΔP path plus ≥1 more fresh tool result. "
             "memory_proposals max 3, kind fact forbidden."
         )
@@ -927,7 +944,9 @@ class InferenceEngine:
                 "narration_parse_failed: no JSON object in output",
             ), {"llm_calls": llm_calls}
 
-        # --- STAGED TOOL LOOP (P1→P5, phase coverage enforced) ---
+        # --- STAGED TOOL LOOP (P1→P6, phase coverage enforced) ---
+        # D1 decision (B2): P4 explanation rides in the P6 synthesis summary
+        # (≥200 chars); no P4 declared-turn is required. P6 must be declared.
         # The model advances OFI (P1) → AD (P2) → market correlation (P3) →
         # explanation (P4) → paper + derived ΔP (P5). Coverage is credited
         # from TOOL FAMILIES actually executed with result "ok"; a FINAL turn
@@ -1081,6 +1100,15 @@ class InferenceEngine:
             "limitations": parsed_final.get("limitations"),
             "model_separation": parsed_final.get("model_separation"),
         }
+        # Validator hardening: coerce confidence blends conservatively so the
+        # persisted artifact never stores "low-medium" (contract enum only).
+        try:
+            from market_service.runtime.contracts import normalize_confidence as _norm_conf
+            _coerced = _norm_conf(interpretation.get("confidence"))
+            if interpretation.get("confidence") is not None and _coerced is not None:
+                interpretation["confidence"] = _coerced
+        except Exception:
+            pass
         # If still null after forced final, fall back to first round's interpretation
         if interpretation["summary"] is None and parsed_1.get("summary") is not None:
             interpretation = {
@@ -1091,6 +1119,15 @@ class InferenceEngine:
                 "model_separation": parsed_1.get("model_separation"),
             }
             parsed_final = parsed_1
+        # Validator hardening (post-fallback): coerce again so fallback path
+        # also persists the contract enum.
+        try:
+            from market_service.runtime.contracts import normalize_confidence as _norm_conf2
+            _coerced2 = _norm_conf2(interpretation.get("confidence"))
+            if interpretation.get("confidence") is not None and _coerced2 is not None:
+                interpretation["confidence"] = _coerced2
+        except Exception:
+            pass
         # Pass C: hypothesis formed via memory.recall_paper + calc.* tools,
         # final DeltaP is derived diagnostic heteroskedastic ν·OFI
         hypothesis = parsed_final.get("hypothesis")
@@ -1113,7 +1150,7 @@ class InferenceEngine:
                 hypothesis_verdict = "invalidated"
                 verdict_reason = "; ".join(gate_reasons)
             if isinstance(hypothesis, dict) and "H0" in hypothesis:
-                verdict_reason += " | H0 paper-grounded via memory.recall_paper"
+                verdict_reason += " ; H0 paper-grounded via memory.recall_paper"
         artifact = InferenceArtifact.create(
             symbol=self.symbol, venue=self.venue,
             generated_at=generated_at, completed_at=_utc_now_iso(),
@@ -1266,7 +1303,7 @@ def bounded_envelope_view(
     }
     kept["coverage"] = payload.get("coverage")
     kept["errors"] = payload.get("errors")
-    kept["_trimmed_keys"] = sorted((payload.get("canonical_state") or {}))
+    kept["_trimmed_keys"] = sorted(payload.get("canonical_state") or {})
     return json_safe_dumps(kept)
 
 
@@ -1447,8 +1484,8 @@ class MicrostructureInterpretationAgent:
 __all__ = [
     "SESSION_TEMPLATE",
     "InferenceEngine",
-    "NarrationParseError",
     "MicrostructureInterpretationAgent",
+    "NarrationParseError",
     "bounded_envelope_view",
     "response_text",
 ]

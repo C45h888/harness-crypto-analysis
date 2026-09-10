@@ -560,6 +560,8 @@ class RunnerOnceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalValidationTests(unittest.TestCase):
+    def _ev(self, path: str) -> dict:
+        return {"path": path, "value": "1", "interpretation": f"{path} shows the fitted state"}
     def test_empty_coverage_fails_with_all_phases_missing(self):
         from market_service.nooa_harness.engine import _validate_final_turn
 
@@ -576,10 +578,11 @@ class FinalValidationTests(unittest.TestCase):
         passed, missing = _validate_final_turn(
             {"phase": "P6",
              "summary": _STAGED_SUMMARY,
+             "confidence": "medium",
              "evidence": [
-                 {"path": "deterministic_state.microstructure_evidence.price_impact_fit.beta"},
-                 {"path": "calc.ofi.intervals → ofi"},
-                 {"path": "calc.price.delta → route_a_direct.delta_ticks"},
+                 self._ev("deterministic_state.microstructure_evidence.price_impact_fit.beta"),
+                 self._ev("calc.ofi.intervals → ofi"),
+                 self._ev("calc.price.delta → route_a_direct.delta_ticks"),
              ],
              "hypothesis": {"H0": "beta > 0"}},
             {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
@@ -593,9 +596,10 @@ class FinalValidationTests(unittest.TestCase):
 
         passed, missing = _validate_final_turn(
             {"summary": _STAGED_SUMMARY,
+             "confidence": "medium",
              "evidence": [
-                 {"path": "deterministic_state.a"},
-                 {"path": "market.read → last_price"},
+                 self._ev("deterministic_state.a"),
+                 self._ev("market.read → last_price"),
              ],
              "hypothesis": {"H0": "beta > 0"}},
             {"P1": {"x"}, "P2": {"x"}, "P3": {"x"}, "P4": set(),
@@ -610,9 +614,10 @@ class FinalValidationTests(unittest.TestCase):
 
         passed, missing = _validate_final_turn(
             {"summary": _STAGED_SUMMARY,
+             "confidence": "medium",
              "evidence": [
-                 {"path": "deterministic_state.a"},
-                 {"path": "deterministic_state.b"},
+                 self._ev("deterministic_state.a"),
+                 self._ev("deterministic_state.b"),
              ],
              "hypothesis": {"H0": "beta > 0"}},
             {"P1": {"x"}, "P2": {"x"}, "P3": {"x"}, "P4": set(),
@@ -620,6 +625,73 @@ class FinalValidationTests(unittest.TestCase):
         )
         self.assertFalse(passed)
         self.assertTrue(any("fresh tool result" in m for m in missing))
+
+    def test_confidence_blend_coerces_conservatively(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"phase": "P6",
+             "summary": _STAGED_SUMMARY,
+             "confidence": "low-medium",
+             "evidence": [
+                 self._ev("deterministic_state.microstructure_evidence.price_impact_fit.beta"),
+                 self._ev("calc.ofi.intervals → ofi"),
+                 self._ev("calc.price.delta → route_a_direct.delta_ticks"),
+             ],
+             "hypothesis": {"H0": "beta > 0"}},
+            {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
+             "P3": {"market.derivatives"}, "P4": set(),
+             "P5": {"calc.price.delta"}, "P6": {"declared"}},
+        )
+        # low-medium normalizes conservatively to low, so it PASSES validation
+        # but the persisted artifact must store the coerced enum, never the blend.
+        # Here we assert the validator accepts via coercion path...
+        # Actually strict gate: blends are accepted (coerced), garbage is rejected.
+        self.assertTrue(passed, missing)
+        from market_service.runtime.contracts import normalize_confidence
+        self.assertEqual(normalize_confidence("low-medium"), "low")
+        self.assertEqual(normalize_confidence("moderate"), "medium")
+        self.assertIsNone(normalize_confidence("ultra"))
+
+    def test_confidence_garbage_fails(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"phase": "P6",
+             "summary": _STAGED_SUMMARY,
+             "confidence": "ultra-high",
+             "evidence": [
+                 self._ev("deterministic_state.microstructure_evidence.price_impact_fit.beta"),
+                 self._ev("calc.ofi.intervals → ofi"),
+                 self._ev("calc.price.delta → route_a_direct.delta_ticks"),
+             ],
+             "hypothesis": {"H0": "beta > 0"}},
+            {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
+             "P3": {"market.derivatives"}, "P4": set(),
+             "P5": {"calc.price.delta"}, "P6": {"declared"}},
+        )
+        self.assertFalse(passed)
+        self.assertTrue(any("confidence" in m for m in missing))
+
+    def test_missing_interpretation_fails(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+
+        passed, missing = _validate_final_turn(
+            {"phase": "P6",
+             "summary": _STAGED_SUMMARY,
+             "confidence": "medium",
+             "evidence": [
+                 {"path": "deterministic_state.a", "value": "1", "interpretation": ""},
+                 self._ev("calc.price.delta → route_a_direct.delta_ticks"),
+                 self._ev("calc.ofi.intervals → ofi"),
+             ],
+             "hypothesis": {"H0": "beta > 0"}},
+            {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
+             "P3": {"market.derivatives"}, "P4": set(),
+             "P5": {"calc.price.delta"}, "P6": {"declared"}},
+        )
+        self.assertFalse(passed)
+        self.assertTrue(any("interpretation" in m for m in missing))
 
 
 class ToolErrorTests(unittest.IsolatedAsyncioTestCase):

@@ -35,7 +35,39 @@ StateStatus = Literal["healthy", "degraded", "invalid"]
 ConfidenceLevel = Literal["low", "medium", "high"]
 ValidConfidence: tuple[str, ...] = ("low", "medium", "high")
 # LLMs sometimes use "moderate" instead of "medium" — accept it as an alias.
-_CONFIDENCE_ALIASES: dict[str, str] = {"moderate": "medium"}
+# Hyphenated blends are coerced CONSERVATIVELY to the lower component
+# (low-medium → low, medium-high → medium) so confidence is never inflated.
+_CONFIDENCE_ALIASES: dict[str, str] = {
+    "moderate": "medium",
+    "med": "medium",
+    "low-medium": "low",
+    "low_medium": "low",
+    "low/medium": "low",
+    "medium-low": "low",
+    "medium-high": "medium",
+    "medium_high": "medium",
+    "high-medium": "medium",
+}
+
+
+def normalize_confidence(value: Any) -> str | None:
+    """Coerce an LLM-supplied confidence to the contract enum.
+
+    Returns the canonical "low"|"medium"|"high" or None when unmappable.
+    Lowercases, strips, maps _ → - , then applies _CONFIDENCE_ALIASES.
+    """
+    if not isinstance(value, str):
+        return None
+    key = value.strip().lower().replace("_", "-").replace("/", "-").replace(" ", "-")
+    # collapse repeats like "low--medium"
+    while "--" in key:
+        key = key.replace("--", "-")
+    if key in ValidConfidence:
+        return key
+    mapped = _CONFIDENCE_ALIASES.get(key)
+    if mapped is not None and mapped in ValidConfidence:
+        return mapped
+    return None
 # Inference-artifact status trichotomy (Pass-3 discipline, generalized):
 # validated  — deterministic inputs passed every quality gate; narration may cite values
 # provisional — fitted but diagnostics incomplete; narration must caveat, never signal
@@ -351,15 +383,12 @@ def _require_str(payload: dict[str, Any], key: str) -> str:
 
 
 def _require_confidence(payload: dict[str, Any], key: str = "confidence") -> str:
-    value = payload.get(key)
-    mapped = _CONFIDENCE_ALIASES.get(str(value)) if value is not None else None
-    if mapped is not None:
-        value = mapped
-    if value not in ValidConfidence:
+    normalized = normalize_confidence(payload.get(key))
+    if normalized is None:
         raise ValueError(
-            f"confidence must be one of {ValidConfidence!r}, got {value!r}"
+            f"confidence must be one of {ValidConfidence!r}, got {payload.get(key)!r}"
         )
-    return str(value)
+    return normalized
 
 
 def _coerce_evidence_list(payload: dict[str, Any], key: str) -> tuple[EvidenceEntry, ...]:
@@ -805,6 +834,26 @@ class InferenceArtifact:
             raise ValueError("deterministic_state must be an object")
         if self.hypothesis_verdict is not None and self.hypothesis_verdict not in ("validated", "invalidated", "inconclusive"):
             raise ValueError(f"invalid hypothesis_verdict: {self.hypothesis_verdict}")
+        # Validator hardening (2026-09-10): interpretation confidence must be
+        # the contract enum (aliases coerce, blends go conservative). Past
+        # rows with "low-medium" read back as "low" via normalize.
+        if self.interpretation is not None:
+            conf = self.interpretation.get("confidence")
+            if conf is not None and normalize_confidence(conf) is None:
+                raise ValueError(
+                    f"interpretation.confidence must be one of {ValidConfidence!r}, got {conf!r}"
+                )
+            evidence = self.interpretation.get("evidence")
+            if isinstance(evidence, list):
+                for i, entry in enumerate(evidence):
+                    if not isinstance(entry, dict):
+                        raise ValueError(f"interpretation.evidence[{i}] must be an object")
+                    if not str(entry.get("path") or "").strip():
+                        raise ValueError(f"interpretation.evidence[{i}] missing required field: path")
+                    if not str(entry.get("interpretation") or "").strip():
+                        raise ValueError(
+                            f"interpretation.evidence[{i}] missing required field: interpretation"
+                        )
         # Combined formula is derived hypothesis only — never a shortcut stored as deterministic prediction.
         if self.calculations and self.calculations.get("combined_prediction") is not None:
             raise ValueError("calculations.combined_prediction must not be stored as deterministic prediction; use derived_diagnostic")

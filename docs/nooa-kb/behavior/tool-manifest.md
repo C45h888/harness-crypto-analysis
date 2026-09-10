@@ -59,13 +59,14 @@ Uncited numeric claims are contract violations.
   last cycle), not a fresh fit.
 - Returns: the stored MicrostructureEvidence dict, or null.
 
-## Staged inference cycle (P1→P5)
+## Staged inference cycle (P1→P6)
 
 Coverage is measured from tool families you EXECUTE, not phases you declare.
-A FINAL turn (`tool_calls=[]`) is rejected for repair unless P1+P2+P3+P5
-all have ≥1 executed tool, `hypothesis.H0` is set, `summary` is ≥200 chars
-(the P4 why-now explanation), and `evidence` cites ≥2 distinct roots
-including ≥1 fresh tool result. Budgets: 5 tool rounds (≤3 calls each),
+A FINAL turn (`tool_calls=[]`, phase P6) is rejected for repair unless P1+P2+P3+P5
+all have ≥1 executed tool, a P6 synthesis turn was declared, `hypothesis.H0` is set,
+`summary` is ≥200 chars (the P4 why-now explanation), `confidence` is low|medium|high,
+every evidence entry carries a non-empty `interpretation`, and `evidence` cites ≥2 distinct roots
+including ≥1 fresh tool result plus a `calc.price.delta → …` ΔP path. Budgets: 5 tool rounds (≤3 calls each),
 8 LLM turns per cycle.
 
 The two fitted models are NEVER merged. Call OFI and AD as SEPARATE tools,
@@ -142,14 +143,6 @@ over half-open clock-bound `[t_{k-1}, t_k)`), with AD explicitly excluded.
   `schema_mismatch` error means the writer is on a different contract:
   report it, do not retry.
 
-### `market.group`
-- When: you need a FRESH computation of one domain group over the raw
-  Redis window (the envelope may be stale relative to the micro tape).
-- Args: `group` (wall|flow|structure|positioning), `window_minutes` (default 15).
-- Returns: `calculations` + `analysis` for that group only. NEVER persists —
-  this is a read-path computation, the canonical envelope stays owned by the
-  outer CLI.
-
 ### `market.derivatives`
 - When: you need funding / OI / cross-asset context to correlate against
   order-flow inference.
@@ -161,6 +154,30 @@ over half-open clock-bound `[t_{k-1}, t_k)`), with AD explicitly excluded.
   reasoning.
 - Args: `count` (default 100, bounded).
 - Returns: newest-first ledger rows.
+
+## T3 — Substrate worker plane (always-fresh warm projections)
+
+Tool-first invocation (replaces the removed run_cycle): agents invoke workers
+for bounded fire-ticks, then read the warm projections. P3 coverage credits
+any `substrate.*` family execution.
+
+### `substrate.read`
+- When: you need the always-fresh worker snapshot (compact by default) or one
+  substrate (`substrate` arg, `mode` compact|full).
+- Returns: per-substrate `{available, status, trigger_source, age_ms}` in compact
+  mode; raw payloads in full mode. Missing workers are `available:false`, never errors.
+- Citation: `substrate.read → substrates.tape.status`.
+
+### `substrate.invoke` / `substrate.<worker>`
+- When: P3 correlation — fire a bounded tick before reading, so the projection
+  is fresh relative to the micro tape.
+- Workers (12): `tape, density, delta, ladders, anchors, tiers, volume_profile,
+  technicals, migration, oi, signals, large_print`. `substrate.invoke` with no
+  substrate fires all registered workers.
+- Returns: `{invoked, fired, trigger_source, status, available}` per worker.
+  Cooldowns still gate inside the core; `invoked:false` is a structured report, never an error.
+- Workflow: invoke `substrate.tape`/`density`/`delta`/… then `substrate.read`;
+  name agreements AND contradictions vs P1/P2 explicitly.
 
 ## Anti-patterns (contract violations)
 
