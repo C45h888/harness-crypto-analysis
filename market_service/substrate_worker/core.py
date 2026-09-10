@@ -72,6 +72,23 @@ def is_recoverable_redis_exc(exc: Exception) -> bool:
     )
 
 
+def _is_nogroup(exc: BaseException) -> bool:
+    """NOGROUP = our consumer group (or its stream) vanished after start.
+
+    Happens when Redis loses state after ``_ensure_group`` ran (reset /
+    failover without persistence) while capture is down. Unlike a dead
+    connection this is HEALABLE in-process: re-create the group and retry
+    once instead of erroring on every tick forever.
+    """
+    return "NOGROUP" in str(exc).upper()
+
+
+# Minimum gap between repeated ws-read warning logs per worker (ms).
+# Heartbeat payloads still carry every error; the log is rate-limited so a
+# starved plane does not spam the container log on every tick.
+_WS_ERR_LOG_COOLDOWN_MS = 60_000
+
+
 # Same-condition collapse across worker instances (adapted from the wake
 # worker's dedupe script): a fire is a duplicate when the consumed high-water
 # has not advanced AND the trigger source is unchanged. Cooldown is NOT
@@ -213,6 +230,7 @@ class SubstrateWorkerCore:
         self._last_fire_ms: int | None = None
         self._last_error: str | None = None
         self._last_dormant_reason: str | None = None
+        self._ws_err_log_ms: int = 0
         self._prev_newest_ms: int | None = None
         self._fired = 0
         self._ticks = 0
@@ -313,21 +331,55 @@ class SubstrateWorkerCore:
                     await asyncio.sleep(1.0)
         return self._fired
 
+    async def _xreadgroup_main(self, block_ms: int | None) -> Any:
+        """One blocking XREADGROUP on the raw evidence stream."""
+        return await self._redis.xreadgroup(
+            self._group, self._consumer,
+            {self._stream: ">"},
+            count=_EVT_READ_LIMIT,
+            block=block_ms if block_ms is not None else self.read_block_ms,
+            noack=True,
+        )
+
+    async def _healed_read(self, read_fn: Callable[[], Awaitable[Any]],
+                           scope: str) -> Any | None:
+        """Run one group read, self-healing a vanished group once.
+
+        Returns the response, or None when the read degrades (recoverable
+        error recorded on ``_last_error``). NOGROUP re-creates via
+        ``_ensure_group`` and retries exactly once — a repeat failure is
+        NOT retried (that would spin); it degrades like any other
+        recoverable error.
+        """
+        try:
+            return await read_fn()
+        except Exception as exc:
+            if not _is_nogroup(exc):
+                raise
+            log.warning("substrate %s lost group (%s); re-creating",
+                        self.SUBSTRATE_NAME, exc)
+            try:
+                await self._ensure_group()
+                return await read_fn()
+            except Exception as retry_exc:
+                if _is_nogroup(retry_exc) or is_recoverable_redis_exc(retry_exc):
+                    self._last_error = f"{scope}: {retry_exc}"
+                    return None
+                raise
+
     async def _read_once(self, block_ms: int | None = None) -> list[dict[str, Any]]:
         """Blocking read of ONE batch of the raw stream (new entries only)."""
         try:
-            resp = await self._redis.xreadgroup(
-                self._group, self._consumer,
-                {self._stream: ">"},
-                count=_EVT_READ_LIMIT,
-                block=block_ms if block_ms is not None else self.read_block_ms,
-                noack=True,
+            resp = await self._healed_read(
+                lambda: self._xreadgroup_main(block_ms), "read",
             )
         except Exception as exc:
             if is_recoverable_redis_exc(exc):
                 self._last_error = f"read: {exc}"
                 return []
             raise
+        if resp is None:
+            return []
         rows: list[dict[str, Any]] = []
         if not resp:
             return rows
@@ -382,6 +434,29 @@ class SubstrateWorkerCore:
             return {"from_state": from_s, "to_state": to_s}
         return None
 
+    async def _xreadgroup_ws(self, block_ms: int | None) -> Any:
+        """One blocking XREADGROUP on the microstructure event stream."""
+        return await self._redis.xreadgroup(
+            self._ws_group, self._ws_consumer,
+            {self._ws_stream: ">"},
+            count=_EVT_READ_LIMIT,
+            block=block_ms if block_ms is not None else self.read_block_ms,
+            noack=True,
+        )
+
+    def _note_ws_error(self, detail: str) -> None:
+        """Record a ws-read failure on the heartbeat + rate-limited log.
+
+        Every failure lands on ``_last_error`` (heartbeat-visible); the
+        container log gets at most one warning per cooldown window so a
+        starved plane stays visible without spamming per-tick lines.
+        """
+        self._last_error = detail
+        now_ms = _now_ms()
+        if now_ms - self._ws_err_log_ms >= _WS_ERR_LOG_COOLDOWN_MS:
+            self._ws_err_log_ms = now_ms
+            log.warning("substrate %s %s", self.SUBSTRATE_NAME, detail)
+
     async def _read_ws_once(
         self, block_ms: int | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
@@ -397,18 +472,17 @@ class SubstrateWorkerCore:
         recovery = False
         if self._ws_stream is not None:
             try:
-                resp = await self._redis.xreadgroup(
-                    self._ws_group, self._ws_consumer,
-                    {self._ws_stream: ">"},
-                    count=_EVT_READ_LIMIT,
-                    block=block_ms if block_ms is not None else self.read_block_ms,
-                    noack=True,
+                resp = await self._healed_read(
+                    lambda: self._xreadgroup_ws(block_ms), "ws read",
                 )
             except Exception as exc:
                 if is_recoverable_redis_exc(exc):
-                    self._last_error = f"ws read: {exc}"
+                    self._note_ws_error(f"ws read: {exc}")
                     return [], False
                 raise
+            if resp is None:
+                self._note_ws_error(str(self._last_error or "ws read degraded"))
+                return [], False
             for _key, entries in resp or []:
                 for entry_id, fields in entries or []:
                     ws_rows.append({

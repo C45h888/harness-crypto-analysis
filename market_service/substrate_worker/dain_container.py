@@ -83,9 +83,12 @@ class CalcHttpApp:
         )
 
     async def _status(self, _request: web.Request) -> web.Response:
-        return web.json_response(
-            await substrate_tools.read_state(self.store, _request.query.get("symbol", "SOLUSDT")),
-        )
+        from market_service.substrate_worker.healthcheck import check_starvation
+        return web.json_response({
+            **await substrate_tools.read_state(
+                self.store, _request.query.get("symbol", "SOLUSDT")),
+            "starved": await check_starvation(self.store, self.workers),
+        })
 
     async def _invoke(self, request: web.Request) -> web.Response:
         try:

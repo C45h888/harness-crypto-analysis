@@ -20,6 +20,7 @@ import unittest
 from typing import Any
 
 from market_service.substrate_worker.contracts import (
+    CadenceProfile,
     SubstrateStatePayload,
     TriggerDecision,
     bound_arrays,
@@ -89,6 +90,9 @@ class _FakeRedis:
         return "1-1"
 
     async def xrange(self, key, min=None, max=None):
+        return []
+
+    async def xread(self, streams, count=None, block=None):
         return []
 
     async def xrevrange(self, key, count=None):
@@ -162,6 +166,115 @@ def _worker(rows=None, latest=None, decision=None, computed=None, **kw) -> _Prob
 
 def _rows(n=1, start_ms=1_700_000_000_000):
     return [{"id": f"{start_ms + i}-0", "fields": {}} for i in range(n)]
+
+
+def _run(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+class _NogroupRedis(_FakeRedis):
+    """Fails the first XREADGROUP with NOGROUP, then behaves normally."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.group_creates = 0
+        self._nogroup_fired = False
+
+    async def xgroup_create(self, stream, group, id=None, mkstream=False):
+        self.group_creates += 1
+        return "OK"
+
+    async def xreadgroup(self, group, consumer, streams, count=None,
+                         block=None, noack=False):
+        if not self._nogroup_fired:
+            self._nogroup_fired = True
+            raise _NogroupError(
+                f"NOGROUP No such key '{list(streams)[0]}' "
+                f"or consumer group '{group}' in XREADGROUP with GROUP option")
+        return await super().xreadgroup(group, consumer, streams, count=count,
+                                        block=block, noack=noack)
+
+
+class _NogroupError(Exception):
+    """Test double for the Redis NOGROUP response error (no redis dep)."""
+
+
+class _WsStore(_FakeStore):
+    """Fake store with the microstructure WS surface attached."""
+    def microstructure_event_stream(self, venue, symbol):
+        return f"mkt:stream:micro:{venue}:{symbol}:events"
+
+    def microstructure_status_stream(self, venue, symbol):
+        return f"mkt:stream:micro:{venue}:{symbol}:status"
+
+
+class _WsProbeWorker(_ProbeWorker):
+    SUBSTRATE_NAME = "wsprobe"
+    INPUT_STREAMS = ("raw", "microstructure")
+    CADENCE = CadenceProfile(cooldown_s=0, staleness_s=3600, ws_input=True)
+
+
+class GroupSelfHealTests(unittest.TestCase):
+    def test_main_read_heals_nogroup_once(self):
+        store = _FakeStore(_NogroupRedis())
+        w = _ProbeWorker(store, symbol="SOLUSDT", cooldown_s=0, staleness_s=120)
+        rows = _run(w._read_once(block_ms=1))
+        self.assertEqual(rows, [])
+        # group re-created (main + ws-absent) then the retry read cleanly
+        self.assertGreaterEqual(store.redis.group_creates, 1)
+        self.assertIsNone(w._last_error)  # healed: no standing error
+
+    def test_ws_read_heals_nogroup_and_logs_once(self):
+        store = _WsStore(_NogroupRedis())
+        w = _WsProbeWorker(store, symbol="SOLUSDT", cooldown_s=0, staleness_s=3600)
+        self.assertIsNotNone(w._ws_stream)
+        ws_rows, recovery = _run(w._read_ws_once(block_ms=1))
+        self.assertEqual(ws_rows, [])
+        self.assertFalse(recovery)
+        self.assertIsNone(w._last_error)  # healed on retry
+        self.assertGreaterEqual(store.redis.group_creates, 1)
+
+    def test_repeated_nogroup_degrades_with_error(self):
+        class _AlwaysNogroup(_NogroupRedis):
+            async def xreadgroup(self, group, consumer, streams, count=None,
+                                 block=None, noack=False):
+                raise _NogroupError("NOGROUP gone")
+        store = _FakeStore(_AlwaysNogroup())
+        w = _ProbeWorker(store, symbol="SOLUSDT", cooldown_s=0, staleness_s=120)
+        rows = _run(w._read_once(block_ms=1))
+        self.assertEqual(rows, [])
+        self.assertIsNotNone(w._last_error)
+        self.assertIn("NOGROUP", w._last_error)
+
+
+class StarvationCheckTests(unittest.TestCase):
+    def test_flags_live_never_fired_with_error(self):
+        from market_service.substrate_worker.healthcheck import check_starvation
+        redis = _FakeRedis()
+        store = _FakeStore(redis)
+        beat = json.dumps({"state": "running", "substrate": "probe",
+                           "symbol": "SOLUSDT", "fired": 0,
+                           "last_error": "ws read: NOGROUP gone"})
+        redis.supervisor[store.substrate_supervisor_key("probe", "SOLUSDT")] = beat
+        w = _ProbeWorker(store, symbol="SOLUSDT")
+        flagged = _run(check_starvation(store, [w]))
+        self.assertEqual(len(flagged), 1)
+        self.assertIn("probe:SOLUSDT", flagged[0])
+
+    def test_ignores_fresh_and_fired_workers(self):
+        from market_service.substrate_worker.healthcheck import check_starvation
+        redis = _FakeRedis()
+        store = _FakeStore(redis)
+        fresh = json.dumps({"state": "running", "fired": 0, "last_error": None})
+        fired = json.dumps({"state": "running", "fired": 3, "last_error": "old"})
+        redis.supervisor[store.substrate_supervisor_key("probe", "SOLUSDT")] = fresh
+        w = _ProbeWorker(store, symbol="SOLUSDT")
+        self.assertEqual(_run(check_starvation(store, [w])), [])
+        redis.supervisor[store.substrate_supervisor_key("probe", "SOLUSDT")] = fired
+        self.assertEqual(_run(check_starvation(store, [w])), [])
 
 
 class CoreFireMatrixTests(unittest.TestCase):

@@ -36,6 +36,41 @@ async def check_workers(store: RedisRuntimeStore, workers: list) -> list[str]:
     return missing
 
 
+async def check_starvation(store: RedisRuntimeStore, workers: list) -> list[str]:
+    """Return ``name:symbol: reason`` for live-but-starved workers.
+
+    A worker is starved when its heartbeat exists (alive) yet it has never
+    fired AND carries a standing read error — the signature of an empty
+    upstream (capture down) or a lost consumer group, NOT of a dead task.
+    Fresh workers (no error yet) and once-fired workers never flag, so this
+    is informational: liveness gates stay on ``check_workers``.
+    """
+    import json as _json
+
+    starved: list[str] = []
+    for w in workers:
+        try:
+            raw = await store.redis.get(w._supervisor_key)
+        except Exception:  # noqa: BLE001 — healthcheck must never crash
+            continue  # absent key is check_workers' domain, not ours
+        if raw is None:
+            continue
+        try:
+            beat = _json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except ValueError:
+            continue
+        if not isinstance(beat, dict):
+            continue
+        try:
+            fired = int(beat.get("fired") or 0)
+        except (TypeError, ValueError):
+            fired = 0
+        err = str(beat.get("last_error") or "").strip()
+        if fired == 0 and err:
+            starved.append(f"{w.SUBSTRATE_NAME}:{w.symbol}: {err[:160]}")
+    return starved
+
+
 async def run_check() -> int:
     store = RedisRuntimeStore(
         os.getenv("REDIS_URL") or "redis://localhost:6379/0",
@@ -45,11 +80,16 @@ async def run_check() -> int:
     try:
         workers = build_workers(store, symbols=_symbols())
         missing = await check_workers(store, workers)
+        starved = await check_starvation(store, workers)
     finally:
         await store.close()
     if missing:
         print(f"SUBSTRATE UNHEALTHY — missing heartbeats: {sorted(missing)}")
         return 1
+    if starved:
+        print(f"SUBSTRATE STARVED — live but never fired ({len(starved)}):")
+        for entry in sorted(starved)[:12]:
+            print(f"  - {entry}")
     print(f"SUBSTRATE HEALTHY — {len(workers)} worker heartbeats present")
     return 0
 
