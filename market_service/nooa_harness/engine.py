@@ -256,7 +256,11 @@ def _coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
 
     Entries without a non-empty string ``name`` can never dispatch — drop
     them here (logged) instead of burning a tool round on tool.unknown.
-    Missing/invalid ``args`` become {}. A non-dict hypothesis is wrapped.
+    Raw-JSON fallbacks (structured output refused) frequently emit the key
+    ``tool`` instead of ``name`` (proven live: a full 8-turn cycle with
+    every call dropped); accept it as an alias, ``name`` winning on
+    conflict. Missing/invalid ``args`` become {}. A non-dict hypothesis
+    is wrapped.
     """
     if not isinstance(parsed, dict):
         return None
@@ -271,6 +275,11 @@ def _coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(call, dict):
             continue
         name = call.get("name")
+        if (not isinstance(name, str) or not name.strip()) and isinstance(
+            call.get("tool"), str
+        ) and call.get("tool").strip():
+            name = call.get("tool")
+            log.warning("coercing tool_call key 'tool' → 'name': %.120r", call)
         if not isinstance(name, str) or not name.strip():
             log.warning("dropping tool_call without a registry name: %.120r", call)
             continue
@@ -614,6 +623,7 @@ class InferenceEngine:
             '  "model_separation": "one sentence on why beta and c/lambda are read separately" or null,\n'
             '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], "evidence_refs": ["calc.ofi.intervals", …]} or null (REQUIRED at final),\n'
             '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
+            '  KEY RULE: the tool-name key is EXACTLY "name" — never "tool", "tool_name", or any other key. Entries under any other key are dropped unread.\n'
             '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "…", "importance": 5.0, "tags": ["…"]}] or null\n'
             "}\n"
             "REGISTRY TOOL NAMES (use EXACTLY — any other name is denied):\n"

@@ -737,6 +737,58 @@ class StructuredCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"phase": "P5"', raw)
 
 
+class CoerceTurnKeyTests(unittest.TestCase):
+    """Raw-JSON fallbacks emit key 'tool' — accept it, 'name' wins."""
+    def test_tool_key_coerced(self):
+        from market_service.nooa_harness.engine import _coerce_turn
+        out = _coerce_turn({"phase": "P1", "tool_calls": [
+            {"tool": "calc.ofi.intervals", "args": {}}]})
+        self.assertEqual(out["tool_calls"], [
+            {"name": "calc.ofi.intervals", "args": {}}])
+
+    def test_name_wins_on_conflict(self):
+        from market_service.nooa_harness.engine import _coerce_turn
+        out = _coerce_turn({"phase": "P1", "tool_calls": [
+            {"name": "micro.events", "tool": "calc.ofi.intervals", "args": {}}]})
+        self.assertEqual(out["tool_calls"][0]["name"], "micro.events")
+
+    def test_neither_key_dropped(self):
+        from market_service.nooa_harness.engine import _coerce_turn
+        out = _coerce_turn({"phase": "P1", "tool_calls": [
+            {"args": {}}, "nope"]})
+        self.assertEqual(out["tool_calls"], [])
+
+
+class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_keyed_calls_cover_phases(self):
+        # Regression for the live 8-turn burn: every model call keyed 'tool'.
+        def _toolkey(phase, tools=None, *, final=False):
+            import json as _json
+            payload = _json.loads(_staged_narration(phase, tools=[], final=final))
+            payload["tool_calls"] = [{"tool": c["name"], "args": c.get("args", {})}
+                                      for c in (tools or [])]
+            return _json.dumps(payload)
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _toolkey("P1", tools=[
+                {"name": "calc.ofi.intervals", "args": {}},
+            ]),
+            _toolkey("P2", tools=[
+                {"name": "calc.depth.average", "args": {}},
+                {"name": "market.derivatives", "args": {}},
+            ]),
+            _toolkey("P5", tools=[
+                {"name": "memory.recall_paper", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "5"}},
+            ]),
+            _toolkey("P6", final=True),
+        ])
+        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        self.assertTrue(meta["final_validation"]["passed"],
+                        meta["final_validation"])
+        self.assertNotIn("tool.unknown",
+                         [str(e.get("capability")) for e in artifact.capability_log])
+
+
 class P3PromptContractTests(unittest.TestCase):
     """Pin the tooling-base prompt contract: substrate.read primary P3,
     invoke-before-read two-beat, freshness/dormant findings discipline."""
