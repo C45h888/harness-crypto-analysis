@@ -16,9 +16,16 @@ COPY market_service ./market_service
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 
+# Engine prompt-payload KBs (tool manifest, memory protocol, paper KB).
+# These are read at inference time by engine.config and injected into the
+# system prompt — without them the engine runs but ships empty KB blocks
+# (null-discipline on KB load failure, see engine.kb.load_kb).
+COPY docs/nooa-kb ./docs/nooa-kb
+
 # The canonical client modules may arrive from a source checkout with private
-# mode bits. The runtime user must be able to import the complete package.
-RUN chmod -R a+rX /app/market_service /app/alembic /app/alembic.ini
+# mode bits. The runtime user must be able to import the complete package
+# AND the runtime must be able to read the KB docs.
+RUN chmod -R a+rX /app/market_service /app/alembic /app/alembic.ini /app/docs
 
 USER marketflow
 

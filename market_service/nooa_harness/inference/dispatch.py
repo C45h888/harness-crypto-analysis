@@ -728,10 +728,12 @@ async def dispatch_calc_scenario_evaluate(
     is run through the FITTED models (`fitting.evaluate_scenario`) —
     required horizon flow vs the empirical rolling-sum OFI distribution at
     that horizon, direction-matched exceedance, SE-band range, route-B
-    cross-check. The current price is resolved INSIDE the tool from the
-    market.read snapshot (mark ?? last) — never agent-supplied, never
-    recomputed in-prompt. Refuses (result None, never zero) on gate-failed
-    fits, β≈0, missing price, unparseable inputs, or thin tapes.
+    cross-check. The current price is resolved INSIDE the tool — collated
+    snapshot (mark ?? last) first, then the TTL-bounded derivatives cache
+    (funding.mark_price); never agent-supplied, never recomputed in-prompt.
+    The winning source is recorded on ``price_source``. Refuses (result
+    None, never zero) on gate-failed fits, β≈0, missing price, unparseable
+    inputs, or thin tapes.
     """
     from decimal import Decimal, InvalidOperation
 
@@ -778,17 +780,27 @@ async def dispatch_calc_scenario_evaluate(
         dsf_dict = evidence_dict.get("depth_scaling_fit")
         depth_fit = (_depth_fit_from_dict(dsf_dict)
                      if isinstance(dsf_dict, dict) else None)
-        # Current price: tool-resolved from the collated snapshot.
+        # Current price: tool-resolved. Collated snapshot first (mark ?? last),
+        # then the TTL-bounded derivatives cache (funding.mark_price — same
+        # exchange, Redis-expiry enforced, so a stale quote can never sneak in).
         payload = await read_paths.read_collated(store, symbol.upper())
         snap = read_paths.market_snapshot(payload) if payload is not None else {}
         current_raw = snap.get("mark_price") or snap.get("last_price")
+        price_source = ("snapshot:" + ("mark_price" if snap.get("mark_price")
+                                         else "last_price")) if current_raw else None
+        if current_raw is None:
+            deriv = await store.read_derivative_evidence(symbol.upper())
+            futures = (deriv or {}).get("futures") or {}
+            funding = futures.get("funding") or {}
+            current_raw = funding.get("mark_price")
+            price_source = "derivatives:funding.mark_price" if current_raw else None
         try:
             current_dec = Decimal(str(current_raw))
         except (InvalidOperation, ValueError, TypeError):
             return None, capability_log_entry(
                 cap.name, scope, "ok",
                 detail={"status": "refused",
-                        "reason": "no_market_price: snapshot carries no mark/last price"},
+                        "reason": "no_market_price: collated snapshot and derivatives cache carry no usable price"},
             )
         if current_dec <= 0:
             return None, capability_log_entry(
@@ -811,7 +823,7 @@ async def dispatch_calc_scenario_evaluate(
                 detail={"status": "refused", "reason": str(vex),
                         "fit_id": price_fit.fit_id},
             )
-        result["price_source"] = ("mark_price" if snap.get("mark_price") else "last_price")
+        result["price_source"] = price_source
         result["units"] = {"price_unit": "ticks", "tick_size": str(tick_dec)}
         result["status"] = "evaluated_ok"
         result["paper"] = "Cont 1011.6402 §3"

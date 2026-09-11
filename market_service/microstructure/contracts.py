@@ -77,7 +77,15 @@ class BestQuoteState:
 
 @dataclass(frozen=True)
 class DepthDelta:
-    """One Binance depth-update range, retained before any interpretation."""
+    """One Binance depth-update range, retained before any interpretation.
+
+    ``previous_update_id`` is Binance's per-frame ``pu`` field — the ``u``
+    (final update id) of the PREVIOUS frame in the stream. On futures at
+    100/500ms cadence it is the ONLY reliable continuity link: the internal
+    update-ID space between consecutive frames is non-contiguous (Binance
+    coalesces many internal updates into each frame), but ``pu`` chains
+    exactly to the prior frame's ``u``, proving arrival order.
+    """
 
     symbol: str
     venue: str
@@ -87,6 +95,7 @@ class DepthDelta:
     received_ts_ms: int
     bids: tuple[tuple[Decimal, Decimal], ...]
     asks: tuple[tuple[Decimal, Decimal], ...]
+    previous_update_id: int | None = None
     schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
 
     @classmethod
@@ -102,6 +111,7 @@ class DepthDelta:
             received_ts_ms=received_ts_ms,
             bids=tuple((decimal(p), decimal(q)) for p, q in payload.get("b") or ()),
             asks=tuple((decimal(p), decimal(q)) for p, q in payload.get("a") or ()),
+            previous_update_id=int(payload["pu"]) if payload.get("pu") is not None else None,
         )
 
     def validate(self) -> None:
@@ -122,6 +132,7 @@ class DepthDelta:
             "received_ts_ms": self.received_ts_ms,
             "bids": [[_d(p), _d(q)] for p, q in self.bids],
             "asks": [[_d(p), _d(q)] for p, q in self.asks],
+            "previous_update_id": self.previous_update_id,
         }
 
     @classmethod
@@ -136,6 +147,8 @@ class DepthDelta:
             received_ts_ms=int(payload["received_ts_ms"]),
             bids=tuple((decimal(p), decimal(q)) for p, q in payload.get("bids") or ()),
             asks=tuple((decimal(p), decimal(q)) for p, q in payload.get("asks") or ()),
+            previous_update_id=int(payload["previous_update_id"])
+            if payload.get("previous_update_id") is not None else None,
             schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
         )
 

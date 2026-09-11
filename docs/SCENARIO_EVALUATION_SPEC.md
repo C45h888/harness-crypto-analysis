@@ -1,7 +1,8 @@
 # Scenario Evaluation Spec — Phases 1 + 2
 
-Status: **Phases 1 + 2 + 3 INTEGRATED** (636 green). Open: live-fire
-validation (real `--task + --target` cycle against the tape).
+Status: **Phases 1 + 2 + 3 INTEGRATED + rationale-discipline finetune**
+(638 green). Open: live-fire validation (real `--task + --target` cycle
+against a healthy tape).
 
 Interaction plane question: **"according to the statistical inference model,
 is it possible for price to hit X?"**
@@ -100,9 +101,11 @@ async def dispatch_calc_scenario_evaluate(
   15m/1h/4h).
 - Intervals via the established replay pattern (`read_microstructure_events`
   → `replay_events_from_payloads` → `replay_intervals`).
-- Current price resolved **inside the tool** from `read_paths.read_collated`
-  snapshot: `mark_price ?? last_price`; absent/unparseable → refused
-  `no_market_price`. The agent never supplies prices (NEVER-recompute rule).
+- Current price resolved **inside the tool**: `read_paths.read_collated`
+  snapshot (`mark_price ?? last_price`) first, then the TTL-bounded
+  derivatives cache (`futures.funding.mark_price`); both absent/unparseable
+  → refused `no_market_price`. Winning source recorded on `price_source`.
+  The agent never supplies prices (NEVER-recompute rule).
 - `horizon` validated against the frozen set; `target_price` parsed to
   Decimal or refused.
 - Returns `(result, capability_log_entry(...))` with

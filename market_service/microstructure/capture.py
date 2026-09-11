@@ -19,7 +19,7 @@ from typing import Any
 
 import aiohttp
 
-from market_service.clients.binance import Binance
+from market_service.clients import BinanceWebSocket, DepthSnapshot
 from market_service.microstructure.contracts import DepthDelta
 from market_service.microstructure.ofi import OFIAggregator
 from market_service.microstructure.orderbook import BookGapError, OrderBookReconstructor
@@ -74,14 +74,28 @@ class MicrostructureSettings:
         # futures perps — enough to bridge, fast enough to outrun the
         # stream. Operators can still override via env.
         default_snapshot = 200 if raw_venue == "futures" else 100
-        # Depth speed: 100ms is the canonical exact-feed stream, but
-        # @1000ms is available and gives the bootstrap 10x more headroom.
-        # Default stays 100ms (exact-feed contract); opt into 1000ms via env.
-        raw_speed = (os.getenv("MICROSTRUCTURE_DEPTH_SPEED_MS") or "100").strip().lower()
+        # Depth speed: futures exposes @100ms (exact-feed) and @500ms;
+        # @1000ms exists ONLY on spot — futures @1000ms subscribes but Binance
+        # never sends a frame (verified live: 15s of silence). Default futures
+        # goes to @500ms = 2x bootstrap headroom over the exact-feed with
+        # still-fresh best-quote events; opt into 100ms via env. Spot keeps
+        # @100ms canonical with @1000ms as its own opt-in.
+        raw_speed = (os.getenv("MICROSTRUCTURE_DEPTH_SPEED_MS") or "").strip().lower()
         try:
-            depth_speed_ms = int(raw_speed)
+            depth_speed_ms = int(raw_speed) if raw_speed else 0
         except ValueError:
-            depth_speed_ms = 100
+            depth_speed_ms = 0
+        if depth_speed_ms <= 0:
+            depth_speed_ms = 500 if raw_venue == "futures" else 100
+        valid_speeds = (100, 500) if raw_venue == "futures" else (100, 1000)
+        if depth_speed_ms not in valid_speeds:
+            log.warning(
+                "invalid MICROSTRUCTURE_DEPTH_SPEED_MS=%r for venue=%s — "
+                "valid=%s, defaulting to %d",
+                depth_speed_ms, raw_venue, valid_speeds,
+                500 if raw_venue == "futures" else 100,
+            )
+            depth_speed_ms = 500 if raw_venue == "futures" else 100
         return cls(
             redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
             redis_prefix=os.getenv("REDIS_KEY_PREFIX", "marketflow"),
@@ -92,7 +106,7 @@ class MicrostructureSettings:
             reconnect_seconds=_positive_env("MICROSTRUCTURE_RECONNECT_SECONDS", 2),
             interval_seconds=_positive_env("MICROSTRUCTURE_INTERVAL_SECONDS", 10),
             websocket_base=os.getenv(env_key, default_ws).rstrip("/"),
-            depth_speed_ms=depth_speed_ms if depth_speed_ms in (100, 1000) else 100,
+            depth_speed_ms=depth_speed_ms,
             bootstrap_retries=_positive_env("MICROSTRUCTURE_BOOTSTRAP_RETRIES", 3),
         )
 
@@ -171,58 +185,22 @@ class BinanceSpotDepthCapture:
 
     async def _run_connection(self, session: aiohttp.ClientSession) -> None:
         # Depth stream speed is configurable via MICROSTRUCTURE_DEPTH_SPEED_MS
-        # (100ms = canonical exact-feed; 1000ms = 10x bootstrap headroom,
-        # may reduce exact-feed quality). The default stays 100ms; switching
-        # to 1000ms is a deployment-level trade-off, not an autodetect.
+        # (futures: 100ms exact / 500ms stable; spot: 100ms / 1000ms).
         stream = f"{self.settings.symbol.lower()}@depth@{self.settings.depth_speed_ms}ms"
         url = f"{self.settings.websocket_base}/{stream}"
         async with session.ws_connect(url, heartbeat=20, receive_timeout=60) as ws:
             await self._status("connected")
-            buffered: list[DepthDelta] = []
-            while not buffered:
-                delta = await self._receive_delta(ws)
-                if delta is not None:
-                    buffered.append(delta)
-            # Drain the WS into a side channel WHILE bootstrap is in
-            # flight. The snapshot REST call takes ~200ms; at 100ms stream
-            # cadence that means 2–3 deltas land in aiohttp's receive
-            # buffer during bootstrap. Without draining them, the next
-            # ``async for message in ws`` picks them up out-of-order
-            # (sequence gap from the snapshot) and raises BookGapError.
-            # Use a stop_event (not cancel) so the drain task finishes
-            # any in-flight message before exiting — cancelling mid-put
-            # would lose the message.
-            drain_queue: asyncio.Queue[DepthDelta | None] = asyncio.Queue()
-            drain_stop = asyncio.Event()
-            drain_task = asyncio.create_task(
-                self._drain_ws_into_queue(ws, drain_queue, drain_stop),
-                name="bootstrap-drain",
-            )
-            try:
-                await self._bootstrap(buffered, drain_queue)
-            finally:
-                drain_stop.set()
-                try:
-                    await drain_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            # Pull whatever the drain task accumulated; these are deltas
-            # that arrived during bootstrap and must be applied to the
-            # live book BEFORE we resume the main loop (otherwise the
-            # main loop picks them up with a gap).
-            post_bootstrap: list[DepthDelta] = []
-            while True:
-                try:
-                    delta = drain_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if delta is not None:
-                    post_bootstrap.append(delta)
-            for delta in post_bootstrap:
-                await self._apply_and_publish(delta)
-                self._record_success()
-            for delta in buffered:
-                await self._apply_and_publish(delta)
+            # Single-receiver bootstrap. The previous design ran a concurrent
+            # ``_drain_ws_into_queue`` task against the SAME websocket while
+            # the main loop awaited on it — aiohttp does not support two
+            # concurrent receivers, and on SOL-USDT perps at 100ms cadence
+            # that race silently dropped deltas, guaranteeing the
+            # ``first_update_id > last_update_id + 1`` BookGapError on every
+            # reconnect → the stuck "waiting" cycle seen in production.
+            # Now exactly ONE task reads the socket: first the bootstrap
+            # (snapshot-first with the canonical straddle rule), then this
+            # main loop. No side channel, no queue, no drops.
+            await self._bootstrap(ws)
             await self._status("running")
             async for message in ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
@@ -233,44 +211,6 @@ class BinanceSpotDepthCapture:
                 if delta is not None:
                     await self._apply_and_publish(delta)
                     self._record_success()
-
-    async def _drain_ws_into_queue(
-        self, ws: aiohttp.ClientWebSocketResponse,
-        queue: asyncio.Queue[DepthDelta | None],
-        stop_event: asyncio.Event,
-    ) -> None:
-        """Background pump: push WS deltas into ``queue`` until ``stop_event`` set.
-
-        Used during bootstrap to capture deltas that arrive while the
-        snapshot REST call is in flight. Honours ``stop_event`` between
-        iterations so an in-flight ``ws.receive`` completes its message
-        and the delta lands on the queue BEFORE the task exits — the
-        caller drains the queue after the task returns. Cancelling
-        mid-message would lose the delta and create the exact sequence
-        gap this whole path exists to prevent.
-        """
-        pumped = 0
-        try:
-            while not stop_event.is_set():
-                msg = await ws.receive()
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    delta = self._decode_delta(msg.data)
-                    if delta is not None:
-                        await queue.put(delta)
-                        pumped += 1
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    return
-                # PING/PONG etc. → continue without queueing.
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            return
-        finally:
-            if pumped:
-                log.info(
-                    "drain %s: pumped=%d remaining_queue=%d",
-                    self.settings.symbol, pumped, queue.qsize(),
-                )
 
     async def _receive_delta(self, ws: aiohttp.ClientWebSocketResponse) -> DepthDelta | None:
         message = await ws.receive()
@@ -290,162 +230,147 @@ class BinanceSpotDepthCapture:
         self.messages += 1
         return delta
 
-    async def _bootstrap(
-        self,
-        buffered: list[DepthDelta],
-        drain_queue: asyncio.Queue[DepthDelta | None] | None = None,
-    ) -> None:
-        """Apply Binance's snapshot/diff bridging rule, draining the buffer.
+    async def _bootstrap(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Snapshot-first, single-receiver sync with the canonical straddle rule.
 
-        The snapshot/diff protocol guarantees: every buffered delta that
-        arrives AFTER the snapshot is applied in arrival order; the orderbook
-        itself validates continuity (``first_update_id > last_update_id + 1``
-        → BookGapError). This means a snapshot whose lastUpdateId is older
-        than the head buffered delta does NOT require a single delta to
-        "bridge" ``snapshot_id + 1`` — any gap will surface naturally as we
-        try to apply.
+        The socket is ALREADY connected and THIS method + the main loop are
+        the ONLY two receivers over its lifetime — never two at once (the
+        previous concurrent drain task was the root cause of the perpetual
+        BookGapError / reconnecting loop).
 
-        ``drain_queue`` (optional) carries deltas that the run-loop's
-        background pump is pushing in while the snapshot REST call is in
-        flight. The bootstrap pulls them in arrival order after each
-        attempt; if any breaks continuity, the attempt fails and the
-        remaining deltas are kept for the next snapshot.
+        Sync protocol (canonical Binance diff-depth):
 
-        Behaviour per attempt:
+          1. Fetch the REST snapshot FIRST. Deltas that arrive while the
+             snapshot request is in flight are held in arrival order inside
+             aiohttp's single websocket reader — nothing races them away.
+          2. Read deltas from the socket. Skip anything fully inside the
+             snapshot (``final_update_id <= snapshot_id`` — already
+             reflected in the snapshot state, kept only in the raw ledger).
+          3. The first delta whose range extends past the snapshot id is the
+             BRIDGE — Binance guarantees contiguity, so it must straddle
+             ``snapshot_id + 1`` (``first_update_id <= snapshot_id + 1``).
+             Apply it as the bridge; the book is now live. If instead it
+             starts past the bridge point (``first > snapshot_id + 1``) the
+             stream raced ahead of our snapshot — the bridge was lost and we
+             retry with a FRESH snapshot.
 
-          1. Fetch snapshot; if ``snapshot_id < buffered[0].first_update_id``
-             the snapshot is too old, retry.
-          2. Bootstrap the local book from the snapshot.
-          3. Apply every buffered delta in arrival order (and any
-             drain-queue deltas already accumulated). If any delta
-             breaks the sequence (gap), the orderbook raises BookGapError;
-             we abandon this attempt, take a fresh snapshot, retry.
-          4. If all deltas apply cleanly, the book is live; any deltas
-             older than the snapshot are discarded (their updates are
-             already reflected in the snapshot state).
-
-        This collapses the previous "single-delta bridge" heuristic which
-        forced a retry whenever the snapshot landed between buffered
-        update ranges — a near-certainty on SOL-USDT perps at 100ms.
+        Retries are bounded by ``bootstrap_retries``; exhausting them raises
+        BookGapError (which the reconnect loop handles).
         """
-        first = buffered[0]
         attempts = max(1, self.settings.bootstrap_retries)
-        async with Binance() as client:
-            for attempt in range(attempts):
-                t0 = time.monotonic()
-                if self.settings.venue == "futures":
-                    snapshot = await client.fut_book(self.settings.symbol, limit=self.settings.snapshot_levels)
-                else:
-                    snapshot = await client.spot_book(self.settings.symbol, limit=self.settings.snapshot_levels)
-                bootstrap_fetch_ms = int((time.monotonic() - t0) * 1000)
-                snapshot_id = int(snapshot["lastUpdateId"])
-                queued_at_arrival = len(buffered)
-                # Drain any background-queued deltas that landed during
-                # the snapshot fetch. These are the source of the chronic
-                # BookGapError loop at high stream velocity.
-                drained: list[DepthDelta] = []
-                if drain_queue is not None:
-                    while True:
-                        try:
-                            d = drain_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                        if d is not None:
-                            drained.append(d)
-                # Orderbook bootstrap from snapshot.
-                if snapshot_id < first.first_update_id:
-                    log.info(
-                        "bootstrap %s attempt %d: snapshot_id=%d < buffered[0].first=%d, "
-                        "fetch_ms=%d queued=%d drained=%d — retrying",
-                        self.settings.symbol, attempt + 1,
-                        snapshot_id, first.first_update_id,
-                        bootstrap_fetch_ms, queued_at_arrival, len(drained),
-                    )
-                    buffered.extend(drained)
+        # WS-owned client: this is the ONLY path the capture uses to touch
+        # Binance (frame stream + REST snapshot cut). It does not reuse the
+        # poller/analysis REST client — that has point-in-time-slice semantics
+        # and must NOT be the authority for a WS tape bootstrap.
+        ws_client = BinanceWebSocket(venue=self.settings.venue, depth_speed_ms=self.settings.depth_speed_ms)
+        for attempt in range(attempts):
+            t0 = time.monotonic()
+            snapshot: DepthSnapshot = await ws_client.fetch_snapshot(
+                self.settings.symbol, levels=self.settings.snapshot_levels,
+            )
+            bootstrap_fetch_ms = int((time.monotonic() - t0) * 1000)
+            snapshot_id = snapshot.update_id
+            # Reset (or first-build) the live book from the REST cut.
+            self._book = OrderBookReconstructor(self.settings.symbol, self.settings.venue)
+            self._book.bootstrap(
+                {"lastUpdateId": snapshot.update_id, "bids": snapshot.bids, "asks": snapshot.asks},
+                received_ts_ms=int(time.time() * 1000),
+            )
+            bridge_lost = False
+            while True:
+                delta = await self._receive_delta(ws)
+                if delta is None:
                     continue
-                self._book = OrderBookReconstructor(self.settings.symbol, self.settings.venue)
-                quote = self._book.bootstrap(snapshot, received_ts_ms=int(time.time() * 1000))
-                applied = 0
-                last_applied_id = snapshot_id
-                sequence_failed = False
-                try:
-                    # Apply pre-bootstrap buffered deltas first.
-                    for d in buffered:
-                        if d.final_update_id <= snapshot_id:
-                            continue
-                        self._book.apply(d)
-                        applied += 1
-                        last_applied_id = d.final_update_id
-                    # Then apply the deltas that landed during the snapshot
-                    # fetch. If any one breaks the sequence, BookGapError
-                    # surfaces naturally — no silent skip.
-                    for d in drained:
-                        if d.final_update_id <= last_applied_id:
-                            continue
-                        self._book.apply(d)
-                        applied += 1
-                        last_applied_id = d.final_update_id
-                except BookGapError:
-                    sequence_failed = True
-                if sequence_failed:
-                    head_velocity_ids_per_sec = (
-                        max(0, last_applied_id - snapshot_id)
-                        / max(0.001, time.monotonic() - t0)
-                    )
-                    log.info(
-                        "bootstrap %s attempt %d: BookGapError after %d/%d buffered, "
-                        "fetch_ms=%d queued=%d drained=%d applied=%d head_velocity≈%.0f id/s",
-                        self.settings.symbol, attempt + 1,
-                        applied, len(buffered) + len(drained), bootstrap_fetch_ms,
-                        queued_at_arrival, len(drained), applied, head_velocity_ids_per_sec,
-                    )
-                    self._book = None
-                    # Drop everything we successfully applied; keep what's
-                    # left (the gap tail) so the next snapshot can bridge.
-                    kept = buffered[applied:] + drained
-                    buffered[:] = [d for d in kept if d.final_update_id > snapshot_id]
-                    continue
-                # All buffered + drained deltas applied cleanly.
-                if self._book.last_quote is not None:
-                    await self.store.set_microstructure_book(
+                if delta.final_update_id <= snapshot_id:
+                    # Already inside the snapshot; keep raw evidence only.
+                    await self.store.publish_microstructure_delta(
                         self.settings.venue, self.settings.symbol,
-                        self._book.last_quote.to_dict(),
+                        delta.to_dict(), maxlen=self.settings.stream_maxlen,
                     )
+                    continue
+                if self.settings.venue == "futures":
+                    # Futures frames are non-contiguous in ID space; the
+                    # bridge is the first frame that STRADDLES the snapshot:
+                    # its ``pu`` (prev frame's final u) is at-or-before the
+                    # snapshot AND its own range extends at-or-past it
+                    # (pu <= S <= u). The frame's absolute-quantity levels
+                    # are the complete state as of ``u`` — applying it
+                    # makes the local book live. A frame whose pu <= S but
+                    # whose OWN u <= S is STILL fully inside the snapshot
+                    # (its levels predate the snapshot state) and must be
+                    # skipped like a spot inside-frame, NOT bridged.
+                    pu = delta.previous_update_id
+                    if pu is not None and delta.final_update_id <= snapshot_id:
+                        # Actually fully inside snapshot; keep raw only.
+                        await self.store.publish_microstructure_delta(
+                            self.settings.venue, self.settings.symbol,
+                            delta.to_dict(), maxlen=self.settings.stream_maxlen,
+                        )
+                        continue
+                    bridge_ok = (
+                        pu is not None
+                        and pu <= snapshot_id
+                        and delta.final_update_id > snapshot_id
+                    )
+                    if not bridge_ok:
+                        # pu > S: the stream head raced past the snapshot.
+                        bridge_lost = True
+                        break
+                else:
+                    # Spot: the bridge must straddle snapshot_id + 1.
+                    if delta.first_update_id > snapshot_id + 1:
+                        bridge_lost = True
+                        break
+                    bridge_ok = True
+                # Bridge: the straddling delta. Applying it makes the
+                # local book continuous with the live stream.
+                log.info(
+                    "bootstrap %s bridge: snapshot_id=%d delta U=%d u=%d pu=%s",
+                    self.settings.symbol, snapshot_id,
+                    delta.first_update_id, delta.final_update_id,
+                    delta.previous_update_id,
+                )
+                await self._apply_and_publish(delta, bridging=True)
+                self._record_success()
                 head_velocity_ids_per_sec = (
-                    max(0, last_applied_id - snapshot_id)
+                    max(0, self._book.last_update_id - snapshot_id)
                     / max(0.001, time.monotonic() - t0)
                 )
-                drained_id_range = (
-                    f"{drained[0].first_update_id}..{drained[-1].final_update_id}"
-                    if drained else "n/a"
-                )
                 log.info(
-                    "bootstrap %s succeeded attempt %d: fetch_ms=%d queued=%d "
-                    "drained=%d (ids=%s) applied=%d head_velocity≈%.0f id/s "
-                    "snapshot_id=%d book_id=%d",
-                    self.settings.symbol, attempt + 1,
-                    bootstrap_fetch_ms, queued_at_arrival, len(drained),
-                    drained_id_range, applied, head_velocity_ids_per_sec,
-                    snapshot_id, self._book.last_update_id,
+                    "bootstrap %s bridged at attempt %d: snapshot_id=%d "
+                    "book_id=%d fetch_ms=%d head_velocity≈%.0f id/s",
+                    self.settings.symbol, attempt + 1, snapshot_id,
+                    self._book.last_update_id, bootstrap_fetch_ms,
+                    head_velocity_ids_per_sec,
                 )
-                # Anything older than the snapshot is now redundant; the
-                # caller will re-publish what remains in ``buffered`` (deltas
-                # newer than the snapshot that we already applied to the
-                # book here). The drain-queue deltas the caller didn't yet
-                # pull (none in the normal path — bootstrap drains all) go
-                # back through the caller's queue-pump below.
-                buffered[:] = [d for d in buffered if d.final_update_id > snapshot_id]
                 return
+            if bridge_lost:
+                self._book = None
+                log.info(
+                    "bootstrap %s attempt %d: bridge lost (snapshot_id=%d, "
+                    "next delta started past it) fetch_ms=%d — retrying",
+                    self.settings.symbol, attempt + 1, snapshot_id,
+                    bootstrap_fetch_ms,
+                )
+                continue
         raise BookGapError("could not bootstrap local order book")
 
-    async def _apply_and_publish(self, delta: DepthDelta) -> None:
+    async def _apply_and_publish(
+        self, delta: DepthDelta, *, bridging: bool = False,
+    ) -> None:
+        """Apply a frame to the live book, then publish all evidence.
+
+        ``bridging`` is the bootstrap splice: the straddle frame starts
+        before the REST cut (U < S) — a legitimate rewind, not an
+        out-of-order arrival. Only the bootstrap path may set it.
+        """
         await self.store.publish_microstructure_delta(
             self.settings.venue, self.settings.symbol, delta.to_dict(), maxlen=self.settings.stream_maxlen,
         )
         if self._book is None:
             return
         try:
-            event = self._book.apply(delta)
+            event = self._book.apply(delta, bridging=bridging)
         except BookGapError:
             self.gaps += 1
             await self._status("gap", error="depth sequence gap")

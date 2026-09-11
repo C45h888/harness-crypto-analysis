@@ -10,6 +10,11 @@ Citation rule: every numeric claim in an interpretation MUST name the tool
 and the field path it came from (e.g. `micro.fit_beta → price_impact_fit.beta`).
 Uncited numeric claims are contract violations.
 
+NOTE: budgets (tool rounds / LLM turns / per-round call cap) are NOT stated
+here — the engine injects the live numbers from `engine/config.py` at
+runtime (`build_output_format`). Stating them here statically went stale the
+moment `config.py` moved; the model must read the injected numbers.
+
 ## T1 — Microstructure tools (paper stack)
 
 ### `micro.capture_status`
@@ -66,8 +71,9 @@ A FINAL turn (`tool_calls=[]`, phase P6) is rejected for repair unless P1+P2+P3+
 all have ≥1 executed tool, a P6 synthesis turn was declared, `hypothesis.H0` is set,
 `summary` is ≥200 chars (the P4 why-now explanation), `confidence` is low|medium|high,
 every evidence entry carries a non-empty `interpretation`, and `evidence` cites ≥2 distinct roots
-including ≥1 fresh tool result plus a `calc.price.delta → …` ΔP path. Budgets: 5 tool rounds (≤3 calls each),
-8 LLM turns per cycle.
+including ≥1 fresh tool result plus a `calc.price.delta → …` ΔP path. Round
+budgets are injected by the engine at runtime (see the NOTE above) — do not
+assume a fixed count from this document.
 
 The two fitted models are NEVER merged. Call OFI and AD as SEPARATE tools,
 then join via `calc.observation.build`. The combined formula is a derived

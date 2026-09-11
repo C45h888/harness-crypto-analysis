@@ -1,6 +1,14 @@
 """
 Direct async REST client for Binance public market data.
 
+SEMANTIC JURISDICTION: **REST-only.** This module owns the point-in-time
+slice model for the 5s poller and analysis — a *cut* (``lastUpdateId`` is a
+snapshot id, not a tape cursor). It does NOT own the WS depth tape; that
+lives in :mod:`market_service.clients.websocket` (ordered event tape,
+non-contiguous U-space, pu-chaining). Do NOT use this module from the WS
+capture to reason about frame continuity; the WS capture uses the WS-owned
+surface (:class:`BinanceWebSocket` + :class:`DepthSnapshot`).
+
 Bypasses both `binance-sdk-spot` and `binance-sdk-derivatives-trading-usds-futures`
 because their methods return synchronous ApiResponse wrappers that are NOT
 directly awaitable from async code (would raise
@@ -220,7 +228,7 @@ class Binance:
     # ---------- spot ----------
 
     async def spot_book(self, symbol: str, limit: int = 50) -> dict:
-        """L2 orderbook. Returns `{lastUpdateId, bids: [[p,q],...], asks: [[p,q],...]}`."""
+        """L2 orderbook (REST point-in-time slice)."""
         self._require_symbol(symbol, "spot_book")
         return await self._spot._get("/api/v3/depth", weight=_depth_weight(limit),
                                      symbol=symbol, limit=limit)
@@ -294,7 +302,7 @@ class Binance:
     # ---------- futures (USD-M) ----------
 
     async def fut_book(self, symbol: str, limit: int = 50) -> dict:
-        """L2 orderbook snapshot. `lastUpdateId` field is camelCase."""
+        """L2 orderbook snapshot (REST point-in-time slice)."""
         self._require_symbol(symbol, "fut_book")
         return await self._fut._get("/fapi/v1/depth", weight=_depth_weight(limit),
                                     symbol=symbol, limit=limit)

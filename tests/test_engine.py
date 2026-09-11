@@ -348,6 +348,62 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
         self.assertIsNotNone(artifact.interpretation)
 
+    async def test_scenario_verdict_without_agent_hypothesis(self):
+        # Live-proven shape: budget spent, agent formed no H0/H1, scenario
+        # given. The verdict must still come from the deterministic tool
+        # payload (here: never evaluated) — never the generic fallback.
+        final = {
+            "phase": "P6", "tool_calls": [],
+            "summary": "x" * 250,
+            "evidence": [
+                {"path": "calc.price.delta → route_a_direct.delta_ticks",
+                 "value": "0.02", "interpretation": "derived ΔP"},
+                {"path": "calc.scenario.evaluate → exceedance",
+                 "value": "none", "interpretation": "tool never called"},
+                {"path": "memory.recall_paper → fact",
+                 "value": "linear impact", "interpretation": "paper grounding"},
+            ],
+            "confidence": "low", "limitations": ["thin tape"],
+            "model_separation": "beta and c/lambda read separately",
+            "hypothesis": None,
+            "scenario": {
+                "target_price": "100.50", "horizon": "15m", "direction": "up",
+                "required_ofi": "50000", "exceedance": "0",
+                "fit_status": "provisional", "n_windows_usable": 61,
+                "probability": "low", "verdict": "not_reachable",
+                "rationale": ("required flow far outside the observed regime on a "
+                                "provisional fit over 61 usable windows; r2 0.04"),
+            },
+        }
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _staged_narration("P1", tools=[
+                {"name": "calc.ofi.intervals", "args": {}},
+            ]),
+            _staged_narration("P2", tools=[
+                {"name": "calc.depth.average", "args": {}},
+                {"name": "market.derivatives", "args": {}},
+            ]),
+            _staged_narration("P5", tools=[
+                {"name": "memory.recall_paper", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "10"}},
+            ]),
+            json.dumps(final),
+            json.dumps(final),
+            json.dumps(final),
+            json.dumps(final),
+            json.dumps(final),
+        ])
+        scenario = {"target_price": "100.50", "horizon": "15m"}
+        artifact, meta = await engine.run_cycle(
+            _wake(), {"decision": "fire"}, scenario=scenario)
+        self.assertEqual(meta["llm_calls"], 8)
+        self.assertFalse(meta["final_validation"]["passed"])
+        self.assertEqual(artifact.hypothesis_verdict, "inconclusive")
+        self.assertIn("scenario unevaluated", artifact.verdict_reason)
+        self.assertIn("agent formed no H0/H1", artifact.verdict_reason)
+        self.assertNotIn("calculations split but hypothesis implicit",
+                         artifact.verdict_reason)
+
     async def test_narration_failure_produces_degraded_artifact(self):
         # LLM raises on the first call → degraded artifact, NULL interpretation,
         # deterministic state preserved, PG+Redis persisted.

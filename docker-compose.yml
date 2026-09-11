@@ -114,6 +114,7 @@ services:
       MICROSTRUCTURE_SNAPSHOT_LEVELS: ${MICROSTRUCTURE_SNAPSHOT_LEVELS:-1000}
       MICROSTRUCTURE_RECONNECT_SECONDS: ${MICROSTRUCTURE_RECONNECT_SECONDS:-2}
       MICROSTRUCTURE_INTERVAL_SECONDS: ${MICROSTRUCTURE_INTERVAL_SECONDS:-10}
+      MICROSTRUCTURE_DEPTH_SPEED_MS: ${MICROSTRUCTURE_DEPTH_SPEED_MS:-500}
       BINANCE_SPOT_WS_BASE: ${BINANCE_SPOT_WS_BASE:-wss://stream.binance.com:9443/ws}
       BINANCE_FUTURES_WS_BASE: ${BINANCE_FUTURES_WS_BASE:-wss://fstream.binance.com/ws}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -123,61 +124,16 @@ services:
     profiles: ["microstructure"]
     restart: unless-stopped
 
-  # Inference is invoked ONLY from the CLI surfaces (the interaction plane):
-  #   docker compose --profile tools run --rm harness SOLUSDT --inference --inference-force --task "..." --json
-  #   docker compose --profile tools run --rm nooa market inference run SOLUSDT --force --task "..."
-  # The autonomous wake-worker `nooa` service was removed: it fired on data
-  # predicates with no directing question, so task-directed one-shots are
-  # the only invocation model.
-  # One-shot outer harness — the READ/INTERPRET surface. It reads worker
-  # state and the canonical ledger; it never computes and never invokes
-  # workers (the calculation container owns every fire — see below). Use via:
-  #   docker compose --profile tools run --rm harness SOLUSDT --substrate-read --json
-  #   docker compose --profile tools run --rm harness SOLUSDT --inference --inference-force --task "..." --json
-  harness:
+  # OOAgent container — the interaction plane inside docker. The OO
+  # inference engine (market_service.nooa_harness.engine.InferenceEngine)
+  # lives here and completes all task-directed cycles + artifact reads.
+  # One-shot; the wake plane was retired. Use via:
+  #   docker compose --profile tools run --rm ooagent market inference run SOLUSDT --force --task "..."
+  #   docker compose --profile tools run --rm ooagent market read SOLUSDT
+  # Worker fire-ticks (substrate.* tools) require `--profile substrates up -d calculation`.
+  ooagent:
     build: .
-    image: crypto-ai-anal-harness:latest
-    user: "marketflow"
-    entrypoint: ["python", "-m", "market_service.commands.harness"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
-      REDIS_URL: redis://redis:6379/0
-      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
-      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
-      MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
-      # --inference dispatches substrate.* tools to the calculation plane.
-      # Requires `--profile substrates up -d calculation`.
-      CALC_CONTROL_URL: ${CALC_CONTROL_URL:-http://calculation:8041}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      NOOA_MODEL_PROVIDER: ${NOOA_MODEL_PROVIDER:-openai}
-      NOOA_MODEL_NAME: ${NOOA_MODEL_NAME:-}
-      NOOA_MODEL_BASE_URL: ${NOOA_MODEL_BASE_URL:-}
-      NOOA_MODEL_TEMPERATURE: ${NOOA_MODEL_TEMPERATURE:-0.2}
-      NOOA_API_KEY: ${NOOA_API_KEY:-}
-      PROVIDER: ${PROVIDER:-}
-      PROVIDER_API_KEY: ${PROVIDER_API_KEY:-}
-      PROVIDER_BASE_URL: ${PROVIDER_BASE_URL:-}
-      NOOA_SESSION_ID: ${NOOA_SESSION_ID:-}
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      db-init:
-        condition: service_completed_successfully
-    profiles: ["tools"]
-    restart: "no"
-
-  # One-shot NOOA CLI — the interaction plane inside docker. Task-directed
-  # inference + artifact/memory/microstructure reads. Use via:
-  #   docker compose --profile tools run --rm nooa market inference run SOLUSDT --force --task "..."
-  #   docker compose --profile tools run --rm nooa market read SOLUSDT
-  nooa:
-    build: .
-    image: crypto-ai-anal-nooa:latest
+    image: crypto-ai-anal-ooagent:latest
     user: "marketflow"
     entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
     env_file:

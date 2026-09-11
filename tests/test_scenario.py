@@ -166,8 +166,11 @@ class ScenarioSemanticsTests(unittest.TestCase):
                 "target_price": "100.50", "horizon": "15m", "direction": "up",
                 "required_ofi": "50000", "required_ofi_range": None,
                 "exceedance": "0", "exceedance_range": None,
-                "probability": "low", "verdict": "not_reachable",
-                "rationale": "required flow outside observed regime",
+                "fit_status": "provisional", "n_windows_usable": 61,
+                "r2": "0.042", "probability": "low", "verdict": "not_reachable",
+                "rationale": ("required flow 50000 sits far outside the observed "
+                                "regime on a provisional fit (r2 0.042) over 61 usable "
+                                "15m windows; verdict reads not-reachable on this tape"),
             },
         }
         base.update(over)
@@ -203,6 +206,19 @@ class ScenarioSemanticsTests(unittest.TestCase):
         self.assertTrue(any("scenario block" in m for m in missing))
         self.assertTrue(any("TWO hypotheses" in m for m in missing))
         self.assertTrue(any("calc.scenario.evaluate" in m for m in missing))
+
+    def test_scenario_missing_context_echoes_and_thin_rationale(self):
+        from market_service.nooa_harness.engine import _validate_final_turn
+        scen = dict(self._final()["scenario"])
+        del scen["fit_status"]
+        del scen["n_windows_usable"]
+        scen["rationale"] = "too thin"
+        passed, missing = _validate_final_turn(
+            self._final(scenario=scen), self._coverage(), scenario=self.SCEN)
+        self.assertFalse(passed)
+        self.assertTrue(any("scenario.fit_status" in m for m in missing))
+        self.assertTrue(any("scenario.n_windows_usable" in m for m in missing))
+        self.assertTrue(any("scenario.rationale" in m for m in missing))
 
     def test_scenario_bad_verdict_and_probability(self):
         from market_service.nooa_harness.engine import _validate_final_turn
@@ -288,6 +304,41 @@ class ScenarioRegistryTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(log["result"], "ok")
         self.assertEqual(log["detail"]["status"], "refused")
+
+    def test_derivatives_price_fallback(self):
+        # Collated snapshot absent + derivatives funding.mark_price present:
+        # price resolution must pass (failure moves downstream to the tape,
+        # never no_market_price).
+        import asyncio
+        from unittest.mock import patch
+
+        from market_service.nooa_harness.inference import dispatch as dispatch_mod
+
+        class _StubStore:
+            async def read_derivative_evidence(self, symbol):
+                return {"futures": {"funding": {"mark_price": "101.10"}}}
+
+            async def read_microstructure_events(self, venue, symbol):
+                return []
+
+        async def _fake_fit(store, symbol, venue, args, postgres=None):
+            return {"price_impact_fit": _fit().to_dict()}, {"result": "ok"}
+
+        async def _run():
+            with patch.object(dispatch_mod, "_tool_fit_beta", _fake_fit), \
+                 patch("market_service.runtime.read_paths.read_collated",
+                       return_value=None):
+                return await dispatch_mod.dispatch_calc_scenario_evaluate(
+                    _StubStore(), "SOLUSDT", "futures",
+                    target_price="102.00", horizon="15m",
+                    interval_seconds=10, window_minutes=30,
+                )
+
+        result, log = asyncio.run(_run())
+        self.assertIsNone(result)
+        self.assertEqual(log["detail"]["status"], "refused")
+        # Empty tape refusal proves the derivatives price resolved.
+        self.assertIn("no_intervals", log["detail"]["reason"])
 
 
 if __name__ == "__main__":
