@@ -85,6 +85,67 @@ from .narration import (
     validate_final_turn,
 )
 
+# --- Cycle controller (the loop's sole deterministic authority) ---
+from .controller import (
+    SCENARIO_TOOL,
+    CycleController,
+    ScenarioEvalStatus,
+    ToolOutcome,
+)
+# --- Loop states (Layer 1 of the agentic surface: the workflow) ---
+# The hierarchical workflow the agentic loop traverses. The old
+# AgentLoopFSM (LoopState / LoopEvent / AgentLoopFSM) was DELETED entirely;
+# its transition-table shape did not match the controller-ledger design and
+# it is superseded by this Layer-1 vocabulary. The governance membrane
+# (Layer 2) that OBSERVES (NestedLoop, TaskIntent) is a later pass.
+from .loop_states import (
+    AgenticStage,
+    NestedLoop,
+    SubLoop,
+    LoopStep,
+    TaskIntent,
+    LoopTerminal,
+    SubLoopSpec,
+    LoopObservation,
+    STAGE_ORDER,
+    STAGE_LOOP,
+    LOOP_STAGE,
+    LOOP_SUBLOOPS,
+    SUBLOOP_SPECS,
+    SUBLOOP_STEPS,
+    LOOP_STEPS,
+    PRIMARY_SUBLOOP,
+    INTENT_LOOP,
+    INTENT_SUBLOOP,
+    LOOP_INTENTS,
+    SUCCESS_TERMINALS,
+    FAILURE_TERMINALS,
+    loop_for_stage,
+    stage_for_loop,
+    sub_loops_for,
+    steps_for_sub_loop,
+    spec_for,
+    steps_for,
+    intents_for,
+    loop_for_intent,
+    sub_loop_for_intent,
+    primary_sub_loop,
+    iterating_sub_loops,
+)
+
+# --- Governance membrane (Layer 2: legality, engine/fsm.py) ---
+# The FSM is the primary governance membrane — a PURE DERIVATION of
+# loop_states. Authority flows fsm (legality) -> controller (semantics) ->
+# agent (proposals). GOVERNANCE_MEMBRANE is the canonical, frozen instance.
+from .fsm import (
+    AgenticLoopMembrane,
+    GovernanceEvent,
+    GovernanceEventKind,
+    MembraneVerdict,
+    GOVERNANCE_MEMBRANE,
+    FAILURE_EVENT_KINDS,
+)
+
 
 __all__ = [
     # top-level classes
@@ -127,6 +188,51 @@ __all__ = [
     "next_uncovered_phase",
     "scenario_verdict",
     "validate_final_turn",
+    # controller
+    "SCENARIO_TOOL",
+    "CycleController",
+    "ScenarioEvalStatus",
+    "ToolOutcome",
+    # loop states (Layer 1 — the workflow)
+    "AgenticStage",
+    "NestedLoop",
+    "SubLoop",
+    "LoopStep",
+    "TaskIntent",
+    "LoopTerminal",
+    "SubLoopSpec",
+    "LoopObservation",
+    "STAGE_ORDER",
+    "STAGE_LOOP",
+    "LOOP_STAGE",
+    "LOOP_SUBLOOPS",
+    "SUBLOOP_SPECS",
+    "SUBLOOP_STEPS",
+    "LOOP_STEPS",
+    "PRIMARY_SUBLOOP",
+    "INTENT_LOOP",
+    "INTENT_SUBLOOP",
+    "LOOP_INTENTS",
+    "SUCCESS_TERMINALS",
+    "FAILURE_TERMINALS",
+    "loop_for_stage",
+    "stage_for_loop",
+    "sub_loops_for",
+    "steps_for_sub_loop",
+    "spec_for",
+    "steps_for",
+    "intents_for",
+    "loop_for_intent",
+    "sub_loop_for_intent",
+    "primary_sub_loop",
+    "iterating_sub_loops",
+    # governance membrane (Layer 2 — legality)
+    "AgenticLoopMembrane",
+    "GovernanceEvent",
+    "GovernanceEventKind",
+    "MembraneVerdict",
+    "GOVERNANCE_MEMBRANE",
+    "FAILURE_EVENT_KINDS",
 ]
 
 

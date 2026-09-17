@@ -255,7 +255,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _staged_narration("P6", final=True),
         ])
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 4)
         self.assertTrue(meta["tool_round"])
         self.assertEqual(meta["repairs"], 0)
@@ -280,7 +280,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         engine, store, postgres, memory = _engine(
             llm_responses=[], capture_state="starting",
         )
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 0)
         self.assertEqual(artifact.status, "insufficient")
         self.assertIsNone(artifact.interpretation)
@@ -296,7 +296,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             llm_responses=[], capture_state="starting",
         )
         task = "is short-term sell pressure exhausting on BTCUSDT?"
-        artifact, meta = await engine.run_cycle(
+        artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task=task)
         self.assertEqual(meta["llm_calls"], 0)
         self.assertEqual(meta["task"], task[:200])
@@ -315,7 +315,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             llm_responses=[], capture_state="starting",
         )
         scenario = {"target_price": "245.30", "horizon": "1h"}
-        artifact, meta = await engine.run_cycle(
+        artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="can price hit 245.30?",
             scenario=scenario)
         self.assertEqual(meta["llm_calls"], 0)
@@ -323,7 +323,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.deterministic_state.get("scenario"), scenario)
         self.assertEqual(
             artifact.capability_log[0]["detail"]["scenario"], scenario)
-        plain, _ = await engine.run_cycle(_wake(), {"decision": "fire"})
+        plain, _ = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertIsNone(plain.deterministic_state.get("scenario"))
 
     async def test_thin_final_triggers_repair_then_finalizes(self):
@@ -342,7 +342,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _staged_narration("P6", final=True),
         ])
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 4)
         self.assertEqual(meta["repairs"], 1)
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
@@ -394,7 +394,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(final),
         ])
         scenario = {"target_price": "100.50", "horizon": "15m"}
-        artifact, meta = await engine.run_cycle(
+        artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, scenario=scenario)
         self.assertEqual(meta["llm_calls"], 8)
         self.assertFalse(meta["final_validation"]["passed"])
@@ -413,7 +413,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("gateway down")
 
         engine.llm.acall = _boom  # type: ignore[union-attr]
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 0)
         self.assertIsNone(artifact.interpretation)
         self.assertTrue(any(
@@ -424,7 +424,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unparseable_narration_is_degraded_not_fatal(self):
         engine, _s, postgres, _m = _engine(llm_responses=["no json here at all"])
-        artifact, _meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, _meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertIsNone(artifact.interpretation)
         self.assertTrue(any(
             "narration_parse_failed" in (e.get("error") or "")
@@ -456,7 +456,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _staged_narration("P6", final=True),
         ])
-        _artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        _artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         # GATHER phase contributes exactly one capture_status dispatch; the
         # tool round contributes capture_status + intervals + evidence (the
         # 4th requested call, micro.events, must be dropped by the cap).
@@ -476,7 +476,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _good_narration(with_tools=True),
             "unparseable",
         ])
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 2)
         self.assertIsNotNone(artifact.interpretation)
         # Parse failure mid-loop falls back without repair: the record is honest.
@@ -805,7 +805,7 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _staged_narration("P6", final=True),
         ])
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
         self.assertTrue(any(
             str(e.get("capability", "")).startswith("tool.error:")
@@ -877,7 +877,7 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _toolkey("P6", final=True),
         ])
-        artifact, meta = await engine.run_cycle(_wake(), {"decision": "fire"})
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertTrue(meta["final_validation"]["passed"],
                         meta["final_validation"])
         self.assertNotIn("tool.unknown",
@@ -926,6 +926,313 @@ class P3PromptContractTests(unittest.TestCase):
         self.assertIn("TWO-BEAT", fmt)
         self.assertIn("substrate.invoke", fmt)
         self.assertIn("age_ms", fmt)
+
+
+class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
+    """Spec docs/agentic-authority-spec.md §6 — the controller is the sole
+    authority over outcome classification, scenario tri-state, refusal
+    terminality, and repair steering. These tests pin the Vector-3 fix."""
+
+    def _refusal_log(self, reason: str = "insufficient_windows: 0 usable windows") -> dict:
+        from market_service.nooa_harness.inference import capability_log_entry
+        return capability_log_entry(
+            "calc.scenario.evaluate",
+            {"symbol": "BTCUSDT", "venue": "spot"},
+            "ok",
+            detail={"status": "refused", "reason": reason},
+        )
+
+    def _refused_final_turn(self, *, good_citation: bool = True) -> dict:
+        """A P6 final that (optionally) cites the refusal as a finding."""
+        evidence = [
+            {"path": "calc.price.delta → route_a_direct.delta_ticks",
+             "value": "0.02", "interpretation": "derived ΔP with band"},
+            {"path": "calc.ofi.intervals → ofi",
+             "value": "12.5", "interpretation": "tape flow"},
+            {"path": "memory.recall_paper → fact",
+             "value": "linear", "interpretation": "paper grounding"},
+        ]
+        if good_citation:
+            evidence.append({
+                "path": "calc.scenario.evaluate → refusal",
+                "value": None,
+                "interpretation": "tool refused deterministically: "
+                                  "insufficient windows on this tape",
+            })
+        return {
+            "phase": "P6", "tool_calls": [],
+            "summary": "x" * 250,
+            "evidence": evidence,
+            "confidence": "low",
+            "limitations": ["thin tape"],
+            "model_separation": "beta and c/lambda read separately",
+            "hypothesis": {
+                "H0": "target NOT reachable per deterministic refusal",
+                "H1": "target reachable would require flow outside regime",
+            },
+            "scenario": {
+                "target_price": "100.50", "horizon": "15m",
+                "probability": "low", "verdict": "unevaluable",
+                "rationale": "the scenario tool refused deterministically: "
+                             "insufficient windows — reachability undecided "
+                             "on this tape; H0 held by default",
+            },
+        }
+
+    def _coverage_all(self) -> dict[str, set[str]]:
+        return {
+            "P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
+            "P3": {"market.derivatives"}, "P4": set(),
+            "P5": {"calc.price.delta"}, "P6": {"declared"},
+        }
+
+    # --- validator: refusal-citation acceptance (spec test 1) ---
+
+    def test_refused_scenario_cited_as_finding_passes(self):
+        from market_service.nooa_harness.engine import (
+            ScenarioEvalStatus, validate_final_turn,
+        )
+        passed, missing = validate_final_turn(
+            self._refused_final_turn(), self._coverage_all(),
+            scenario={"target_price": "100.50", "horizon": "15m"},
+            scenario_status=ScenarioEvalStatus.REFUSED,
+            scenario_refusal_reason="insufficient_windows: 0 usable windows",
+        )
+        self.assertTrue(passed, missing)
+
+    def test_refused_scenario_with_reachable_verdict_fails(self):
+        # The LLM cannot declare reachable/not_reachable without tool data.
+        from market_service.nooa_harness.engine import (
+            ScenarioEvalStatus, validate_final_turn,
+        )
+        turn = self._refused_final_turn()
+        turn["scenario"]["verdict"] = "not_reachable"
+        passed, missing = validate_final_turn(
+            turn, self._coverage_all(),
+            scenario={"target_price": "100.50", "horizon": "15m"},
+            scenario_status=ScenarioEvalStatus.REFUSED,
+            scenario_refusal_reason="insufficient_windows",
+        )
+        self.assertFalse(passed)
+        self.assertTrue(any("unevaluable" in m for m in missing))
+
+    def test_refused_scenario_without_refusal_citation_fails(self):
+        from market_service.nooa_harness.engine import (
+            ScenarioEvalStatus, validate_final_turn,
+        )
+        turn = self._refused_final_turn(good_citation=False)
+        passed, missing = validate_final_turn(
+            turn, self._coverage_all(),
+            scenario={"target_price": "100.50", "horizon": "15m"},
+            scenario_status=ScenarioEvalStatus.REFUSED,
+            scenario_refusal_reason="insufficient_windows",
+        )
+        self.assertFalse(passed)
+        self.assertTrue(any("refusal" in m for m in missing))
+
+    def test_legacy_call_path_unchanged(self):
+        # scenario_status=None → legacy behavior (evaluated/unknown branch).
+        from market_service.nooa_harness.engine import validate_final_turn
+        turn = self._refused_final_turn()
+        turn["scenario"]["verdict"] = "not_reachable"
+        turn["scenario"]["required_ofi"] = "50000"
+        turn["scenario"]["exceedance"] = "0"
+        turn["scenario"]["fit_status"] = "provisional"
+        turn["scenario"]["n_windows_usable"] = 61
+        passed, missing = validate_final_turn(
+            turn, self._coverage_all(),
+            scenario={"target_price": "100.50", "horizon": "15m"},
+        )
+        self.assertTrue(passed, missing)
+
+    # --- controller: classification + tri-state ---
+
+    def test_controller_classifies_refusal_and_state(self):
+        from market_service.nooa_harness.engine import (
+            CycleController, ScenarioEvalStatus,
+        )
+        controller = CycleController({"target_price": "100.50", "horizon": "15m"})
+        self.assertEqual(controller.scenario_state(), ScenarioEvalStatus.NOT_CALLED)
+        # record_outcome is ATOMIC: classification + credit in one step,
+        # returning the successor controller (immutable value semantics).
+        controller = controller.record_outcome(
+            "calc.scenario.evaluate", self._refusal_log(), None)
+        self.assertTrue(controller.outcomes[-1].refused)
+        self.assertEqual(controller.scenario_state(), ScenarioEvalStatus.REFUSED)
+        self.assertEqual(
+            controller.scenario_refusal_reason(),
+            "insufficient_windows: 0 usable windows")
+        # Refusal never credits coverage (atomic with classification).
+        self.assertEqual(controller.phase_coverage.get("P5"), frozenset())
+        self.assertTrue(controller.is_redundant("calc.scenario.evaluate"))
+
+    def test_controller_data_outcome_credits_and_evaluates(self):
+        from market_service.nooa_harness.engine import (
+            CycleController, ScenarioEvalStatus,
+        )
+        from market_service.nooa_harness.inference import capability_log_entry
+        controller = CycleController({"target_price": "100.50", "horizon": "15m"})
+        payload = {"exceedance": "0.4", "n_windows_usable": 61}
+        log_row = capability_log_entry(
+            "calc.scenario.evaluate", {}, "ok", detail={"status": "evaluated_ok"})
+        controller = controller.record_outcome(
+            "calc.scenario.evaluate", log_row, payload)
+        self.assertEqual(controller.scenario_state(), ScenarioEvalStatus.EVALUATED)
+        self.assertEqual(
+            controller.phase_coverage.get("P5"),
+            frozenset({"calc.scenario.evaluate"}))
+        self.assertFalse(controller.is_redundant("calc.scenario.evaluate"))
+
+    # --- steer synthesis (spec tests 3 + 4) ---
+
+    def test_not_called_steer_fires(self):
+        from market_service.nooa_harness.engine import CycleController
+        controller = CycleController({"target_price": "100.50", "horizon": "15m"})
+        steer = controller.scenario_steer()
+        self.assertIn("call calc.scenario.evaluate", steer)
+        self.assertIn("100.50", steer)
+
+    def test_refused_steers_citation_not_recall(self):
+        from market_service.nooa_harness.engine import CycleController
+        controller = CycleController({"target_price": "100.50", "horizon": "15m"})
+        # record_outcome returns the successor — rebind so the steer sees
+        # the refusal in the ledger (immutable value semantics).
+        controller = controller.record_outcome(
+            "calc.scenario.evaluate", self._refusal_log(), None)
+        steer = controller.scenario_steer()
+        self.assertIn("Do NOT re-call", steer)
+        self.assertIn("insufficient_windows", steer)
+        self.assertIn("→ refusal", steer)
+        self.assertIn("unevaluable", steer)
+
+    def test_no_scenario_no_steer(self):
+        from market_service.nooa_harness.engine import CycleController
+        self.assertEqual(CycleController(None).scenario_steer(), "")
+
+    # --- end-to-end: refused cycle converges without re-dispatch ---
+
+    async def test_e2e_refused_scenario_no_redispatch(self):
+        # Live-proven shape made correct: tool refuses → model's final cites
+        # the refusal → PASS on the first validation. No repair, no re-call.
+        from market_service.nooa_harness.engine import InferenceEngine
+
+        refusal = {
+            "capability": "calc.scenario.evaluate",
+            "scope": {}, "result": "ok",
+            "detail": {"status": "refused",
+                       "reason": "insufficient_windows: 0 usable windows"},
+        }
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _staged_narration("P1", tools=[
+                {"name": "calc.ofi.intervals", "args": {}}]),
+            _staged_narration("P2", tools=[
+                {"name": "calc.depth.average", "args": {}}]),
+            _staged_narration("P3", tools=[
+                {"name": "market.derivatives", "args": {}}]),
+            _staged_narration("P5", tools=[
+                {"name": "memory.recall_paper", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "10"}},
+                {"name": "calc.scenario.evaluate",
+                 "args": {"target_price": "100.50", "horizon": "15m"}},
+            ]),
+            json.dumps(self._refused_final_turn()),
+        ])
+        engine_run = engine
+        # The FakeStore dispatches scenario.evaluate generically (unknown →
+        # error); we need a deterministic refusal. Intercept execute_tool.
+        import market_service.nooa_harness.engine.core as core_mod
+
+        real_execute = core_mod.execute_tool
+
+        async def refusing_execute(store, name, args, **kwargs):
+            if name == "calc.scenario.evaluate":
+                return None, dict(refusal)
+            return await real_execute(store, name, args, **kwargs)
+
+        core_mod.execute_tool = refusing_execute
+        try:
+            artifact, meta = await engine_run.narrate_cycle(
+                _wake(), {"decision": "fire"},
+                scenario={"target_price": "100.50", "horizon": "15m"})
+        finally:
+            core_mod.execute_tool = real_execute
+        self.assertTrue(meta["final_validation"]["passed"],
+                        meta["final_validation"])
+        self.assertEqual(meta["repairs"], 0)
+        # Exactly ONE scenario.evaluate dispatch; no suppression needed.
+        scen_entries = [
+            e for e in artifact.capability_log
+            if e.get("capability") == "calc.scenario.evaluate"
+        ]
+        self.assertEqual(len(scen_entries), 1)
+        self.assertEqual(artifact.hypothesis_verdict, "inconclusive")
+        self.assertIn("unevaluated", artifact.verdict_reason)
+
+    async def test_e2e_redundant_redispatch_suppressed(self):
+        # Model re-calls the refused tool: controller suppresses structurally.
+        from market_service.nooa_harness.engine import InferenceEngine
+        import market_service.nooa_harness.engine.core as core_mod
+
+        refusal = {
+            "capability": "calc.scenario.evaluate",
+            "scope": {}, "result": "ok",
+            "detail": {"status": "refused", "reason": "thin tape"},
+        }
+        bad_final = self._refused_final_turn(good_citation=False)
+        good_final = self._refused_final_turn()
+        re_call = dict(good_final)
+        re_call["tool_calls"] = [
+            {"name": "calc.scenario.evaluate",
+             "args": {"target_price": "100.50", "horizon": "15m"}}]
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _staged_narration("P1", tools=[
+                {"name": "calc.ofi.intervals", "args": {}}]),
+            _staged_narration("P2", tools=[
+                {"name": "calc.depth.average", "args": {}}]),
+            _staged_narration("P3", tools=[
+                {"name": "market.derivatives", "args": {}}]),
+            _staged_narration("P5", tools=[
+                {"name": "memory.recall_paper", "args": {}},
+                {"name": "calc.price.delta", "args": {"ofi": "10"}},
+                {"name": "calc.scenario.evaluate",
+                 "args": {"target_price": "100.50", "horizon": "15m"}},
+            ]),
+            json.dumps(bad_final),    # final without refusal citation → repair
+            json.dumps(re_call),      # repair re-calls → suppressed, citation ok
+        ])
+        real_execute = core_mod.execute_tool
+
+        async def refusing_execute(store, name, args, **kwargs):
+            if name == "calc.scenario.evaluate":
+                return None, dict(refusal)
+            return await real_execute(store, name, args, **kwargs)
+
+        core_mod.execute_tool = refusing_execute
+        try:
+            artifact, meta = await engine.narrate_cycle(
+                _wake(), {"decision": "fire"},
+                scenario={"target_price": "100.50", "horizon": "15m"})
+        finally:
+            core_mod.execute_tool = real_execute
+        self.assertTrue(meta["final_validation"]["passed"],
+                        meta["final_validation"])
+        self.assertEqual(meta["repairs"], 1)
+        # ONE real dispatch + ONE suppressed entry — never two dispatches.
+        real = [e for e in artifact.capability_log
+                if e.get("capability") == "calc.scenario.evaluate"]
+        suppressed = [e for e in artifact.capability_log
+                      if str(e.get("capability", "")).startswith("tool.suppressed")]
+        self.assertEqual(len(real), 1)
+        self.assertEqual(len(suppressed), 1)
+
+    def test_next_action_semantics(self):
+        from market_service.nooa_harness.engine import CycleController
+        controller = CycleController(None)
+        self.assertEqual(
+            controller.next_action({"tool_calls": [{"name": "x", "args": {}}]}),
+            "dispatch")
+        self.assertEqual(controller.next_action({"tool_calls": []}), "validate")
+        self.assertEqual(controller.next_action({}), "validate")
 
 
 if __name__ == "__main__":

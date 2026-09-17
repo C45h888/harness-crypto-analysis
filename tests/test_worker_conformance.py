@@ -47,7 +47,7 @@ _BANNED_TARGETS = (
 
 def _worker_files() -> list[Path]:
     return sorted(p for p in WORKER_DIR.glob("*_worker.py")
-                  if p.name not in ("core.py",))
+                  if p.name not in ("pi",))
 
 
 def _module_imports(path: Path) -> list[str]:

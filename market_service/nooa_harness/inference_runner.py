@@ -126,7 +126,7 @@ async def run_inference_once(
                 "venue": venue,
                 "decision": {"source": "none", "reason": "no envelope and not forced"},
             }
-        artifact, cycle_meta = await engine.run_cycle(
+        artifact, cycle_meta = await engine.narrate_cycle(
             wake, wake_meta, task=task, scenario=scenario)
         return {
             "status": artifact.status,

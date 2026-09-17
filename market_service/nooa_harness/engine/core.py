@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -54,11 +55,37 @@ from .config import (
     MAX_MEMORY_PROPOSALS,
     _PRIOR_HEADLINE_MAX_CHARS,
 )
+from .controller import CycleController
+from .fsm import (
+    GOVERNANCE_MEMBRANE,
+    GovernanceEvent,
+    GovernanceEventKind,
+    MembraneVerdict,
+)
 from .kb import SystemPromptCache, TURN_CONTRACT_LINE, build_output_format
 from .llm import call_narration_llm
+from .loop_states import (
+    NestedLoop,
+    SubLoop,
+    TaskIntent,
+)
 from .schemas import NarrationParseError
 
 log = logging.getLogger(__name__)
+
+
+# Phase-name -> intent for the GOVERNED OBSERVATION only. Phase coverage
+# credit stays exactly as-is (TOOL_PHASE, untouched); this binding merely
+# moves the membrane's observation intent to follow the phase the agent is
+# serving, so the governance surface sees intent, not P-ordinals.
+_PHASE_INTENT: dict[str, TaskIntent] = {
+    "P1": TaskIntent.INFER_ORDER_FLOW,
+    "P2": TaskIntent.INFER_DEPTH,
+    "P3": TaskIntent.CORRELATE_EVIDENCE,
+    "P4": TaskIntent.EXPLAIN_FINDINGS,
+    "P5": TaskIntent.DERIVE_HYPOTHESIS,
+    "P6": TaskIntent.SYNTHESIZE_OUTPUT,
+}
 
 
 def _utc_now_iso() -> str:
@@ -76,6 +103,77 @@ def _stable_session_id(symbol: str, venue: str) -> str:
     return str(uuid.uuid5(
         uuid.NAMESPACE_URL, f"inference-engine://{symbol.lower()}/{venue}",
     ))
+
+
+def _govern(
+    controller: CycleController,
+    kind: GovernanceEventKind,
+    target: Any = None,
+) -> tuple[CycleController, MembraneVerdict]:
+    """Govern ONE move through the membrane; NEVER raises.
+
+    Legal -> applied (controller advanced). Illegal because an open sub-loop
+    blocks ENTER_LOOP -> close first, retry. Still illegal -> the move is
+    DENIED and the observation is left unchanged: the constitution is
+    consulted, never guessed. Failure kinds route to their terminal through
+    ``CycleController.advance``.
+    """
+    event = GovernanceEvent(kind, target)
+    verdict = controller.govern(event)
+    if verdict.allowed:
+        return controller.advance(event), verdict
+    obs = controller.observation
+    if (
+        obs is not None
+        and obs.sub_loop is not None
+        and kind is GovernanceEventKind.ENTER_LOOP
+    ):
+        closed = controller.advance(
+            GovernanceEvent(GovernanceEventKind.CLOSE_SUBLOOP)
+        )
+        retry = closed.govern(event)
+        if retry.allowed:
+            return closed.advance(event), retry
+    return controller, verdict
+
+
+
+
+@dataclass(frozen=True)
+class _GatheredEvidence:
+    evidence: dict[str, Any] | None
+    gate_status: str
+    gate_reasons: list[str]
+    deterministic_state: dict[str, Any]
+    accumulated_tool_results: dict[str, Any]
+    tool_results: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ReasonedCycle:
+    parsed_first: dict[str, Any]
+    parsed_final: dict[str, Any]
+    llm_calls: int
+    tool_rounds_used: int
+    repairs_sent: int
+    finalize_now: bool
+    final_validation: dict[str, Any]
+    unexecuted: list[str]
+    tool_results: dict[str, Any]
+
+
+@dataclass
+class _CycleContext:
+    """Per-invocation handoffs, never an alternative governance authority."""
+
+    wake: WakeEnvelope
+    task: str | None
+    scenario: dict[str, Any] | None
+    generated_at: str
+    controller: CycleController
+    capability_log: list[dict[str, Any]]
+    gathered: _GatheredEvidence | None = None
+    reasoned: _ReasonedCycle | None = None
 
 
 class InferenceEngine:
@@ -365,12 +463,20 @@ class InferenceEngine:
     # The cycle
     # ------------------------------------------------------------------
 
-    async def run_cycle(
+    async def narrate_cycle(
         self, wake: WakeEnvelope, wake_meta: dict[str, Any],
         task: str | None = None,
         scenario: dict[str, Any] | None = None,
     ) -> tuple[InferenceArtifact, dict[str, Any]]:
-        """One full inference cycle. Returns (artifact, cycle_meta).
+        """One narration cycle — READ-PLANE, envelope-driven.
+
+        The controller receives the envelope (task, scenario, wake identity)
+        and hands it to the agent via narrate#1. The agent then reads as it
+        pleases through the tool base — calc.*/substrate.*/market.*/memory.*
+        read tools — to complete its task; the controller classifies every
+        outcome and the loop persists the artifact. NO deterministic spine is
+        pre-computed here; only the two pre-gate reads serving the zero-token
+        gate contract precede narration.
 
         ``task`` is the interactive-plane directive: a free-text trade
         hypothesis / question from the harness caller (``harness.py --task``
@@ -385,6 +491,20 @@ class InferenceEngine:
         on ``deterministic_state["scenario"]`` and echoed in the prompt so
         Phase 3 semantics can evaluate it via ``calc.scenario.evaluate``.
         """
+        ctx = self._stage_wake(wake, wake_meta, task, scenario)
+        completed = await self._stage_gather(ctx)
+        if completed is not None:
+            return completed
+        completed = await self._stage_reason_and_check(ctx)
+        if completed is not None:
+            return completed
+        return await self._stage_output(ctx)
+
+    def _stage_wake(
+        self, wake: WakeEnvelope, wake_meta: dict[str, Any],
+        task: str | None, scenario: dict[str, Any] | None,
+    ) -> _CycleContext:
+        """Initialize the envelope and governed controller (WAKE seam)."""
         generated_at = _utc_now_iso()
         capability_log: list[dict[str, Any]] = [{
             "capability": "engine.wake",
@@ -400,15 +520,80 @@ class InferenceEngine:
             },
         }]
 
-        # --- GATHER: capture status + deterministic fit via the tool base ---
-        # All dispatches run on the ENGINE's injected connections + settings;
-        # no tool opens its own store (two-plane boundary pass).
+        # --- CYCLE CONTROLLER (constructed at wake, immutable from here) ---
+        # The controller is the loop's sole semantic authority. It RECEIVES
+        # the envelope: cycle context (task, scenario, wake identity) enters
+        # its ledger, it hands the envelope to the agent via narrate#1, and
+        # every outcome the agent produces is classified by IT alone. Every
+        # transition returns a NEW immutable controller; ``controller`` is
+        # rebound in place at each step.
+        #
+        # GOVERNANCE: the controller SITS UNDER the governing membrane. It is
+        # built with GOVERNANCE_MEMBRANE and the initial observation
+        # (COMPREHENSION / UNDERSTAND_TASK) — the membrane's legality governs
+        # every subsequent move.
+        controller = (
+            CycleController(scenario)
+            .with_membrane(GOVERNANCE_MEMBRANE)
+            .with_observation(GOVERNANCE_MEMBRANE.initial())
+        )
+
+        return _CycleContext(
+            wake=wake, task=task, scenario=scenario, generated_at=generated_at,
+            controller=controller, capability_log=capability_log,
+        )
+
+    async def _stage_gather(
+        self, ctx: _CycleContext,
+    ) -> tuple[InferenceArtifact, dict[str, Any]] | None:
+        """Acquire gate evidence; a refusal returns the completed cycle."""
+        wake, task, scenario = ctx.wake, ctx.task, ctx.scenario
+        generated_at = ctx.generated_at
+        controller, capability_log = ctx.controller, ctx.capability_log
+
+        # --- PRE-GATE READS (the only pre-LLM dispatches) ---
+        # Two pure reads serve the zero-token gate contract: capture status
+        # (capture_state) and the fit (fit_status + n_observations). Both are
+        # routed through the controller (its first classified outcomes — the
+        # controller RECEIVES the envelope and opens the ledger the agent
+        # reads/cites) and mirrored into accumulated_tool_results so the
+        # model can cite what it owns. Everything beyond these two reads is
+        # the AGENT's to pull.
+        accumulated_tool_results: dict[str, Any] = {}
+        tool_results: dict[str, Any] = {}
+
+        # --- GOVERNANCE: EVIDENCE loop (GATHER stage) ---
+        # The two pre-gate reads are the loop's first evidence work: enter
+        # EVIDENCE (INFER_ORDER_FLOW is its default intent) and open the
+        # SOURCING sub-loop. Every move is routed through the membrane;
+        # an illegal move is silently denied (never a crash) and the
+        # observation is whatever IS legal.
+        controller, _ = _govern(
+            controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.EVIDENCE
+        )
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.SOURCING
+        )
+
+        # OPEN_SUBLOOP advances directly to the next sibling. Closing
+        # SOURCING first would reset the cursor and deny ACQUISITION.
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.ACQUISITION
+        )
+
         status, status_log = await execute_tool(
             self.store, "micro.capture_status",
             {"symbol": self.symbol, "venue": self.venue},
             memory=self.memory, settings=self.settings,
         )
         capability_log.append(status_log)
+        controller = controller.record_outcome(
+            "micro.capture_status", status_log, status,
+            args={"symbol": self.symbol, "venue": self.venue},
+        )
+        accumulated_tool_results["micro.capture_status"] = status
+        tool_results["micro.capture_status"] = status
+
         evidence, fit_log = await execute_tool(
             self.store, "micro.fit_beta",
             {"symbol": self.symbol, "venue": self.venue,
@@ -416,6 +601,19 @@ class InferenceEngine:
             postgres=self.postgres, memory=self.memory, settings=self.settings,
         )
         capability_log.append(fit_log)
+        controller = controller.record_outcome(
+            "micro.fit_beta", fit_log, evidence,
+            args={"symbol": self.symbol, "venue": self.venue,
+                  "interval_seconds": 10, "window_minutes": 30},
+        )
+        accumulated_tool_results["micro.fit_beta"] = evidence
+        tool_results["micro.fit_beta"] = evidence
+
+        # GOVERNANCE: reads observed — adopt the depth intent for the
+        # rest of the evidence work.
+        controller, _ = _govern(
+            controller, GovernanceEventKind.SET_TASK, TaskIntent.INFER_DEPTH
+        )
 
         fit_status = None
         n_observations = 0
@@ -435,23 +633,15 @@ class InferenceEngine:
             sequence_gaps=int(status_obj.get("sequence_gaps") or 0),
         )
 
-        # Pass C split: AD and OFI are calculated as SEPARATE deterministic tools
-        # in the wake cycle — agent will call them to validate, final DeltaP is derived diagnostic
-        ofi_blocks, ofi_log = await execute_tool(self.store, "calc.ofi.intervals", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30}, memory=self.memory, settings=self.settings)
-        capability_log.append(ofi_log)
-        ad_result, ad_log = await execute_tool(self.store, "calc.depth.average", {"symbol": self.symbol, "venue": self.venue, "window_minutes": 30}, memory=self.memory, settings=self.settings)
-        capability_log.append(ad_log)
-        obs_preview, obs_log = await execute_tool(self.store, "calc.observation.build", {"symbol": self.symbol, "venue": self.venue, "interval_seconds": 10, "window_minutes": 30}, memory=self.memory, settings=self.settings)
-        capability_log.append(obs_log)
-        derived_diag, derived_log = await execute_tool(self.store, "calc.derived_diagnostic", {"symbol": self.symbol, "venue": self.venue}, memory=self.memory, settings=self.settings)
-        capability_log.append(derived_log)
-        calculations = {
-            "ofi_blocks": ofi_blocks[:5] if isinstance(ofi_blocks, list) else ofi_blocks,
-            "ad_blocks": ad_result,
-            "observations_preview": obs_preview[:5] if isinstance(obs_preview, list) else obs_preview,
-            "derived_diagnostic": derived_diag,
-            "split_note": "AD and OFI called as separate tools; final DeltaP is derived hypothesis, not shortcut — per Cont 1011.6402"
-        }
+        # --- READ-PLANE SHAPE (envelope-driven) ---
+        # The controller receives the envelope and hands it to the agent;
+        # the agent then READS AS IT PLEASES via the tool base to complete
+        # its task. NO deterministic spine is pre-computed here: the four
+        # calc.* dispatches (ofi.intervals / depth.average / observation.build
+        # / derived_diagnostic) DISSOLVED from this block — they are registry
+        # read tools the agent pulls during P1/P2/P5 (PHASE_GUIDANCE drives
+        # this). Only the two pre-gate reads remain, because the zero-token
+        # gate contract needs fit status + capture state BEFORE the LLM runs.
         deterministic_state: dict[str, Any] = {
             "task": task,
             "scenario": scenario,
@@ -462,7 +652,6 @@ class InferenceEngine:
             "capture_status": status,
             "microstructure_evidence": evidence,
             "gate": {"status": gate_status, "reasons": list(gate_reasons)},
-            "calculations": calculations,
             "data_quality": {
                 "capture_state": status_obj.get("state"),
                 "sequence_gaps": int(status_obj.get("sequence_gaps") or 0),
@@ -472,11 +661,26 @@ class InferenceEngine:
                 "spine": {"interval_seconds": 10, "window_minutes": 30},
                 "note": ("provisional persists while gaps>0 or hetero=true; "
                          "agent may recompute at interval 10/15/30s × window 15/30/60m via tool args"),
+                "read_plane": ("the deterministic spine (OFI intervals, AD, "
+                               "observations, ΔP) is NOT pre-computed — pull it "
+                               "via your read tools during P1/P2/P5"),
             },
         }
 
         # --- HARD GATE ---
         if gate_status == "insufficient":
+            # GOVERNANCE: the gate refusal is a first-class failure — report
+            # the kind, the membrane returns the terminal, and it lands beside
+            # the meta AND the deterministic state.
+            controller = controller.advance(
+                GovernanceEvent(GovernanceEventKind.GATE_REFUSED)
+            )
+            terminal = (
+                controller.terminal.value if controller.terminal
+                else "gate_refused"
+            )
+            ctx.controller = controller
+            deterministic_state["terminal"] = terminal
             artifact = InferenceArtifact.create(
                 symbol=self.symbol, venue=self.venue,
                 generated_at=generated_at, completed_at=_utc_now_iso(),
@@ -506,7 +710,30 @@ class InferenceEngine:
             return artifact, {"task": task[:200] if task else None,
                               "scenario": scenario,
                               "llm_calls": 0, "gate": gate_status,
-                              "reasons": list(gate_reasons)}
+                              "reasons": list(gate_reasons),
+                              "terminal": terminal}
+
+        ctx.controller = controller
+        ctx.gathered = _GatheredEvidence(
+            evidence=evidence, gate_status=gate_status,
+            gate_reasons=list(gate_reasons), deterministic_state=deterministic_state,
+            accumulated_tool_results=accumulated_tool_results,
+            tool_results=tool_results,
+        )
+        return None
+
+    async def _stage_reason_and_check(
+        self, ctx: _CycleContext,
+    ) -> tuple[InferenceArtifact, dict[str, Any]] | None:
+        """Coordinate REASON/CHECK feedback; preserve early failure returns."""
+        gathered = ctx.gathered
+        if gathered is None:
+            raise RuntimeError("reason/check requires gathered evidence")
+        wake, task, scenario = ctx.wake, ctx.task, ctx.scenario
+        controller, capability_log = ctx.controller, ctx.capability_log
+        deterministic_state = gathered.deterministic_state
+        accumulated_tool_results = gathered.accumulated_tool_results
+        tool_results = gathered.tool_results
 
         # --- CONTEXT: memory + prior diff ---
         _memories, memory_block = await self._recall_memory()
@@ -533,7 +760,9 @@ class InferenceEngine:
             f"{task_block}"
             f"{scenario_block}"
             f"WAKE: {wake_block}\n\n"
-            "DETERMINISTIC STATE (computed; never recomputed by you):\n"
+            "ENVELOPE STATE (gate reads + wake identity — READ-PLANE; pull "
+            "everything else yourself via tools; never recompute values, "
+            "COMMAND the read tools and cite their paths):\n"
             f"{json.dumps(deterministic_state, default=str)[:60_000]}\n\n"
             f"{prior_note}\n\n"
         )
@@ -544,23 +773,55 @@ class InferenceEngine:
             )
         user_prompt_1 += self._output_format()
 
+        # --- GOVERNANCE: REASONING loop (REASON stage) ---
+        # Narrate#1 is the agent's first reasoning turn: enter the REASONING
+        # loop and open its HYPOTHESIS sub-loop.
+        controller, _ = _govern(
+            controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING
+        )
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.HYPOTHESIS
+        )
+
         # --- NARRATE#1 ---
         llm_calls = 0
         try:
             raw_1 = await self._call_llm(user_prompt_1)
         except Exception as exc:
             log.exception("narration#1 failed")
+            # GOVERNANCE: the narration transport failed — report the kind,
+            # the membrane routes it to NARRATION_FAILED.
+            controller = controller.advance(
+                GovernanceEvent(GovernanceEventKind.NARRATION_FAILED)
+            )
+            terminal = (
+                controller.terminal.value if controller.terminal
+                else "narration_failed"
+            )
+            ctx.controller = controller
+            deterministic_state["terminal"] = terminal
             return await self._degraded_artifact(
                 deterministic_state, capability_log,
                 f"narration_failed: {type(exc).__name__}: {exc}",
-            ), {"llm_calls": llm_calls}
+            ), {"llm_calls": llm_calls, "terminal": terminal}
         llm_calls += 1
         parsed_1 = narration_mod.coerce_turn(narration_mod.extract_json_object(raw_1))
         if parsed_1 is None:
+            # GOVERNANCE: unparseable narration -> PARSE_FAILED. The degraded
+            # artifact is persisted with the terminal in deterministic state.
+            controller = controller.advance(
+                GovernanceEvent(GovernanceEventKind.PARSE_FAILED)
+            )
+            terminal = (
+                controller.terminal.value if controller.terminal
+                else "parse_failed"
+            )
+            ctx.controller = controller
+            deterministic_state["terminal"] = terminal
             return await self._degraded_artifact(
                 deterministic_state, capability_log,
                 "narration_parse_failed: no JSON object in output",
-            ), {"llm_calls": llm_calls}
+            ), {"llm_calls": llm_calls, "terminal": terminal}
 
         # --- STAGED TOOL LOOP (P1→P6, phase coverage enforced) ---
         # D1 decision (B2): P4 explanation rides in the P6 synthesis summary
@@ -571,23 +832,23 @@ class InferenceEngine:
         # with empty tool_calls is validated and REJECTED FOR REPAIR while
         # LLM budget remains (depth is structural, not advisory).
         from market_service.nooa_harness.inference import (
-            TOOL_PHASE,
             _normalize_tool_name,
             capability_log_entry,
         )
 
-        tool_results: dict[str, Any] = {}
-        accumulated_tool_results: dict[str, Any] = {}
-        phase_coverage: dict[str, set[str]] = {
-            phase: set() for phase in ("P1", "P2", "P3", "P4", "P5", "P6")
-        }
+        # The controller opened the ledger with the two pre-gate reads; the
+        # staged loop REBINDS the immutable controller as it classifies each
+        # agent dispatch — it never re-constructs.
+        phase_coverage = controller.phase_coverage
 
-        def _mark_declared(parsed: dict[str, Any]) -> None:
-            declared = str(parsed.get("phase") or "").strip().upper()
-            if declared in ("P4", "P6"):
-                phase_coverage[declared].add("declared")
+        def _mark_declared(
+            ctrl: CycleController, parsed: dict[str, Any],
+        ) -> CycleController:
+            # PURE helper — returns the successor controller; the loop rebinds.
+            return ctrl.mark_declared(parsed)
 
-        _mark_declared(parsed_1)
+        controller = _mark_declared(controller, parsed_1)
+        phase_coverage = controller.phase_coverage
         parsed_current = parsed_1
         task_reminder = (
             f"TASK reminder (answer this): {task[:500]}\n"
@@ -633,6 +894,24 @@ class InferenceEngine:
                     args.setdefault("symbol", self.symbol)
                     args.setdefault("venue", self.venue)
                     canonical = _normalize_tool_name(raw_name) or raw_name
+                    # Controller authority: redundant re-dispatch of a tool
+                    # that already refused this cycle is suppressed
+                    # structurally (logged, never executed).
+                    if controller.is_redundant(canonical):
+                        log.warning(
+                            "staged loop: suppressing redundant dispatch of "
+                            "%s (refused earlier this cycle)", canonical,
+                        )
+                        _supp_log = capability_log_entry(
+                            f"tool.suppressed:{canonical}",
+                            {"symbol": self.symbol, "venue": self.venue},
+                            "denied",
+                            detail={"reason": "refused_deterministically",
+                                    "refusal_reason": controller.scenario_refusal_reason()},
+                        )
+                        capability_log.append(_supp_log)
+                        round_results[canonical] = None
+                        continue
                     try:
                         result, tool_log = await execute_tool(
                             self.store, raw_name, args, postgres=self.postgres,
@@ -647,17 +926,15 @@ class InferenceEngine:
                             detail=f"{type(exc).__name__}: {exc}",
                         )
                     capability_log.append(tool_log)
-                    # Phase credit needs a real dispatch: denials, errors,
-                    # and explicit null-discipline refusals never count. A
-                    # successful read that legitimately returns null
-                    # (absent evidence, empty cache) still counts — the
-                    # absence itself is information the agent must interpret.
-                    _detail = tool_log.get("detail")
-                    _refused = isinstance(_detail, dict) and _detail.get("status") == "refused"
-                    if tool_log.get("result") == "ok" and not _refused:
-                        phase = TOOL_PHASE.get(canonical)
-                        if phase is not None:
-                            phase_coverage[phase].add(canonical)
+                    # Controller classifies the outcome (the ONLY place the
+                    # ok-with-refused-detail null-discipline shape is
+                    # interpreted), applies phase-coverage credit, and returns
+                    # a NEW immutable controller — rebound here.
+                    controller = controller.record_outcome(
+                        canonical, tool_log, result,
+                        raw_name=raw_name, args=args,
+                    )
+                    phase_coverage = controller.phase_coverage
                     if result is None:
                         result_payload = None
                     else:
@@ -670,6 +947,13 @@ class InferenceEngine:
                     accumulated_tool_results[canonical] = result_payload
                 tool_results.update(round_results)
                 next_phase = narration_mod.next_uncovered_phase(phase_coverage)
+                # GOVERNANCE: the observation intent follows the phase the
+                # agent is serving (phase COVERAGE credit stays untouched).
+                intent = _PHASE_INTENT.get(next_phase)
+                if intent is not None:
+                    controller, _ = _govern(
+                        controller, GovernanceEventKind.SET_TASK, intent
+                    )
                 # Follow-up prompt economy: the prior round's results arrive
                 # in ACCUMULATED only (they are the delta the model has not
                 # seen as fresh data) — no separate ROUND block re-sending
@@ -700,24 +984,33 @@ class InferenceEngine:
                     log.warning("staged round parse failed, keeping prior")
                     break
                 parsed_current = parsed_next
-                _mark_declared(parsed_current)
+                controller = _mark_declared(controller, parsed_current)
+                phase_coverage = controller.phase_coverage
                 continue
             # No (more) tool calls this turn → validate the final.
+            # GOVERNANCE: CHECK stage (VALIDATION loop) — gate sub-loop.
+            controller, _ = _govern(
+                controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.VALIDATION
+            )
+            controller, _ = _govern(
+                controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.GATE
+            )
             passed, missing = narration_mod.validate_final_turn(
-                parsed_current, phase_coverage, scenario=scenario)
+                parsed_current, phase_coverage, scenario=scenario,
+                scenario_status=controller.scenario_state(),
+                scenario_refusal_reason=controller.scenario_refusal_reason(),
+            )
             if passed:
                 final_validation = {"passed": True, "missing": []}
                 finalize_now = True
             else:
                 repairs_sent += 1
-                scenario_steer = ""
-                if scenario and "calc.scenario.evaluate" not in accumulated_tool_results:
-                    scenario_steer = (
-                        "SCENARIO UNEVALUATED: call calc.scenario.evaluate with the "
-                        f"SCENARIO target_price/horizon ({json.dumps(scenario)}) "
-                        "before finalizing — the final is rejected without its "
-                        "→ … evidence root.\n"
-                    )
+                # GOVERNANCE: a rejected final opens the RECOVERY sub-loop
+                # (repair — iterates until the final passes or budget ends).
+                controller, _ = _govern(
+                    controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.RECOVERY
+                )
+                scenario_steer = controller.scenario_steer()
                 repair_prompt = (
                     f"{task_reminder if task else ''}"
                     f"{scenario_reminder if scenario else ''}"
@@ -742,7 +1035,8 @@ class InferenceEngine:
                     log.warning("repair parse failed, keeping prior")
                     break
                 parsed_current = parsed_repair
-                _mark_declared(parsed_current)
+                controller = _mark_declared(controller, parsed_current)
+                phase_coverage = controller.phase_coverage
         parsed_final = parsed_current
         # Budget-exhaustion transparency (live-proven): a final turn may carry
         # tool_calls that never dispatched because the LLM/round budget was
@@ -763,11 +1057,44 @@ class InferenceEngine:
         # or LLM budget spent): validate whatever we finalize with.
         if not finalize_now:
             passed, missing = narration_mod.validate_final_turn(
-                parsed_final, phase_coverage, scenario=scenario)
+                parsed_final, phase_coverage, scenario=scenario,
+                scenario_status=controller.scenario_state(),
+                scenario_refusal_reason=controller.scenario_refusal_reason(),
+            )
             final_validation = {"passed": passed, "missing": missing}
         # ensure tool_results reflects all rounds for cycle_meta
         if accumulated_tool_results:
             tool_results = accumulated_tool_results
+
+        ctx.controller = controller
+        ctx.reasoned = _ReasonedCycle(
+            parsed_first=parsed_1, parsed_final=parsed_final,
+            llm_calls=llm_calls, tool_rounds_used=tool_rounds_used,
+            repairs_sent=repairs_sent, finalize_now=finalize_now,
+            final_validation=final_validation, unexecuted=unexecuted,
+            tool_results=tool_results,
+        )
+        return None
+
+    async def _stage_output(
+        self, ctx: _CycleContext,
+    ) -> tuple[InferenceArtifact, dict[str, Any]]:
+        """Compose, persist and dispose memory (FINALIZE seam)."""
+        gathered, reasoned = ctx.gathered, ctx.reasoned
+        if gathered is None or reasoned is None:
+            raise RuntimeError("output requires gathered evidence and reasoning")
+        task, scenario, generated_at = ctx.task, ctx.scenario, ctx.generated_at
+        controller, capability_log = ctx.controller, ctx.capability_log
+        evidence = gathered.evidence
+        gate_status, gate_reasons = gathered.gate_status, gathered.gate_reasons
+        deterministic_state = gathered.deterministic_state
+        accumulated_tool_results = gathered.accumulated_tool_results
+        tool_results = reasoned.tool_results
+        parsed_1, parsed_final = reasoned.parsed_first, reasoned.parsed_final
+        llm_calls, tool_rounds_used = reasoned.llm_calls, reasoned.tool_rounds_used
+        repairs_sent, finalize_now = reasoned.repairs_sent, reasoned.finalize_now
+        final_validation, unexecuted = reasoned.final_validation, reasoned.unexecuted
+        phase_coverage = controller.phase_coverage
 
         interpretation = {
             "summary": parsed_final.get("summary"),
@@ -854,6 +1181,39 @@ class InferenceEngine:
                 verdict_reason = "; ".join(gate_reasons)
             if isinstance(hypothesis, dict) and "H0" in hypothesis:
                 verdict_reason += " ; H0 paper-grounded via memory.recall_paper"
+        # Read-plane state assembly: the artifact's calculations block is the
+        # controller-classified calc-family outcomes the agent pulled during
+        # the loop — no pre-gather spine exists anymore.
+        calculations: dict[str, Any] = {
+            k: v for k, v in accumulated_tool_results.items()
+            if k.startswith("calc.") or k == "micro.fit_beta"
+        }
+        calculations["split_note"] = (
+            "AD and OFI read as separate tools by the agent; final DeltaP is "
+            "derived hypothesis, not shortcut — per Cont 1011.6402"
+        )
+        # --- GOVERNANCE: OUTPUT loop (FINALIZE stage) + terminal landing ---
+        # A passed final places the output: enter OUTPUT, open COMPOSITION,
+        # settle. A loop that ended without finalization is budget
+        # exhaustion. In BOTH cases the terminal lands beside the meta AND
+        # the deterministic state.
+        if finalize_now:
+            controller, _ = _govern(
+                controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.OUTPUT
+            )
+            controller, _ = _govern(
+                controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.COMPOSITION
+            )
+            controller = controller.advance(
+                GovernanceEvent(GovernanceEventKind.SETTLE)
+            )
+        else:
+            controller = controller.advance(
+                GovernanceEvent(GovernanceEventKind.BUDGET_EXHAUSTED)
+            )
+        ctx.controller = controller
+        terminal = controller.terminal.value if controller.terminal else None
+        deterministic_state["terminal"] = terminal
         artifact = InferenceArtifact.create(
             symbol=self.symbol, venue=self.venue,
             generated_at=generated_at, completed_at=_utc_now_iso(),
@@ -881,6 +1241,7 @@ class InferenceEngine:
         cycle_meta = {
             "task": task[:200] if task else None,
             "scenario": scenario,
+            "terminal": terminal,
             "unexecuted_tool_calls": unexecuted,
             "llm_calls": llm_calls,
             "gate": gate_status,
@@ -893,6 +1254,7 @@ class InferenceEngine:
                        "written": written},
         }
         return artifact, cycle_meta
+
 
     async def _degraded_artifact(
         self,

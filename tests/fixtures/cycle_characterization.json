@@ -1,0 +1,3018 @@
+{
+  "success": {
+    "artifact": {
+      "schema_version": 1,
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "BTCUSDT",
+      "venue": "spot",
+      "generated_at": "2026-01-01T00:00:00+00:00",
+      "completed_at": "2026-01-01T00:00:00+00:00",
+      "status": "provisional",
+      "window_minutes": 30,
+      "interval_seconds": 10,
+      "deterministic_state": {
+        "task": "Explain the evidence",
+        "scenario": null,
+        "wake": {
+          "trigger_source": "watcher",
+          "predicates_fired": {
+            "cold_start": {}
+          }
+        },
+        "capture_status": {
+          "state": "running",
+          "sequence_gaps": 0
+        },
+        "microstructure_evidence": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "gate": {
+          "status": "provisional",
+          "reasons": [
+            "observations 40 < 2x minimum 60"
+          ]
+        },
+        "data_quality": {
+          "capture_state": "running",
+          "sequence_gaps": 0,
+          "heteroskedasticity_flag": null,
+          "fit_status": "validated",
+          "n_observations": 40,
+          "spine": {
+            "interval_seconds": 10,
+            "window_minutes": 30
+          },
+          "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+          "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+        },
+        "terminal": "settled"
+      },
+      "capability_log": [
+        {
+          "capability": "engine.wake",
+          "scope": {
+            "symbol": "BTCUSDT",
+            "venue": "spot"
+          },
+          "result": "ok",
+          "detail": {
+            "trigger_source": "watcher",
+            "predicates_fired": {
+              "cold_start": {}
+            },
+            "decision": "fire",
+            "consumed_wake_ids": [],
+            "task": "Explain the evidence",
+            "scenario": null
+          }
+        },
+        {
+          "capability": "micro.capture_status",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "micro.fit_beta",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "calc.ofi.intervals",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "calc.depth.average",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "market.derivatives",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "memory.recall_paper",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "calc.price.delta",
+          "scope": {},
+          "result": "ok"
+        }
+      ],
+      "input_hash": "fixture",
+      "model_version": "inference-engine-v1",
+      "interpretation": {
+        "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+        "evidence": [
+          {
+            "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+            "value": "0.001",
+            "interpretation": "positive impact",
+            "metric_name": "beta"
+          },
+          {
+            "path": "calc.ofi.intervals \u2192 ofi",
+            "value": "12.5",
+            "interpretation": "sustained one-sided flow",
+            "metric_name": "ofi"
+          },
+          {
+            "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+            "value": "+0.53",
+            "interpretation": "derived move with band",
+            "metric_name": "delta_ticks"
+          }
+        ],
+        "confidence": "medium",
+        "limitations": [
+          "synthetic window"
+        ],
+        "model_separation": "nu*OFI is heteroskedastic; never merged."
+      },
+      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+      "errors": [],
+      "hypothesis": {
+        "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+        "H1": "beta <= 0 (flow no longer moves price)",
+        "paper_refs": [
+          "Cont 1011.6402"
+        ],
+        "evidence_refs": [
+          "calc.ofi.intervals",
+          "calc.depth.average"
+        ]
+      },
+      "hypothesis_verdict": "inconclusive",
+      "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+      "calculations": {
+        "micro.fit_beta": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "calc.ofi.intervals": {
+          "value": "fixture"
+        },
+        "calc.depth.average": {
+          "value": "fixture"
+        },
+        "calc.price.delta": {
+          "value": "fixture"
+        },
+        "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+      }
+    },
+    "meta": {
+      "task": "Explain the evidence",
+      "scenario": null,
+      "terminal": "settled",
+      "unexecuted_tool_calls": [],
+      "llm_calls": 5,
+      "gate": "provisional",
+      "tool_round": true,
+      "tool_rounds": 4,
+      "repairs": 0,
+      "phase_coverage": {
+        "P1": [
+          "calc.ofi.intervals",
+          "micro.capture_status"
+        ],
+        "P2": [
+          "calc.depth.average",
+          "micro.fit_beta"
+        ],
+        "P3": [
+          "market.derivatives"
+        ],
+        "P4": [],
+        "P5": [
+          "calc.price.delta",
+          "memory.recall_paper"
+        ],
+        "P6": [
+          "declared"
+        ]
+      },
+      "final_validation": {
+        "passed": true,
+        "missing": []
+      },
+      "memory": {
+        "accepted": [
+          {
+            "kind": "observation",
+            "content": "Beta positive on the 30m window",
+            "importance": 6.0,
+            "tags": [
+              "beta",
+              "btcusdt-spot"
+            ]
+          }
+        ],
+        "dispositions": [],
+        "written": [
+          {
+            "memory_id": "mem-1",
+            "kind": "observation"
+          }
+        ]
+      }
+    },
+    "effects": [
+      [
+        "tool",
+        "micro.capture_status",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "micro.fit_beta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "interval_seconds": 10,
+          "window_minutes": 30
+        }
+      ],
+      [
+        "llm",
+        "TASK (interactive-plane directive \u2014 frame H0/H1 to ANSWER this; cite it in hypothesis.evidence_refs as 'task'):\nExplain the evidence\n\nWAKE: {\"trigger_source\": \"watcher\", \"predicates\": {\"cold_start\": {}}}\n\nENVELOPE STATE (gate reads + wake identity \u2014 READ-PLANE; pull everything else yourself via tools; never recompute values, COMMAND the read tools and cite their paths):\n{\"task\": \"Explain the evidence\", \"scenario\": null, \"wake\": {\"trigger_source\": \"watcher\", \"predicates_fired\": {\"cold_start\": {}}}, \"capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"microstructure_evidence\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"gate\": {\"status\": \"provisional\", \"reasons\": [\"observations 40 < 2x minimum 60\"]}, \"data_quality\": {\"capture_state\": \"running\", \"sequence_gaps\": 0, \"heteroskedasticity_flag\": null, \"fit_status\": \"validated\", \"n_observations\": 40, \"spine\": {\"interval_seconds\": 10, \"window_minutes\": 30}, \"note\": \"provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \\u00d7 window 15/30/60m via tool args\", \"read_plane\": \"the deterministic spine (OFI intervals, AD, observations, \\u0394P) is NOT pre-computed \\u2014 pull it via your read tools during P1/P2/P5\"}}\n\nNo prior artifact: this is the first inference cycle.\n\nRECALLED MEMORY (provenance-tagged priors; subordinate to the ledger):\n## Recalled session memory\n- [observation#abc] prior conclusion\n\nSTAGED INFERENCE \u2014 6 phases (P1\u2192P6), one JSON object per turn, up to 8 tool rounds. Declare your phase every turn.\nReturn ONLY one JSON object per turn with EXACTLY these keys:\n{\n  \"phase\": \"P1|P2|P3|P4|P5|P6 \u2014 the phase this turn advances (P6 = final output generation, no tools)\",\n  \"summary\": \"P4 explanation (\u2265200 chars: what the fits show AND why now), or null while tools are still pending\",\n  \"evidence\": [{\"path\": \"deterministic_state.\u2026 OR <tool-name> \u2192 <field>\", \"value\": \u2026, \"interpretation\": \"\u2026\", \"metric_name\": \"\u2026\"}] or null,\n  \"confidence\": \"low|medium|high\" or null,\n  \"limitations\": [\"\u2026\"] or null,\n  \"model_separation\": \"one sentence on why beta and c/lambda are read separately\" or null,\n  \"hypothesis\": {\"H0\": \"\u2026\", \"H1\": \"\u2026\", \"paper_refs\": [\"Cont 1011.6402 \u00a7\u2026\"], \"evidence_refs\": [\"calc.ofi.intervals\", \u2026]} or null (REQUIRED at final),\n  \"scenario\": {\"target_price\": \"\u2026\", \"horizon\": \"15m|1h|4h\", \"direction\": \"up|down\", \"required_ofi\": \"\u2026\", \"required_ofi_range\": [\u2026] or null, \"exceedance\": \"\u2026\", \"exceedance_range\": [\u2026] or null, \"fit_status\": \"validated|provisional\", \"n_windows_usable\": N, \"r2\": \"\u2026\" or null, \"probability\": \"low|medium|high\", \"verdict\": \"reachable|not_reachable|unevaluable\", \"rationale\": \"\u2026 (\u226580 chars, name fit_status + usable windows + r2 beside the verdict)\"} or null (REQUIRED at final ONLY when a SCENARIO block was given \u2014 echo numerics from calc.scenario.evaluate \u2192 \u2026 paths, never compute),\n  \"tool_calls\": [{\"name\": \"<ONE registry tool name>\", \"args\": {\"symbol\": \"<this cycle's symbol>\", \"venue\": \"<this cycle's venue>\", \"interval_seconds\": 10, \"window_minutes\": 30, \u2026}}],\n  KEY RULE: the tool-name key is EXACTLY \"name\" \u2014 never \"tool\", \"tool_name\", or any other key. Entries under any other key are dropped unread.\n  \"memory_proposals\": [{\"kind\": \"observation|hypothesis\", \"content\": \"\u2026\", \"importance\": 5.0, \"tags\": [\"\u2026\"]}] or null\n}\nREGISTRY TOOL NAMES (use EXACTLY \u2014 any other name is denied):\n  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n  P6 output: no tools \u2014 synthesis only.\nSTAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n  P1 OFI inference \u2192 P2 AD inference (split \u2014 never merged) \u2192 P3 warm-plane correlation (TWO-BEAT: invoke \u22651 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; substrate.read is the verdict, market.read is context; judge freshness via age_ms; dormant/empty results are findings, never re-invoke) \u2192 P4 explanation (the why-now synthesis) \u2192 P5 derivation (memory.recall_paper FIRST, then calc.price.delta with an OFI value for the NUMERIC \u0394P + band) \u2192 P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\nWINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds (10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\nRules: tool_calls max 3 per round, max 8 rounds. Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn (phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, a P6 synthesis turn was declared, hypothesis.H0 is set, summary \u2265200 chars, confidence low|medium|high, every evidence entry carries a non-empty interpretation, and evidence cites \u22652 distinct roots incl. a calc.price.delta \u2192 \u2026 \u0394P path plus \u22651 more fresh tool result. memory_proposals max 3, kind fact forbidden."
+      ],
+      [
+        "tool",
+        "calc.ofi.intervals",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 1/8 dispatched; cite paths):\n{\"calc.ofi.intervals\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": []}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 7. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "tool",
+        "calc.depth.average",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 2/8 dispatched; cite paths):\n{\"calc.depth.average\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"calc.ofi.intervals\": {\"value\": \"fixture\"}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"calc.depth.average\", \"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": []}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 6. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "tool",
+        "market.derivatives",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 3/8 dispatched; cite paths):\n{\"market.derivatives\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"calc.ofi.intervals\": {\"value\": \"fixture\"}, \"calc.depth.average\": {\"value\": \"fixture\"}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"calc.depth.average\", \"micro.fit_beta\"], \"P3\": [\"market.derivatives\"], \"P4\": [], \"P5\": [], \"P6\": []}\nPHASE P5 \u2014 DERIVE: call memory.recall_paper FIRST (ground H0/H1 in Cont 1011.6402 facts), then calc.price.delta (alias calc.derived_diagnostic) with an OFI value \u2014 scenario arg or latest-interval default \u2014 for the NUMERIC derived \u0394P (route A direct + route B when c/\u03bb exist, with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 5. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "tool",
+        "memory.recall_paper",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "calc.price.delta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 4/8 dispatched; cite paths):\n{\"memory.recall_paper\": {\"value\": \"fixture\"}, \"calc.price.delta\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"calc.ofi.intervals\": {\"value\": \"fixture\"}, \"calc.depth.average\": {\"value\": \"fixture\"}, \"market.derivatives\": {\"value\": \"fixture\"}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"calc.depth.average\", \"micro.fit_beta\"], \"P3\": [\"market.derivatives\"], \"P4\": [], \"P5\": [\"calc.price.delta\", \"memory.recall_paper\"], \"P6\": []}\nPHASE P6 \u2014 OUTPUT GENERATION (final): no tools. Synthesize the PRIMARY inference output strictly from this run's reasoning: H0/H1 verdict, numeric \u0394P with band, regime explanation, confidence, limitations. Every numeric claim cites its tool path, including a calc.price.delta \u2192 \u2026 path for the \u0394P. Return FINAL JSON: tool_calls=[], full summary/evidence/confidence/limitations/model_separation/hypothesis{H0,H1,paper_refs,evidence_refs}.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 4. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "postgres",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "settled"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.ofi.intervals",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.depth.average",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "market.derivatives",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "memory.recall_paper",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.price.delta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": {
+            "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+            "evidence": [
+              {
+                "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+                "value": "0.001",
+                "interpretation": "positive impact",
+                "metric_name": "beta"
+              },
+              {
+                "path": "calc.ofi.intervals \u2192 ofi",
+                "value": "12.5",
+                "interpretation": "sustained one-sided flow",
+                "metric_name": "ofi"
+              },
+              {
+                "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+                "value": "+0.53",
+                "interpretation": "derived move with band",
+                "metric_name": "delta_ticks"
+              }
+            ],
+            "confidence": "medium",
+            "limitations": [
+              "synthetic window"
+            ],
+            "model_separation": "nu*OFI is heteroskedastic; never merged."
+          },
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [],
+          "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": [
+              "Cont 1011.6402"
+            ],
+            "evidence_refs": [
+              "calc.ofi.intervals",
+              "calc.depth.average"
+            ]
+          },
+          "hypothesis_verdict": "inconclusive",
+          "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+          "calculations": {
+            "micro.fit_beta": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "calc.ofi.intervals": {
+              "value": "fixture"
+            },
+            "calc.depth.average": {
+              "value": "fixture"
+            },
+            "calc.price.delta": {
+              "value": "fixture"
+            },
+            "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+          }
+        }
+      ],
+      [
+        "redis",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "settled"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.ofi.intervals",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.depth.average",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "market.derivatives",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "memory.recall_paper",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.price.delta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": {
+            "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+            "evidence": [
+              {
+                "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+                "value": "0.001",
+                "interpretation": "positive impact",
+                "metric_name": "beta"
+              },
+              {
+                "path": "calc.ofi.intervals \u2192 ofi",
+                "value": "12.5",
+                "interpretation": "sustained one-sided flow",
+                "metric_name": "ofi"
+              },
+              {
+                "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+                "value": "+0.53",
+                "interpretation": "derived move with band",
+                "metric_name": "delta_ticks"
+              }
+            ],
+            "confidence": "medium",
+            "limitations": [
+              "synthetic window"
+            ],
+            "model_separation": "nu*OFI is heteroskedastic; never merged."
+          },
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [],
+          "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": [
+              "Cont 1011.6402"
+            ],
+            "evidence_refs": [
+              "calc.ofi.intervals",
+              "calc.depth.average"
+            ]
+          },
+          "hypothesis_verdict": "inconclusive",
+          "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+          "calculations": {
+            "micro.fit_beta": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "calc.ofi.intervals": {
+              "value": "fixture"
+            },
+            "calc.depth.average": {
+              "value": "fixture"
+            },
+            "calc.price.delta": {
+              "value": "fixture"
+            },
+            "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+          }
+        }
+      ],
+      [
+        "memory",
+        [
+          "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "observation",
+          "Beta positive on the 30m window"
+        ],
+        {
+          "run_id": "00000000-0000-0000-0000-000000000001",
+          "importance": 6.0,
+          "tags": [
+            "beta",
+            "btcusdt-spot"
+          ],
+          "evidence_refs": [
+            "00000000-0000-0000-0000-000000000001"
+          ]
+        }
+      ]
+    ]
+  },
+  "repair": {
+    "artifact": {
+      "schema_version": 1,
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "BTCUSDT",
+      "venue": "spot",
+      "generated_at": "2026-01-01T00:00:00+00:00",
+      "completed_at": "2026-01-01T00:00:00+00:00",
+      "status": "provisional",
+      "window_minutes": 30,
+      "interval_seconds": 10,
+      "deterministic_state": {
+        "task": "Explain the evidence",
+        "scenario": null,
+        "wake": {
+          "trigger_source": "watcher",
+          "predicates_fired": {
+            "cold_start": {}
+          }
+        },
+        "capture_status": {
+          "state": "running",
+          "sequence_gaps": 0
+        },
+        "microstructure_evidence": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "gate": {
+          "status": "provisional",
+          "reasons": [
+            "observations 40 < 2x minimum 60"
+          ]
+        },
+        "data_quality": {
+          "capture_state": "running",
+          "sequence_gaps": 0,
+          "heteroskedasticity_flag": null,
+          "fit_status": "validated",
+          "n_observations": 40,
+          "spine": {
+            "interval_seconds": 10,
+            "window_minutes": 30
+          },
+          "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+          "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+        },
+        "terminal": "settled"
+      },
+      "capability_log": [
+        {
+          "capability": "engine.wake",
+          "scope": {
+            "symbol": "BTCUSDT",
+            "venue": "spot"
+          },
+          "result": "ok",
+          "detail": {
+            "trigger_source": "watcher",
+            "predicates_fired": {
+              "cold_start": {}
+            },
+            "decision": "fire",
+            "consumed_wake_ids": [],
+            "task": "Explain the evidence",
+            "scenario": null
+          }
+        },
+        {
+          "capability": "micro.capture_status",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "micro.fit_beta",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "calc.ofi.intervals",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "calc.depth.average",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "market.derivatives",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "memory.recall_paper",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "calc.price.delta",
+          "scope": {},
+          "result": "ok"
+        }
+      ],
+      "input_hash": "fixture",
+      "model_version": "inference-engine-v1",
+      "interpretation": {
+        "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+        "evidence": [
+          {
+            "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+            "value": "0.001",
+            "interpretation": "positive impact",
+            "metric_name": "beta"
+          },
+          {
+            "path": "calc.ofi.intervals \u2192 ofi",
+            "value": "12.5",
+            "interpretation": "sustained one-sided flow",
+            "metric_name": "ofi"
+          },
+          {
+            "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+            "value": "+0.53",
+            "interpretation": "derived move with band",
+            "metric_name": "delta_ticks"
+          }
+        ],
+        "confidence": "medium",
+        "limitations": [
+          "synthetic window"
+        ],
+        "model_separation": "nu*OFI is heteroskedastic; never merged."
+      },
+      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+      "errors": [],
+      "hypothesis": {
+        "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+        "H1": "beta <= 0 (flow no longer moves price)",
+        "paper_refs": [
+          "Cont 1011.6402"
+        ],
+        "evidence_refs": [
+          "calc.ofi.intervals",
+          "calc.depth.average"
+        ]
+      },
+      "hypothesis_verdict": "inconclusive",
+      "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+      "calculations": {
+        "micro.fit_beta": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "calc.ofi.intervals": {
+          "value": "fixture"
+        },
+        "calc.depth.average": {
+          "value": "fixture"
+        },
+        "calc.price.delta": {
+          "value": "fixture"
+        },
+        "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+      }
+    },
+    "meta": {
+      "task": "Explain the evidence",
+      "scenario": null,
+      "terminal": "settled",
+      "unexecuted_tool_calls": [],
+      "llm_calls": 6,
+      "gate": "provisional",
+      "tool_round": true,
+      "tool_rounds": 4,
+      "repairs": 1,
+      "phase_coverage": {
+        "P1": [
+          "calc.ofi.intervals",
+          "micro.capture_status"
+        ],
+        "P2": [
+          "calc.depth.average",
+          "micro.fit_beta"
+        ],
+        "P3": [
+          "market.derivatives"
+        ],
+        "P4": [],
+        "P5": [
+          "calc.price.delta",
+          "memory.recall_paper"
+        ],
+        "P6": [
+          "declared"
+        ]
+      },
+      "final_validation": {
+        "passed": true,
+        "missing": []
+      },
+      "memory": {
+        "accepted": [
+          {
+            "kind": "observation",
+            "content": "Beta positive on the 30m window",
+            "importance": 6.0,
+            "tags": [
+              "beta",
+              "btcusdt-spot"
+            ]
+          }
+        ],
+        "dispositions": [],
+        "written": [
+          {
+            "memory_id": "mem-1",
+            "kind": "observation"
+          }
+        ]
+      }
+    },
+    "effects": [
+      [
+        "tool",
+        "micro.capture_status",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "micro.fit_beta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "interval_seconds": 10,
+          "window_minutes": 30
+        }
+      ],
+      [
+        "llm",
+        "TASK (interactive-plane directive \u2014 frame H0/H1 to ANSWER this; cite it in hypothesis.evidence_refs as 'task'):\nExplain the evidence\n\nWAKE: {\"trigger_source\": \"watcher\", \"predicates\": {\"cold_start\": {}}}\n\nENVELOPE STATE (gate reads + wake identity \u2014 READ-PLANE; pull everything else yourself via tools; never recompute values, COMMAND the read tools and cite their paths):\n{\"task\": \"Explain the evidence\", \"scenario\": null, \"wake\": {\"trigger_source\": \"watcher\", \"predicates_fired\": {\"cold_start\": {}}}, \"capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"microstructure_evidence\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"gate\": {\"status\": \"provisional\", \"reasons\": [\"observations 40 < 2x minimum 60\"]}, \"data_quality\": {\"capture_state\": \"running\", \"sequence_gaps\": 0, \"heteroskedasticity_flag\": null, \"fit_status\": \"validated\", \"n_observations\": 40, \"spine\": {\"interval_seconds\": 10, \"window_minutes\": 30}, \"note\": \"provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \\u00d7 window 15/30/60m via tool args\", \"read_plane\": \"the deterministic spine (OFI intervals, AD, observations, \\u0394P) is NOT pre-computed \\u2014 pull it via your read tools during P1/P2/P5\"}}\n\nNo prior artifact: this is the first inference cycle.\n\nRECALLED MEMORY (provenance-tagged priors; subordinate to the ledger):\n## Recalled session memory\n- [observation#abc] prior conclusion\n\nSTAGED INFERENCE \u2014 6 phases (P1\u2192P6), one JSON object per turn, up to 8 tool rounds. Declare your phase every turn.\nReturn ONLY one JSON object per turn with EXACTLY these keys:\n{\n  \"phase\": \"P1|P2|P3|P4|P5|P6 \u2014 the phase this turn advances (P6 = final output generation, no tools)\",\n  \"summary\": \"P4 explanation (\u2265200 chars: what the fits show AND why now), or null while tools are still pending\",\n  \"evidence\": [{\"path\": \"deterministic_state.\u2026 OR <tool-name> \u2192 <field>\", \"value\": \u2026, \"interpretation\": \"\u2026\", \"metric_name\": \"\u2026\"}] or null,\n  \"confidence\": \"low|medium|high\" or null,\n  \"limitations\": [\"\u2026\"] or null,\n  \"model_separation\": \"one sentence on why beta and c/lambda are read separately\" or null,\n  \"hypothesis\": {\"H0\": \"\u2026\", \"H1\": \"\u2026\", \"paper_refs\": [\"Cont 1011.6402 \u00a7\u2026\"], \"evidence_refs\": [\"calc.ofi.intervals\", \u2026]} or null (REQUIRED at final),\n  \"scenario\": {\"target_price\": \"\u2026\", \"horizon\": \"15m|1h|4h\", \"direction\": \"up|down\", \"required_ofi\": \"\u2026\", \"required_ofi_range\": [\u2026] or null, \"exceedance\": \"\u2026\", \"exceedance_range\": [\u2026] or null, \"fit_status\": \"validated|provisional\", \"n_windows_usable\": N, \"r2\": \"\u2026\" or null, \"probability\": \"low|medium|high\", \"verdict\": \"reachable|not_reachable|unevaluable\", \"rationale\": \"\u2026 (\u226580 chars, name fit_status + usable windows + r2 beside the verdict)\"} or null (REQUIRED at final ONLY when a SCENARIO block was given \u2014 echo numerics from calc.scenario.evaluate \u2192 \u2026 paths, never compute),\n  \"tool_calls\": [{\"name\": \"<ONE registry tool name>\", \"args\": {\"symbol\": \"<this cycle's symbol>\", \"venue\": \"<this cycle's venue>\", \"interval_seconds\": 10, \"window_minutes\": 30, \u2026}}],\n  KEY RULE: the tool-name key is EXACTLY \"name\" \u2014 never \"tool\", \"tool_name\", or any other key. Entries under any other key are dropped unread.\n  \"memory_proposals\": [{\"kind\": \"observation|hypothesis\", \"content\": \"\u2026\", \"importance\": 5.0, \"tags\": [\"\u2026\"]}] or null\n}\nREGISTRY TOOL NAMES (use EXACTLY \u2014 any other name is denied):\n  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n  P6 output: no tools \u2014 synthesis only.\nSTAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n  P1 OFI inference \u2192 P2 AD inference (split \u2014 never merged) \u2192 P3 warm-plane correlation (TWO-BEAT: invoke \u22651 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; substrate.read is the verdict, market.read is context; judge freshness via age_ms; dormant/empty results are findings, never re-invoke) \u2192 P4 explanation (the why-now synthesis) \u2192 P5 derivation (memory.recall_paper FIRST, then calc.price.delta with an OFI value for the NUMERIC \u0394P + band) \u2192 P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\nWINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds (10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\nRules: tool_calls max 3 per round, max 8 rounds. Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn (phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, a P6 synthesis turn was declared, hypothesis.H0 is set, summary \u2265200 chars, confidence low|medium|high, every evidence entry carries a non-empty interpretation, and evidence cites \u22652 distinct roots incl. a calc.price.delta \u2192 \u2026 \u0394P path plus \u22651 more fresh tool result. memory_proposals max 3, kind fact forbidden."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "tool",
+        "calc.ofi.intervals",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 1/8 dispatched; cite paths):\n{\"calc.ofi.intervals\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 7. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "tool",
+        "calc.depth.average",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 2/8 dispatched; cite paths):\n{\"calc.depth.average\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"calc.ofi.intervals\": {\"value\": \"fixture\"}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"calc.depth.average\", \"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 6. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "tool",
+        "market.derivatives",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 3/8 dispatched; cite paths):\n{\"market.derivatives\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"calc.ofi.intervals\": {\"value\": \"fixture\"}, \"calc.depth.average\": {\"value\": \"fixture\"}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"calc.depth.average\", \"micro.fit_beta\"], \"P3\": [\"market.derivatives\"], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P5 \u2014 DERIVE: call memory.recall_paper FIRST (ground H0/H1 in Cont 1011.6402 facts), then calc.price.delta (alias calc.derived_diagnostic) with an OFI value \u2014 scenario arg or latest-interval default \u2014 for the NUMERIC derived \u0394P (route A direct + route B when c/\u03bb exist, with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 5. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "tool",
+        "memory.recall_paper",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "calc.price.delta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nTOOL RESULTS (round 4/8 dispatched; cite paths):\n{\"memory.recall_paper\": {\"value\": \"fixture\"}, \"calc.price.delta\": {\"value\": \"fixture\"}}\n\nPRIOR ROUNDS (earlier results, for citation):\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"calc.ofi.intervals\": {\"value\": \"fixture\"}, \"calc.depth.average\": {\"value\": \"fixture\"}, \"market.derivatives\": {\"value\": \"fixture\"}}\n\nPHASE COVERAGE (families with \u22651 ok tool): {\"P1\": [\"calc.ofi.intervals\", \"micro.capture_status\"], \"P2\": [\"calc.depth.average\", \"micro.fit_beta\"], \"P3\": [\"market.derivatives\"], \"P4\": [], \"P5\": [\"calc.price.delta\", \"memory.recall_paper\"], \"P6\": [\"declared\"]}\nPHASE P5 \u2014 DERIVE: call memory.recall_paper FIRST (ground H0/H1 in Cont 1011.6402 facts), then calc.price.delta (alias calc.derived_diagnostic) with an OFI value \u2014 scenario arg or latest-interval default \u2014 for the NUMERIC derived \u0394P (route A direct + route B when c/\u03bb exist, with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nTool rounds remaining: 4. Declare \"phase\" every turn; call the next phase's tools, or advance with tool_calls=[]."
+      ],
+      [
+        "postgres",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "settled"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.ofi.intervals",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.depth.average",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "market.derivatives",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "memory.recall_paper",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.price.delta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": {
+            "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+            "evidence": [
+              {
+                "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+                "value": "0.001",
+                "interpretation": "positive impact",
+                "metric_name": "beta"
+              },
+              {
+                "path": "calc.ofi.intervals \u2192 ofi",
+                "value": "12.5",
+                "interpretation": "sustained one-sided flow",
+                "metric_name": "ofi"
+              },
+              {
+                "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+                "value": "+0.53",
+                "interpretation": "derived move with band",
+                "metric_name": "delta_ticks"
+              }
+            ],
+            "confidence": "medium",
+            "limitations": [
+              "synthetic window"
+            ],
+            "model_separation": "nu*OFI is heteroskedastic; never merged."
+          },
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [],
+          "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": [
+              "Cont 1011.6402"
+            ],
+            "evidence_refs": [
+              "calc.ofi.intervals",
+              "calc.depth.average"
+            ]
+          },
+          "hypothesis_verdict": "inconclusive",
+          "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+          "calculations": {
+            "micro.fit_beta": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "calc.ofi.intervals": {
+              "value": "fixture"
+            },
+            "calc.depth.average": {
+              "value": "fixture"
+            },
+            "calc.price.delta": {
+              "value": "fixture"
+            },
+            "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+          }
+        }
+      ],
+      [
+        "redis",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "settled"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.ofi.intervals",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.depth.average",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "market.derivatives",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "memory.recall_paper",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "calc.price.delta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": {
+            "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+            "evidence": [
+              {
+                "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+                "value": "0.001",
+                "interpretation": "positive impact",
+                "metric_name": "beta"
+              },
+              {
+                "path": "calc.ofi.intervals \u2192 ofi",
+                "value": "12.5",
+                "interpretation": "sustained one-sided flow",
+                "metric_name": "ofi"
+              },
+              {
+                "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+                "value": "+0.53",
+                "interpretation": "derived move with band",
+                "metric_name": "delta_ticks"
+              }
+            ],
+            "confidence": "medium",
+            "limitations": [
+              "synthetic window"
+            ],
+            "model_separation": "nu*OFI is heteroskedastic; never merged."
+          },
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [],
+          "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": [
+              "Cont 1011.6402"
+            ],
+            "evidence_refs": [
+              "calc.ofi.intervals",
+              "calc.depth.average"
+            ]
+          },
+          "hypothesis_verdict": "inconclusive",
+          "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+          "calculations": {
+            "micro.fit_beta": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "calc.ofi.intervals": {
+              "value": "fixture"
+            },
+            "calc.depth.average": {
+              "value": "fixture"
+            },
+            "calc.price.delta": {
+              "value": "fixture"
+            },
+            "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+          }
+        }
+      ],
+      [
+        "memory",
+        [
+          "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "observation",
+          "Beta positive on the 30m window"
+        ],
+        {
+          "run_id": "00000000-0000-0000-0000-000000000001",
+          "importance": 6.0,
+          "tags": [
+            "beta",
+            "btcusdt-spot"
+          ],
+          "evidence_refs": [
+            "00000000-0000-0000-0000-000000000001"
+          ]
+        }
+      ]
+    ]
+  },
+  "gate": {
+    "artifact": {
+      "schema_version": 1,
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "BTCUSDT",
+      "venue": "spot",
+      "generated_at": "2026-01-01T00:00:00+00:00",
+      "completed_at": "2026-01-01T00:00:00+00:00",
+      "status": "insufficient",
+      "window_minutes": 30,
+      "interval_seconds": 10,
+      "deterministic_state": {
+        "task": "Explain the evidence",
+        "scenario": null,
+        "wake": {
+          "trigger_source": "watcher",
+          "predicates_fired": {
+            "cold_start": {}
+          }
+        },
+        "capture_status": {
+          "state": "starting",
+          "sequence_gaps": 0
+        },
+        "microstructure_evidence": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "gate": {
+          "status": "insufficient",
+          "reasons": [
+            "capture state 'starting' is not established"
+          ]
+        },
+        "data_quality": {
+          "capture_state": "starting",
+          "sequence_gaps": 0,
+          "heteroskedasticity_flag": null,
+          "fit_status": "validated",
+          "n_observations": 40,
+          "spine": {
+            "interval_seconds": 10,
+            "window_minutes": 30
+          },
+          "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+          "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+        },
+        "terminal": "gate_refused"
+      },
+      "capability_log": [
+        {
+          "capability": "engine.wake",
+          "scope": {
+            "symbol": "BTCUSDT",
+            "venue": "spot"
+          },
+          "result": "ok",
+          "detail": {
+            "trigger_source": "watcher",
+            "predicates_fired": {
+              "cold_start": {}
+            },
+            "decision": "fire",
+            "consumed_wake_ids": [],
+            "task": "Explain the evidence",
+            "scenario": null
+          }
+        },
+        {
+          "capability": "micro.capture_status",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "micro.fit_beta",
+          "scope": {},
+          "result": "ok"
+        }
+      ],
+      "input_hash": "fixture",
+      "model_version": "inference-engine-v1",
+      "interpretation": null,
+      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+      "errors": [
+        {
+          "source": "gate",
+          "error": "capture state 'starting' is not established"
+        }
+      ],
+      "hypothesis": null,
+      "hypothesis_verdict": null,
+      "verdict_reason": null,
+      "calculations": null
+    },
+    "meta": {
+      "task": "Explain the evidence",
+      "scenario": null,
+      "llm_calls": 0,
+      "gate": "insufficient",
+      "reasons": [
+        "capture state 'starting' is not established"
+      ],
+      "terminal": "gate_refused"
+    },
+    "effects": [
+      [
+        "tool",
+        "micro.capture_status",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "micro.fit_beta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "interval_seconds": 10,
+          "window_minutes": 30
+        }
+      ],
+      [
+        "postgres",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "insufficient",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "starting",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "insufficient",
+              "reasons": [
+                "capture state 'starting' is not established"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "starting",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "gate_refused"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": null,
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [
+            {
+              "source": "gate",
+              "error": "capture state 'starting' is not established"
+            }
+          ],
+          "hypothesis": null,
+          "hypothesis_verdict": null,
+          "verdict_reason": null,
+          "calculations": null
+        }
+      ],
+      [
+        "redis",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "insufficient",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "starting",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "insufficient",
+              "reasons": [
+                "capture state 'starting' is not established"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "starting",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "gate_refused"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": null,
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [
+            {
+              "source": "gate",
+              "error": "capture state 'starting' is not established"
+            }
+          ],
+          "hypothesis": null,
+          "hypothesis_verdict": null,
+          "verdict_reason": null,
+          "calculations": null
+        }
+      ],
+      [
+        "memory",
+        [
+          "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "observation",
+          "Cycle refused by gate: capture state 'starting' is not established"
+        ],
+        {
+          "run_id": "00000000-0000-0000-0000-000000000001",
+          "importance": 2.0,
+          "tags": [
+            "gate",
+            "insufficient",
+            "btcusdt"
+          ],
+          "evidence_refs": [
+            "00000000-0000-0000-0000-000000000001"
+          ]
+        }
+      ]
+    ]
+  },
+  "parse": {
+    "artifact": {
+      "schema_version": 1,
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "BTCUSDT",
+      "venue": "spot",
+      "generated_at": "2026-01-01T00:00:00+00:00",
+      "completed_at": "2026-01-01T00:00:00+00:00",
+      "status": "provisional",
+      "window_minutes": 30,
+      "interval_seconds": 10,
+      "deterministic_state": {
+        "task": "Explain the evidence",
+        "scenario": null,
+        "wake": {
+          "trigger_source": "watcher",
+          "predicates_fired": {
+            "cold_start": {}
+          }
+        },
+        "capture_status": {
+          "state": "running",
+          "sequence_gaps": 0
+        },
+        "microstructure_evidence": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "gate": {
+          "status": "provisional",
+          "reasons": [
+            "observations 40 < 2x minimum 60"
+          ]
+        },
+        "data_quality": {
+          "capture_state": "running",
+          "sequence_gaps": 0,
+          "heteroskedasticity_flag": null,
+          "fit_status": "validated",
+          "n_observations": 40,
+          "spine": {
+            "interval_seconds": 10,
+            "window_minutes": 30
+          },
+          "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+          "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+        },
+        "terminal": "parse_failed"
+      },
+      "capability_log": [
+        {
+          "capability": "engine.wake",
+          "scope": {
+            "symbol": "BTCUSDT",
+            "venue": "spot"
+          },
+          "result": "ok",
+          "detail": {
+            "trigger_source": "watcher",
+            "predicates_fired": {
+              "cold_start": {}
+            },
+            "decision": "fire",
+            "consumed_wake_ids": [],
+            "task": "Explain the evidence",
+            "scenario": null
+          }
+        },
+        {
+          "capability": "micro.capture_status",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "micro.fit_beta",
+          "scope": {},
+          "result": "ok"
+        }
+      ],
+      "input_hash": "fixture",
+      "model_version": "inference-engine-v1",
+      "interpretation": null,
+      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+      "errors": [
+        {
+          "source": "narration",
+          "error": "narration_parse_failed: no JSON object in output"
+        }
+      ],
+      "hypothesis": null,
+      "hypothesis_verdict": null,
+      "verdict_reason": null,
+      "calculations": null
+    },
+    "meta": {
+      "llm_calls": 1,
+      "terminal": "parse_failed"
+    },
+    "effects": [
+      [
+        "tool",
+        "micro.capture_status",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "micro.fit_beta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "interval_seconds": 10,
+          "window_minutes": 30
+        }
+      ],
+      [
+        "llm",
+        "TASK (interactive-plane directive \u2014 frame H0/H1 to ANSWER this; cite it in hypothesis.evidence_refs as 'task'):\nExplain the evidence\n\nWAKE: {\"trigger_source\": \"watcher\", \"predicates\": {\"cold_start\": {}}}\n\nENVELOPE STATE (gate reads + wake identity \u2014 READ-PLANE; pull everything else yourself via tools; never recompute values, COMMAND the read tools and cite their paths):\n{\"task\": \"Explain the evidence\", \"scenario\": null, \"wake\": {\"trigger_source\": \"watcher\", \"predicates_fired\": {\"cold_start\": {}}}, \"capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"microstructure_evidence\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"gate\": {\"status\": \"provisional\", \"reasons\": [\"observations 40 < 2x minimum 60\"]}, \"data_quality\": {\"capture_state\": \"running\", \"sequence_gaps\": 0, \"heteroskedasticity_flag\": null, \"fit_status\": \"validated\", \"n_observations\": 40, \"spine\": {\"interval_seconds\": 10, \"window_minutes\": 30}, \"note\": \"provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \\u00d7 window 15/30/60m via tool args\", \"read_plane\": \"the deterministic spine (OFI intervals, AD, observations, \\u0394P) is NOT pre-computed \\u2014 pull it via your read tools during P1/P2/P5\"}}\n\nNo prior artifact: this is the first inference cycle.\n\nRECALLED MEMORY (provenance-tagged priors; subordinate to the ledger):\n## Recalled session memory\n- [observation#abc] prior conclusion\n\nSTAGED INFERENCE \u2014 6 phases (P1\u2192P6), one JSON object per turn, up to 8 tool rounds. Declare your phase every turn.\nReturn ONLY one JSON object per turn with EXACTLY these keys:\n{\n  \"phase\": \"P1|P2|P3|P4|P5|P6 \u2014 the phase this turn advances (P6 = final output generation, no tools)\",\n  \"summary\": \"P4 explanation (\u2265200 chars: what the fits show AND why now), or null while tools are still pending\",\n  \"evidence\": [{\"path\": \"deterministic_state.\u2026 OR <tool-name> \u2192 <field>\", \"value\": \u2026, \"interpretation\": \"\u2026\", \"metric_name\": \"\u2026\"}] or null,\n  \"confidence\": \"low|medium|high\" or null,\n  \"limitations\": [\"\u2026\"] or null,\n  \"model_separation\": \"one sentence on why beta and c/lambda are read separately\" or null,\n  \"hypothesis\": {\"H0\": \"\u2026\", \"H1\": \"\u2026\", \"paper_refs\": [\"Cont 1011.6402 \u00a7\u2026\"], \"evidence_refs\": [\"calc.ofi.intervals\", \u2026]} or null (REQUIRED at final),\n  \"scenario\": {\"target_price\": \"\u2026\", \"horizon\": \"15m|1h|4h\", \"direction\": \"up|down\", \"required_ofi\": \"\u2026\", \"required_ofi_range\": [\u2026] or null, \"exceedance\": \"\u2026\", \"exceedance_range\": [\u2026] or null, \"fit_status\": \"validated|provisional\", \"n_windows_usable\": N, \"r2\": \"\u2026\" or null, \"probability\": \"low|medium|high\", \"verdict\": \"reachable|not_reachable|unevaluable\", \"rationale\": \"\u2026 (\u226580 chars, name fit_status + usable windows + r2 beside the verdict)\"} or null (REQUIRED at final ONLY when a SCENARIO block was given \u2014 echo numerics from calc.scenario.evaluate \u2192 \u2026 paths, never compute),\n  \"tool_calls\": [{\"name\": \"<ONE registry tool name>\", \"args\": {\"symbol\": \"<this cycle's symbol>\", \"venue\": \"<this cycle's venue>\", \"interval_seconds\": 10, \"window_minutes\": 30, \u2026}}],\n  KEY RULE: the tool-name key is EXACTLY \"name\" \u2014 never \"tool\", \"tool_name\", or any other key. Entries under any other key are dropped unread.\n  \"memory_proposals\": [{\"kind\": \"observation|hypothesis\", \"content\": \"\u2026\", \"importance\": 5.0, \"tags\": [\"\u2026\"]}] or null\n}\nREGISTRY TOOL NAMES (use EXACTLY \u2014 any other name is denied):\n  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n  P6 output: no tools \u2014 synthesis only.\nSTAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n  P1 OFI inference \u2192 P2 AD inference (split \u2014 never merged) \u2192 P3 warm-plane correlation (TWO-BEAT: invoke \u22651 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; substrate.read is the verdict, market.read is context; judge freshness via age_ms; dormant/empty results are findings, never re-invoke) \u2192 P4 explanation (the why-now synthesis) \u2192 P5 derivation (memory.recall_paper FIRST, then calc.price.delta with an OFI value for the NUMERIC \u0394P + band) \u2192 P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\nWINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds (10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\nRules: tool_calls max 3 per round, max 8 rounds. Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn (phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, a P6 synthesis turn was declared, hypothesis.H0 is set, summary \u2265200 chars, confidence low|medium|high, every evidence entry carries a non-empty interpretation, and evidence cites \u22652 distinct roots incl. a calc.price.delta \u2192 \u2026 \u0394P path plus \u22651 more fresh tool result. memory_proposals max 3, kind fact forbidden."
+      ],
+      [
+        "postgres",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "parse_failed"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": null,
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [
+            {
+              "source": "narration",
+              "error": "narration_parse_failed: no JSON object in output"
+            }
+          ],
+          "hypothesis": null,
+          "hypothesis_verdict": null,
+          "verdict_reason": null,
+          "calculations": null
+        }
+      ],
+      [
+        "redis",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "parse_failed"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": null,
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [
+            {
+              "source": "narration",
+              "error": "narration_parse_failed: no JSON object in output"
+            }
+          ],
+          "hypothesis": null,
+          "hypothesis_verdict": null,
+          "verdict_reason": null,
+          "calculations": null
+        }
+      ]
+    ]
+  },
+  "transport": {
+    "artifact": {
+      "schema_version": 1,
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "BTCUSDT",
+      "venue": "spot",
+      "generated_at": "2026-01-01T00:00:00+00:00",
+      "completed_at": "2026-01-01T00:00:00+00:00",
+      "status": "provisional",
+      "window_minutes": 30,
+      "interval_seconds": 10,
+      "deterministic_state": {
+        "task": "Explain the evidence",
+        "scenario": null,
+        "wake": {
+          "trigger_source": "watcher",
+          "predicates_fired": {
+            "cold_start": {}
+          }
+        },
+        "capture_status": {
+          "state": "running",
+          "sequence_gaps": 0
+        },
+        "microstructure_evidence": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "gate": {
+          "status": "provisional",
+          "reasons": [
+            "observations 40 < 2x minimum 60"
+          ]
+        },
+        "data_quality": {
+          "capture_state": "running",
+          "sequence_gaps": 0,
+          "heteroskedasticity_flag": null,
+          "fit_status": "validated",
+          "n_observations": 40,
+          "spine": {
+            "interval_seconds": 10,
+            "window_minutes": 30
+          },
+          "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+          "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+        },
+        "terminal": "narration_failed"
+      },
+      "capability_log": [
+        {
+          "capability": "engine.wake",
+          "scope": {
+            "symbol": "BTCUSDT",
+            "venue": "spot"
+          },
+          "result": "ok",
+          "detail": {
+            "trigger_source": "watcher",
+            "predicates_fired": {
+              "cold_start": {}
+            },
+            "decision": "fire",
+            "consumed_wake_ids": [],
+            "task": "Explain the evidence",
+            "scenario": null
+          }
+        },
+        {
+          "capability": "micro.capture_status",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "micro.fit_beta",
+          "scope": {},
+          "result": "ok"
+        }
+      ],
+      "input_hash": "fixture",
+      "model_version": "inference-engine-v1",
+      "interpretation": null,
+      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+      "errors": [
+        {
+          "source": "narration",
+          "error": "narration_failed: AssertionError: LLM called more times than scripted"
+        }
+      ],
+      "hypothesis": null,
+      "hypothesis_verdict": null,
+      "verdict_reason": null,
+      "calculations": null
+    },
+    "meta": {
+      "llm_calls": 0,
+      "terminal": "narration_failed"
+    },
+    "effects": [
+      [
+        "tool",
+        "micro.capture_status",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "micro.fit_beta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "interval_seconds": 10,
+          "window_minutes": 30
+        }
+      ],
+      [
+        "llm",
+        "TASK (interactive-plane directive \u2014 frame H0/H1 to ANSWER this; cite it in hypothesis.evidence_refs as 'task'):\nExplain the evidence\n\nWAKE: {\"trigger_source\": \"watcher\", \"predicates\": {\"cold_start\": {}}}\n\nENVELOPE STATE (gate reads + wake identity \u2014 READ-PLANE; pull everything else yourself via tools; never recompute values, COMMAND the read tools and cite their paths):\n{\"task\": \"Explain the evidence\", \"scenario\": null, \"wake\": {\"trigger_source\": \"watcher\", \"predicates_fired\": {\"cold_start\": {}}}, \"capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"microstructure_evidence\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"gate\": {\"status\": \"provisional\", \"reasons\": [\"observations 40 < 2x minimum 60\"]}, \"data_quality\": {\"capture_state\": \"running\", \"sequence_gaps\": 0, \"heteroskedasticity_flag\": null, \"fit_status\": \"validated\", \"n_observations\": 40, \"spine\": {\"interval_seconds\": 10, \"window_minutes\": 30}, \"note\": \"provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \\u00d7 window 15/30/60m via tool args\", \"read_plane\": \"the deterministic spine (OFI intervals, AD, observations, \\u0394P) is NOT pre-computed \\u2014 pull it via your read tools during P1/P2/P5\"}}\n\nNo prior artifact: this is the first inference cycle.\n\nRECALLED MEMORY (provenance-tagged priors; subordinate to the ledger):\n## Recalled session memory\n- [observation#abc] prior conclusion\n\nSTAGED INFERENCE \u2014 6 phases (P1\u2192P6), one JSON object per turn, up to 8 tool rounds. Declare your phase every turn.\nReturn ONLY one JSON object per turn with EXACTLY these keys:\n{\n  \"phase\": \"P1|P2|P3|P4|P5|P6 \u2014 the phase this turn advances (P6 = final output generation, no tools)\",\n  \"summary\": \"P4 explanation (\u2265200 chars: what the fits show AND why now), or null while tools are still pending\",\n  \"evidence\": [{\"path\": \"deterministic_state.\u2026 OR <tool-name> \u2192 <field>\", \"value\": \u2026, \"interpretation\": \"\u2026\", \"metric_name\": \"\u2026\"}] or null,\n  \"confidence\": \"low|medium|high\" or null,\n  \"limitations\": [\"\u2026\"] or null,\n  \"model_separation\": \"one sentence on why beta and c/lambda are read separately\" or null,\n  \"hypothesis\": {\"H0\": \"\u2026\", \"H1\": \"\u2026\", \"paper_refs\": [\"Cont 1011.6402 \u00a7\u2026\"], \"evidence_refs\": [\"calc.ofi.intervals\", \u2026]} or null (REQUIRED at final),\n  \"scenario\": {\"target_price\": \"\u2026\", \"horizon\": \"15m|1h|4h\", \"direction\": \"up|down\", \"required_ofi\": \"\u2026\", \"required_ofi_range\": [\u2026] or null, \"exceedance\": \"\u2026\", \"exceedance_range\": [\u2026] or null, \"fit_status\": \"validated|provisional\", \"n_windows_usable\": N, \"r2\": \"\u2026\" or null, \"probability\": \"low|medium|high\", \"verdict\": \"reachable|not_reachable|unevaluable\", \"rationale\": \"\u2026 (\u226580 chars, name fit_status + usable windows + r2 beside the verdict)\"} or null (REQUIRED at final ONLY when a SCENARIO block was given \u2014 echo numerics from calc.scenario.evaluate \u2192 \u2026 paths, never compute),\n  \"tool_calls\": [{\"name\": \"<ONE registry tool name>\", \"args\": {\"symbol\": \"<this cycle's symbol>\", \"venue\": \"<this cycle's venue>\", \"interval_seconds\": 10, \"window_minutes\": 30, \u2026}}],\n  KEY RULE: the tool-name key is EXACTLY \"name\" \u2014 never \"tool\", \"tool_name\", or any other key. Entries under any other key are dropped unread.\n  \"memory_proposals\": [{\"kind\": \"observation|hypothesis\", \"content\": \"\u2026\", \"importance\": 5.0, \"tags\": [\"\u2026\"]}] or null\n}\nREGISTRY TOOL NAMES (use EXACTLY \u2014 any other name is denied):\n  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n  P6 output: no tools \u2014 synthesis only.\nSTAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n  P1 OFI inference \u2192 P2 AD inference (split \u2014 never merged) \u2192 P3 warm-plane correlation (TWO-BEAT: invoke \u22651 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; substrate.read is the verdict, market.read is context; judge freshness via age_ms; dormant/empty results are findings, never re-invoke) \u2192 P4 explanation (the why-now synthesis) \u2192 P5 derivation (memory.recall_paper FIRST, then calc.price.delta with an OFI value for the NUMERIC \u0394P + band) \u2192 P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\nWINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds (10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\nRules: tool_calls max 3 per round, max 8 rounds. Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn (phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, a P6 synthesis turn was declared, hypothesis.H0 is set, summary \u2265200 chars, confidence low|medium|high, every evidence entry carries a non-empty interpretation, and evidence cites \u22652 distinct roots incl. a calc.price.delta \u2192 \u2026 \u0394P path plus \u22651 more fresh tool result. memory_proposals max 3, kind fact forbidden."
+      ],
+      [
+        "postgres",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "narration_failed"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": null,
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [
+            {
+              "source": "narration",
+              "error": "narration_failed: AssertionError: LLM called more times than scripted"
+            }
+          ],
+          "hypothesis": null,
+          "hypothesis_verdict": null,
+          "verdict_reason": null,
+          "calculations": null
+        }
+      ],
+      [
+        "redis",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "narration_failed"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": null,
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [
+            {
+              "source": "narration",
+              "error": "narration_failed: AssertionError: LLM called more times than scripted"
+            }
+          ],
+          "hypothesis": null,
+          "hypothesis_verdict": null,
+          "verdict_reason": null,
+          "calculations": null
+        }
+      ]
+    ]
+  },
+  "budget": {
+    "artifact": {
+      "schema_version": 1,
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "BTCUSDT",
+      "venue": "spot",
+      "generated_at": "2026-01-01T00:00:00+00:00",
+      "completed_at": "2026-01-01T00:00:00+00:00",
+      "status": "provisional",
+      "window_minutes": 30,
+      "interval_seconds": 10,
+      "deterministic_state": {
+        "task": "Explain the evidence",
+        "scenario": null,
+        "wake": {
+          "trigger_source": "watcher",
+          "predicates_fired": {
+            "cold_start": {}
+          }
+        },
+        "capture_status": {
+          "state": "running",
+          "sequence_gaps": 0
+        },
+        "microstructure_evidence": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "gate": {
+          "status": "provisional",
+          "reasons": [
+            "observations 40 < 2x minimum 60"
+          ]
+        },
+        "data_quality": {
+          "capture_state": "running",
+          "sequence_gaps": 0,
+          "heteroskedasticity_flag": null,
+          "fit_status": "validated",
+          "n_observations": 40,
+          "spine": {
+            "interval_seconds": 10,
+            "window_minutes": 30
+          },
+          "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+          "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+        },
+        "terminal": "budget_exhausted"
+      },
+      "capability_log": [
+        {
+          "capability": "engine.wake",
+          "scope": {
+            "symbol": "BTCUSDT",
+            "venue": "spot"
+          },
+          "result": "ok",
+          "detail": {
+            "trigger_source": "watcher",
+            "predicates_fired": {
+              "cold_start": {}
+            },
+            "decision": "fire",
+            "consumed_wake_ids": [],
+            "task": "Explain the evidence",
+            "scenario": null
+          }
+        },
+        {
+          "capability": "micro.capture_status",
+          "scope": {},
+          "result": "ok"
+        },
+        {
+          "capability": "micro.fit_beta",
+          "scope": {},
+          "result": "ok"
+        }
+      ],
+      "input_hash": "fixture",
+      "model_version": "inference-engine-v1",
+      "interpretation": {
+        "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+        "evidence": [
+          {
+            "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+            "value": "0.001",
+            "interpretation": "positive impact",
+            "metric_name": "beta"
+          },
+          {
+            "path": "calc.ofi.intervals \u2192 ofi",
+            "value": "12.5",
+            "interpretation": "sustained one-sided flow",
+            "metric_name": "ofi"
+          },
+          {
+            "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+            "value": "+0.53",
+            "interpretation": "derived move with band",
+            "metric_name": "delta_ticks"
+          }
+        ],
+        "confidence": "medium",
+        "limitations": [
+          "synthetic window"
+        ],
+        "model_separation": "nu*OFI is heteroskedastic; never merged."
+      },
+      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+      "errors": [],
+      "hypothesis": {
+        "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+        "H1": "beta <= 0 (flow no longer moves price)",
+        "paper_refs": [
+          "Cont 1011.6402"
+        ],
+        "evidence_refs": [
+          "calc.ofi.intervals",
+          "calc.depth.average"
+        ]
+      },
+      "hypothesis_verdict": "inconclusive",
+      "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+      "calculations": {
+        "micro.fit_beta": {
+          "input_hash": "fixture",
+          "price_impact_fit": {
+            "status": "validated",
+            "n_observations": 40,
+            "beta": "0.001"
+          },
+          "coverage": {
+            "events_in_window": 5000
+          }
+        },
+        "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+      }
+    },
+    "meta": {
+      "task": "Explain the evidence",
+      "scenario": null,
+      "terminal": "budget_exhausted",
+      "unexecuted_tool_calls": [],
+      "llm_calls": 12,
+      "gate": "provisional",
+      "tool_round": true,
+      "tool_rounds": 0,
+      "repairs": 11,
+      "phase_coverage": {
+        "P1": [
+          "micro.capture_status"
+        ],
+        "P2": [
+          "micro.fit_beta"
+        ],
+        "P3": [],
+        "P4": [],
+        "P5": [],
+        "P6": [
+          "declared"
+        ]
+      },
+      "final_validation": {
+        "passed": false,
+        "missing": [
+          "phase P3 uncovered: execute its tools before finalizing (covered so far: [])",
+          "phase P5 uncovered: execute its tools before finalizing (covered so far: [])"
+        ]
+      },
+      "memory": {
+        "accepted": [
+          {
+            "kind": "observation",
+            "content": "Beta positive on the 30m window",
+            "importance": 6.0,
+            "tags": [
+              "beta",
+              "btcusdt-spot"
+            ]
+          }
+        ],
+        "dispositions": [],
+        "written": [
+          {
+            "memory_id": "mem-1",
+            "kind": "observation"
+          }
+        ]
+      }
+    },
+    "effects": [
+      [
+        "tool",
+        "micro.capture_status",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot"
+        }
+      ],
+      [
+        "tool",
+        "micro.fit_beta",
+        {
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "interval_seconds": 10,
+          "window_minutes": 30
+        }
+      ],
+      [
+        "llm",
+        "TASK (interactive-plane directive \u2014 frame H0/H1 to ANSWER this; cite it in hypothesis.evidence_refs as 'task'):\nExplain the evidence\n\nWAKE: {\"trigger_source\": \"watcher\", \"predicates\": {\"cold_start\": {}}}\n\nENVELOPE STATE (gate reads + wake identity \u2014 READ-PLANE; pull everything else yourself via tools; never recompute values, COMMAND the read tools and cite their paths):\n{\"task\": \"Explain the evidence\", \"scenario\": null, \"wake\": {\"trigger_source\": \"watcher\", \"predicates_fired\": {\"cold_start\": {}}}, \"capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"microstructure_evidence\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}, \"gate\": {\"status\": \"provisional\", \"reasons\": [\"observations 40 < 2x minimum 60\"]}, \"data_quality\": {\"capture_state\": \"running\", \"sequence_gaps\": 0, \"heteroskedasticity_flag\": null, \"fit_status\": \"validated\", \"n_observations\": 40, \"spine\": {\"interval_seconds\": 10, \"window_minutes\": 30}, \"note\": \"provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \\u00d7 window 15/30/60m via tool args\", \"read_plane\": \"the deterministic spine (OFI intervals, AD, observations, \\u0394P) is NOT pre-computed \\u2014 pull it via your read tools during P1/P2/P5\"}}\n\nNo prior artifact: this is the first inference cycle.\n\nRECALLED MEMORY (provenance-tagged priors; subordinate to the ledger):\n## Recalled session memory\n- [observation#abc] prior conclusion\n\nSTAGED INFERENCE \u2014 6 phases (P1\u2192P6), one JSON object per turn, up to 8 tool rounds. Declare your phase every turn.\nReturn ONLY one JSON object per turn with EXACTLY these keys:\n{\n  \"phase\": \"P1|P2|P3|P4|P5|P6 \u2014 the phase this turn advances (P6 = final output generation, no tools)\",\n  \"summary\": \"P4 explanation (\u2265200 chars: what the fits show AND why now), or null while tools are still pending\",\n  \"evidence\": [{\"path\": \"deterministic_state.\u2026 OR <tool-name> \u2192 <field>\", \"value\": \u2026, \"interpretation\": \"\u2026\", \"metric_name\": \"\u2026\"}] or null,\n  \"confidence\": \"low|medium|high\" or null,\n  \"limitations\": [\"\u2026\"] or null,\n  \"model_separation\": \"one sentence on why beta and c/lambda are read separately\" or null,\n  \"hypothesis\": {\"H0\": \"\u2026\", \"H1\": \"\u2026\", \"paper_refs\": [\"Cont 1011.6402 \u00a7\u2026\"], \"evidence_refs\": [\"calc.ofi.intervals\", \u2026]} or null (REQUIRED at final),\n  \"scenario\": {\"target_price\": \"\u2026\", \"horizon\": \"15m|1h|4h\", \"direction\": \"up|down\", \"required_ofi\": \"\u2026\", \"required_ofi_range\": [\u2026] or null, \"exceedance\": \"\u2026\", \"exceedance_range\": [\u2026] or null, \"fit_status\": \"validated|provisional\", \"n_windows_usable\": N, \"r2\": \"\u2026\" or null, \"probability\": \"low|medium|high\", \"verdict\": \"reachable|not_reachable|unevaluable\", \"rationale\": \"\u2026 (\u226580 chars, name fit_status + usable windows + r2 beside the verdict)\"} or null (REQUIRED at final ONLY when a SCENARIO block was given \u2014 echo numerics from calc.scenario.evaluate \u2192 \u2026 paths, never compute),\n  \"tool_calls\": [{\"name\": \"<ONE registry tool name>\", \"args\": {\"symbol\": \"<this cycle's symbol>\", \"venue\": \"<this cycle's venue>\", \"interval_seconds\": 10, \"window_minutes\": 30, \u2026}}],\n  KEY RULE: the tool-name key is EXACTLY \"name\" \u2014 never \"tool\", \"tool_name\", or any other key. Entries under any other key are dropped unread.\n  \"memory_proposals\": [{\"kind\": \"observation|hypothesis\", \"content\": \"\u2026\", \"importance\": 5.0, \"tags\": [\"\u2026\"]}] or null\n}\nREGISTRY TOOL NAMES (use EXACTLY \u2014 any other name is denied):\n  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n  P6 output: no tools \u2014 synthesis only.\nSTAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n  P1 OFI inference \u2192 P2 AD inference (split \u2014 never merged) \u2192 P3 warm-plane correlation (TWO-BEAT: invoke \u22651 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; substrate.read is the verdict, market.read is context; judge freshness via age_ms; dormant/empty results are findings, never re-invoke) \u2192 P4 explanation (the why-now synthesis) \u2192 P5 derivation (memory.recall_paper FIRST, then calc.price.delta with an OFI value for the NUMERIC \u0394P + band) \u2192 P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\nWINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds (10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\nRules: tool_calls max 3 per round, max 8 rounds. Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn (phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, a P6 synthesis turn was declared, hypothesis.H0 is set, summary \u2265200 chars, confidence low|medium|high, every evidence entry carries a non-empty interpretation, and evidence cites \u22652 distinct roots incl. a calc.price.delta \u2192 \u2026 \u0394P path plus \u22651 more fresh tool result. memory_proposals max 3, kind fact forbidden."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "llm",
+        "TASK reminder (answer this): Explain the evidence\nFINAL REJECTED \u2014 staged inference incomplete. Missing:\n- phase P3 uncovered: execute its tools before finalizing (covered so far: [])\n- phase P5 uncovered: execute its tools before finalizing (covered so far: [])\n\nACCUMULATED TOOL RESULTS:\n{\"micro.capture_status\": {\"state\": \"running\", \"sequence_gaps\": 0}, \"micro.fit_beta\": {\"input_hash\": \"fixture\", \"price_impact_fit\": {\"status\": \"validated\", \"n_observations\": 40, \"beta\": \"0.001\"}, \"coverage\": {\"events_in_window\": 5000}}}\n\nPHASE COVERAGE: {\"P1\": [\"micro.capture_status\"], \"P2\": [\"micro.fit_beta\"], \"P3\": [], \"P4\": [], \"P5\": [], \"P6\": [\"declared\"]}\nPHASE P3 \u2014 CORRELATE (substrate.read is the PRIMARY evidence; market.read is context): first invoke >=1 substrate.* worker (substrate.tape/density/delta/... for a bounded fire-tick), THEN substrate.read IN THE SAME tool_calls array with invoke listed BEFORE read (dispatches run sequentially in order, so the read sees the fresh projection). An invoke is a REQUEST to the calculation plane, not a guaranteed compute: that plane applies its own cooldown gates and may decline. Judge freshness from age_ms in the compact projection, AGAINST THAT WORKER'S OWN CADENCE \u2014 large_print refreshes in ~60s, most workers ~120s, oi/technicals/volume_profile ~300s, migration ~900s \u2014 never one global threshold, or you will mislabel the slow workers as stale. available:false, fired:0, or invoked:false (cooldown-dormant) are FINDINGS \u2014 report them, never re-invoke the same worker in one cycle. An unreachable calculation plane is a FINDING of the same kind: report it and continue from substrate.read; never treat a failed invoke as a reason to retry or as neutral evidence. An empty upstream (no projections \u2014 capture down) is itself the finding: cite substrate.read -> substrates.<name>.available. Cross-validate P1/P2 against the warm plane and name agreements AND contradictions explicitly. market.read (snapshot) plus derivatives/keystone/wall histories are regime context, not the correlation verdict.\nReturn ONE JSON object per turn with keys {phase, summary, evidence, confidence, limitations, model_separation, hypothesis, scenario, tool_calls, memory_proposals} \u2014 the tool-name key is EXACTLY \"name\".\nReturn the next turn now: declare \"phase\", include the missing tool_calls, and finalize (tool_calls=[]) only when every missing item is addressed."
+      ],
+      [
+        "postgres",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "budget_exhausted"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": {
+            "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+            "evidence": [
+              {
+                "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+                "value": "0.001",
+                "interpretation": "positive impact",
+                "metric_name": "beta"
+              },
+              {
+                "path": "calc.ofi.intervals \u2192 ofi",
+                "value": "12.5",
+                "interpretation": "sustained one-sided flow",
+                "metric_name": "ofi"
+              },
+              {
+                "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+                "value": "+0.53",
+                "interpretation": "derived move with band",
+                "metric_name": "delta_ticks"
+              }
+            ],
+            "confidence": "medium",
+            "limitations": [
+              "synthetic window"
+            ],
+            "model_separation": "nu*OFI is heteroskedastic; never merged."
+          },
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [],
+          "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": [
+              "Cont 1011.6402"
+            ],
+            "evidence_refs": [
+              "calc.ofi.intervals",
+              "calc.depth.average"
+            ]
+          },
+          "hypothesis_verdict": "inconclusive",
+          "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+          "calculations": {
+            "micro.fit_beta": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+          }
+        }
+      ],
+      [
+        "redis",
+        {
+          "schema_version": 1,
+          "artifact_id": "00000000-0000-0000-0000-000000000001",
+          "symbol": "BTCUSDT",
+          "venue": "spot",
+          "generated_at": "2026-01-01T00:00:00+00:00",
+          "completed_at": "2026-01-01T00:00:00+00:00",
+          "status": "provisional",
+          "window_minutes": 30,
+          "interval_seconds": 10,
+          "deterministic_state": {
+            "task": "Explain the evidence",
+            "scenario": null,
+            "wake": {
+              "trigger_source": "watcher",
+              "predicates_fired": {
+                "cold_start": {}
+              }
+            },
+            "capture_status": {
+              "state": "running",
+              "sequence_gaps": 0
+            },
+            "microstructure_evidence": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "gate": {
+              "status": "provisional",
+              "reasons": [
+                "observations 40 < 2x minimum 60"
+              ]
+            },
+            "data_quality": {
+              "capture_state": "running",
+              "sequence_gaps": 0,
+              "heteroskedasticity_flag": null,
+              "fit_status": "validated",
+              "n_observations": 40,
+              "spine": {
+                "interval_seconds": 10,
+                "window_minutes": 30
+              },
+              "note": "provisional persists while gaps>0 or hetero=true; agent may recompute at interval 10/15/30s \u00d7 window 15/30/60m via tool args",
+              "read_plane": "the deterministic spine (OFI intervals, AD, observations, \u0394P) is NOT pre-computed \u2014 pull it via your read tools during P1/P2/P5"
+            },
+            "terminal": "budget_exhausted"
+          },
+          "capability_log": [
+            {
+              "capability": "engine.wake",
+              "scope": {
+                "symbol": "BTCUSDT",
+                "venue": "spot"
+              },
+              "result": "ok",
+              "detail": {
+                "trigger_source": "watcher",
+                "predicates_fired": {
+                  "cold_start": {}
+                },
+                "decision": "fire",
+                "consumed_wake_ids": [],
+                "task": "Explain the evidence",
+                "scenario": null
+              }
+            },
+            {
+              "capability": "micro.capture_status",
+              "scope": {},
+              "result": "ok"
+            },
+            {
+              "capability": "micro.fit_beta",
+              "scope": {},
+              "result": "ok"
+            }
+          ],
+          "input_hash": "fixture",
+          "model_version": "inference-engine-v1",
+          "interpretation": {
+            "summary": "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402.",
+            "evidence": [
+              {
+                "path": "deterministic_state.microstructure_evidence.price_impact_fit.beta",
+                "value": "0.001",
+                "interpretation": "positive impact",
+                "metric_name": "beta"
+              },
+              {
+                "path": "calc.ofi.intervals \u2192 ofi",
+                "value": "12.5",
+                "interpretation": "sustained one-sided flow",
+                "metric_name": "ofi"
+              },
+              {
+                "path": "calc.price.delta \u2192 route_a_direct.delta_ticks",
+                "value": "+0.53",
+                "interpretation": "derived move with band",
+                "metric_name": "delta_ticks"
+              }
+            ],
+            "confidence": "medium",
+            "limitations": [
+              "synthetic window"
+            ],
+            "model_separation": "nu*OFI is heteroskedastic; never merged."
+          },
+          "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "errors": [],
+          "hypothesis": {
+            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H1": "beta <= 0 (flow no longer moves price)",
+            "paper_refs": [
+              "Cont 1011.6402"
+            ],
+            "evidence_refs": [
+              "calc.ofi.intervals",
+              "calc.depth.average"
+            ]
+          },
+          "hypothesis_verdict": "inconclusive",
+          "verdict_reason": "Gate provisional (observations 40 < 2x minimum 60); hypothesis held as derived diagnostic, not shortcut \u2014 \u0394P diagnostic heteroskedastic ; H0 paper-grounded via memory.recall_paper",
+          "calculations": {
+            "micro.fit_beta": {
+              "input_hash": "fixture",
+              "price_impact_fit": {
+                "status": "validated",
+                "n_observations": 40,
+                "beta": "0.001"
+              },
+              "coverage": {
+                "events_in_window": 5000
+              }
+            },
+            "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut \u2014 per Cont 1011.6402"
+          }
+        }
+      ],
+      [
+        "memory",
+        [
+          "160cf59b-65ad-53c7-9b64-472306bed5a9",
+          "observation",
+          "Beta positive on the 30m window"
+        ],
+        {
+          "run_id": "00000000-0000-0000-0000-000000000001",
+          "importance": 6.0,
+          "tags": [
+            "beta",
+            "btcusdt-spot"
+          ],
+          "evidence_refs": [
+            "00000000-0000-0000-0000-000000000001"
+          ]
+        }
+      ]
+    ]
+  }
+}

@@ -35,9 +35,12 @@ from __future__ import annotations
 import json
 import logging
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import SUMMARY_MIN_CHARS
+
+if TYPE_CHECKING:  # circular at runtime: controller imports inference.* only
+    from .controller import ScenarioEvalStatus
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +134,9 @@ def validate_final_turn(
     parsed: dict[str, Any],
     coverage: dict[str, set[str]],
     scenario: dict[str, Any] | None = None,
+    *,
+    scenario_status: "ScenarioEvalStatus | None" = None,
+    scenario_refusal_reason: str | None = None,
 ) -> tuple[bool, list[str]]:
     """Phase-aware final gate: depth is structural, not advisory.
 
@@ -142,6 +148,19 @@ def validate_final_turn(
     distinct roots with at least one fresh tool result (not just
     deterministic_state). Returns (passed, missing[]) — missing drives
     the repair prompt.
+
+    Scenario semantics come from the CONTROLLER's tri-state
+    (``ScenarioEvalStatus``), never re-derived here:
+      - EVALUATED (or legacy None → treated as evaluated/unknown): the
+        evidence must cite a calc.scenario.evaluate → … data path.
+      - REFUSED: the tool refused deterministically — the citation
+        requirement is satisfied by a refusal FINDING (path
+        ``calc.scenario.evaluate → refusal``), scenario.verdict must be
+        ``unevaluable`` (reachable/not_reachable are forbidden without
+        tool data), and the numeric echo requirements are waived (nothing
+        to echo). The LLM cannot override null discipline.
+      - NOT_CALLED: the citation demand stands unchanged; the repair
+        steer (controller-owned) tells the model to call the tool.
     """
     from market_service.nooa_harness.inference import _REQUIRED_PHASES
     from market_service.runtime.contracts import normalize_confidence
@@ -208,56 +227,103 @@ def validate_final_turn(
             "evidence must cite the derived ΔP via a calc.price.delta → … path"
         )
     if scenario is not None:
+        from .controller import ScenarioEvalStatus  # local import: avoids cycle
         scen = parsed.get("scenario")
-        if not isinstance(scen, dict):
-            missing.append(
-                "scenario block required: a scenario was given — return the "
-                "scenario{target_price,horizon,direction,required_ofi,exceedance,"
-                "probability,verdict,rationale} object evaluated via calc.scenario.evaluate"
-            )
+        if scenario_status is ScenarioEvalStatus.REFUSED:
+            # Controller says the tool refused deterministically. The
+            # citation requirement is satisfied by a refusal FINDING;
+            # verdict must be unevaluable; numeric echoes are waived.
+            scen_ok = isinstance(scen, dict)
+            if not scen_ok:
+                missing.append(
+                    "scenario block required: the scenario tool refused — "
+                    "return the scenario object with verdict=unevaluable "
+                    "and the refusal cited"
+                )
+            else:
+                verdict = str(scen.get("verdict") or "")
+                if verdict not in ("unevaluable",):
+                    missing.append(
+                        "scenario.verdict must be 'unevaluable': the tool "
+                        f"refused deterministically ({scenario_refusal_reason or 'refusal'}) "
+                        "— reachable/not_reachable are forbidden without tool data"
+                    )
+                rationale = scen.get("rationale")
+                reason_stub = str(scenario_refusal_reason or "refused")[:20].lower()
+                names_cause = (
+                    isinstance(rationale, str)
+                    and (reason_stub in rationale.lower()
+                         or "refus" in rationale.lower())
+                )
+                if (not isinstance(rationale, str)
+                        or len(rationale.strip()) < 80
+                        or not names_cause):
+                    missing.append(
+                        "scenario.rationale required (≥80 chars) naming the "
+                        "refusal reason — a bare verdict without the "
+                        "deterministic cause is rejected"
+                    )
+            if not any(
+                head == "calc.scenario.evaluate"
+                and "refusal" in path
+                for path in delta_paths
+                for head in [path.split("→")[0].strip()]
+            ):
+                missing.append(
+                    "evidence must cite the refusal as "
+                    "`calc.scenario.evaluate → refusal` (a finding, not a "
+                    "re-call demand — the tool will refuse again)"
+                )
         else:
-            if str(scen.get("verdict") or "") not in (
-                    "reachable", "not_reachable", "unevaluable"):
+            if not isinstance(scen, dict):
                 missing.append(
-                    "scenario.verdict required: reachable|not_reachable|unevaluable"
+                    "scenario block required: a scenario was given — return the "
+                    "scenario{target_price,horizon,direction,required_ofi,exceedance,"
+                    "probability,verdict,rationale} object evaluated via calc.scenario.evaluate"
                 )
-            if normalize_confidence(scen.get("probability")) is None:
-                missing.append(
-                    "scenario.probability required: low|medium|high "
-                    "(qualitative read of the exceedance + band + tape quality)"
-                )
-            for field in ("required_ofi", "exceedance"):
-                if not str(scen.get(field) or "").strip():
+            else:
+                if str(scen.get("verdict") or "") not in (
+                        "reachable", "not_reachable", "unevaluable"):
                     missing.append(
-                        f"scenario.{field} required: echo the calc.scenario.evaluate "
-                        f"→ … value, never compute it yourself"
+                        "scenario.verdict required: reachable|not_reachable|unevaluable"
                     )
-            # Thin-tape context travels WITH the verdict: a 0% exceedance
-            # without fit_status + window count reads as "impossible" when
-            # it means "the tape couldn't speak". Both are deterministic
-            # echoes, so the check is structural, never semantic.
-            for field in ("fit_status", "n_windows_usable"):
-                if not str(scen.get(field) or "").strip():
+                if normalize_confidence(scen.get("probability")) is None:
                     missing.append(
-                        f"scenario.{field} required: echo the calc.scenario.evaluate "
-                        f"→ … value so the verdict carries its tape context"
+                        "scenario.probability required: low|medium|high "
+                        "(qualitative read of the exceedance + band + tape quality)"
                     )
-            rationale = scen.get("rationale")
-            if not isinstance(rationale, str) or len(rationale.strip()) < 80:
+                for field in ("required_ofi", "exceedance"):
+                    if not str(scen.get(field) or "").strip():
+                        missing.append(
+                            f"scenario.{field} required: echo the calc.scenario.evaluate "
+                            f"→ … value, never compute it yourself"
+                        )
+                # Thin-tape context travels WITH the verdict: a 0% exceedance
+                # without fit_status + window count reads as "impossible" when
+                # it means "the tape couldn't speak". Both are deterministic
+                # echoes, so the check is structural, never semantic.
+                for field in ("fit_status", "n_windows_usable"):
+                    if not str(scen.get(field) or "").strip():
+                        missing.append(
+                            f"scenario.{field} required: echo the calc.scenario.evaluate "
+                            f"→ … value so the verdict carries its tape context"
+                        )
+                rationale = scen.get("rationale")
+                if not isinstance(rationale, str) or len(rationale.strip()) < 80:
+                    missing.append(
+                        "scenario.rationale required (≥80 chars): name fit_status + "
+                        "usable windows + r2 beside the verdict — a bare verdict "
+                        "without its tape context is rejected"
+                    )
+            if not any(
+                head == "calc.scenario.evaluate"
+                for path in delta_paths
+                for head in [path.split("→")[0].strip()]
+            ):
                 missing.append(
-                    "scenario.rationale required (≥80 chars): name fit_status + "
-                    "usable windows + r2 beside the verdict — a bare verdict "
-                    "without its tape context is rejected"
+                    "evidence must cite the scenario evaluation via a "
+                    "calc.scenario.evaluate → … path"
                 )
-        if not any(
-            head == "calc.scenario.evaluate"
-            for path in delta_paths
-            for head in [path.split("→")[0].strip()]
-        ):
-            missing.append(
-                "evidence must cite the scenario evaluation via a "
-                "calc.scenario.evaluate → … path"
-            )
         hypothesis_sc = parsed.get("hypothesis")
         if (not isinstance(hypothesis_sc, dict)
                 or not str(hypothesis_sc.get("H0") or "").strip()
