@@ -463,3 +463,398 @@ class MicrostructureEvidence:
             "coverage": self.coverage,
             "status": self.status,
         }
+
+
+# ---------------------------------------------------------------------------
+# Track D (D1-D5) — additive only. Existing dataclasses above are frozen.
+# ---------------------------------------------------------------------------
+
+FEATURE_VECTOR_VERSION = "xt-v1"
+FORWARD_MODEL_VERSION = "forward-ols-v1"
+HYPOTHESIS_VERSION = "hyp-v1"
+EVIDENCE_V2_VERSION = "evidence-v2"
+
+
+@dataclass(frozen=True)
+class QuoteMeasurement:
+    """Optional D1 microprice measurement attached to one quote (additive)."""
+
+    mid: Decimal | None
+    microprice: Decimal | None
+    displacement: Decimal | None
+    estimator: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mid": _d(self.mid) if self.mid is not None else None,
+            "microprice": _d(self.microprice) if self.microprice is not None else None,
+            "displacement": _d(self.displacement) if self.displacement is not None else None,
+            "estimator": self.estimator,
+        }
+
+
+@dataclass(frozen=True)
+class FeatureVector:
+    """Versioned D2 feature vector X_t (Decimal canonical strings)."""
+
+    symbol: str
+    venue: str
+    ts_ms: int
+    vector_version: str
+    fields: dict[str, str]
+    def_versions: dict[str, str]
+    quality: str
+    input_hash: str
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "ts_ms": self.ts_ms,
+            "vector_version": self.vector_version,
+            "fields": dict(self.fields),
+            "def_versions": dict(self.def_versions),
+            "quality": self.quality,
+            "input_hash": self.input_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> FeatureVector:
+        """Rebuild one vector from its transport form (replay seam)."""
+        return cls(
+            symbol=str(payload["symbol"]).upper(),
+            venue=str(payload["venue"]),
+            ts_ms=int(payload["ts_ms"]),
+            vector_version=str(payload.get("vector_version", FEATURE_VECTOR_VERSION)),
+            fields={str(k): str(v) for k, v in (payload.get("fields") or {}).items()},
+            def_versions={str(k): str(v) for k, v in (payload.get("def_versions") or {}).items()},
+            quality=str(payload.get("quality", "exact_feed")),
+            input_hash=str(payload["input_hash"]),
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )
+
+
+@dataclass(frozen=True)
+class ForwardObservation:
+    """D3 (X_t, {Y_t(h)}) pair with exclusion reasons per horizon."""
+
+    x: FeatureVector
+    y_ticks: dict[int, str | None]
+    y_quote: dict[int, str | None]
+    price_source: str
+    excluded: dict[int, str]
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "x": self.x.to_dict(),
+            "y_ticks": {str(k): v for k, v in self.y_ticks.items()},
+            "y_quote": {str(k): v for k, v in self.y_quote.items()},
+            "price_source": self.price_source,
+            "excluded": {str(k): v for k, v in self.excluded.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ForwardObservation:
+        """Rebuild one pair from its transport form (replay seam)."""
+        return cls(
+            x=FeatureVector.from_dict(payload["x"]),
+            y_ticks={int(k): v for k, v in (payload.get("y_ticks") or {}).items()},
+            y_quote={int(k): v for k, v in (payload.get("y_quote") or {}).items()},
+            price_source=str(payload.get("price_source", "microstructure_mid")),
+            excluded={int(k): str(v) for k, v in (payload.get("excluded") or {}).items()},
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )
+
+
+@dataclass(frozen=True)
+class ForwardFit:
+    """D4 per-horizon multivariate OLS fit with trichotomy status."""
+
+    fit_id: str
+    symbol: str
+    venue: str
+    horizon_ms: int
+    betas: dict[str, str]
+    stderr: dict[str, str | None]
+    r2: str | None
+    resid_std: str | None
+    hetero_flag: bool
+    n_obs: int
+    n_excluded: int
+    oos_skill: str | None
+    comparator: dict[str, str]
+    input_hash: str
+    model_version: str
+    status: str
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "fit_id": self.fit_id,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "horizon_ms": self.horizon_ms,
+            "betas": dict(self.betas),
+            "stderr": dict(self.stderr),
+            "r2": self.r2,
+            "resid_std": self.resid_std,
+            "hetero_flag": self.hetero_flag,
+            "n_obs": self.n_obs,
+            "n_excluded": self.n_excluded,
+            "oos_skill": self.oos_skill,
+            "comparator": dict(self.comparator),
+            "input_hash": self.input_hash,
+            "model_version": self.model_version,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ForwardFit:
+        """Rebuild one fit from its transport form (replay seam)."""
+        return cls(
+            fit_id=str(payload["fit_id"]),
+            symbol=str(payload["symbol"]).upper(),
+            venue=str(payload["venue"]),
+            horizon_ms=int(payload["horizon_ms"]),
+            betas={str(k): str(v) for k, v in (payload.get("betas") or {}).items()},
+            stderr={str(k): v for k, v in (payload.get("stderr") or {}).items()},
+            r2=payload.get("r2"),
+            resid_std=payload.get("resid_std"),
+            hetero_flag=bool(payload.get("hetero_flag", False)),
+            n_obs=int(payload.get("n_obs", 0)),
+            n_excluded=int(payload.get("n_excluded", 0)),
+            oos_skill=payload.get("oos_skill"),
+            comparator={str(k): str(v) for k, v in (payload.get("comparator") or {}).items()},
+            input_hash=str(payload["input_hash"]),
+            model_version=str(payload.get("model_version", FORWARD_MODEL_VERSION)),
+            status=str(payload.get("status", "insufficient")),
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Track D (D7/D10) — additive only. Existing dataclasses above are frozen.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HypothesisEvidence:
+    """D7 formal evidence object for one pre-registered directional hypothesis.
+
+    No signal/action/execution field exists by construction: p<0.05 is
+    evidence, never an execution predicate.
+    """
+
+    hypothesis_id: str
+    h0: str
+    h1: str
+    horizon_ms: int
+    effect: str
+    se: str | None
+    ci_lo: str | None
+    ci_hi: str | None
+    p_value: str | None
+    equiv_stat: str | None
+    method: str
+    n: int
+    split: str
+    oos_skill: str | None
+    multiplicity_adj: str
+    m_tests: int
+    model_version: str
+    input_hash: str
+    status: str
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "hypothesis_id": self.hypothesis_id,
+            "h0": self.h0,
+            "h1": self.h1,
+            "horizon_ms": self.horizon_ms,
+            "effect": self.effect,
+            "se": self.se,
+            "ci_lo": self.ci_lo,
+            "ci_hi": self.ci_hi,
+            "p_value": self.p_value,
+            "equiv_stat": self.equiv_stat,
+            "method": self.method,
+            "n": self.n,
+            "split": self.split,
+            "oos_skill": self.oos_skill,
+            "multiplicity_adj": self.multiplicity_adj,
+            "m_tests": self.m_tests,
+            "model_version": self.model_version,
+            "input_hash": self.input_hash,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> HypothesisEvidence:
+        """Rebuild one hypothesis record from its transport form (replay seam)."""
+        return cls(
+            hypothesis_id=str(payload["hypothesis_id"]),
+            h0=str(payload.get("h0", "")),
+            h1=str(payload.get("h1", "")),
+            horizon_ms=int(payload["horizon_ms"]),
+            effect=str(payload["effect"]),
+            se=payload.get("se"),
+            ci_lo=payload.get("ci_lo"),
+            ci_hi=payload.get("ci_hi"),
+            p_value=payload.get("p_value"),
+            equiv_stat=payload.get("equiv_stat"),
+            method=str(payload.get("method", "")),
+            n=int(payload.get("n", 0)),
+            split=str(payload.get("split", "")),
+            oos_skill=payload.get("oos_skill"),
+            multiplicity_adj=str(payload.get("multiplicity_adj", "")),
+            m_tests=int(payload.get("m_tests", 1)),
+            model_version=str(payload.get("model_version", FORWARD_MODEL_VERSION)),
+            input_hash=str(payload["input_hash"]),
+            status=str(payload.get("status", "insufficient")),
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )
+
+
+@dataclass(frozen=True)
+class HypothesisLedger:
+    """D7 append-only ledger of HypothesisEvidence (idempotent on id)."""
+
+    entries: tuple[HypothesisEvidence, ...]
+    ledger_version: str = "hyp-ledger-v1"
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def append(self, entry: HypothesisEvidence) -> HypothesisLedger:
+        for existing in self.entries:
+            if existing.hypothesis_id == entry.hypothesis_id:
+                if existing == entry:
+                    return self
+                raise ValueError(
+                    f"duplicate hypothesis_id with different bytes: {entry.hypothesis_id!r}"
+                )
+        return HypothesisLedger(entries=(*self.entries, entry))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "ledger_version": self.ledger_version,
+            "entries": [e.to_dict() for e in self.entries],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> HypothesisLedger:
+        """Rebuild a ledger from its transport form (replay seam)."""
+        return cls(
+            entries=tuple(HypothesisEvidence.from_dict(e) for e in payload.get("entries") or ()),
+            ledger_version=str(payload.get("ledger_version", "hyp-ledger-v1")),
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )
+
+
+@dataclass(frozen=True)
+class MicrostructureEvidenceV2:
+    """D10 unified analytical evidence object (compose-only, additive)."""
+
+    symbol: str
+    venue: str
+    evidence_id: str
+    generated_at_ms: int
+    tick_size: str
+    depth_estimator: str
+    input_hash: str
+    model_version: str
+    vector_version: str | None = None
+    x_t: dict[str, Any] | None = None
+    horizon_ms: int | None = None
+    expected_dP_ticks: str | None = None
+    variance_ticks: str | None = None
+    se: str | None = None
+    interval_lo_95: str | None = None
+    interval_hi_95: str | None = None
+    p_positive: str | None = None
+    p_target: dict[str, Any] | None = None
+    p_invalidation: dict[str, Any] | None = None
+    hypothesis: str | None = None
+    effect: str | None = None
+    evidence: dict[str, Any] | None = None
+    n: int | None = None
+    split: str | None = None
+    multiplicity_adj: str | None = None
+    oos_info: dict[str, Any] | None = None
+    events: list[dict[str, Any]] | None = None
+    legacy_fit: dict[str, Any] | None = None
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "evidence_id": self.evidence_id,
+            "generated_at_ms": self.generated_at_ms,
+            "tick_size": self.tick_size,
+            "depth_estimator": self.depth_estimator,
+            "input_hash": self.input_hash,
+            "model_version": self.model_version,
+            "vector_version": self.vector_version,
+            "x_t": self.x_t,
+            "horizon_ms": self.horizon_ms,
+            "expected_dP_ticks": self.expected_dP_ticks,
+            "variance_ticks": self.variance_ticks,
+            "se": self.se,
+            "interval_lo_95": self.interval_lo_95,
+            "interval_hi_95": self.interval_hi_95,
+            "p_positive": self.p_positive,
+            "p_target": self.p_target,
+            "p_invalidation": self.p_invalidation,
+            "hypothesis": self.hypothesis,
+            "effect": self.effect,
+            "evidence": self.evidence,
+            "n": self.n,
+            "split": self.split,
+            "multiplicity_adj": self.multiplicity_adj,
+            "oos_info": self.oos_info,
+            "events": self.events,
+            "legacy_fit": self.legacy_fit,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> MicrostructureEvidenceV2:
+        """Rebuild a v2 evidence object from its transport form (replay seam)."""
+        return cls(
+            symbol=str(payload["symbol"]).upper(),
+            venue=str(payload["venue"]),
+            evidence_id=str(payload["evidence_id"]),
+            generated_at_ms=int(payload["generated_at_ms"]),
+            tick_size=str(payload["tick_size"]),
+            depth_estimator=str(payload.get("depth_estimator", "")),
+            input_hash=str(payload["input_hash"]),
+            model_version=str(payload.get("model_version", EVIDENCE_V2_VERSION)),
+            vector_version=payload.get("vector_version"),
+            x_t=payload.get("x_t"),
+            horizon_ms=payload.get("horizon_ms"),
+            expected_dP_ticks=payload.get("expected_dP_ticks"),
+            variance_ticks=payload.get("variance_ticks"),
+            se=payload.get("se"),
+            interval_lo_95=payload.get("interval_lo_95"),
+            interval_hi_95=payload.get("interval_hi_95"),
+            p_positive=payload.get("p_positive"),
+            p_target=payload.get("p_target"),
+            p_invalidation=payload.get("p_invalidation"),
+            hypothesis=payload.get("hypothesis"),
+            effect=payload.get("effect"),
+            evidence=payload.get("evidence"),
+            n=payload.get("n"),
+            split=payload.get("split"),
+            multiplicity_adj=payload.get("multiplicity_adj"),
+            oos_info=payload.get("oos_info"),
+            events=payload.get("events"),
+            legacy_fit=payload.get("legacy_fit"),
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )

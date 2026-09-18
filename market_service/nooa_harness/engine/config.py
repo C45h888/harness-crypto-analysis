@@ -55,6 +55,27 @@ AGENTIC_MAX_TOOL_ROUNDS = 8
 AGENTIC_MAX_LLM_TURNS = 12
 # Max dispatches per tool round.
 AGENTIC_PER_ROUND_CALL_CAP = 3
+# Per-loop-state pass allotment (Track A congruence shape, loop-surface spec v1).
+# The budget counts LLM passes per nested loop, never tools: within a pass
+# the agent packs whatever calls the work needs, bounded only by the
+# anti-runaway dispatch ceiling below. Pre-gate fixed reads sit outside the
+# budget (zero-LLM gate doctrine). Planned LLM max is 9 = 1+3+2+1(+1 retry)+1,
+# inside the AGENTIC_MAX_LLM_TURNS backstop.
+LOOP_PASS_BUDGET: dict[str, int] = {
+    "comprehension": 1,
+    "evidence": 3,
+    "reasoning": 2,
+    "validation": 1,
+    "output": 1,
+}
+# Bounded internal retry inside VALIDATION (diagnose -> steered repair ->
+# revalidate). Persistent failure emits a structured issue to the FSM
+# terminal; terminal stewardship is a later FSM pass.
+VALIDATION_RETRY_PASSES = 1
+# Anti-runaway dispatch ceiling per pass (directive band 10-15). Steering
+# lives in guidance, never in this number; excess calls are named on the
+# cycle's unexecuted list (existing transparency mechanism).
+MAX_DISPATCHES_PER_PASS = 12
 # P4 explanation floor — thinner finals are repaired.
 SUMMARY_MIN_CHARS = 200
 
@@ -109,6 +130,9 @@ __all__ = [
     "AGENTIC_MAX_TOOL_ROUNDS",
     "AGENTIC_MAX_LLM_TURNS",
     "AGENTIC_PER_ROUND_CALL_CAP",
+    "LOOP_PASS_BUDGET",
+    "VALIDATION_RETRY_PASSES",
+    "MAX_DISPATCHES_PER_PASS",
     "SUMMARY_MIN_CHARS",
     "MEMORY_RECALL_LIMIT",
     "MEMORY_CONTEXT_BUDGET",

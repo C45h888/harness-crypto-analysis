@@ -61,6 +61,8 @@ from market_service.nooa_harness.engine.loop_states import (
 log = logging.getLogger(__name__)
 
 SCENARIO_TOOL = "calc.scenario.evaluate"
+FORWARD_SCENARIO_TOOL = "calc.forward.scenario"
+HYPOTHESIS_TOOL = "calc.hypothesis.test"
 
 
 class ScenarioEvalStatus(Enum):
@@ -88,6 +90,21 @@ class ToolOutcome:
 
 
 @dataclass(frozen=True)
+class LoopVisit:
+    """One nested loop's traversal record (Track A congruence shape).
+
+    Which loop ran, how many LLM passes it spent, which sub-loops the
+    driver opened, and whether it completed (vs budget spent). The
+    controller classifies the visit; the loop driver in core.py reports it.
+    """
+
+    loop: str
+    passes_spent: int
+    sub_loops: tuple[str, ...] = ()
+    completed: bool = False
+
+
+@dataclass(frozen=True)
 class CycleController:
     """Immutable, cycle-scoped semantic authority over the agentic loop.
 
@@ -112,6 +129,7 @@ class CycleController:
 
     scenario: dict[str, Any] | None = None
     outcomes: tuple[ToolOutcome, ...] = ()
+    loop_visits: tuple[LoopVisit, ...] = ()
     phase_coverage: dict[str, frozenset[str]] = field(
         default_factory=lambda: {
             p: frozenset() for p in
@@ -139,6 +157,7 @@ class CycleController:
         return CycleController(
             scenario=self.scenario,
             outcomes=self.outcomes,
+            loop_visits=self.loop_visits,
             phase_coverage=self.phase_coverage,
             membrane=membrane,
             observation=self.observation,
@@ -150,6 +169,7 @@ class CycleController:
         return CycleController(
             scenario=self.scenario,
             outcomes=self.outcomes,
+            loop_visits=self.loop_visits,
             phase_coverage=self.phase_coverage,
             membrane=self.membrane,
             observation=observation,
@@ -190,6 +210,7 @@ class CycleController:
             return CycleController(
                 scenario=self.scenario,
                 outcomes=self.outcomes,
+                loop_visits=self.loop_visits,
                 phase_coverage=self.phase_coverage,
                 membrane=self.membrane,
                 observation=None,
@@ -200,6 +221,7 @@ class CycleController:
         return CycleController(
             scenario=self.scenario,
             outcomes=self.outcomes,
+            loop_visits=self.loop_visits,
             phase_coverage=self.phase_coverage,
             membrane=self.membrane,
             observation=verdict.next,
@@ -252,6 +274,7 @@ class CycleController:
         return CycleController(
             scenario=self.scenario,
             outcomes=self.outcomes + (outcome,),
+            loop_visits=self.loop_visits,
             phase_coverage=coverage,
             # Governance coupling — an immutable controller must carry its
             # membrane/observation/terminal through every successor.
@@ -270,6 +293,7 @@ class CycleController:
         return CycleController(
             scenario=self.scenario,
             outcomes=self.outcomes,
+            loop_visits=self.loop_visits,
             phase_coverage=coverage,
             membrane=self.membrane,
             observation=self.observation,
@@ -277,13 +301,55 @@ class CycleController:
         )
 
     # ------------------------------------------------------------------
+    # Loop-traversal ledger (Track A congruence shape: traversal is
+    # classified here, driven in core.py — same split as phase coverage).
+    # ------------------------------------------------------------------
+
+    def record_loop_visit(
+        self, loop: str, passes_spent: int,
+        sub_loops: tuple[str, ...] = (), completed: bool = False,
+    ) -> "CycleController":
+        """Append one nested loop's traversal record (immutable)."""
+        return CycleController(
+            scenario=self.scenario,
+            outcomes=self.outcomes,
+            loop_visits=self.loop_visits + (LoopVisit(
+                loop=loop, passes_spent=passes_spent,
+                sub_loops=tuple(sub_loops), completed=completed,
+            ),),
+            phase_coverage=self.phase_coverage,
+            membrane=self.membrane,
+            observation=self.observation,
+            terminal=self.terminal,
+        )
+
+    def loop_coverage(self) -> dict[str, dict[str, Any]]:
+        """Traversal summary per loop: passes spent + completed or not."""
+        return {
+            visit.loop: {
+                "passes_spent": visit.passes_spent,
+                "sub_loops": list(visit.sub_loops),
+                "completed": visit.completed,
+            }
+            for visit in self.loop_visits
+        }
+
+    # ------------------------------------------------------------------
     # Scenario tri-state (one answer, all consumers)
     # ------------------------------------------------------------------
 
     def scenario_state(self) -> ScenarioEvalStatus:
         """Tri-state: NOT_CALLED / REFUSED / EVALUATED — sole source."""
+        return self.tool_state(SCENARIO_TOOL)
+
+    def tool_state(self, tool: str) -> ScenarioEvalStatus:
+        """Generic tri-state for any deterministic scenario/test tool.
+
+        Same semantics as scenario_state: REFUSED covers policy refusals
+        and non-ok dispatches; EVALUATED needs an ok non-refused payload.
+        """
         for outcome in reversed(self.outcomes):
-            if outcome.canonical != SCENARIO_TOOL:
+            if outcome.canonical != tool:
                 continue
             if outcome.refused:
                 return ScenarioEvalStatus.REFUSED
@@ -295,22 +361,82 @@ class CycleController:
                 return ScenarioEvalStatus.REFUSED
         return ScenarioEvalStatus.NOT_CALLED
 
+    def forward_scenario_state(self) -> ScenarioEvalStatus:
+        """Tri-state for the horizon-native forward scenario tool."""
+        return self.tool_state(FORWARD_SCENARIO_TOOL)
+
+    def hypothesis_state(self) -> ScenarioEvalStatus:
+        """Tri-state for the independent hypothesis-test tool."""
+        return self.tool_state(HYPOTHESIS_TOOL)
+
     def scenario_refusal_reason(self) -> str | None:
         """The refusal reason when state is REFUSED, else None."""
+        return self.tool_refusal_reason(SCENARIO_TOOL)
+
+    def tool_refusal_reason(self, tool: str) -> str | None:
+        """The refusal reason for any tracked tool when REFUSED, else None."""
         for outcome in reversed(self.outcomes):
-            if outcome.canonical == SCENARIO_TOOL and outcome.refused:
+            if outcome.canonical == tool and outcome.refused:
                 return outcome.refusal_reason
         return None
 
+    def forward_scenario_refusal_reason(self) -> str | None:
+        """The forward-scenario refusal reason when REFUSED, else None."""
+        return self.tool_refusal_reason(FORWARD_SCENARIO_TOOL)
+
     def scenario_payload(self) -> Any:
         """The scenario tool's numeric payload when EVALUATED, else None."""
+        return self.tool_payload(SCENARIO_TOOL)
+
+    def tool_payload(self, tool: str) -> Any:
+        """A tracked tool's numeric payload when EVALUATED, else None."""
         for outcome in reversed(self.outcomes):
-            if (outcome.canonical == SCENARIO_TOOL
+            if (outcome.canonical == tool
                     and outcome.result == "ok"
                     and not outcome.refused
                     and isinstance(outcome.payload, dict)):
                 return outcome.payload
         return None
+
+    def forward_scenario_payload(self) -> Any:
+        """The forward-scenario tool's payload when EVALUATED, else None."""
+        return self.tool_payload(FORWARD_SCENARIO_TOOL)
+
+    def congruence(self) -> dict[str, Any]:
+        """Presence-level legacy-vs-forward verdict (Track A congruence shape).
+
+        Reports WHAT happened (which paths evaluated/refused), never what
+        it means — numeric agreement lives in deterministic
+        ``compare_scenario_paths``, which the prompts pass cites. This is
+        the loop-side substrate of "legacy upgraded by forward": both
+        paths evaluated means comparable; a refusal on either side names
+        its reason so the repair steer can cite it.
+        """
+        legacy = self.tool_state(SCENARIO_TOOL)
+        forward = self.tool_state(FORWARD_SCENARIO_TOOL)
+        evaluated = ScenarioEvalStatus.EVALUATED
+        refused = ScenarioEvalStatus.REFUSED
+        if legacy is evaluated and forward is evaluated:
+            verdict = "both_evaluated"
+        elif refused in (legacy, forward):
+            verdict = "refused_present"
+        elif legacy is evaluated or forward is evaluated:
+            verdict = "partial"
+        else:
+            verdict = "none"
+        return {
+            "legacy": legacy.value,
+            "forward": forward.value,
+            "hypothesis": self.tool_state(HYPOTHESIS_TOOL).value,
+            "verdict": verdict,
+            "refusal_reasons": {
+                "legacy": self.tool_refusal_reason(SCENARIO_TOOL),
+                "forward": self.tool_refusal_reason(FORWARD_SCENARIO_TOOL),
+                "hypothesis": self.tool_refusal_reason(HYPOTHESIS_TOOL),
+            },
+            "note": ("numeric agreement via deterministic "
+                       "compare_scenario_paths; neither path is ground truth"),
+        }
 
     # ------------------------------------------------------------------
     # Redundant-dispatch suppression (refusal is terminal per tool/cycle)
@@ -384,7 +510,10 @@ class CycleController:
 
 __all__ = [
     "SCENARIO_TOOL",
+    "FORWARD_SCENARIO_TOOL",
+    "HYPOTHESIS_TOOL",
     "CycleController",
+    "LoopVisit",
     "ScenarioEvalStatus",
     "ToolOutcome",
 ]

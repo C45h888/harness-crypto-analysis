@@ -50,6 +50,9 @@ from .config import (
     AGENTIC_MAX_LLM_TURNS,
     AGENTIC_MAX_TOOL_ROUNDS,
     AGENTIC_PER_ROUND_CALL_CAP,
+    LOOP_PASS_BUDGET,
+    MAX_DISPATCHES_PER_PASS,
+    VALIDATION_RETRY_PASSES,
     MEMORY_CONTEXT_BUDGET,
     MEMORY_RECALL_LIMIT,
     MAX_MEMORY_PROPOSALS,
@@ -160,6 +163,8 @@ class _ReasonedCycle:
     final_validation: dict[str, Any]
     unexecuted: list[str]
     tool_results: dict[str, Any]
+    comprehension: dict[str, Any] | None = None
+    passes_per_loop: dict[str, int] | None = None
 
 
 @dataclass
@@ -345,6 +350,65 @@ class InferenceEngine:
             "Prior artifact headline (deterministic diff basis):\n"
             + json.dumps(headline, default=str)[:_PRIOR_HEADLINE_MAX_CHARS]
         )
+
+    @staticmethod
+    def _seed_evidence_plan(
+        task: str | None, scenario: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Deterministic evidence seed: task shape -> suggested tools.
+
+        Autonomy inside a planned frame: the engine suggests, the agent
+        disposes. Seeds never execute by themselves — every dispatch is an
+        agent tool_call classified by the controller. Pure over injected
+        task/scenario (no I/O, no LLM).
+        """
+        seeds: list[str] = [
+            "calc.feature.build", "calc.forward.join", "calc.forward.fit",
+        ]
+        rationale = ["forward baseline always seeded (horizon-native first)"]
+        blob = f"{task or ''} {json.dumps(scenario or {})}".lower()
+        if scenario is not None:
+            seeds += ["calc.scenario.evaluate", "calc.forward.scenario"]
+            rationale.append("scenario present: legacy + forward scenario paths")
+        if any(k in blob for k in ("horizon", "1s", "5s", "30s", "60s",
+                                    "target", "theta", "probab",
+                                    "hypothes", "h0", "h1")):
+            seeds += ["calc.forward.distribution", "calc.hypothesis.test",
+                        "calc.decay.report"]
+            rationale.append("horizon/hypothesis language: distribution + test + decay")
+        if any(k in blob for k in ("wall", "absorb", "liquid", "reversal",
+                                    "support", "resist")):
+            seeds += ["calc.events.absorption", "calc.events.walls"]
+            rationale.append("liquidity language: typed event detectors")
+        seeds.append("memory.recall_paper")
+        rationale.append("paper grounding always seeded (evidence home)")
+        seen: list[str] = []
+        for seed in seeds:
+            if seed not in seen:
+                seen.append(seed)
+        return {"seeds": seen, "rationale": rationale}
+
+    @staticmethod
+    def _default_comprehension(
+        task: str | None, scenario: dict[str, Any] | None,
+        seed: dict[str, Any], reason: str,
+    ) -> dict[str, Any]:
+        """Fallback understanding block when the comprehension pass fails.
+
+        Never kills the cycle: a defaulted block plus the seeded plan keeps
+        the loop moving, and the parse note records what happened.
+        """
+        return {
+            "intent": (task[:200] if task else "autonomous microstructure inference"),
+            "constraints": {
+                "scenario": scenario,
+                "pass_budgets": dict(LOOP_PASS_BUDGET),
+            },
+            "questions": ["what is the current microstructure state?",
+                            "what does the forward evidence support?"],
+            "evidence_plan": list(seed.get("seeds") or []),
+            "parse_note": reason,
+        }
 
     # ------------------------------------------------------------------
     # Narration (delegates to sibling modules)
@@ -773,6 +837,85 @@ class InferenceEngine:
             )
         user_prompt_1 += self._output_format()
 
+        # --- COMPREHENSION PASS (LOOP_PASS_BUDGET["comprehension"] = 1 LLM call, no tools) ---
+        # The base pass: the prompt is understood before anything is pulled.
+        # Output is a structured understanding block persisted for audit.
+        # narrate#1 below is then EVIDENCE pass 1 (first dispatch round).
+        llm_calls = 0
+        seed_plan = self._seed_evidence_plan(task, scenario)
+        deterministic_state["seeded_plan"] = seed_plan
+        user_prompt_1 += (
+            "\nSEEDED EVIDENCE PLAN (engine suggestion — dispose freely, "
+            "every dispatch is still classified):\n"
+            f"{', '.join(seed_plan['seeds'])}\n"
+            f"Rationale: {'; '.join(seed_plan['rationale'])}\n"
+        )
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTERPRETATION
+        )
+        comprehension: dict[str, Any] | None = None
+        comprehension_prompt = (
+            f"{task_block}"
+            f"{scenario_block}"
+            f"WAKE: {wake_block}\n\n"
+            "GATE (deterministic pre-reads — data quality only, never a prediction):\n"
+            f"{json.dumps(deterministic_state.get('gate'), default=str)}\n"
+            f"{json.dumps(deterministic_state.get('data_quality'), default=str)[:2_000]}\n\n"
+            "COMPREHENSION PASS (no tools available): return ONE JSON object "
+            "with EXACTLY {intent, constraints, questions, evidence_plan} — "
+            "intent: what is being asked; constraints: horizons/scenario/limits; "
+            "questions: what must be answered; evidence_plan: which calc/memory "
+            "tools to pull first "
+            f"(suggested seeds: {', '.join(seed_plan['seeds'])})."
+        )
+        try:
+            raw_comp = await self._call_llm(comprehension_prompt)
+        except Exception as exc:
+            log.exception("comprehension pass failed")
+            controller = controller.advance(
+                GovernanceEvent(GovernanceEventKind.NARRATION_FAILED)
+            )
+            terminal = (
+                controller.terminal.value if controller.terminal
+                else "narration_failed"
+            )
+            ctx.controller = controller
+            deterministic_state["terminal"] = terminal
+            return await self._degraded_artifact(
+                deterministic_state, capability_log,
+                f"comprehension_failed: {type(exc).__name__}: {exc}",
+            ), {"llm_calls": llm_calls, "terminal": terminal}
+        llm_calls += 1
+        parsed_comp = narration_mod.extract_json_object(raw_comp)
+        if isinstance(parsed_comp, dict) and all(
+            k in parsed_comp
+            for k in ("intent", "constraints", "questions", "evidence_plan")
+        ):
+            comprehension = {
+                k: parsed_comp.get(k)
+                for k in ("intent", "constraints", "questions", "evidence_plan")
+            }
+            comprehension["parse_note"] = "llm"
+        else:
+            comprehension = self._default_comprehension(
+                task, scenario, seed_plan, "unparseable: defaulted",
+            )
+        deterministic_state["comprehension"] = comprehension
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.FRAMING
+        )
+        controller = controller.record_loop_visit(
+            "comprehension", 1,
+            ("intake", "interpretation", "framing"), True,
+        )
+        passes_per_loop: dict[str, int] = {
+            "comprehension": 1, "evidence": 0, "reasoning": 0,
+            "validation": 0, "output": 0,
+        }
+        dispatched_in_pass = 0
+        validation_retries_used = 0
+        validation_entered = False
+
         # --- GOVERNANCE: REASONING loop (REASON stage) ---
         # Narrate#1 is the agent's first reasoning turn: enter the REASONING
         # loop and open its HYPOTHESIS sub-loop.
@@ -783,8 +926,17 @@ class InferenceEngine:
             controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.HYPOTHESIS
         )
 
-        # --- NARRATE#1 ---
-        llm_calls = 0
+        # --- NARRATE#1 = EVIDENCE PASS 1 (first dispatch round) ---
+        # The staged loop below spends EVIDENCE passes then REASONING passes
+        # (LOOP_PASS_BUDGET); VALIDATION spends its own pass on repair.
+        # Within a pass tools are free up to MAX_DISPATCHES_PER_PASS — the
+        # per-round call cap is retired (left defined for compat).
+        controller, _ = _govern(
+            controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.EVIDENCE
+        )
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.ACQUISITION
+        )
         try:
             raw_1 = await self._call_llm(user_prompt_1)
         except Exception as exc:
@@ -805,6 +957,8 @@ class InferenceEngine:
                 f"narration_failed: {type(exc).__name__}: {exc}",
             ), {"llm_calls": llm_calls, "terminal": terminal}
         llm_calls += 1
+        passes_per_loop["evidence"] += 1
+        dispatched_in_pass = 0
         parsed_1 = narration_mod.coerce_turn(narration_mod.extract_json_object(raw_1))
         if parsed_1 is None:
             # GOVERNANCE: unparseable narration -> PARSE_FAILED. The degraded
@@ -874,16 +1028,65 @@ class InferenceEngine:
         repairs_sent = 0
         finalize_now = False
         final_validation: dict[str, Any] = {"passed": False, "missing": ["loop_not_run"]}
+        unexecuted: list[str] = []
+        # Loop partition (spec v1): the first agent turns spend EVIDENCE
+        # passes (narrate#1 already spent one), then REASONING passes.
+        # Repair turns spend VALIDATION passes (bounded retry below).
+        loop_tag = "evidence"
         while llm_calls < AGENTIC_MAX_LLM_TURNS and not finalize_now:
+            if loop_tag == "evidence" and passes_per_loop["evidence"] >= LOOP_PASS_BUDGET["evidence"]:
+                controller, _ = _govern(
+                    controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.VERIFICATION
+                )
+                controller = controller.record_loop_visit(
+                    "evidence", passes_per_loop["evidence"],
+                    ("sourcing", "acquisition", "verification"),
+                    completed=True,
+                )
+                controller, _ = _govern(
+                    controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING
+                )
+                controller, _ = _govern(
+                    controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.ANALYSIS
+                )
+                loop_tag = "reasoning"
+                dispatched_in_pass = 0
+            if loop_tag == "reasoning" and passes_per_loop["reasoning"] >= LOOP_PASS_BUDGET["reasoning"]:
+                # Passes spent — but the standing turn still deserves its
+                # validation below (a fresh final must be judged, never
+                # skipped). "closing" only shuts dispatch, never the gate.
+                controller = controller.record_loop_visit(
+                    "reasoning", passes_per_loop["reasoning"],
+                    ("hypothesis", "analysis"),
+                    completed=False,
+                )
+                loop_tag = "closing"
+                continue
+            dispatched_in_pass = 0
             tool_calls = parsed_current.get("tool_calls")
+            pass_remaining = MAX_DISPATCHES_PER_PASS - dispatched_in_pass
+            dispatch_open = (
+                loop_tag in ("evidence", "reasoning")
+                or (loop_tag == "validation"
+                    and validation_retries_used <= VALIDATION_RETRY_PASSES)
+            )
             if (
                 isinstance(tool_calls, list)
                 and tool_calls
                 and tool_rounds_used < AGENTIC_MAX_TOOL_ROUNDS
+                and pass_remaining > 0
+                and dispatch_open
             ):
-                to_execute = [
-                    c for c in tool_calls if isinstance(c, dict)
-                ][:AGENTIC_PER_ROUND_CALL_CAP]
+                # Free packing within the pass ceiling (per-round call cap
+                # retired): the agent's whole turn dispatches in order;
+                # overflow is named on unexecuted, never silently dropped.
+                dict_calls = [c for c in tool_calls if isinstance(c, dict)]
+                to_execute = dict_calls[:pass_remaining]
+                for call in dict_calls[pass_remaining:]:
+                    raw_name = str(call.get("name") or call.get("tool") or "").strip()
+                    if raw_name:
+                        unexecuted.append(raw_name)
+                        log.warning("pass ceiling: deferring %s to unexecuted", raw_name)
                 if not to_execute:
                     break
                 tool_rounds_used += 1
@@ -925,6 +1128,7 @@ class InferenceEngine:
                             "error",
                             detail=f"{type(exc).__name__}: {exc}",
                         )
+                    dispatched_in_pass += 1
                     capability_log.append(tool_log)
                     # Controller classifies the outcome (the ONLY place the
                     # ok-with-refused-detail null-discipline shape is
@@ -979,6 +1183,7 @@ class InferenceEngine:
                     log.exception("staged narration round failed; falling back")
                     break
                 llm_calls += 1
+                passes_per_loop[loop_tag] = passes_per_loop.get(loop_tag, 0) + 1
                 parsed_next = narration_mod.coerce_turn(narration_mod.extract_json_object(raw_next))
                 if parsed_next is None:
                     log.warning("staged round parse failed, keeping prior")
@@ -988,6 +1193,14 @@ class InferenceEngine:
                 phase_coverage = controller.phase_coverage
                 continue
             # No (more) tool calls this turn → validate the final.
+            # The cycle leaves the agent loops here: validation owns the
+            # verdict (and the single bounded retry below).
+            loop_tag = "validation"
+            # The check itself spends the validation pass (repair turns add
+            # more via the normal follow-up accounting below).
+            if not validation_entered:
+                validation_entered = True
+                passes_per_loop["validation"] = passes_per_loop.get("validation", 0) + 1
             # GOVERNANCE: CHECK stage (VALIDATION loop) — gate sub-loop.
             controller, _ = _govern(
                 controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.VALIDATION
@@ -1003,8 +1216,62 @@ class InferenceEngine:
             if passed:
                 final_validation = {"passed": True, "missing": []}
                 finalize_now = True
+                controller = controller.record_loop_visit(
+                    "validation", passes_per_loop.get("validation", 0),
+                    ("gate",) if validation_retries_used == 0
+                    else ("gate", "recovery"),
+                    completed=True,
+                )
+            elif validation_retries_used >= VALIDATION_RETRY_PASSES:
+                # Internal retry spent: emit the structured issue to the FSM
+                # so the failure state is managed gracefully there (terminal
+                # stewardship is a later FSM pass — the loop never guesses).
+                validation_issue = {
+                    "loop": "validation",
+                    "missing": list(missing),
+                    "congruence": controller.congruence(),
+                    "loop_traversal": controller.loop_coverage(),
+                    "passes_per_loop": dict(passes_per_loop),
+                }
+                # Ledger completeness on the terminal path: loops that spent
+                # passes but never closed still get their visit (uncompleted).
+                _covered = set(controller.loop_coverage())
+                if passes_per_loop.get("evidence", 0) > 0 and "evidence" not in _covered:
+                    controller = controller.record_loop_visit(
+                        "evidence", passes_per_loop["evidence"],
+                        ("sourcing", "acquisition", "verification"),
+                        completed=False,
+                    )
+                if passes_per_loop.get("reasoning", 0) > 0 and "reasoning" not in _covered:
+                    controller = controller.record_loop_visit(
+                        "reasoning", passes_per_loop["reasoning"],
+                        ("hypothesis", "analysis", "synthesis"),
+                        completed=False,
+                    )
+                controller = controller.record_loop_visit(
+                    "validation", passes_per_loop.get("validation", 0),
+                    ("gate", "recovery"), completed=False,
+                )
+                controller = controller.advance(
+                    GovernanceEvent(GovernanceEventKind.VALIDATION_FAILED)
+                )
+                terminal = (
+                    controller.terminal.value if controller.terminal
+                    else "validation_failed"
+                )
+                ctx.controller = controller
+                deterministic_state["terminal"] = terminal
+                deterministic_state["validation_issue"] = validation_issue
+                deterministic_state["loop_traversal"] = controller.loop_coverage()
+                deterministic_state["congruence"] = controller.congruence()
+                return await self._degraded_artifact(
+                    deterministic_state, capability_log,
+                    f"validation_failed: {'; '.join(missing)[:500]}",
+                ), {"llm_calls": llm_calls, "terminal": terminal,
+                    "validation_issue": validation_issue}
             else:
                 repairs_sent += 1
+                validation_retries_used += 1
                 # GOVERNANCE: a rejected final opens the RECOVERY sub-loop
                 # (repair — iterates until the final passes or budget ends).
                 controller, _ = _govern(
@@ -1038,11 +1305,28 @@ class InferenceEngine:
                 controller = _mark_declared(controller, parsed_current)
                 phase_coverage = controller.phase_coverage
         parsed_final = parsed_current
+        # Traversal sweep: loops that spent passes but never closed with a
+        # visit record (early finalize, reasoning-budget break without a
+        # flip, validation entry) are recorded here so the ledger is
+        # complete on every path. completed tracks whether the cycle went
+        # on to finalize.
+        covered = set(controller.loop_coverage())
+        if passes_per_loop.get("evidence", 0) > 0 and "evidence" not in covered:
+            controller = controller.record_loop_visit(
+                "evidence", passes_per_loop["evidence"],
+                ("sourcing", "acquisition", "verification"),
+                completed=finalize_now,
+            )
+        if passes_per_loop.get("reasoning", 0) > 0 and "reasoning" not in covered:
+            controller = controller.record_loop_visit(
+                "reasoning", passes_per_loop["reasoning"],
+                ("hypothesis", "analysis", "synthesis"),
+                completed=finalize_now,
+            )
         # Budget-exhaustion transparency (live-proven): a final turn may carry
         # tool_calls that never dispatched because the LLM/round budget was
         # spent. Name them on cycle_meta so the artifact is self-documenting
         # about work the agent requested but never received.
-        unexecuted: list[str] = []
         if not finalize_now:
             pending = parsed_final.get("tool_calls")
             if isinstance(pending, list):
@@ -1072,7 +1356,8 @@ class InferenceEngine:
             llm_calls=llm_calls, tool_rounds_used=tool_rounds_used,
             repairs_sent=repairs_sent, finalize_now=finalize_now,
             final_validation=final_validation, unexecuted=unexecuted,
-            tool_results=tool_results,
+            tool_results=tool_results, comprehension=comprehension,
+            passes_per_loop=dict(passes_per_loop),
         )
         return None
 
@@ -1095,6 +1380,52 @@ class InferenceEngine:
         repairs_sent, finalize_now = reasoned.repairs_sent, reasoned.finalize_now
         final_validation, unexecuted = reasoned.final_validation, reasoned.unexecuted
         phase_coverage = controller.phase_coverage
+        passes_per_loop = dict(reasoned.passes_per_loop or {})
+        comprehension = reasoned.comprehension
+
+        # --- OUTPUT COMPOSITION PASS (LOOP_PASS_BUDGET["output"] = 1, non-agentic) ---
+        # One LLM call, tools forbidden: compose the final artifact JSON
+        # strictly from this run's material. Any tool_calls returned are
+        # dropped and logged. Parse failure keeps the staged final.
+        controller, _ = _govern(
+            controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.OUTPUT
+        )
+        controller, _ = _govern(
+            controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.COMPOSITION
+        )
+        staged_final = parsed_final
+        compose_prompt = (
+            "OUTPUT COMPOSITION PASS (no tools available — any tool_calls you "
+            "return will be dropped): compose the FINAL artifact JSON strictly "
+            "from this run's material below. Return ONLY one JSON object with "
+            "EXACTLY {summary, evidence, confidence, limitations, "
+            "model_separation, hypothesis, scenario, memory_proposals} — every "
+            "numeric claim already cited; invent no values.\n\n"
+            "SYNTHESIS MATERIAL:\n"
+            f"{json.dumps({'summary': staged_final.get('summary'), 'evidence': staged_final.get('evidence'), 'confidence': staged_final.get('confidence'), 'limitations': staged_final.get('limitations'), 'model_separation': staged_final.get('model_separation'), 'hypothesis': staged_final.get('hypothesis'), 'scenario': staged_final.get('scenario')}, default=str)[:20_000]}\n\n"
+            "DISPATCHED TOOL PATHS:\n"
+            f"{json.dumps(sorted(accumulated_tool_results), default=str)[:4_000]}\n"
+        )
+        try:
+            raw_compose = await self._call_llm(compose_prompt)
+            llm_calls += 1
+            passes_per_loop["output"] = passes_per_loop.get("output", 0) + 1
+            maybe_composed = narration_mod.extract_json_object(raw_compose)
+            if isinstance(maybe_composed, dict):
+                if maybe_composed.pop("tool_calls", None):
+                    log.warning("output pass: tool_calls dropped (non-agentic)")
+                if maybe_composed.get("memory_proposals") is None:
+                    maybe_composed["memory_proposals"] = staged_final.get("memory_proposals")
+                parsed_final = maybe_composed
+        except Exception:
+            log.exception("output composition pass failed; keeping staged final")
+        controller = controller.record_loop_visit(
+            "output", passes_per_loop.get("output", 0),
+            ("composition", "architecture", "placement", "memory"),
+            completed=True,
+        )
+        deterministic_state["loop_traversal"] = controller.loop_coverage()
+        deterministic_state["congruence"] = controller.congruence()
 
         interpretation = {
             "summary": parsed_final.get("summary"),
@@ -1244,6 +1575,8 @@ class InferenceEngine:
             "terminal": terminal,
             "unexecuted_tool_calls": unexecuted,
             "llm_calls": llm_calls,
+            "passes_per_loop": passes_per_loop,
+            "comprehension_present": comprehension is not None,
             "gate": gate_status,
             "tool_round": bool(tool_results),
             "tool_rounds": tool_rounds_used,

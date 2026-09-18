@@ -28,6 +28,7 @@ identical outputs and identical fit ids.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 from decimal import Decimal, localcontext
@@ -678,7 +679,7 @@ def assemble_evidence(
     )
     first, last = intervals[0], intervals[-1]
     status = price_fit.status
-    return MicrostructureEvidence(
+    evidence = MicrostructureEvidence(
         symbol=symbol.upper(), venue=venue, evidence_id=evidence_id,
         generated_at_ms=generated_at_ms, interval_seconds=interval_seconds,
         window_start_ms=first.start_ts_ms, window_end_ms=last.end_ts_ms,
@@ -687,4 +688,687 @@ def assemble_evidence(
         price_impact_fit=price_fit, sensitivity_fit=sensitivity_fit,
         depth_scaling_fit=depth_fit, block_average_depth=price_fit.mean_ad,
         coverage=coverage or {}, status=status,
+    )
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# Track D (D2-D5) — additive only. Existing fits above are frozen.
+# ---------------------------------------------------------------------------
+
+from .contracts import (
+    FEATURE_VECTOR_VERSION,
+    FORWARD_MODEL_VERSION,
+    BestQuoteState,
+    FeatureVector,
+    ForwardFit,
+    ForwardObservation,
+)
+
+FORWARD_HORIZONS_MS: tuple[int, ...] = (1_000, 5_000, 30_000, 60_000)
+
+# Frozen per-field definition labels for xt-v1.
+FEATURE_DEF_VERSIONS: dict[str, str] = {
+    "ofi_10s": "event_contribution-v1",
+    "ad_10s": "event_mean_best_bid_ask_v1",
+    "dmu": "microprice-v1",
+    "spread_bps": "spread-v1",
+    "obi_top": "obi-top-v1",
+    "cvd_slope_60s": "cvd-slope-v1",
+    "skew_bps": "skew-v1",
+}
+
+
+def feature_input_hash(
+    *, symbol: str, venue: str, ts_ms: int,
+    fields: dict[str, str], def_versions: dict[str, str],
+) -> str:
+    """SHA-256 over the canonical feature-vector bytes (replay guarantee)."""
+    payload = {
+        "symbol": symbol.upper(), "venue": venue, "ts_ms": ts_ms,
+        "fields": fields, "def_versions": def_versions,
+        "vector_version": FEATURE_VECTOR_VERSION,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_feature_vector(
+    *,
+    symbol: str,
+    venue: str,
+    ts_ms: int,
+    ofi: Decimal | None = None,
+    average_depth: Decimal | None = None,
+    quote: BestQuoteState | None = None,
+    displacement: Decimal | None = None,
+    cvd_slope: Decimal | None = None,
+    quality: str = "exact_feed",
+) -> FeatureVector:
+    """Promote Decimal measurements into a versioned xt-v1 vector (pure).
+
+    Floats from substrates/poller must NEVER be passed here — recompute in
+    Decimal from raw events/trades first. Unavailable fields are omitted
+    (NULL = not-provided, never zero-filled). ``displacement`` may be passed
+    explicitly (D1 output) or derived from ``quote``; an explicit value wins.
+    """
+    if not symbol or not venue:
+        raise ValueError("symbol and venue are required")
+    if ts_ms <= 0:
+        raise ValueError("ts_ms must be positive")
+    for name, value in (("ofi", ofi), ("average_depth", average_depth),
+                         ("displacement", displacement), ("cvd_slope", cvd_slope)):
+        if value is not None and isinstance(value, float):
+            raise TypeError(f"{name} must be Decimal, not float — recompute, never copy")
+    fields: dict[str, str] = {}
+    defs: dict[str, str] = {}
+
+    def _put(key: str, value: Decimal | None) -> None:
+        if value is not None:
+            fields[key] = format(value, "f")
+            defs[key] = FEATURE_DEF_VERSIONS[key]
+
+    _put("ofi_10s", ofi)
+    _put("ad_10s", average_depth)
+    dmu = displacement
+    if dmu is None and quote is not None:
+        from .microprice import displacement as _dmu
+        try:
+            dmu = _dmu(quote)
+        except ValueError:
+            dmu = None
+    _put("dmu", dmu)
+    if quote is not None:
+        quote.validate()
+        with localcontext() as ctx:
+            ctx.prec = PRECISION
+            mid = (quote.bid_price + quote.ask_price) / Decimal(2)
+            if mid > 0:
+                _put("spread_bps", (quote.ask_price - quote.bid_price) / mid * Decimal(10000))
+        queue = quote.bid_qty + quote.ask_qty
+        _put("obi_top", (quote.bid_qty - quote.ask_qty) / queue if queue != 0 else None)
+        with localcontext() as ctx:
+            ctx.prec = PRECISION
+            mu = ((quote.ask_price * quote.bid_qty + quote.bid_price * quote.ask_qty)
+                  / queue) if queue != 0 else None
+            if mu is not None and mid > 0:
+                _put("skew_bps", (mu / mid - Decimal(1)) * Decimal(10000))
+    _put("cvd_slope_60s", cvd_slope)
+    digest = feature_input_hash(
+        symbol=symbol, venue=venue, ts_ms=ts_ms, fields=fields, def_versions=defs,
+    )
+    return FeatureVector(
+        symbol=symbol.upper(), venue=venue, ts_ms=ts_ms,
+        vector_version=FEATURE_VECTOR_VERSION, fields=fields, def_versions=defs,
+        quality=quality, input_hash=digest,
+    )
+
+
+def build_forward_observations(
+    vectors: list[FeatureVector],
+    mids: list[tuple[int, Decimal]],
+    *,
+    tick_size: Decimal,
+    venue: str,
+) -> tuple[list[ForwardObservation], dict[str, int]]:
+    """Join event-grain X_t to forward mid changes Y_t(h) (pure, no lookahead).
+
+    ``mids`` is a sorted (ts_ms, mid) series from microstructure events.
+    Each horizon resolves independently: gaps/halts/end-of-window/venue
+    mismatch yield NULL + a counted reason, never a bridged value.
+    """
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive")
+    if isinstance(tick_size, float):
+        raise TypeError("tick_size must be Decimal, not float")
+    if not vectors:
+        return [], {"excluded_total": 0}
+    series = sorted(mids, key=lambda row: row[0])
+    stamps = [ts for ts, _ in series]
+
+    def _at_or_after(t: int) -> Decimal | None:
+        """First mid with ts >= t (bisect; identical to linear scan)."""
+        i = bisect.bisect_left(stamps, t)
+        return series[i][1] if i < len(series) else None
+    log: dict[str, int] = {"excluded_total": 0}
+    out: list[ForwardObservation] = []
+    for vec in vectors:
+        if vec.venue != venue:
+            y_t = {h: None for h in FORWARD_HORIZONS_MS}
+            y_q = {h: None for h in FORWARD_HORIZONS_MS}
+            exc = {h: "venue_mismatch" for h in FORWARD_HORIZONS_MS}
+            for h in FORWARD_HORIZONS_MS:
+                log[f"excluded_{h}"] = log.get(f"excluded_{h}", 0) + 1
+            log["excluded_total"] += len(FORWARD_HORIZONS_MS)
+            out.append(ForwardObservation(x=vec, y_ticks=y_t, y_quote=y_q,
+                                          price_source="microstructure_mid", excluded=exc))
+            continue
+        base = _at_or_after(vec.ts_ms)
+        y_t: dict[int, str | None] = {}
+        y_q: dict[int, str | None] = {}
+        exc2: dict[int, str] = {}
+        for h in FORWARD_HORIZONS_MS:
+            target = vec.ts_ms + h
+            fwd = _at_or_after(target)
+            if base is None or fwd is None:
+                y_t[h], y_q[h], exc2[h] = None, None, "end_of_window"
+                log[f"excluded_{h}"] = log.get(f"excluded_{h}", 0) + 1
+                log["excluded_total"] += 1
+                continue
+            with localcontext() as ctx:
+                ctx.prec = PRECISION
+                dq = fwd - base
+                y_q[h] = format(dq, "f")
+                y_t[h] = format(dq / tick_size, "f")
+        out.append(ForwardObservation(x=vec, y_ticks=y_t, y_quote=y_q,
+                                      price_source="microstructure_mid", excluded=exc2))
+    return out, log
+
+
+def _forward_input_hash(symbol: str, venue: str, horizon_ms: int,
+                        pairs: list[ForwardObservation]) -> str:
+    payload = {
+        "symbol": symbol.upper(), "venue": venue, "horizon_ms": horizon_ms,
+        "model_version": FORWARD_MODEL_VERSION,
+        "xs": [p.x.to_dict() for p in pairs],
+        "ys": [p.y_ticks.get(horizon_ms) for p in pairs],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def fit_forward_ols(
+    pairs: list[ForwardObservation],
+    *,
+    symbol: str,
+    venue: str,
+    horizon_ms: int,
+    feature_keys: list[str] | None = None,
+    min_observations: int = MIN_OBSERVATIONS,
+) -> tuple[ForwardFit, list[ForwardObservation]]:
+    """Per-horizon multivariate OLS Y(h) ~ X (Decimal, time-ordered OOS).
+
+    Usable rows: vector quality ``exact_feed`` with a non-NULL y for this
+    horizon. Design columns: ``feature_keys`` (default: sorted union of
+    present fields, intercept always added). Time-ordered 70/30 train/test
+    split for OOS skill (in-sample R2 on train, OOS R2 on test vs train
+    mean). Trichotomy mirrors ``fit_price_impact``: ``insufficient`` when
+    under ``min_observations`` or zero-variance design; ``provisional``
+    when heteroskedastic or below 2x minimum; else ``validated``.
+    """
+    if horizon_ms not in FORWARD_HORIZONS_MS:
+        raise ValueError(f"unsupported horizon_ms: {horizon_ms!r}")
+    usable = [p for p in pairs
+              if p.x.quality == "exact_feed" and p.y_ticks.get(horizon_ms) is not None]
+    n_excluded = len(pairs) - len(usable)
+    digest = _forward_input_hash(symbol, venue, horizon_ms, pairs)
+
+    def _make(betas: dict[str, Decimal], stderr: dict[str, Decimal | None],
+              r2: Decimal | None, resid: Decimal | None, hetero: bool,
+              oos: Decimal | None, comp: dict[str, str],
+              status: str, n: int) -> ForwardFit:
+        return ForwardFit(
+            fit_id=_fit_id("fwd", digest), symbol=symbol.upper(), venue=venue,
+            horizon_ms=horizon_ms,
+            betas={k: format(v, "f") for k, v in betas.items()},
+            stderr={k: (format(v, "f") if v is not None else None) for k, v in stderr.items()},
+            r2=format(r2, "f") if r2 is not None else None,
+            resid_std=format(resid, "f") if resid is not None else None,
+            hetero_flag=hetero, n_obs=n, n_excluded=n_excluded,
+            oos_skill=format(oos, "f") if oos is not None else None,
+            comparator=comp, input_hash=digest,
+            model_version=FORWARD_MODEL_VERSION, status=status,
+        )
+
+    keys = feature_keys or sorted({k for p in usable for k in p.x.fields})
+    # Drop zero-variance columns (constant fields are collinear with the
+    # intercept and would singularize the normal equations). Dropped keys
+    # are simply absent from betas/stderr — documented, never imputed.
+    if usable:
+        counts = len(usable)
+        kept: list[str] = []
+        for k in keys:
+            vals = [p.x.fields.get(k) for p in usable]
+            if all(v == vals[0] for v in vals):
+                continue
+            kept.append(k)
+        keys = kept
+    with localcontext() as ctx:
+        ctx.prec = PRECISION
+        if len(usable) < 2:
+            return _make({"intercept": Decimal(0)}, {"intercept": None},
+                          None, None, False, None, {}, "insufficient", len(usable)), usable
+        cols = ["intercept", *keys]
+        X: list[list[Decimal]] = []
+        y: list[Decimal] = []
+        kept: list[ForwardObservation] = []
+        for p in usable:
+            try:
+                row = [Decimal(1)] + [Decimal(p.x.fields[k]) for k in keys]
+                yval = Decimal(str(p.y_ticks[horizon_ms]))
+            except Exception:
+                continue
+            X.append(row)
+            y.append(yval)
+            kept.append(p)
+        n = len(y)
+        if n < 2:
+            return _make({"intercept": Decimal(0)}, {"intercept": None},
+                          None, None, False, None, {}, "insufficient", n), usable
+        if not keys:
+            # Intercept-only null model: estimable but carries no feature
+            # information — must not wear validated/provisional.
+            with localcontext() as ctx:
+                ctx.prec = PRECISION
+                ybar0 = sum(y, Decimal(0)) / Decimal(n)
+            return _make({"intercept": ybar0}, {"intercept": None},
+                          None, None, False, None, {}, "insufficient", n), kept
+        k = len(cols)
+        # Normal equations via Gauss-Jordan on Decimal (small k by construction).
+        XtX = [[sum(X[i][a] * X[i][b] for i in range(n)) for b in range(k)] for a in range(k)]
+        Xty = [sum(X[i][a] * y[i] for i in range(n)) for a in range(k)]
+        aug = [row[:] + [Xty[a]] for a, row in enumerate(XtX)]
+        singular = False
+        for col in range(k):
+            # Partial pivoting: largest-magnitude pivot in column (stability
+            # for ill-conditioned designs, e.g. near-constant AD columns).
+            piv = None
+            best = Decimal(0)
+            for r in range(col, k):
+                mag = abs(aug[r][col])
+                if mag > best:
+                    best, piv = mag, r
+            if piv is None or best == 0:
+                singular = True
+                break
+            aug[col], aug[piv] = aug[piv], aug[col]
+            pivval = aug[col][col]
+            aug[col] = [v / pivval for v in aug[col]]
+            for r in range(k):
+                if r != col and aug[r][col] != 0:
+                    factor = aug[r][col]
+                    aug[r] = [rv - factor * cv for rv, cv in zip(aug[r], aug[col])]
+        if singular:
+            return _make({c: Decimal(0) for c in cols}, {c: None for c in cols},
+                          None, None, False, None, {}, "insufficient", n), kept
+        beta = [aug[a][k] for a in range(k)]
+        betas = dict(zip(cols, beta))
+        yhat = [sum(b * v for b, v in zip(beta, row)) for row in X]
+        resid = [yi - yh for yi, yh in zip(y, yhat)]
+        ybar = sum(y, Decimal(0)) / Decimal(n)
+        sst = sum(((v - ybar) ** 2 for v in y), Decimal(0))
+        ssr = sum(((e) ** 2 for e in resid), Decimal(0))
+        r2 = (Decimal(1) - ssr / sst) if sst != 0 else None
+        resid_std = (ssr / Decimal(max(n - k, 1))).sqrt() if n > k else None
+        # White/HC0 sandwich: Var(beta) = (X'X)^{-1} S (X'X)^{-1} with
+        # S_ab = sum_i e_i^2 X_ia X_ib. Exact (up to Decimal precision),
+        # matching the single-regressor HC0 in fit_price_impact. The inverse
+        # is readable from the reduced aug block.
+        inv = [row[:k] for row in aug]
+        meat = [[sum((resid[i] ** 2) * X[i][a] * X[i][b] for i in range(n))
+                 for b in range(k)] for a in range(k)]
+        se: dict[str, Decimal | None] = {}
+        for j, c in enumerate(cols):
+            try:
+                var = sum(inv[j][a] * meat[a][b] * inv[j][b]
+                          for a in range(k) for b in range(k))
+                se[c] = var.sqrt() if var >= 0 else None
+            except Exception:
+                se[c] = None
+        # Heteroskedasticity proxy: median split on |yhat - mean|.
+        order = sorted(range(n), key=lambda i: abs(yhat[i] - ybar))
+        half = n // 2
+        lo = sum((resid[i] ** 2 for i in order[:half]), Decimal(0)) / Decimal(max(half, 1))
+        hi = sum((resid[i] ** 2 for i in order[half:]), Decimal(0)) / Decimal(max(n - half, 1))
+        hetero = bool((hi > lo * 2) or (lo > hi * 2)) if n >= 4 else False
+        # Time-ordered OOS: first 70% train, last 30% test, skill vs train mean.
+        cut = max(1, int(n * 0.7))
+        oos: Decimal | None = None
+        if n - cut >= 2:
+            ytr, yte = y[:cut], y[cut:]
+            mtr = sum(ytr, Decimal(0)) / Decimal(len(ytr))
+            sst_te = sum(((v - mtr) ** 2 for v in yte), Decimal(0))
+            ssr_te = sum(((v - sum(b * X[cut + i][a] for a, b in enumerate(beta))) ** 2
+                           for i, v in enumerate(yte)), Decimal(0))
+            oos = (Decimal(1) - ssr_te / sst_te) if sst_te != 0 else None
+        # Univariate Cont comparator on the same kept rows (ofi_10s only).
+        comp: dict[str, str] = {}
+        ofi_rows = [(Decimal(p.x.fields["ofi_10s"]), Decimal(str(p.y_ticks[horizon_ms])))
+                     for p in kept if "ofi_10s" in p.x.fields]
+        if len(ofi_rows) >= 2:
+            xs = [r[0] for r in ofi_rows]
+            ys = [r[1] for r in ofi_rows]
+            xb = sum(xs, Decimal(0)) / Decimal(len(xs))
+            yb = sum(ys, Decimal(0)) / Decimal(len(ys))
+            sxx = sum(((v - xb) ** 2 for v in xs), Decimal(0))
+            if sxx != 0:
+                b1 = sum(((x - xb) * (yy - yb) for x, yy in zip(xs, ys)), Decimal(0)) / sxx
+                comp = {"beta_ofi": format(b1, "f"), "n": str(len(ofi_rows))}
+        if n < min_observations:
+            status = "insufficient"
+        elif n < 2 * min_observations or hetero or r2 is None:
+            status = "provisional"
+        else:
+            status = "validated"
+        return _make(betas, se, r2, resid_std, hetero, oos, comp, status, n), kept
+
+
+def predict_distribution(fit: ForwardFit, x: FeatureVector,
+                         *, theta_ticks: Decimal | None = None) -> dict[str, Any]:
+    """Expected Y(h) + 95% PI + P(>0)/P(>theta) from a FITTED ForwardFit (pure).
+
+    Raises ValueError on gate-failed (``insufficient``) fits — deriving from
+    one would be fabrication (mirrors ``derive_price_delta``). Normal-approx
+    probabilities are a stated assumption, recorded on the output.
+    """
+    if fit.status not in ("validated", "provisional"):
+        raise ValueError(f"cannot predict from {fit.status} forward fit {fit.fit_id}")
+    if (x.symbol.upper(), x.venue) != (fit.symbol.upper(), fit.venue):
+        raise ValueError("feature vector belongs to a different instrument")
+    with localcontext() as ctx:
+        ctx.prec = PRECISION
+        betas = {kk: Decimal(vv) for kk, vv in fit.betas.items()}
+        exp = betas.get("intercept", Decimal(0)) + sum(
+            betas.get(kk, Decimal(0)) * Decimal(x.fields[kk])
+            for kk in x.fields if kk in betas
+        )
+        resid = Decimal(fit.resid_std) if fit.resid_std is not None else None
+        out: dict[str, Any] = {
+            "expected_ticks": format(exp, "f"),
+            "variance_ticks": format(resid * resid, "f") if resid is not None else None,
+            "interval_lo_95": format(exp - Decimal("1.96") * resid, "f") if resid is not None else None,
+            "interval_hi_95": format(exp + Decimal("1.96") * resid, "f") if resid is not None else None,
+            "p_positive": None,
+            "p_above_theta": None,
+            "resid_std": format(resid, "f") if resid is not None else None,
+            "fit_id": fit.fit_id,
+            "horizon_ms": fit.horizon_ms,
+            "assumption": "normal-approx probabilities from residual std; stated, not proven",
+        }
+        if resid is not None and resid > 0:
+            from math import erf, sqrt as _sqrt
+            z = float(exp / resid)
+            out["p_positive"] = str(0.5 * (1.0 + erf(z / _sqrt(2.0))))
+            if theta_ticks is not None:
+                zt = float((exp - theta_ticks) / resid)
+                out["p_above_theta"] = str(0.5 * (1.0 + erf(zt / _sqrt(2.0))))
+        return out
+
+
+def calibration_report(fit: ForwardFit,
+                       pairs: list[ForwardObservation],
+                       *, n_bins: int = 5) -> dict[str, Any]:
+    """Reliability bins: predicted vs realized per quantile of expected Y(h)."""
+    if n_bins < 2:
+        raise ValueError("n_bins must be >= 2")
+    scored: list[tuple[Decimal, Decimal]] = []
+    for p in pairs:
+        raw = p.y_ticks.get(fit.horizon_ms)
+        if raw is None or p.x.quality != "exact_feed":
+            continue
+        try:
+            pred = Decimal(predict_distribution(fit, p.x)["expected_ticks"])
+            scored.append((pred, Decimal(str(raw))))
+        except Exception:
+            continue
+    bins: list[dict[str, Any]] = []
+    calibrated = True
+    if scored:
+        scored.sort(key=lambda row: row[0])
+        size = max(1, len(scored) // n_bins)
+        for b in range(n_bins):
+            chunk = scored[b * size:(b + 1) * size if b < n_bins - 1 else len(scored)]
+            if not chunk:
+                bins.append({"bin": b, "n": 0, "predicted": None, "realized": None})
+                continue
+            mp = sum((r[0] for r in chunk), Decimal(0)) / Decimal(len(chunk))
+            mr = sum((r[1] for r in chunk), Decimal(0)) / Decimal(len(chunk))
+            bins.append({"bin": b, "n": len(chunk),
+                         "predicted": format(mp, "f"), "realized": format(mr, "f")})
+            if (mp > 0) != (mr > 0) and abs(mp - mr) > (abs(mp) + abs(mr)) / 2:
+                calibrated = False
+    return {"fit_id": fit.fit_id, "horizon_ms": fit.horizon_ms,
+            "n": len(scored), "n_bins": n_bins, "bins": bins,
+            "calibrated": calibrated,
+            "refusal": None if calibrated else "miscalibrated: do not quote probabilities"}
+
+
+# ---------------------------------------------------------------------------
+# Track D (D6/D9/D10) — additive only. Existing fits above are frozen.
+# ---------------------------------------------------------------------------
+
+from .contracts import EVIDENCE_V2_VERSION, MicrostructureEvidenceV2  # noqa: E402
+from .ofi import DEPTH_ESTIMATOR as _DEPTH_ESTIMATOR  # noqa: E402
+
+FORWARD_SCENARIO_VERSION = "fwd-scenario-v1"
+
+
+def _norm_cdf(z: float) -> float:
+    from math import erf, sqrt as _sqrt
+    return 0.5 * (1.0 + erf(z / _sqrt(2.0)))
+
+
+def evaluate_forward_scenario(
+    fit: ForwardFit,
+    x: FeatureVector,
+    *,
+    spot_price: Decimal,
+    targets: list[Decimal],
+    invalidations: list[Decimal],
+    tick_size: Decimal,
+    calibrated: bool = True,
+    calibration_refusal: str | None = None,
+) -> dict[str, Any]:
+    """D6 horizon-native P(P_{t+h}>=T|X) / P(P_{t+h}<=S|X) curves (pure).
+
+    Read-only over D4/D5. Normal-approx is a stated assumption, recorded on
+    every output. Miscalibrated horizon -> probs NULL (never 0).
+    """
+    if isinstance(tick_size, float):
+        raise TypeError("tick_size must be Decimal, not float")
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive")
+    if isinstance(spot_price, float):
+        raise TypeError("spot_price must be Decimal, not float")
+    if fit.status not in ("validated", "provisional"):
+        raise ValueError(f"cannot scenario from {fit.status} fit {fit.fit_id}")
+    if (x.symbol.upper(), x.venue) != (fit.symbol.upper(), fit.venue):
+        raise ValueError("feature vector belongs to a different instrument")
+    if not targets and not invalidations:
+        raise ValueError("at least one target or invalidation is required")
+    dist = predict_distribution(fit, x)
+    mu = Decimal(str(dist["expected_ticks"]))
+    sig_raw = dist.get("resid_std")
+    sig = Decimal(str(sig_raw)) if sig_raw is not None else None
+    null_probs = (sig is None or sig <= 0 or not calibrated)
+    # SE projection for bands.
+    band_method = "null-no-se"
+    se_mu: Decimal | None = None
+    with localcontext() as ctx:
+        ctx.prec = PRECISION
+        try:
+            terms: list[Decimal] = []
+            if fit.stderr.get("intercept") is not None:
+                terms.append(Decimal(str(fit.stderr["intercept"])) ** 2)
+            for kk, vv in x.fields.items():
+                s = fit.betas.get(kk) and fit.stderr.get(kk)
+                if s is not None:
+                    terms.append((Decimal(str(s)) * abs(Decimal(vv))) ** 2)
+            if terms:
+                se_mu = sum(terms, Decimal(0)).sqrt()
+                band_method = "se-projection-v1"
+            elif sig is not None and fit.n_obs > 0:
+                se_mu = sig / Decimal(fit.n_obs).sqrt()
+                band_method = "resid-over-sqrt-n-v1"
+        except Exception:
+            se_mu = None
+            band_method = "null-no-se"
+    out: dict[str, Any] = {
+        "scenario_version": FORWARD_SCENARIO_VERSION,
+        "fit_id": fit.fit_id, "horizon_ms": fit.horizon_ms,
+        "vector_version": x.vector_version,
+        "expected_ticks": format(mu, "f"),
+        "expected_quote": format(spot_price + mu * tick_size, "f"),
+        "resid_std_ticks": format(sig, "f") if sig is not None else None,
+        "spot_price": format(spot_price, "f"),
+        "tick_size": format(tick_size, "f"),
+        "band_method": band_method,
+        "band_note": None if se_mu is not None else "stderr null: no band range",
+        "assumption": "normal-approx from D5 residual std; stated, not proven",
+        "calibration": {"calibrated": calibrated, "refusal": calibration_refusal},
+        "kind": "forward-conditional (horizon-native)",
+        "targets": [], "invalidations": [],
+    }
+    with localcontext() as ctx:
+        ctx.prec = PRECISION
+        for T in targets:
+            if isinstance(T, float):
+                raise TypeError("targets must be Decimal, not float")
+            d_req = (T - spot_price) / tick_size
+            row: dict[str, Any] = {"T": format(T, "f"), "d_req_ticks": format(d_req, "f"),
+                                   "p_ge": None, "p_lo": None, "p_hi": None}
+            if not null_probs and sig is not None and sig > 0:
+                assert sig > 0
+                row["p_ge"] = str(1.0 - _norm_cdf(float((d_req - mu) / sig)))
+                if se_mu is not None:
+                    row["p_lo"] = str(1.0 - _norm_cdf(float((d_req - (mu + Decimal("1.96") * se_mu)) / sig)))
+                    row["p_hi"] = str(1.0 - _norm_cdf(float((d_req - (mu - Decimal("1.96") * se_mu)) / sig)))
+                    lo, hi = row["p_lo"], row["p_hi"]
+                    if lo is not None and hi is not None and float(lo) > float(hi):
+                        row["p_lo"], row["p_hi"] = hi, lo
+            out["targets"].append(row)
+        for S in invalidations:
+            if isinstance(S, float):
+                raise TypeError("invalidations must be Decimal, not float")
+            d_req = (S - spot_price) / tick_size
+            row2: dict[str, Any] = {"S": format(S, "f"), "d_req_ticks": format(d_req, "f"),
+                                    "p_le": None, "p_lo": None, "p_hi": None}
+            if not null_probs and sig is not None and sig > 0:
+                assert sig > 0
+                row2["p_le"] = str(_norm_cdf(float((d_req - mu) / sig)))
+                if se_mu is not None:
+                    row2["p_lo"] = str(_norm_cdf(float((d_req - (mu + Decimal("1.96") * se_mu)) / sig)))
+                    row2["p_hi"] = str(_norm_cdf(float((d_req - (mu - Decimal("1.96") * se_mu)) / sig)))
+                    lo2, hi2 = row2["p_lo"], row2["p_hi"]
+                    if lo2 is not None and hi2 is not None and float(lo2) > float(hi2):
+                        row2["p_lo"], row2["p_hi"] = hi2, lo2
+            out["invalidations"].append(row2)
+    return out
+
+
+def compare_scenario_paths(legacy: dict[str, Any], fwd: dict[str, Any]) -> dict[str, Any]:
+    """D6 agreement/disagreement table: legacy flow-requirement vs horizon-native."""
+    agreements: list[str] = []
+    disagreements: list[str] = []
+    if legacy.get("direction") == "up" and fwd.get("targets"):
+        agreements.append("both paths frame upside as one-sided exceedance")
+    if str(legacy.get("horizon", "")) not in {str(fwd.get("horizon_ms")), "15m", "1h", "4h"}:
+        disagreements.append(
+            f"horizon mismatch: legacy {legacy.get('horizon')} vs fwd {fwd.get('horizon_ms')}ms"
+        )
+    else:
+        disagreements.append(
+            f"assumption differs: legacy scale-invariance ({legacy.get('horizon')}) "
+            f"vs fwd normal-approx ({fwd.get('horizon_ms')}ms)"
+        )
+    disagreements.append("legacy answers required-flow; fwd answers conditional probability")
+    return {
+        "agreement": "; ".join(agreements) if agreements else "none (different questions)",
+        "disagreement": disagreements,
+        "note": "different horizons/assumptions; neither is ground truth",
+    }
+
+
+def population_key(x: FeatureVector, horizon_ms: int, regime: str | None) -> str:
+    """D9 population-membership key (statistical, not architectural)."""
+    import hashlib as _hl
+    import json as _js
+    payload = {"vector_version": x.vector_version, "horizon_ms": horizon_ms,
+               "regime": regime if regime is not None else "all",
+               "quality": x.quality}
+    return _hl.sha256(_js.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def skill_decay_report(
+    pairs: list[ForwardObservation],
+    fits: dict[int, ForwardFit],
+    *,
+    regime_of: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """D9 per-horizon skill-decay curves with bands (read-only over D4 OOS)."""
+    per_h: dict[str, Any] = {}
+    nulls: list[str] = []
+    for h in sorted(fits):
+        f = fits[h]
+        n = sum(1 for p in pairs if p.y_ticks.get(h) is not None
+                and p.x.quality == "exact_feed")
+        per_h[str(h)] = {"oos_skill": f.oos_skill, "n": n, "status": f.status}
+        if f.status == "insufficient" or f.oos_skill is None:
+            nulls.append(f"{h}: no skill (status={f.status}) — null is a result")
+    finalized = [h for h in sorted(fits)
+                 if fits[h].status != "insufficient" and fits[h].oos_skill is not None]
+    per_regime = None
+    if regime_of:
+        per_regime = {}
+        regs = sorted(set(regime_of.values()))
+        for r in regs:
+            per_regime[r] = {str(h): fits[h].oos_skill for h in sorted(fits)}
+    return {
+        "per_horizon": per_h,
+        "per_regime": per_regime,
+        "decay_curve": [{"h": h, "skill": fits[h].oos_skill} for h in sorted(fits)],
+        "finalized_horizons": finalized,
+        "feed_resolution_note": "1s/5s require event grain (D3); 10s intervals cannot resolve them",
+        "null_results": nulls,
+    }
+
+
+def assemble_evidence_v2(
+    *,
+    symbol: str, venue: str, evidence_id: str, generated_at_ms: int,
+    tick_size: Decimal,
+    x: FeatureVector | None = None,
+    fit: ForwardFit | None = None,
+    distribution: dict[str, Any] | None = None,
+    scenario: dict[str, Any] | None = None,
+    hypothesis: Any | None = None,
+    events: list[dict[str, Any]] | None = None,
+    legacy_fit: dict[str, Any] | None = None,
+) -> MicrostructureEvidenceV2:
+    """D10 compose-only assembly (never fits; unproven fields stay NULL)."""
+    import hashlib as _hl
+    import json as _js
+    digest = _hl.sha256(_js.dumps(
+        {"evidence_id": evidence_id, "fit": fit.fit_id if fit else None,
+         "x": x.input_hash if x else None,
+         "h": scenario.get("horizon_ms") if scenario else (fit.horizon_ms if fit else None)},
+        sort_keys=True).encode()).hexdigest()
+    dist = distribution or {}
+    scen = scenario or {}
+    hyp = hypothesis.to_dict() if hypothesis is not None and hasattr(hypothesis, "to_dict") else (hypothesis or None)
+    return MicrostructureEvidenceV2(
+        symbol=symbol.upper(), venue=venue, evidence_id=evidence_id,
+        generated_at_ms=generated_at_ms, tick_size=format(tick_size, "f"),
+        depth_estimator=_DEPTH_ESTIMATOR, input_hash=digest,
+        model_version=EVIDENCE_V2_VERSION,
+        vector_version=x.vector_version if x else None,
+        x_t=x.to_dict() if x else None,
+        horizon_ms=scen.get("horizon_ms") if scen else (fit.horizon_ms if fit else None),
+        expected_dP_ticks=dist.get("expected_ticks"),
+        variance_ticks=dist.get("variance_ticks"),
+        se=None,
+        interval_lo_95=dist.get("interval_lo_95"),
+        interval_hi_95=dist.get("interval_hi_95"),
+        p_positive=dist.get("p_positive"),
+        p_target={"curves": scen.get("targets")} if scen.get("targets") else None,
+        p_invalidation={"curves": scen.get("invalidations")} if scen.get("invalidations") else None,
+        hypothesis=(hyp.get("hypothesis_id") if isinstance(hyp, dict) else None),
+        effect=(hyp.get("effect") if isinstance(hyp, dict) else None),
+        evidence=hyp,
+        n=(hyp.get("n") if isinstance(hyp, dict) else (fit.n_obs if fit else None)),
+        split=(hyp.get("split") if isinstance(hyp, dict) else None),
+        multiplicity_adj=(hyp.get("multiplicity_adj") if isinstance(hyp, dict) else None),
+        oos_info={"oos_skill": fit.oos_skill, "fit_id": fit.fit_id} if fit else None,
+        events=events if events is not None else [{"note": "no_events"}],
+        legacy_fit=legacy_fit,
     )

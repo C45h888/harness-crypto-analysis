@@ -132,6 +132,16 @@ TOOL_NAMES: dict[str, str] = {
     "calc.derived_diagnostic": "calc.derived_diagnostic",
     "calc.price.delta": "calc.derived_diagnostic",
     "calc.scenario.evaluate": "calc.scenario.evaluate",
+    "calc.feature.build": "calc.feature.build",
+    "calc.forward.join": "calc.forward.join",
+    "calc.forward.fit": "calc.forward.fit",
+    "calc.forward.distribution": "calc.forward.distribution",
+    "calc.forward.scenario": "calc.forward.scenario",
+    "calc.hypothesis.test": "calc.hypothesis.test",
+    "calc.events.absorption": "calc.events.absorption",
+    "calc.events.walls": "calc.events.walls",
+    "calc.decay.report": "calc.decay.report",
+    "calc.discipline.audit": "calc.discipline.audit",
     "memory.recall_paper": "memory.recall_paper",
     # T2 — market correlation (canonical pipeline seams)
     "market.read": "market.read",
@@ -193,12 +203,42 @@ TOOL_PHASE: dict[str, str] = {
     "substrate.technicals": "P3",
     "substrate.tiers": "P3",
     "substrate.volume_profile": "P3",
-    # P5 — paper grounding + derived ΔP
+    # P5 — paper grounding + derived ΔP + Track D forward stack
     "memory.recall_paper": "P5",
     "calc.derived_diagnostic": "P5",
     "calc.price.delta": "P5",
     "calc.scenario.evaluate": "P5",
+    "calc.feature.build": "P5",
+    "calc.forward.join": "P5",
+    "calc.forward.fit": "P5",
+    "calc.forward.distribution": "P5",
+    "calc.forward.scenario": "P5",
+    "calc.hypothesis.test": "P5",
+    "calc.events.absorption": "P3",
+    "calc.events.walls": "P3",
+    "calc.decay.report": "P5",
+    "calc.discipline.audit": "P5",
 }
+
+# Loop home (Track A congruence shape, loop-surface spec v1) — which nested
+# loop each tool executes inside (runtime truth, not purpose-fiction).
+# P-phases stay orthogonal: a phase names the evidence family, the loop
+# names when in the cycle the call executes. Only the two fixed pre-gate
+# reads execute inside EVIDENCE; every agent-pulled call executes inside
+# REASONING (the staged loop lives there); the discipline audit's primary
+# home is VALIDATION. Nothing executes inside COMPREHENSION or OUTPUT by
+# design (prompt understanding and non-agentic composition take no tools).
+TOOL_LOOP_DEFAULT = "reasoning"
+TOOL_LOOP_OVERRIDES: dict[str, str] = {
+    "micro.capture_status": "evidence",
+    "micro.fit_beta": "evidence",
+    "calc.discipline.audit": "validation",
+}
+
+
+def tool_loop(tool: str) -> str:
+    """The nested loop a tool call executes inside (congruence table)."""
+    return TOOL_LOOP_OVERRIDES.get(tool, TOOL_LOOP_DEFAULT)
 _PHASE_ORDER = ("P1", "P2", "P3", "P4", "P5")
 _REQUIRED_PHASES = ("P1", "P2", "P3", "P5")
 
@@ -528,7 +568,8 @@ async def dispatch_calc_observation_build(
         end_ts = events[-1].current.exchange_ts_ms if events else 0
         windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
         intervals = fm.replay_intervals(windowed, interval_ms=interval_seconds*1000)
-        observations, excluded = fm.build_observations(intervals, tick_size=Decimal("0.01"))
+        from market_service.microstructure.tick import resolve_tick_size
+        observations, excluded = fm.build_observations(intervals, tick_size=resolve_tick_size(symbol, venue))
         proj = [{"ofi": str(o.ofi), "delta_ticks": str(o.delta_ticks), "average_depth": str(o.average_depth) if o.average_depth else None, "quality": o.quality} for o in observations[:50]]
         return proj, capability_log_entry(cap.name, scope, "ok", detail={"n_observations": len(observations), "excluded": excluded, "note": "ΔP = α+β·OFI observations ready for calc.fit.price_impact"})
     except CapabilityDenied as exc:
@@ -551,7 +592,8 @@ async def dispatch_calc_fit_price_impact(
         events, _ = fm.replay_events_from_payloads(payloads)
         windowed = [e for e in events if e.current.exchange_ts_ms >= (events[-1].current.exchange_ts_ms - window_minutes*60_000)] if events else []
         intervals = fm.replay_intervals(windowed, interval_ms=interval_seconds*1000)
-        fit, _ = fm.fit_price_impact(intervals, symbol=symbol, venue=venue, tick_size=Decimal("0.01"), interval_seconds=interval_seconds)
+        from market_service.microstructure.tick import resolve_tick_size
+        fit, _ = fm.fit_price_impact(intervals, symbol=symbol, venue=venue, tick_size=resolve_tick_size(symbol, venue), interval_seconds=interval_seconds)
         return fit.to_dict(), capability_log_entry(cap.name, scope, "ok", detail={"beta": str(fit.beta), "status": fit.status})
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
@@ -571,7 +613,8 @@ async def dispatch_calc_fit_depth_scaling(
         payloads = await store.read_microstructure_events(venue, symbol.upper())
         events, _ = fm.replay_events_from_payloads(payloads)
         intervals = fm.replay_intervals(events, interval_ms=10_000)
-        fit, _ = fm.fit_price_impact(intervals, symbol=symbol, venue=venue, tick_size=fm.DECIMAL("0.01") if hasattr(fm,"DECIMAL") else __import__("decimal").Decimal("0.01"), interval_seconds=10) if intervals else (None,None)
+        from market_service.microstructure.tick import resolve_tick_size
+        fit, _ = fm.fit_price_impact(intervals, symbol=symbol, venue=venue, tick_size=resolve_tick_size(symbol, venue), interval_seconds=10) if intervals else (None,None)
         if fit is None:
             return None, capability_log_entry(cap.name, scope, "ok", detail={"status": "insufficient", "reason": "no intervals"})
         depth_fit = fm.fit_depth_scaling([fit], symbol=symbol, venue=venue)
@@ -882,6 +925,441 @@ async def dispatch_memory_recall_paper(
         return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Track A base instantiation — forward-stack dispatchers (thin wrappers over
+# proven market_service.microstructure pure functions; refused-shape on
+# insufficient/miscalibrated/thin inputs, never fabricated values).
+# ---------------------------------------------------------------------------
+
+async def dispatch_calc_feature_build(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.feature.build — xt-v1 vector from the latest event window."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.feature.build"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "window_minutes": window_minutes}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        if not events:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no events in ledger"})
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms]
+        intervals = fm.replay_intervals(windowed, interval_ms=10_000)
+        last_iv = intervals[-1] if intervals else None
+        quote = windowed[-1].current
+        vec = fm.build_feature_vector(symbol=symbol, venue=venue, ts_ms=quote.exchange_ts_ms,
+            ofi=last_iv.ofi if last_iv else None,
+            average_depth=last_iv.average_depth if last_iv else None,
+            quote=quote, quality=last_iv.quality if last_iv else "exact_feed")
+        return vec.to_dict(), capability_log_entry(cap.name, scope, "ok",
+            detail={"vector_version": vec.vector_version, "fields": sorted(vec.fields)})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_forward_join(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+    tick_size: str = "0.01",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.forward.join — (X_t, Y(h)) pairs + exclusion log."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    from market_service.microstructure.ofi import _mid
+    cap = CAPABILITIES["calc.forward.join"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "window_minutes": window_minutes}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        if not events:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no events in ledger"})
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms]
+        vecs = []
+        for e in windowed:
+            try:
+                vecs.append(fm.build_feature_vector(symbol=symbol, venue=venue,
+                    ts_ms=e.current.exchange_ts_ms, ofi=e.contribution,
+                    average_depth=None, quote=e.current, quality=e.source_quality))
+            except Exception:
+                continue
+        mids = [(e.current.exchange_ts_ms, _mid(e.current)) for e in windowed]
+        pairs, log = fm.build_forward_observations(vecs, mids,
+            tick_size=Decimal(str(tick_size)), venue=venue)
+        return {"n_pairs": len(pairs), "exclusion_log": log,
+                "sample": [p.to_dict() for p in pairs[:5]]}, capability_log_entry(
+            cap.name, scope, "ok", detail={"n_pairs": len(pairs), **log})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_forward_fit(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+    horizon_ms: int = 5_000, tick_size: str = "0.01",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.forward.fit — per-horizon OLS + comparator + OOS."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    from market_service.microstructure.ofi import _mid
+    cap = CAPABILITIES["calc.forward.fit"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "horizon_ms": horizon_ms}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        if not events:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no events in ledger"})
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms]
+        vecs = []
+        for e in windowed:
+            try:
+                vecs.append(fm.build_feature_vector(symbol=symbol, venue=venue,
+                    ts_ms=e.current.exchange_ts_ms, ofi=e.contribution,
+                    average_depth=None, quote=e.current, quality=e.source_quality))
+            except Exception:
+                continue
+        mids = [(e.current.exchange_ts_ms, _mid(e.current)) for e in windowed]
+        pairs, _ = fm.build_forward_observations(vecs, mids,
+            tick_size=Decimal(str(tick_size)), venue=venue)
+        try:
+            fit, _ = fm.fit_forward_ols(pairs, symbol=symbol, venue=venue, horizon_ms=horizon_ms)
+        except ValueError as vex:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": str(vex)})
+        return fit.to_dict(), capability_log_entry(cap.name, scope, "ok",
+            detail={"status": fit.status, "horizon_ms": horizon_ms, "oos_skill": fit.oos_skill})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_forward_distribution(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, horizon_ms: int = 5_000,
+    theta_ticks: Any | None = None, window_minutes: int = 30, tick_size: str = "0.01",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.forward.distribution — E[Y(h)] + PI + P(>0)/P(>theta)."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    cap = CAPABILITIES["calc.forward.distribution"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "horizon_ms": horizon_ms}
+    try:
+        cap.validate_scope(symbol, venue)
+        fit_dict, fit_log = await dispatch_calc_forward_fit(
+            store, symbol, venue, window_minutes=window_minutes, horizon_ms=horizon_ms, tick_size=tick_size)
+        if not fit_dict:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": f"no forward fit: {(fit_log.get('detail') or {})}",})
+        from market_service.microstructure.contracts import ForwardFit
+        fit = ForwardFit(symbol=str(fit_dict["symbol"]), venue=str(fit_dict["venue"]),
+            fit_id=str(fit_dict["fit_id"]), horizon_ms=int(fit_dict["horizon_ms"]),
+            betas=dict(fit_dict["betas"]), stderr=dict(fit_dict["stderr"]),
+            r2=fit_dict.get("r2"), resid_std=fit_dict.get("resid_std"),
+            hetero_flag=bool(fit_dict.get("hetero_flag")), n_obs=int(fit_dict.get("n_obs") or 0),
+            n_excluded=int(fit_dict.get("n_excluded") or 0), oos_skill=fit_dict.get("oos_skill"),
+            comparator=dict(fit_dict.get("comparator") or {}), input_hash=str(fit_dict.get("input_hash") or ""),
+            model_version=str(fit_dict.get("model_version") or ""), status=str(fit_dict.get("status") or "insufficient"))
+        vec_dict, _ = await dispatch_calc_feature_build(store, symbol, venue, window_minutes=window_minutes)
+        if not vec_dict:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no live feature vector"})
+        from market_service.microstructure.contracts import FeatureVector
+        x = FeatureVector(symbol=str(vec_dict["symbol"]), venue=str(vec_dict["venue"]),
+            ts_ms=int(vec_dict["ts_ms"]), vector_version=str(vec_dict["vector_version"]),
+            fields=dict(vec_dict["fields"]), def_versions=dict(vec_dict["def_versions"]),
+            quality=str(vec_dict["quality"]), input_hash=str(vec_dict["input_hash"]))
+        theta = Decimal(str(theta_ticks)) if theta_ticks is not None else None
+        try:
+            out = fm.predict_distribution(fit, x, theta_ticks=theta)
+        except ValueError as vex:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": str(vex), "fit_id": fit.fit_id})
+        return out, capability_log_entry(cap.name, scope, "ok",
+            detail={"fit_id": fit.fit_id, "horizon_ms": horizon_ms})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_forward_scenario(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, horizon_ms: int = 5_000,
+    targets: list[Any] | None = None, invalidations: list[Any] | None = None,
+    window_minutes: int = 30, tick_size: str = "0.01",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.forward.scenario — horizon-native P(T)/P(S) with bands."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    from market_service.runtime import read_paths
+    cap = CAPABILITIES["calc.forward.scenario"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "horizon_ms": horizon_ms}
+    try:
+        cap.validate_scope(symbol, venue)
+        dist, dist_log = await dispatch_calc_forward_distribution(
+            store, symbol, venue, horizon_ms=horizon_ms,
+            window_minutes=window_minutes, tick_size=tick_size)
+        if not dist:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": f"no distribution: {(dist_log.get('detail') or {})}",})
+        payload = await read_paths.read_collated(store, symbol.upper())
+        snap = read_paths.market_snapshot(payload) if payload is not None else {}
+        spot_raw = snap.get("mark_price") or snap.get("last_price")
+        if spot_raw is None:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no_market_price"})
+        # Rebuild fit+x via the distribution path's own tools for hash discipline.
+        fit_dict, _ = await dispatch_calc_forward_fit(
+            store, symbol, venue, window_minutes=window_minutes, horizon_ms=horizon_ms, tick_size=tick_size)
+        vec_dict, _ = await dispatch_calc_feature_build(store, symbol, venue, window_minutes=window_minutes)
+        from market_service.microstructure.contracts import FeatureVector, ForwardFit
+        fit = ForwardFit(symbol=str(fit_dict["symbol"]), venue=str(fit_dict["venue"]),
+            fit_id=str(fit_dict["fit_id"]), horizon_ms=int(fit_dict["horizon_ms"]),
+            betas=dict(fit_dict["betas"]), stderr=dict(fit_dict["stderr"]),
+            r2=fit_dict.get("r2"), resid_std=fit_dict.get("resid_std"),
+            hetero_flag=bool(fit_dict.get("hetero_flag")), n_obs=int(fit_dict.get("n_obs") or 0),
+            n_excluded=int(fit_dict.get("n_excluded") or 0), oos_skill=fit_dict.get("oos_skill"),
+            comparator=dict(fit_dict.get("comparator") or {}), input_hash=str(fit_dict.get("input_hash") or ""),
+            model_version=str(fit_dict.get("model_version") or ""), status=str(fit_dict.get("status") or "insufficient"))
+        x = FeatureVector(symbol=str(vec_dict["symbol"]), venue=str(vec_dict["venue"]),
+            ts_ms=int(vec_dict["ts_ms"]), vector_version=str(vec_dict["vector_version"]),
+            fields=dict(vec_dict["fields"]), def_versions=dict(vec_dict["def_versions"]),
+            quality=str(vec_dict["quality"]), input_hash=str(vec_dict["input_hash"]))
+        try:
+            out = fm.evaluate_forward_scenario(fit, x, spot_price=Decimal(str(spot_raw)),
+                targets=[Decimal(str(t)) for t in (targets or [])],
+                invalidations=[Decimal(str(s)) for s in (invalidations or [])],
+                tick_size=Decimal(str(tick_size)))
+        except ValueError as vex:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": str(vex), "fit_id": fit.fit_id})
+        return out, capability_log_entry(cap.name, scope, "ok",
+            detail={"fit_id": fit.fit_id, "horizon_ms": horizon_ms})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_hypothesis_test(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, hypothesis_id: str,
+    horizon_ms: int = 5_000, m_tests: int = 1, window_minutes: int = 30,
+    tick_size: str = "0.01",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.hypothesis.test — independent post-fit test (never auto-called)."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    from market_service.microstructure.hypothesis import test_hypothesis
+    from market_service.microstructure.ofi import _mid
+    cap = CAPABILITIES["calc.hypothesis.test"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "hypothesis_id": hypothesis_id}
+    try:
+        cap.validate_scope(symbol, venue)
+        if not hypothesis_id:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "hypothesis_id required (pre-registration)"})
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        vecs = []
+        for e in windowed:
+            try:
+                vecs.append(fm.build_feature_vector(symbol=symbol, venue=venue,
+                    ts_ms=e.current.exchange_ts_ms, ofi=e.contribution,
+                    average_depth=None, quote=e.current, quality=e.source_quality))
+            except Exception:
+                continue
+        mids = [(e.current.exchange_ts_ms, _mid(e.current)) for e in windowed]
+        pairs, _ = fm.build_forward_observations(vecs, mids,
+            tick_size=Decimal(str(tick_size)), venue=venue)
+        fit_dict, fit_log = await dispatch_calc_forward_fit(
+            store, symbol, venue, window_minutes=window_minutes, horizon_ms=horizon_ms, tick_size=tick_size)
+        if not fit_dict:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": f"no forward fit: {(fit_log.get('detail') or {})}",})
+        from market_service.microstructure.contracts import ForwardFit
+        fit = ForwardFit(symbol=str(fit_dict["symbol"]), venue=str(fit_dict["venue"]),
+            fit_id=str(fit_dict["fit_id"]), horizon_ms=int(fit_dict["horizon_ms"]),
+            betas=dict(fit_dict["betas"]), stderr=dict(fit_dict["stderr"]),
+            r2=fit_dict.get("r2"), resid_std=fit_dict.get("resid_std"),
+            hetero_flag=bool(fit_dict.get("hetero_flag")), n_obs=int(fit_dict.get("n_obs") or 0),
+            n_excluded=int(fit_dict.get("n_excluded") or 0), oos_skill=fit_dict.get("oos_skill"),
+            comparator=dict(fit_dict.get("comparator") or {}), input_hash=str(fit_dict.get("input_hash") or ""),
+            model_version=str(fit_dict.get("model_version") or ""), status=str(fit_dict.get("status") or "insufficient"))
+        try:
+            ev = test_hypothesis(fit, pairs, hypothesis_id=hypothesis_id, m_tests=int(m_tests or 1))
+        except ValueError as vex:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": str(vex)})
+        return ev.to_dict(), capability_log_entry(cap.name, scope, "ok",
+            detail={"hypothesis_id": hypothesis_id, "p_value": ev.p_value, "status": ev.status})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_events(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, kind: str,
+    window_minutes: int = 30,
+) -> tuple[Any, dict[str, Any]]:
+    """Tools: calc.events.absorption / calc.events.walls — typed detectors."""
+    from market_service.microstructure import fitting as fm
+    from market_service.microstructure.events import detect_absorption, detect_walls, replay_agreement
+    cap = CAPABILITIES[f"calc.events.{kind}"]
+    scope = {"symbol": symbol.upper(), "venue": venue, "kind": kind}
+    try:
+        cap.validate_scope(symbol, venue)
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        if kind == "absorption":
+            found, log = detect_absorption(windowed, symbol=symbol, venue=venue)
+        else:
+            found, log = detect_walls(windowed, symbol=symbol, venue=venue)
+        agr = replay_agreement(windowed, symbol=symbol, venue=venue) if windowed else {"agreement": True}
+        return {"events": [f.to_dict() for f in found], "log": log, "replay_agreement": agr}, \
+            capability_log_entry(cap.name, scope, "ok", detail={"n": len(found), **log})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_decay_report(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+    tick_size: str = "0.01",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.decay.report — skill-decay + finalized horizons."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    from market_service.microstructure.ofi import _mid
+    cap = CAPABILITIES["calc.decay.report"]
+    scope = {"symbol": symbol.upper(), "venue": venue}
+    try:
+        cap.validate_scope(symbol, venue)
+        from market_service.microstructure.contracts import ForwardFit
+        fits = {}
+        pairs_ref = None
+        for h in fm.FORWARD_HORIZONS_MS:
+            fit_dict, _ = await dispatch_calc_forward_fit(
+                store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size)
+            if not fit_dict:
+                continue
+            fits[h] = ForwardFit(symbol=str(fit_dict["symbol"]), venue=str(fit_dict["venue"]),
+                fit_id=str(fit_dict["fit_id"]), horizon_ms=int(fit_dict["horizon_ms"]),
+                betas=dict(fit_dict["betas"]), stderr=dict(fit_dict["stderr"]),
+                r2=fit_dict.get("r2"), resid_std=fit_dict.get("resid_std"),
+                hetero_flag=bool(fit_dict.get("hetero_flag")), n_obs=int(fit_dict.get("n_obs") or 0),
+                n_excluded=int(fit_dict.get("n_excluded") or 0), oos_skill=fit_dict.get("oos_skill"),
+                comparator=dict(fit_dict.get("comparator") or {}), input_hash=str(fit_dict.get("input_hash") or ""),
+                model_version=str(fit_dict.get("model_version") or ""), status=str(fit_dict.get("status") or "insufficient"))
+        if not fits:
+            return None, capability_log_entry(cap.name, scope, "ok",
+                detail={"status": "refused", "reason": "no forward fits"})
+        # Pairs for counts: rebuild once at the first horizon.
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        vecs = []
+        for e in windowed:
+            try:
+                vecs.append(fm.build_feature_vector(symbol=symbol, venue=venue,
+                    ts_ms=e.current.exchange_ts_ms, ofi=e.contribution,
+                    average_depth=None, quote=e.current, quality=e.source_quality))
+            except Exception:
+                continue
+        mids = [(e.current.exchange_ts_ms, _mid(e.current)) for e in windowed]
+        pairs_ref, _ = fm.build_forward_observations(vecs, mids,
+            tick_size=Decimal(str(tick_size)), venue=venue)
+        rep = fm.skill_decay_report(pairs_ref, fits)
+        return rep, capability_log_entry(cap.name, scope, "ok",
+            detail={"finalized": rep.get("finalized_horizons")})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_calc_discipline_audit(
+    store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+    tick_size: str = "0.01", cost_statement: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Tool: calc.discipline.audit — 9-lock audit -> go/no-go memo."""
+    from decimal import Decimal
+
+    from market_service.microstructure import fitting as fm
+    from market_service.microstructure.discipline import discipline_audit
+    from market_service.microstructure.ofi import _mid
+    cap = CAPABILITIES["calc.discipline.audit"]
+    scope = {"symbol": symbol.upper(), "venue": venue}
+    try:
+        cap.validate_scope(symbol, venue)
+        from market_service.microstructure.contracts import ForwardFit
+        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        events, _ = fm.replay_events_from_payloads(payloads)
+        window_ms = window_minutes * 60_000
+        end_ts = events[-1].current.exchange_ts_ms if events else 0
+        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms] if events else []
+        vecs = []
+        for e in windowed:
+            try:
+                vecs.append(fm.build_feature_vector(symbol=symbol, venue=venue,
+                    ts_ms=e.current.exchange_ts_ms, ofi=e.contribution,
+                    average_depth=None, quote=e.current, quality=e.source_quality))
+            except Exception:
+                continue
+        mids = [(e.current.exchange_ts_ms, _mid(e.current)) for e in windowed]
+        pairs, _ = fm.build_forward_observations(vecs, mids,
+            tick_size=Decimal(str(tick_size)), venue=venue)
+        fits = {}
+        for h in fm.FORWARD_HORIZONS_MS:
+            fit_dict, _ = await dispatch_calc_forward_fit(
+                store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size)
+            if not fit_dict:
+                continue
+            fits[h] = ForwardFit(symbol=str(fit_dict["symbol"]), venue=str(fit_dict["venue"]),
+                fit_id=str(fit_dict["fit_id"]), horizon_ms=int(fit_dict["horizon_ms"]),
+                betas=dict(fit_dict["betas"]), stderr=dict(fit_dict["stderr"]),
+                r2=fit_dict.get("r2"), resid_std=fit_dict.get("resid_std"),
+                hetero_flag=bool(fit_dict.get("hetero_flag")), n_obs=int(fit_dict.get("n_obs") or 0),
+                n_excluded=int(fit_dict.get("n_excluded") or 0), oos_skill=fit_dict.get("oos_skill"),
+                comparator=dict(fit_dict.get("comparator") or {}), input_hash=str(fit_dict.get("input_hash") or ""),
+                model_version=str(fit_dict.get("model_version") or ""), status=str(fit_dict.get("status") or "insufficient"))
+        out = discipline_audit(forward_pairs=pairs, fits=fits, cost_statement=cost_statement)
+        return out, capability_log_entry(cap.name, scope, "ok", detail={"verdict": out["verdict"]})
+    except CapabilityDenied as exc:
+        return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    except Exception as exc:
+        return None, capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
 async def execute_tool(
     store: RedisRuntimeStore, name: str, args: dict[str, Any],
     *, postgres: Any | None = None, memory: Any | None = None,
@@ -994,6 +1472,51 @@ async def execute_tool(
             tick_size=str(args.get("tick_size") or "0.01"),
             postgres=postgres,
         )
+    if name == "calc.feature.build":
+        return await dispatch_calc_feature_build(
+            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30))
+    if name == "calc.forward.join":
+        return await dispatch_calc_forward_join(
+            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"))
+    if name == "calc.forward.fit":
+        return await dispatch_calc_forward_fit(
+            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
+            horizon_ms=int(args.get("horizon_ms") or 5000),
+            tick_size=str(args.get("tick_size") or "0.01"))
+    if name == "calc.forward.distribution":
+        theta = args.get("theta_ticks")
+        return await dispatch_calc_forward_distribution(
+            store, symbol, venue, horizon_ms=int(args.get("horizon_ms") or 5000),
+            theta_ticks=theta, window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"))
+    if name == "calc.forward.scenario":
+        return await dispatch_calc_forward_scenario(
+            store, symbol, venue, horizon_ms=int(args.get("horizon_ms") or 5000),
+            targets=list(args.get("targets") or []), invalidations=list(args.get("invalidations") or []),
+            window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"))
+    if name == "calc.hypothesis.test":
+        return await dispatch_calc_hypothesis_test(
+            store, symbol, venue, hypothesis_id=str(args.get("hypothesis_id") or ""),
+            horizon_ms=int(args.get("horizon_ms") or 5000),
+            m_tests=int(args.get("m_tests") or 1),
+            window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"))
+    if name in ("calc.events.absorption", "calc.events.walls"):
+        kind = "absorption" if name.endswith("absorption") else "walls"
+        return await dispatch_calc_events(
+            store, symbol, venue, kind=kind,
+            window_minutes=int(args.get("window_minutes") or 30))
+    if name == "calc.decay.report":
+        return await dispatch_calc_decay_report(
+            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"))
+    if name == "calc.discipline.audit":
+        return await dispatch_calc_discipline_audit(
+            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
+            tick_size=str(args.get("tick_size") or "0.01"),
+            cost_statement=args.get("cost_statement"))
     if name == "memory.recall_paper":
         return await dispatch_memory_recall_paper(
             symbol, venue, query=str(args.get("query") or "Cont OFI AD beta"),
@@ -1047,6 +1570,19 @@ def _normalize_tool_name(name: Any) -> str | None:
     return None
 
 
+def _legacy_tick(data: dict[str, Any]) -> Any:
+    """Tick for PG-history reconstruction: frozen table first, legacy 0.01
+    only for payloads whose symbol/venue predate the table (compat, logged
+    by the caller's fit_id prefix)."""
+    from decimal import Decimal
+
+    try:
+        from market_service.microstructure.tick import resolve_tick_size
+        return resolve_tick_size(str(data.get("symbol") or ""), str(data.get("venue") or ""))
+    except KeyError:
+        return Decimal("0.01")
+
+
 def _price_fit_from_dict(data: dict[str, Any]) -> Any | None:
     """Reconstruct a PriceImpactFit from a persisted PG-history dict.
 
@@ -1084,7 +1620,7 @@ def _price_fit_from_dict(data: dict[str, Any]) -> Any | None:
             heteroskedasticity_flag=bool(data.get("heteroskedasticity_flag", False)),
             mean_ad=_dec("mean_ad"),
             price_unit=str(data.get("price_unit") or "ticks"),
-            tick_size=_dec("tick_size") or Decimal("0.01"),
+            tick_size=_dec("tick_size") or _legacy_tick(data),
             input_hash=str(data.get("input_hash") or ""),
             model_version=str(data.get("model_version") or ""),
             sensitivity=bool(data.get("sensitivity", False)),

@@ -430,7 +430,13 @@ PHASE_GUIDANCE: dict[str, str] = {
     "P5": ("PHASE P5 — DERIVE: call memory.recall_paper FIRST (ground H0/H1 in Cont 1011.6402 facts), "
            "then calc.price.delta (alias calc.derived_diagnostic) with an OFI value — scenario arg or "
            "latest-interval default — for the NUMERIC derived ΔP (route A direct + route B when c/λ exist, "
-           "with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it."),
+           "with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it. "
+           "Forward stack (Track D, horizon-native): calc.feature.build → calc.forward.join → calc.forward.fit "
+           "(per-horizon OLS + comparator + OOS) → calc.forward.distribution (theta arrives with query) → "
+           "calc.forward.scenario (P(T)/P(S) with bands; legacy calc.scenario.evaluate stays flow-requirement) → "
+           "calc.hypothesis.test ONLY after a fit exists (needs pre-registered hypothesis_id; p<0.05 is evidence, "
+           "never execution). calc.decay.report names surviving horizons (nulls are results); "
+           "calc.discipline.audit gates Phase-12 (go/no-go)."),
     "P6": ("PHASE P6 — OUTPUT GENERATION (final): no tools. Synthesize the PRIMARY inference output "
            "strictly from this run's reasoning: H0/H1 verdict, numeric ΔP with band, regime explanation, "
            "confidence, limitations. Every numeric claim cites its tool path, including a "

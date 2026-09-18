@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 /legacy
 legacy
+
+# long event-grain captures (local analysis only, >30MB)
+tests/fixtures/long_tape_*.json
