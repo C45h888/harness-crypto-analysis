@@ -4,7 +4,7 @@ Source of truth: `docs/agenitc-theory.md` Part A (§§4–9) + Part C (§§29–
 Scope: `market_service/microstructure/` pure math + frozen types + replay tests.
 Non-goals (explicit): no `dispatch.py` / `engine/` / `controller.py` / `fsm.py` / Redis / PG / API / worker changes in this spec. Those are Phase-12.
 
-Status: **SPEC ONLY — zero code diff**. Code opens per-vector after spec approval.
+Status: **IMPLEMENTED BASE + v2 hardening in progress**. The original xt-v1/forward-ols-v1 specification is retained as historical provenance; the deterministic surface now uses xt-v2 and forward-ols-v2 for corrected feature association, train-only OOS evaluation, schema identity, and calibration gating.
 
 ---
 
@@ -63,7 +63,7 @@ Edge rules (frozen): `BestQuoteState.validate()` already refuses crossed/locked 
 ### D2.1 Frozen contract (extends `contracts.py`)
 
 ```python
-FEATURE_VECTOR_VERSION = "xt-v1"
+FEATURE_VECTOR_VERSION = "xt-v2"
 
 @dataclass(frozen=True)
 class FeatureVector:
@@ -76,7 +76,7 @@ class FeatureVector:
     input_hash: str             # SHA-256 over (symbol,venue,ts,fields,def_versions,vector_version)
 ```
 
-`xt-v1` field table (small, all computable now; everything else = NULL + `quality` note):
+`xt-v2` field table (small, all computable now; everything else = NULL + `quality` note):
 
 | Field | Source stream (current data) | Decimal def (frozen) | NULL when |
 |---|---|---|---|
@@ -111,7 +111,7 @@ Rules: Decimal-only; floats from substrates/poller NEVER enter (recompute from r
 | `capture.py`, `ofi.py`, `orderbook.py`, dispatch, engine | NO CHANGE | zero downstream effect in Track D |
 | tests | ADD `test_feature_vector_*`: determinism (same inputs→same hash), NULL propagation, float-rejection (passing poller float raises or is ignored — spec: raise `TypeError`) | — |
 
-**Exit (per §31):** one `xt-v1` version; replay test proves every field traces to a named def version; no model, no "best subset" claim.
+**Exit (per §31):** one `xt-v2` version; replay test proves every field traces to a named def version; no model, no "best subset" claim.
 
 ---
 
@@ -162,7 +162,7 @@ Tick-size contract (specs the Phase-12 dispatch fix): `tick_size` is a required 
 ### D4.1 Pure fit (in `fitting.py`, mirrors `fit_price_impact` machinery)
 
 ```python
-FORWARD_MODEL_VERSION = "forward-ols-v1"
+FORWARD_MODEL_VERSION = "forward-ols-v2"
 
 @dataclass(frozen=True)  # in contracts.py
 class ForwardFit:

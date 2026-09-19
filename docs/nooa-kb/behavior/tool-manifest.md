@@ -1,4 +1,4 @@
-# Inference Engine — Tool Manifest
+# Inference Engine — Tool Packages
 
 The statistical inference engine commands deterministic calculation modules
 as TOOLS. The LLM never recomputes a value: it dispatches a tool, receives
@@ -8,191 +8,160 @@ and bounded in output size.
 
 Citation rule: every numeric claim in an interpretation MUST name the tool
 and the field path it came from (e.g. `micro.fit_beta → price_impact_fit.beta`).
-Uncited numeric claims are contract violations.
+Uncited numeric claims are contract violations. `null` means not-provided —
+never zero, never invent.
 
-NOTE: budgets (tool rounds / LLM turns / per-round call cap) are NOT stated
-here — the engine injects the live numbers from `engine/config.py` at
-runtime (`build_output_format`). Stating them here statically went stale the
-moment `config.py` moved; the model must read the injected numbers.
+NOTE: loop pass budgets and dispatch ceilings are NOT stated here — the engine
+injects the live numbers from `engine/config.py` at runtime. The model reads
+the LOOP STATE block on every turn for its current loop, passes spent/left,
+and traversal so far.
 
-## T1 — Microstructure tools (paper stack)
+## Package micro — capture / replay / persisted evidence reads
+
+Purpose: establish tape health, replay determinism, and read the persisted
+same-window fit state. Reads only — never a prediction. Gate-quality signals
+(state, gaps, fit status) gate the cycle; everything else is audit material.
 
 ### `micro.capture_status`
-- When: always first — establish capture health before trusting any tape.
-- Returns: `state` (running/gap/reconnecting/...), `sequence_gaps`,
-  `reconnects`, `last_update_id`.
-- Interpretation: `sequence_gaps > 0` or state != running → caveat every
-  downstream fit; never silently ignore.
+- First read, every cycle: `state`, `sequence_gaps`, `reconnects`.
+- Gaps or non-running state caveat every downstream fit; never ignore.
 
 ### `micro.events`
-- When: you need the raw best-quote transition tape (with paper `e_n`
-  contributions) for a window.
-- Args: `count` (default 200, bounded).
-- Returns: ordered transition records (`previous`/`current` quotes,
-  `contribution`).
+- Raw best-quote transition tape with paper `e_n` contributions. Args: `count` (bounded).
+- Ordered `previous`/`current` quotes + `contribution` per transition.
 
 ### `micro.ofi_intervals`
-- When: you need completed OFI interval rows (paper `OFI_k` + event-average
-  depth) rather than raw transitions.
-- Args: `count` (default 200, bounded).
-- Returns: interval rows with `ofi`, `average_depth`, `mid_start`/`mid_end`,
-  `quality`, `depth_estimator`.
+- Completed OFI interval rows (`ofi`, `average_depth`, boundary mids, `quality`, estimator label).
+- Args: `count` (bounded). Deterministic replay of the tape.
 
 ### `micro.replay`
-- When: you must verify that interval aggregation reproduces from raw
-  events (determinism check), or rebuild intervals at a different cadence.
-- Args: `event_payloads`, `interval_ms`.
-- Returns: `(events, intervals, dropped_count, log)` — pure, no I/O.
+- Pure determinism check: events + `interval_ms` → `(events, intervals, dropped)`. No I/O.
+- Use to verify aggregation reproduces or to rebuild at another cadence.
 
 ### `micro.fit_beta`
-- When: you need the CURRENT fitted state: β (price impact), the
-  tautology-caveat sensitivity fit, and the cross-block depth scaling
-  (c, λ) over prior evidence.
-- Args: `interval_seconds` (10|15|30), `window_minutes` (15|30|60),
-  `tick_size` (default 0.01).
-- Returns: full MicrostructureEvidence: `price_impact_fit` (α, β, stderr,
-  r², status), `sensitivity_fit`, `depth_scaling_fit` (c, λ or nulls),
-  `block_average_depth`, `coverage`.
-- Interpretation discipline (constitution): the two models are NEVER
-  merged into a point prediction — the combined expression carries a
-  heteroskedastic ν·OFI term and is at most a derived diagnostic. Respect
-  `status`: `insufficient` fits must not be interpreted at all;
-  `provisional` fits must be caveated.
+- Current same-window fitted state (β impact, sensitivity fit, c/λ depth scaling, coverage).
+- Same-window impact never substitutes for a forward target (doctrine). Respected `status` only.
 
 ### `micro.evidence`
-- When: you need the last PERSISTED immutable evidence object (the fit at
-  last cycle), not a fresh fit.
-- Returns: the stored MicrostructureEvidence dict, or null.
+- Last PERSISTED immutable evidence object (prior cycle), not a fresh fit. May be null.
 
-## Staged inference cycle (P1→P6)
+## Package calc-base — split OFI/AD inference + derived diagnostic
 
-Coverage is measured from tool families you EXECUTE, not phases you declare.
-A FINAL turn (`tool_calls=[]`, phase P6) is rejected for repair unless P1+P2+P3+P5
-all have ≥1 executed tool, a P6 synthesis turn was declared, `hypothesis.H0` is set,
-`summary` is ≥200 chars (the P4 why-now explanation), `confidence` is low|medium|high,
-every evidence entry carries a non-empty `interpretation`, and `evidence` cites ≥2 distinct roots
-including ≥1 fresh tool result plus a `calc.price.delta → …` ΔP path. Round
-budgets are injected by the engine at runtime (see the NOTE above) — do not
-assume a fixed count from this document.
-
-The two fitted models are NEVER merged. Call OFI and AD as SEPARATE tools,
-then join via `calc.observation.build`. The combined formula is a derived
-diagnostic only (`calc.derived_diagnostic`).
+Purpose: the paper stack split into separately-cited steps (OFI and AD never
+merged), ending in the derived ΔP diagnostic. Baseline path: forward-native
+tools upgrade it; agreement AND disagreement between paths are both reported.
 
 ### `calc.ofi.intervals`
-- When: you need deterministic OFI per interval (paper Cont `OFI_k` = sum e_n
-over half-open clock-bound `[t_{k-1}, t_k)`), with AD explicitly excluded.
-- Args: `interval_seconds` (default 10), `window_minutes` (default 30).
-- Returns: OFI-only interval rows (`ofi`, `event_count`, `quality`).
+- Deterministic OFI per interval (Cont `OFI_k`), AD excluded. Args: cadence/window.
+- OFI-only rows (`ofi`, `event_count`, `quality`).
 
 ### `calc.depth.average`
-- When: you need deterministic AD per block (paper `AD_i` = event-average
-  `(qB+qA)/2`), with OFI explicitly excluded.
-- Returns: `ad_per_interval`, `mean_ad`, `depth_estimator`.
+- Deterministic AD per block (event-average `(qB+qA)/2`), OFI excluded.
+- `ad_per_interval`, `mean_ad`, estimator label.
 
 ### `calc.observation.build`
-- When: you need the joined observations (ΔP ticks vs OFI) that feed the fits.
-- Returns: observation rows (`ofi`, `delta_ticks`, `average_depth`, `quality`)
-  plus excluded count.
+- Joins intervals + AD + mids → observations (`ofi`, `delta_ticks`, `average_depth`) + excluded count.
+- The join the fits consume; excluded rows are findings, not errors.
 
 ### `calc.fit.price_impact` / `calc.fit.depth_scaling`
-- When: you need the OLS ΔP=α+β·OFI fit (HC0 SE) or the log-log depth-scaling
-  fit recomputed as an independent check on `micro.fit_beta`.
-- Depth scaling needs ≥3 distinct-AD blocks; a single window yields
-  `insufficient` by design — that is a correct null, not an error.
+- OLS ΔP=α+β·OFI (HC0 SE) and log-log depth scaling as independent checks.
+- Depth scaling needs ≥3 distinct-AD blocks; single-window `insufficient` is a correct null.
 
 ### `calc.price.delta` (alias `calc.derived_diagnostic`)
-- When: P5 derivation — you have an OFI value (scenario arg, or latest
-  closed interval by default) and need the NUMERIC derived ΔP.
-- Args: `ofi` (optional; default = latest interval OFI, `ofi_source` echoed),
-  `interval_seconds` (10/15/30), `window_minutes` (15/30/60).
-- Returns: `route_a_direct` (ΔP ticks + quote + 95% band from α+β·OFI),
-  `route_b_depth_scaled` (depth-scaled ΔP when c/λ identify, else
-  `unavailable` with reason), `agreement_ticks`, hetero warning.
-- Refuses (`status: refused`, result null) on gate-failed fits, empty tape,
-  or bad OFI — a refusal is a finding, report it, never substitute zero.
-  Cite as `calc.price.delta → route_a_direct.delta_ticks`.
+- NUMERIC derived ΔP for one OFI value (arg, else latest interval): route A direct + band, route B depth-scaled when c/λ identify.
+- Refuses (null, never zero) on gate-failed fits / empty tape / bad OFI. Cite `→ route_a_direct.delta_ticks`.
 
-### `memory.recall_paper`
-- When: FIRST step of every validation workflow — pull Cont-Kukanov-Stoikov
-  paper facts (OFI definition, β regression, depth scaling, heteroskedastic
-  caveat) from the real MemoryNode paper KB to ground H0/H1.
-- Args: `query` (default "Cont OFI AD beta").
-- Returns: paper fact entries (`content`, `tags`, `importance`). Empty means
-  the KB is unseeded — report it, do not invent paper claims.
+### `calc.scenario.evaluate`
+- Legacy flow-requirement path: target + 15m|1h|4h → required horizon flow vs empirical OFI distribution, band-aware, route-B cross-check.
+- Current price resolved inside the tool (never agent-supplied). Baseline for forward comparison, never a short-horizon verdict.
 
-## T2 — Market correlation tools (canonical pipeline)
+## Package calc-forward — horizon-native forward stack (primary for horizon questions)
+
+Purpose: event-grain forward targets, per-horizon fits, conditional
+probabilities, formal tests, typed events, decay, discipline. For any
+question bearing a horizon, threshold, target, or hypothesis, this package
+outranks calc-base; calc-base remains its comparator.
+
+### `calc.forward.forecast`
+- Canonical deterministic `ForecastResult`: schema-checked feature vector, forward target, train-only OOS evaluation, calibration-gated probabilities, native/long-horizon semantics, assumptions, and preserved Route A/Route B disagreement.
+- This is the primary forward tool. The lower-level feature/join/fit/distribution tools are diagnostic sub-steps.
+
+### `calc.feature.build`
+- Versioned xt-v2 feature vector from the latest window (OFI/AD/Dmu/spread/OBI/skew/CVD + definition versions + schema hash).
+- Floats rejected; unproven fields NULL. Cite `vector_version` + fields.
+
+### `calc.forward.join`
+- True forward join Y(h)=P_{t+h}−P_t at event grain (1s/5s/30s/60s) + per-horizon exclusion log.
+- Gaps never bridged; exclusions counted. No fitting here.
+
+### `calc.forward.fit`
+- Per-horizon multivariate OLS Y(h)~X (Decimal, train-only time-ordered OOS) + univariate Cont comparator. Args: `horizon_ms`.
+- Carries feature-schema identity, train/OOS counts, OOS metrics, and separate estimation/validation/probability status. No-skill is a valid stop, never overruled.
+
+### `calc.forward.distribution`
+- E[Y(h)] + 95% PI + P(>0)/P(>theta) from a fitted fit. Threshold arrives with the query, never embedded.
+- Normal-approx stated on output; miscalibrated/insufficient → NULL + refusal.
+
+### `calc.forward.scenario`
+- Horizon-native P(T)/P(S) curves with bands from forward fits. Args: `horizon_ms`, `targets`, `invalidations`.
+- Compares against the legacy path (agreement + disagreement). No optimality claim.
+
+### `calc.hypothesis.test`
+- Independent post-fit test ONLY (never auto-called): effect/SE/CI/p + n/split/OOS + multiplicity. Args: `hypothesis_id` (pre-registered, required), `horizon_ms`, `m_tests`.
+- p<0.05 is evidence, never an execution predicate. No signal/action field exists.
+
+### `calc.events.absorption` / `calc.events.walls`
+- Typed Absorption detector + 10-field wall lifecycle (Decimal, event grain) + replay-agreement stats.
+- No institutional attribution, structurally. E[ΔP|event] runs through the forward fit.
+
+### `calc.decay.report`
+- Per-horizon skill-decay (OOS skill), regime splits, finalized horizon set. Nulls listed — nulls are results.
+
+### `calc.discipline.audit`
+- Nine-lock audit (leakage/time-order/horizon/regime/baseline/cost/calibration/multiplicity/pins) → go/no-go memo.
+- Any fail → no-go. Phase-12 opens only on go.
+
+## Package market — canonical pipeline correlation context
+
+Purpose: regime context for correlation (P3), subordinate to fresh
+calculation-plane evidence. Snapshot-first; deep-dives only on demonstrated need.
 
 ### `market.read`
-- When: you need the latest collated market run — prices, funding, OI,
-  keystone/wall, flow, technical classification, CVD sign series.
-- Args: `mode` (optional): `snapshot` (default — bounded headline view),
-  `inventory` (section keys + snapshot), `full` (raw payload deep-dive;
-  only when the snapshot demonstrably lacks the field you need — prefer
-  citing what the snapshot has).
-- Returns (snapshot): run identity (`schema_version`, `symbol`, `status`,
-  `run_id`, `generated_at`, `completed_at`, `data_source`,
-  `domain_status`, `error_count`), headline scalars (`last_price`,
-  `volume_24h`, `high_24h`, `low_24h`, `funding_rate`, `mark_price`,
-  `open_interest`, `spot_cvd`, `futures_cvd`, `spot_obi`, `futures_obi`,
-  `fut_keystone_bid`, `fut_keystone_ask`, `keystone_bid_qty`,
-  `keystone_ask_qty`, `bid_ladder_notional`, `ask_ladder_notional`,
-  `keystone_trade_buy_qty`, `keystone_trade_sell_qty`,
-  `hourly_keystone_verdict`, `seller_aggression`, `bid_anchor_count`,
-  `mega_tier_pct`, `fut_microprice_skew_bps`), and `cvd_sign_series` —
-  per-window `{window_seconds, buckets, delta_usd_sum, sign}` across
-  900/300/120/60/30s. Sign flips across these windows are the
-  institutional delta-flip signal.
-- Citation paths use this tool name and its field names:
-  `market.read → fut_keystone_bid`.
-- `null` means not-computable/absent — never zero, never invent. A
-  `schema_mismatch` error means the writer is on a different contract:
-  report it, do not retry.
+- Latest collated run. Modes: `snapshot` (bounded headline + CVD sign series — default), `inventory`, `full` (explicit deep-dive only).
+- Cite `market.read → <field>`. Schema mismatch = stale writer: report, never coerce.
 
 ### `market.derivatives`
-- When: you need funding / OI / cross-asset context to correlate against
-  order-flow inference.
-- Returns: cached derivative evidence (may be null/expired — null means
-  unavailable, never zero).
+- Funding / OI / cross-asset cache. Null/expired means unavailable, never zero.
 
 ### `market.keystone_history` / `market.wall_history`
-- When: cross-cycle context — prior keystone/wall states for migration
-  reasoning.
-- Args: `count` (default 100, bounded).
-- Returns: newest-first ledger rows.
+- Bounded cross-cycle ledgers for migration reasoning. Args: `count`.
 
-## T3 — Substrate worker plane (always-fresh warm projections)
+## Package substrate — always-fresh worker plane (primary P3 evidence)
 
-Tool-first invocation (replaces the removed run_cycle): agents invoke workers
-for bounded fire-ticks, then read the warm projections. P3 coverage credits
-any `substrate.*` family execution.
+Purpose: warm projections computed on the calculation plane. Invoke for a
+bounded fire-tick, then read; judge freshness from `age_ms` against each
+worker's own cadence.
 
 ### `substrate.read`
-- When: you need the always-fresh worker snapshot (compact by default) or one
-  substrate (`substrate` arg, `mode` compact|full).
-- Returns: per-substrate `{available, status, trigger_source, age_ms}` in compact
-  mode; raw payloads in full mode. Missing workers are `available:false`, never errors.
-- Citation: `substrate.read → substrates.tape.status`.
+- Snapshot over workers (compact default) or one substrate (`substrate`, `mode` compact|full).
+- Missing workers are `available:false`, never errors. Cite `→ substrates.<name>.available`.
 
 ### `substrate.invoke` / `substrate.<worker>`
-- When: P3 correlation — fire a bounded tick before reading, so the projection
-  is fresh relative to the micro tape.
-- Workers (12): `tape, density, delta, ladders, anchors, tiers, volume_profile,
-  technicals, migration, oi, signals, large_print`. `substrate.invoke` with no
-  substrate fires all registered workers.
-- Returns: `{invoked, fired, trigger_source, status, available}` per worker.
-  Cooldowns still gate inside the core; `invoked:false` is a structured report, never an error.
-- Workflow: invoke `substrate.tape`/`density`/`delta`/… then `substrate.read`;
-  name agreements AND contradictions vs P1/P2 explicitly.
-- Ordering: dispatches run sequentially in the listed order — put invoke BEFORE
-  read in the same `tool_calls` array so the read sees the fresh projection.
-  Never request the same worker twice in one cycle (deterministic — anti-pattern 5).
-- Freshness: compact projections carry `age_ms` — judge staleness from it.
-  `available:false`, `fired:0`, or `invoked:false` (cooldown-dormant) are FINDINGS:
-  cite them (`substrate.read → substrates.<name>.available`) and move on.
-- Empty upstream (no projections at all — capture down) is itself the finding:
-  report `substrate.read → substrates.*.available:false` as the P3 verdict
-  instead of forcing correlation against absent data.
+- Bounded fire-tick request (12 workers: tape, density, delta, ladders, anchors, tiers, volume_profile, technicals, migration, oi, signals, large_print).
+- Cooldowns gate inside the core; `invoked:false` is a finding. Same worker never twice per cycle; invoke BEFORE read in one array.
+
+## Package memory — paper grounding + episodic priors
+
+Purpose: Cont-Kukanov-Stoikov facts for H0/H1 grounding (evidence home) and
+provenance-tagged priors subordinate to fresh ledger data. Contradicting a prior is allowed, stated explicitly.
+
+### `memory.recall_paper`
+- Paper facts from the real MemoryNode KB (kind=fact, paper session). Args: `query`.
+- Empty = unseeded KB: report it, never invent paper claims. `fact` kind is LLM-forbidden in proposals.
+
+## Loop walk (runtime values injected per turn — see LOOP STATE block)
+
+Comprehension (understand once, no tools) → Evidence (gather: micro + calc-base + reads + memory) → Reasoning (test + compare: calc-forward) → Validation (discipline audit + gate; one bounded retry, then terminal with findings preserved) → Output (non-agentic composition, tools dropped). Closed loops are never revisited; refusals and nulls travel forward as findings.
 
 ## Anti-patterns (contract violations)
 
@@ -200,5 +169,6 @@ any `substrate.*` family execution.
 2. Citing a tool you did not dispatch this cycle.
 3. Treating `insufficient` fits, null evidence, or empty ledgers as zeros.
 4. Merging the two fitted models into a single prediction.
-5. Requesting the same tool with identical args repeatedly in one cycle
-   (deterministic — the answer will not change).
+5. Requesting the same tool with identical args repeatedly in one cycle.
+6. Concluding or testing hypotheses inside Evidence passes; gathering inside Reasoning passes (loops own their work).
+7. Placing tools in the Output pass (dropped unread) or revisiting a closed loop.
