@@ -112,16 +112,17 @@ _MARKET_TOOLS: dict[str, Capability] = {
         "calc.derived_diagnostic": "NUMERIC derived ΔP (alias: calc.price.delta): pass ofi (else latest interval OFI) → route A ΔP=α+β·OFI with 95% band + route B depth-scaled when c/λ exist. Refuses on insufficient fits. Heteroskedastic ν·OFI — diagnostic, not prediction.",
         "calc.scenario.evaluate": "SCENARIO price-target evaluation (interaction plane): pass target_price + horizon 15m|1h|4h → required horizon flow OFI_req=(Δ−n·α)/β vs empirical rolling-sum OFI distribution at that horizon → direction-matched exceedance + SE-band range + route-B cross-check. Current price resolved inside the tool from market.read (never agent-supplied). Refuses on insufficient fits, β≈0, missing price, thin tapes.",
         "memory.recall_paper": "Recall Cont-Kukanov-Stoikov paper facts from real MemoryNode (kind=fact, paper-kb session) — not prompt.",
-        "calc.feature.build": "Track D forward feature vector xt-v1: Decimal OFI/AD/Dmu/spread/OBI/skew/CVD promotion with def_versions + input_hash. Floats rejected. Unproven field = NULL.",
+        "calc.feature.build": "Track D forward feature vector xt-v2: Decimal OFI/AD/Dmu/spread/OBI/skew/CVD promotion with def_versions + input_hash. Floats rejected. Unproven field = NULL.",
         "calc.forward.join": "Track D forward join Y(h)=P_{t+h}-P_t at event grain (1s/5s/30s/60s) with per-horizon exclusion log. Gaps never bridged.",
         "calc.forward.fit": "Track D per-horizon multivariate OLS Y(h)~X (Decimal, time-ordered 70/30 OOS) with univariate Cont comparator. Trichotomy gated.",
         "calc.forward.distribution": "Track D conditional distribution: expected Y(h) + 95% PI + P(>0)/P(>theta). Normal-approx stated. Miscalibrated/insufficient -> NULL/refusal.",
         "calc.forward.scenario": "Track D horizon-native P(T)/P(S) curves with bands from forward fits. Legacy calc.scenario.evaluate retained as flow-requirement.",
+        "calc.forward.forecast": "Canonical deterministic forward ForecastResult: schema-checked features, train-only OOS evaluation, calibration-gated probabilities, native horizon metadata, and preserved Route A/Route B disagreement.",
         "calc.hypothesis.test": "Track D formal hypothesis test (independent module, post-fit only): effect/SE/CI/p + n/split/OOS + multiplicity. p<0.05 is evidence, never execution predicate.",
         "calc.events.absorption": "Track D typed Absorption detector (Decimal, event grain) + replay-agreement. No institutional attribution.",
         "calc.events.walls": "Track D 10-field wall lifecycle detector (Decimal, event grain) + replay-agreement. No institutional attribution.",
         "calc.decay.report": "Track D population + skill-decay report: per-horizon OOS skill, regime splits, finalized horizon set. Nulls are results.",
-        "calc.discipline.audit": "Track D discipline lock: 9-check audit (leakage/time-order/horizon/regime/baseline/cost/calibration/multiplicity/pins) -> go/no-go memo. Phase-12 opens only on go.",
+        "calc.discipline.audit": "Track D discipline lock: 10-check audit (leakage/estimation/time-order/horizon/regime/baseline/cost/calibration/multiplicity/pins) -> go/no-go memo. Phase-12 opens only on go.",
     }.items()
 }
 CAPABILITIES.update(_MARKET_TOOLS)

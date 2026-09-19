@@ -7,8 +7,8 @@ semantic blocks (move-don't-rewrite; every body is verbatim):
                    (validated / provisional / insufficient) + null discipline
     capability.py  CAPABILITY REGISTRY — named, scope-validated dispatch
                    surfaces + audit entries (CAPABILITIES dict)
-    dispatch.py    TOOL BASE — dispatch_* implementations, TOOL_NAMES /
-                   TOOL_PHASE registries, execute_tool, name normalization
+    dispatch.py    TOOL BASE — thin re-export shim over tooling/ (the 1909-line
+                   monolith was split along its five planes; see tooling/).
 
 The autonomous wake plane (``wake.py``: trigger evaluation, dedupe,
 coalescing, revalidation) was REMOVED — inference is invoked only with an
@@ -37,6 +37,8 @@ from .dispatch import (
     _REQUIRED_PHASES,
     TOOL_NAMES,
     TOOL_PHASE,
+    tool_home,
+    tool_homes,
     _bounded,
     _depth_fit_from_dict,
     _load_prior_block_fits,
@@ -49,6 +51,7 @@ from .dispatch import (
     dispatch_calc_derived_diagnostic,
     dispatch_calc_fit_depth_scaling,
     dispatch_calc_fit_price_impact,
+    dispatch_calc_forward_forecast,
     dispatch_calc_observation_build,
     dispatch_calc_ofi_intervals,
     dispatch_market_read,
@@ -76,10 +79,13 @@ __all__ = [
     "CAPABILITIES",
     "TOOL_NAMES",
     "TOOL_PHASE",
+    "tool_home",
+    "tool_homes",
     "Capability",
     "CapabilityDenied",
     "capability_log_entry",
     "dispatch_assemble_evidence",
+    "dispatch_calc_forward_forecast",
     "dispatch_read_capture_status",
     "dispatch_read_events",
     "dispatch_replay",
