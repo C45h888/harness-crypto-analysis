@@ -4,14 +4,14 @@ from __future__ import annotations
 from typing import Any
 
 from ..capability import CAPABILITIES, CapabilityDenied, capability_log_entry
-from .replay_adapter import _forward_replay_inputs, _read_windowed_events
+from .replay_adapter import _forward_replay_inputs, _read_tape_payloads
 from .tick_guard import _frozen_tick
 from .tools_forward import dispatch_calc_forward_fit
 
 async def dispatch_calc_hypothesis_test(
     store: RedisRuntimeStore, symbol: str, venue: str, *, hypothesis_id: str,
     horizon_ms: int = 5_000, m_tests: int = 1, window_minutes: int = 30,
-    tick_size: str | None = None,
+    tick_size: str | None = None, postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.hypothesis.test — independent post-fit test (never auto-called)."""
     from decimal import Decimal
@@ -29,9 +29,11 @@ async def dispatch_calc_hypothesis_test(
                 detail={"status": "refused", "reason": "hypothesis_id required (pre-registration)"})
         # Shared interval-attached replay (same semantic as forecast/fit).
         _windowed, _vecs, _mids, pairs, _join_log = await _forward_replay_inputs(
-            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size,
+            postgres=postgres)
         fit_dict, fit_log = await dispatch_calc_forward_fit(
-            store, symbol, venue, window_minutes=window_minutes, horizon_ms=horizon_ms, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, horizon_ms=horizon_ms, tick_size=tick_size,
+            postgres=postgres)
         if not fit_dict:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": f"no forward fit: {(fit_log.get('detail') or {})}",})
@@ -52,7 +54,7 @@ async def dispatch_calc_hypothesis_test(
 
 async def dispatch_calc_events(
     store: RedisRuntimeStore, symbol: str, venue: str, *, kind: str,
-    window_minutes: int = 30,
+    window_minutes: int = 30, postgres: Any | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Tools: calc.events.absorption / calc.events.walls — typed detectors."""
     import market_service.microstructure as fm
@@ -61,7 +63,7 @@ async def dispatch_calc_events(
     scope = {"symbol": symbol.upper(), "venue": venue, "kind": kind}
     try:
         cap.validate_scope(symbol, venue)
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, _ = fm.replay_events_from_payloads(payloads)
         window_ms = window_minutes * 60_000
         end_ts = events[-1].current.exchange_ts_ms if events else 0
@@ -81,7 +83,7 @@ async def dispatch_calc_events(
 
 async def dispatch_calc_decay_report(
     store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
-    tick_size: str | None = None,
+    tick_size: str | None = None, postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.decay.report — skill-decay + finalized horizons."""
     from decimal import Decimal
@@ -98,7 +100,8 @@ async def dispatch_calc_decay_report(
         pairs_ref = None
         for h in fm.FORWARD_HORIZONS_MS:
             fit_dict, _ = await dispatch_calc_forward_fit(
-                store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size)
+                store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size,
+                postgres=postgres)
             if not fit_dict:
                 continue
             fits[h] = ForwardFit.from_dict(fit_dict)
@@ -107,7 +110,8 @@ async def dispatch_calc_decay_report(
                 detail={"status": "refused", "reason": "no forward fits"})
         # Pairs for counts: one shared interval-attached replay (not per-horizon).
         _windowed, _vecs, _mids, pairs_ref, _join_log = await _forward_replay_inputs(
-            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size,
+            postgres=postgres)
         pairs_ref = pairs_ref or []
         rep = fm.skill_decay_report(pairs_ref, fits)
         return rep, capability_log_entry(cap.name, scope, "ok",
@@ -121,6 +125,7 @@ async def dispatch_calc_decay_report(
 async def dispatch_calc_discipline_audit(
     store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
     tick_size: str | None = None, cost_statement: str | None = None,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.discipline.audit — 9-lock audit -> go/no-go memo."""
     from decimal import Decimal
@@ -135,12 +140,14 @@ async def dispatch_calc_discipline_audit(
         tick_size = _frozen_tick(symbol, venue, tick_size)
         from market_service.microstructure.contracts import ForwardFit
         _windowed, _vecs, _mids, pairs, _join_log = await _forward_replay_inputs(
-            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size,
+            postgres=postgres)
         pairs = pairs or []
         fits = {}
         for h in fm.FORWARD_HORIZONS_MS:
             fit_dict, _ = await dispatch_calc_forward_fit(
-                store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size)
+                store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size,
+                postgres=postgres)
             if not fit_dict:
                 continue
             fits[h] = ForwardFit.from_dict(fit_dict)

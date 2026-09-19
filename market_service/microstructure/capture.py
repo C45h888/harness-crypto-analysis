@@ -23,6 +23,7 @@ from market_service.clients import BinanceWebSocket, DepthSnapshot
 from market_service.microstructure.contracts import DepthDelta
 from market_service.microstructure.ofi import OFIAggregator
 from market_service.microstructure.orderbook import BookGapError, OrderBookReconstructor
+from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,16 @@ class MicrostructureSettings:
     websocket_base: str = "wss://fstream.binance.com/ws"
     depth_speed_ms: int = 100
     bootstrap_retries: int = 3
+    # Top-N L2 ladder projection carried on every published tape event.
+    # The tape encapsulates the L2 evidence the analysis planes need; 0
+    # disables the projection (replay of best-quote-only payloads is
+    # unchanged). Env: MICROSTRUCTURE_L2_LEVELS.
+    l2_depth_levels: int = 20
+    # Durable tape: every published event is ALSO appended to Postgres
+    # (microstructure_event_tape) when DATABASE_URL is configured, so tape
+    # reads are no longer bounded by the volatile Redis stream maxlen.
+    # Env: MICROSTRUCTURE_TAPE_POSTGRES ("0" disables even with DATABASE_URL).
+    tape_postgres: bool = True
 
     @classmethod
     def from_env(cls, symbol: str, venue: str | None = None) -> MicrostructureSettings:
@@ -108,6 +119,9 @@ class MicrostructureSettings:
             websocket_base=os.getenv(env_key, default_ws).rstrip("/"),
             depth_speed_ms=depth_speed_ms,
             bootstrap_retries=_positive_env("MICROSTRUCTURE_BOOTSTRAP_RETRIES", 3),
+            l2_depth_levels=_positive_env("MICROSTRUCTURE_L2_LEVELS", 20),
+            tape_postgres=(os.getenv("MICROSTRUCTURE_TAPE_POSTGRES", "1").strip().lower()
+                           not in ("0", "false", "no", "off")),
         )
 
 
@@ -125,6 +139,13 @@ class BinanceSpotDepthCapture:
     def __init__(self, settings: MicrostructureSettings):
         self.settings = settings
         self.store = RedisRuntimeStore(settings.redis_url, settings.redis_prefix)
+        # Durable tape seam (optional): appends every published event to the
+        # Postgres microstructure_event_tape ledger. Best-effort — a failed
+        # durable write NEVER breaks the capture loop (Redis remains the live
+        # seam; the durable read path falls back to the stream).
+        self._tape: PostgresRuntimeStore | None = None
+        self.tape_writes = 0
+        self.tape_errors = 0
         self.messages = 0
         self.events = 0
         self.gaps = 0
@@ -140,6 +161,50 @@ class BinanceSpotDepthCapture:
 
     async def close(self) -> None:
         await self.store.close()
+        if self._tape is not None:
+            await self._tape.close()
+            self._tape = None
+
+    async def _durable_tape(self) -> PostgresRuntimeStore | None:
+        """Lazily connect the durable tape writer (None when disabled/failed)."""
+        if not self.settings.tape_postgres:
+            return None
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if not database_url:
+            return None
+        if self._tape is None:
+            self._tape = PostgresRuntimeStore(database_url)
+            try:
+                await self._tape.connect()
+                await self._tape.ensure_microstructure_tape()
+            except Exception as exc:
+                log.warning("durable tape connect failed (%s) — falling back to stream-only", exc)
+                self.tape_errors += 1
+                self._tape = None
+                return None
+        return self._tape
+
+    async def _record_event(self, event_payload: dict) -> None:
+        """Publish one event to the live stream AND the durable tape.
+
+        The durable append is best-effort: errors are counted, never raised
+        into the capture loop. Persistence failure degrades reads to the
+        bounded stream — it must never cost live evidence.
+        """
+        await self.store.publish_microstructure_event(
+            self.settings.venue, self.settings.symbol, event_payload, maxlen=self.settings.stream_maxlen,
+        )
+        tape = await self._durable_tape()
+        if tape is None:
+            return
+        try:
+            inserted = await tape.insert_microstructure_tape_event(event_payload)
+            if inserted:
+                self.tape_writes += 1
+        except Exception as exc:
+            self.tape_errors += 1
+            if self.tape_errors % 50 == 1:
+                log.warning("durable tape insert failed (%s) — continuing stream-only", exc)
 
     def _record_success(self) -> None:
         """One clean delta: nudge the backoff down toward the floor."""
@@ -271,7 +336,10 @@ class BinanceSpotDepthCapture:
             bootstrap_fetch_ms = int((time.monotonic() - t0) * 1000)
             snapshot_id = snapshot.update_id
             # Reset (or first-build) the live book from the REST cut.
-            self._book = OrderBookReconstructor(self.settings.symbol, self.settings.venue)
+            self._book = OrderBookReconstructor(
+                self.settings.symbol, self.settings.venue,
+                l2_depth_levels=self.settings.l2_depth_levels,
+            )
             self._book.bootstrap(
                 {"lastUpdateId": snapshot.update_id, "bids": snapshot.bids, "asks": snapshot.asks},
                 received_ts_ms=int(time.time() * 1000),
@@ -383,9 +451,7 @@ class BinanceSpotDepthCapture:
             await self.store.set_microstructure_book(self.settings.venue, self.settings.symbol, quote.to_dict())
         if event is not None:
             self.events += 1
-            await self.store.publish_microstructure_event(
-                self.settings.venue, self.settings.symbol, event.to_dict(), maxlen=self.settings.stream_maxlen,
-            )
+            await self._record_event(event.to_dict())
             for interval in self._aggregator.add(event):
                 self.intervals += 1
                 await self.store.publish_microstructure_interval(
@@ -406,6 +472,10 @@ class BinanceSpotDepthCapture:
             "completed_ofi_intervals": self.intervals,
             "ofi_interval_seconds": self.settings.interval_seconds,
             "sequence_gaps": self.gaps,
+            "l2_depth_levels": self.settings.l2_depth_levels,
+            "tape_postgres": self.settings.tape_postgres,
+            "tape_writes": self.tape_writes,
+            "tape_errors": self.tape_errors,
             "reconnects": self.reconnects,
             "last_update_id": self._book.last_update_id if self._book else None,
             "error": error,

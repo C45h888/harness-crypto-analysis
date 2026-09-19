@@ -704,6 +704,20 @@ class RedisRuntimeStore:
             return None
         return decoded if isinstance(decoded, dict) else None
 
+    async def read_microstructure_status_transitions(
+        self, venue: str, symbol: str, *, count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the status-TRANSITION ledger (window-scoped gap spans source).
+
+        Each entry is one capture state change with ``updated_at_ms``. This
+        is the ledger the forward plane derives DEGRADED SPANS from — the
+        cumulative ``sequence_gaps`` counter in the latest-key status payload
+        is transport telemetry only and must never gate data quality.
+        """
+        return await self._read_microstructure_stream(
+            self.microstructure_status_stream(venue, symbol), start="-", end="+", count=count,
+        )
+
     async def publish_microstructure_evidence(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
         """Persist one immutable MicrostructureEvidence projection (latest)."""
         await self.redis.set(

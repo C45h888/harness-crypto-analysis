@@ -141,6 +141,27 @@ from .fsm import (
     MembraneVerdict,
     GOVERNANCE_MEMBRANE,
     FAILURE_EVENT_KINDS,
+    FAILURE_EVENT_WORKERS,
+)
+
+# --- Failure substrate (Layer 3: remediation over FSM-designated failures) ---
+# The FSM designates the failure state; this substrate classifies, remediates,
+# and reports. See failure_substrate/README.md.
+from . import failure_substrate as failure_substrate
+from .failure_substrate import (
+    FAILURE_CLASSIFICATION,
+    FAILURE_WORKER_REGISTRY,
+    FailureClass,
+    FailureOutcome,
+    FailureReport,
+    FailureSeverity,
+    FailureSubstrateMembrane,
+    FailureVerdict,
+    FailureWorker,
+    MAX_RETRIES,
+    RemediationKind,
+    RemediationOutcome,
+    signal_failure,
 )
 
 
@@ -230,6 +251,22 @@ __all__ = [
     "MembraneVerdict",
     "GOVERNANCE_MEMBRANE",
     "FAILURE_EVENT_KINDS",
+    "FAILURE_EVENT_WORKERS",
+    # failure substrate (Layer 3 — remediation)
+    "FAILURE_CLASSIFICATION",
+    "FAILURE_WORKER_REGISTRY",
+    "FailureClass",
+    "FailureOutcome",
+    "FailureReport",
+    "FailureSeverity",
+    "FailureSubstrateMembrane",
+    "FailureVerdict",
+    "FailureWorker",
+    "MAX_RETRIES",
+    "RemediationKind",
+    "RemediationOutcome",
+    "failure_substrate",
+    "signal_failure",
 ]
 
 

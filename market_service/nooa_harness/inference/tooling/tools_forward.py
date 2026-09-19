@@ -9,13 +9,17 @@ from .history_adapter import (
     _price_fit_from_dict,
     _tool_fit_beta,
 )
-from .replay_adapter import _forward_replay_inputs, _read_windowed_events
+from .replay_adapter import (
+    _forward_replay_inputs,
+    _read_windowed_events,
+)
 from .tick_guard import _frozen_tick
 
 
 async def _forward_core(
     store: Any, symbol: str, venue: str, *, horizon_ms: int,
     window_minutes: int, tick_size: str | None, theta_ticks: Any | None = None,
+    postgres: Any | None = None,
 ) -> dict[str, Any]:
     """Single-replay forward core: one tape read → pairs → fit → x → calibration.
 
@@ -29,7 +33,8 @@ async def _forward_core(
 
     frozen = _frozen_tick(symbol, venue, tick_size)
     windowed, vectors, _mids, pairs, join_log = await _forward_replay_inputs(
-        store, symbol, venue, window_minutes=window_minutes, tick_size=frozen)
+        store, symbol, venue, window_minutes=window_minutes, tick_size=frozen,
+        postgres=postgres)
     if not windowed or not vectors:
         raise ValueError("no forward observation window")
     fit, _used = fm.fit_forward_ols(
@@ -45,6 +50,7 @@ async def _forward_core(
 
 async def dispatch_calc_feature_build(
     store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.feature.build — xt-v2 vector from the latest event window."""
     from decimal import Decimal
@@ -54,14 +60,11 @@ async def dispatch_calc_feature_build(
     scope = {"symbol": symbol.upper(), "venue": venue, "window_minutes": window_minutes}
     try:
         cap.validate_scope(symbol, venue)
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
-        events, _ = fm.replay_events_from_payloads(payloads)
+        events, windowed, _start, _end, _dropped = await _read_windowed_events(
+            store, symbol, venue, window_minutes=window_minutes, postgres=postgres)
         if not events:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "no events in ledger"})
-        window_ms = window_minutes * 60_000
-        end_ts = events[-1].current.exchange_ts_ms
-        windowed = [e for e in events if e.current.exchange_ts_ms >= end_ts - window_ms]
         intervals = fm.replay_intervals(windowed, interval_ms=10_000)
         last_iv = intervals[-1] if intervals else None
         quote = windowed[-1].current
@@ -79,7 +82,7 @@ async def dispatch_calc_feature_build(
 
 async def dispatch_calc_forward_join(
     store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
-    tick_size: str | None = None,
+    tick_size: str | None = None, postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.forward.join — (X_t, Y(h)) pairs + exclusion log."""
     from decimal import Decimal
@@ -92,7 +95,8 @@ async def dispatch_calc_forward_join(
         cap.validate_scope(symbol, venue)
         tick_size = _frozen_tick(symbol, venue, tick_size)
         windowed, vecs, mids, pairs, log = await _forward_replay_inputs(
-            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size,
+            postgres=postgres)
         if not windowed:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "no events in ledger"})
@@ -107,7 +111,7 @@ async def dispatch_calc_forward_join(
 
 async def dispatch_calc_forward_fit(
     store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
-    horizon_ms: int = 5_000, tick_size: str | None = None,
+    horizon_ms: int = 5_000, tick_size: str | None = None, postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.forward.fit — per-horizon OLS + comparator + OOS."""
     from decimal import Decimal
@@ -120,7 +124,8 @@ async def dispatch_calc_forward_fit(
         cap.validate_scope(symbol, venue)
         tick_size = _frozen_tick(symbol, venue, tick_size)
         windowed, vecs, mids, pairs, _join_log = await _forward_replay_inputs(
-            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size,
+            postgres=postgres)
         if not windowed:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "no events in ledger"})
@@ -140,6 +145,7 @@ async def dispatch_calc_forward_fit(
 async def dispatch_calc_forward_distribution(
     store: RedisRuntimeStore, symbol: str, venue: str, *, horizon_ms: int = 5_000,
     theta_ticks: Any | None = None, window_minutes: int = 30, tick_size: str | None = None,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.forward.distribution — E[Y(h)] + PI + P(>0)/P(>theta)."""
     from decimal import Decimal
@@ -153,7 +159,7 @@ async def dispatch_calc_forward_distribution(
             core = await _forward_core(
                 store, symbol, venue, horizon_ms=horizon_ms,
                 window_minutes=window_minutes, tick_size=tick_size,
-                theta_ticks=theta_ticks)
+                theta_ticks=theta_ticks, postgres=postgres)
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": f"no forward fit: {vex}"})
@@ -176,6 +182,7 @@ async def dispatch_calc_forward_scenario(
     store: RedisRuntimeStore, symbol: str, venue: str, *, horizon_ms: int = 5_000,
     targets: list[Any] | None = None, invalidations: list[Any] | None = None,
     window_minutes: int = 30, tick_size: str | None = None,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.forward.scenario — horizon-native P(T)/P(S) with bands."""
     from decimal import Decimal
@@ -189,7 +196,8 @@ async def dispatch_calc_forward_scenario(
         try:
             core = await _forward_core(
                 store, symbol, venue, horizon_ms=horizon_ms,
-                window_minutes=window_minutes, tick_size=tick_size)
+                window_minutes=window_minutes, tick_size=tick_size,
+                postgres=postgres)
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": f"no distribution: {vex}"})
@@ -237,7 +245,8 @@ async def dispatch_calc_forward_forecast(
         cap.validate_scope(symbol, venue)
         tick_size = _frozen_tick(symbol, venue, tick_size)
         windowed, vectors, _mids, pairs, join_log = await _forward_replay_inputs(
-            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size)
+            store, symbol, venue, window_minutes=window_minutes, tick_size=tick_size,
+            postgres=postgres)
         if not windowed or not vectors:
             return None, capability_log_entry(
                 cap.name, scope, "ok",

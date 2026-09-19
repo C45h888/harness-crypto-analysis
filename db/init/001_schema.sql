@@ -285,3 +285,25 @@ CREATE TABLE IF NOT EXISTS substrate_calculation (
 
 CREATE INDEX IF NOT EXISTS substrate_calculation_symbol_substrate_idx
     ON substrate_calculation (symbol, substrate, computed_at DESC);
+
+-- Durable append-only microstructure EVENT TAPE (2026-09-20 forward-plane
+-- hardening). Capture appends every published best-quote transition
+-- (payload = the same serialized OrderBookEvent the live Redis stream
+-- carries, including the additive L2 ladder projection when enabled) so
+-- tape reads are no longer bounded by the Redis stream maxlen. The forward
+-- replay read path merges durable rows with the live stream. Idempotent
+-- inserts; no retention policy initially (revisit at volume).
+CREATE TABLE IF NOT EXISTS microstructure_event_tape (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    update_id BIGINT NOT NULL,
+    exchange_ts_ms BIGINT NOT NULL,
+    received_ts_ms BIGINT NOT NULL,
+    payload JSONB NOT NULL,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (symbol, venue, update_id, exchange_ts_ms)
+);
+
+CREATE INDEX IF NOT EXISTS microstructure_event_tape_window_idx
+    ON microstructure_event_tape (symbol, venue, exchange_ts_ms);

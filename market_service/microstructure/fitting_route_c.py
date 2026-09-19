@@ -1004,27 +1004,29 @@ def replay_forward_window(
     tick_size: Decimal,
     window_start_ms: int,
     window_end_ms: int,
-    sequence_gaps: int = 0,
+    degraded_spans: list[dict[str, Any]] | None = None,
 ) -> tuple[list[Any], list[tuple[int, Decimal]], list[Any], dict[str, int]]:
     """Attach enclosing-interval OFI/AD to each event and join forward pairs.
 
     Pure deterministic helper owned by the fitting plane: tooling supplies
-    already-replayed ``windowed`` events + ``intervals`` and the window
-    bounds; all vector math + quality spans + forward joins happen here so
-    every forward consumer (forecast, distribution, scenario, hypothesis,
-    decay, discipline) shares one semantic. Sequence gaps refuse the whole
-    span rather than bridging an unknown discontinuity.
+    already-replayed ``windowed`` events + ``intervals`` + pre-derived
+    ``degraded_spans`` and the window bounds; all vector math + quality spans
+    + forward joins happen here so every forward consumer (forecast,
+    distribution, scenario, hypothesis, decay, discipline) shares one
+    semantic. Degraded spans are WINDOW-SCOPED [start_ts_ms, end_ts_ms]
+    intervals of tape degradation (capture gaps, discontinuities, degraded
+    feed) — a target is refused only when it CROSSES a span, never because a
+    cumulative transport counter is non-zero. Nothing is bridged across an
+    unknown discontinuity.
     """
     from .ofi import _mid
 
     interval_by_start = {iv.start_ts_ms: iv for iv in intervals}
     vectors: list[Any] = []
-    quality_spans: list[dict[str, Any]] = []
-    if int(sequence_gaps or 0) > 0:
-        quality_spans.append({
-            "start_ts_ms": window_start_ms, "end_ts_ms": window_end_ms,
-            "quality": "sequence_gap", "reason": "sequence_gap",
-        })
+    quality_spans: list[dict[str, Any]] = [
+        span for span in (degraded_spans or ())
+        if isinstance(span, dict) and "start_ts_ms" in span and "end_ts_ms" in span
+    ]
     for index, event in enumerate(windowed):
         interval_start = (event.current.exchange_ts_ms // 10_000) * 10_000
         interval = interval_by_start.get(interval_start)

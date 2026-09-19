@@ -32,7 +32,7 @@ def resolve_inference_status(
     fit_status: str | None,
     capture_state: str | None,
     events_in_window: int,
-    sequence_gaps: int = 0,
+    degraded_spans_in_window: int = 0,
 ) -> tuple[str, tuple[str, ...]]:
     """Deterministically resolve the artifact status trichotomy.
 
@@ -44,8 +44,10 @@ def resolve_inference_status(
     - insufficient: fewer usable observations than the minimum; the
       underlying fit is insufficient; capture never established; or fewer
       than 2 events in the window.
-    - provisional: the fit is provisional; sequence gaps occurred during
-      capture; or observation count is below twice the minimum.
+    - provisional: the fit is provisional; DEGRADED CAPTURE SPANS overlap
+      the window (window-scoped, derived from the status-transition ledger
+      — never the cumulative ``sequence_gaps`` transport counter); or
+      observation count is below twice the minimum.
     - validated: none of the above.
     """
     reasons: list[str] = []
@@ -66,8 +68,10 @@ def resolve_inference_status(
     provisional_reasons: list[str] = []
     if fit_status == "provisional":
         provisional_reasons.append("underlying fit is provisional")
-    if sequence_gaps > 0:
-        provisional_reasons.append(f"{sequence_gaps} sequence gap(s) during capture")
+    if degraded_spans_in_window > 0:
+        provisional_reasons.append(
+            f"{degraded_spans_in_window} degraded capture span(s) overlap the window"
+        )
     if n_observations < 2 * min_observations:
         provisional_reasons.append(
             f"observations {n_observations} < 2x minimum {2 * min_observations}"

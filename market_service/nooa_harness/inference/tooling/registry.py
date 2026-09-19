@@ -124,6 +124,11 @@ TOOL_HOME_OVERRIDES: dict[str, tuple[str, str]] = {
 
 TOOL_HOME_OPTIONS_OVERRIDES: dict[str, tuple[tuple[str, str], ...]] = {
     "memory.recall_paper": (("evidence", "acquisition"), ("reasoning", "analysis")),
+    "calc.ofi.intervals": (("evidence", "acquisition"), ("reasoning", "analysis")),
+    "calc.depth.average": (("evidence", "acquisition"), ("reasoning", "analysis")),
+    "calc.observation.build": (("evidence", "acquisition"), ("reasoning", "analysis")),
+    "calc.fit.price_impact": (("evidence", "acquisition"), ("reasoning", "analysis")),
+    "calc.fit.depth_scaling": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.derived_diagnostic": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.price.delta": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.scenario.evaluate": (("evidence", "acquisition"), ("reasoning", "analysis")),

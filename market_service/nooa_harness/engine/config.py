@@ -49,22 +49,26 @@ DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
 # --- Cycle budgets (the agentic loop). ---
 # live-proven: fallback-path models burn rounds on redundant re-invocation;
 # budget must survive waste + repairs + final.
-AGENTIC_MAX_TOOL_ROUNDS = 8
+AGENTIC_MAX_TOOL_ROUNDS = 10
 # narrate#1 + tool follow-ups + repairs + forced-final, with headroom for
 # redundant rounds.
-AGENTIC_MAX_LLM_TURNS = 12
+AGENTIC_MAX_LLM_TURNS = 14
 # Max dispatches per tool round.
 AGENTIC_PER_ROUND_CALL_CAP = 3
 # Per-loop-state pass allotment (Track A congruence shape, loop-surface spec v1).
 # The budget counts LLM passes per nested loop, never tools: within a pass
 # the agent packs whatever calls the work needs, bounded only by the
 # anti-runaway dispatch ceiling below. Pre-gate fixed reads sit outside the
-# budget (zero-LLM gate doctrine). Planned LLM max is 9 = 1+3+2+1(+1 retry)+1,
-# inside the AGENTIC_MAX_LLM_TURNS backstop.
+# budget (zero-LLM gate doctrine). Planned LLM max is 12 = 1+3+6+1(+1 retry)+1,
+# inside the AGENTIC_MAX_LLM_TURNS backstop. Reasoning needs 6: three forced
+# track positions (assemble → interpret → hypothesize, one pass minimum each)
+# plus the empty-leftover steer, the close, and one slack pass — the
+# hard-track floor is what the steady statistical track spends, not a
+# suggestion.
 LOOP_PASS_BUDGET: dict[str, int] = {
     "comprehension": 1,
     "evidence": 3,
-    "reasoning": 2,
+    "reasoning": 6,
     "validation": 1,
     "output": 1,
 }

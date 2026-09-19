@@ -42,7 +42,11 @@ from .registry import (
     tool_homes,
     tool_loop,
 )
-from .replay_adapter import _forward_replay_inputs, _read_windowed_events, forward_replay_inputs
+from .replay_adapter import (
+    _forward_replay_inputs, _read_tape_payloads, _read_windowed_events,
+    _spans_from_discontinuities, _spans_from_status_transitions,
+    degraded_spans_in_window, forward_replay_inputs,
+)
 from .tick_guard import _frozen_tick, _legacy_tick, _resolved_tick_for_dispatch
 from .tools_evidence import (
     dispatch_calc_decay_report,
@@ -97,6 +101,10 @@ __all__ = [
     "_bounded",
     "_forward_core",
     "_forward_replay_inputs",
+    "_read_tape_payloads",
+    "_spans_from_discontinuities",
+    "_spans_from_status_transitions",
+    "degraded_spans_in_window",
     "_frozen_tick",
     "_legacy_tick",
     "_load_prior_block_fits",

@@ -37,6 +37,10 @@ class _FakeRedis:
     async def xlen(self, key):
         return 5_000
 
+    async def get(self, key):
+        # No collated runs exist in the fake tape world (null = absent).
+        return None
+
 
 class _FakeStore:
     def __init__(self, *, capture_state: str = "running", event_len: int = 5_000):
@@ -61,6 +65,9 @@ class _FakeStore:
 
     def microstructure_event_stream(self, venue, symbol):
         return f"test:events:{symbol}"
+
+    def collated_latest_key(self, symbol):
+        return f"test:collated:{symbol}"
 
     async def read_microstructure_events(self, venue, symbol, *, start="-", end="+", count=None):
         payloads = []
@@ -173,6 +180,34 @@ def _good_narration(with_tools: bool = False) -> str:
     return json.dumps(payload)
 
 
+def _track_tools(*names, hypothesis_id=None):
+    """Hard-track turn payloads: reasoning-position tool calls.
+
+    Assembly / interpretation / hypothesis tools walk the three forced
+    reasoning positions in order; the hypothesis test carries a
+    pre-registered id (testable H0 is formed in position 3 only).
+    """
+    calls = []
+    for name in names:
+        args: dict[str, Any] = {"symbol": "BTCUSDT", "venue": "spot"}
+        if name == "calc.hypothesis.test":
+            args.update({"hypothesis_id": hypothesis_id or "H-track",
+                         "horizon_ms": 5000, "m_tests": 1})
+        if name == "calc.forward.scenario":
+            args.update({"horizon_ms": 5000,
+                         "targets": ["101.50"], "invalidations": ["99.50"]})
+        calls.append({"name": name, "args": args})
+    return _staged_narration("P5", tools=calls)
+
+
+_TRACK_ASSEMBLE = ("calc.ofi.intervals", "calc.depth.average",
+                   "calc.forward.join")
+_TRACK_INTERPRET = ("calc.forward.fit", "calc.forward.distribution",
+                    "calc.decay.report")
+_TRACK_HYPOTHESIZE = ("calc.hypothesis.test",)
+_TRACK_DISCIPLINE = ("calc.discipline.audit",)
+
+
 _STAGED_SUMMARY = (
     "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the "
     "P1 verdict holds. Average depth is stable across the window, giving a clean P2 "
@@ -254,11 +289,20 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "calc.price.delta", "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
             ]),
             _staged_narration("P6", final=True),
+            # Hard track: three forced reasoning positions, then close.
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _staged_narration("P6", final=True),
+            # Validation rejects on the missing discipline audit; the
+            # bounded repair pulls it, then the final passes.
+            _track_tools(*_TRACK_DISCIPLINE),
+            _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 4)
+        self.assertEqual(meta["llm_calls"], 10)
         self.assertTrue(meta["tool_round"])
-        self.assertEqual(meta["repairs"], 0)
+        self.assertEqual(meta["repairs"], 1)
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
         for phase in ("P1", "P2", "P3", "P5", "P6"):
             self.assertTrue(meta["phase_coverage"][phase], phase)
@@ -329,23 +373,20 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plain.deterministic_state.get("scenario"))
 
     async def test_thin_final_triggers_repair_then_finalizes(self):
-        # narrate#1 finalizes with zero validation → one bounded repair path;
-        # the canonical runtime does not add legacy extra narration turns.
+        # narrate#1 finalizes with zero validation → the hard track still
+        # forces three reasoning positions, then one bounded repair path;
+        # the thin final (no H0) cannot pass either gate.
         engine, _s, _p, _m = _engine(llm_responses=[
-            _good_narration(),  # thin, no tools → repair
-            _staged_narration("P1", tools=[
-                {"name": "calc.ofi.intervals", "args": {}},
-                {"name": "calc.depth.average", "args": {}},
-                {"name": "market.derivatives", "args": {}},
-            ]),
-            _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper", "args": {}},
-                {"name": "calc.price.delta", "args": {"ofi": "10"}},
-            ]),
-            _staged_narration("P6", final=True),
+            _good_narration(),  # thin, no tools → evidence breaks at once
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _good_narration(),  # thin close, still no H0
+            _track_tools(*_TRACK_DISCIPLINE),  # repair pulls the audit
+            _good_narration(),  # repair followup close
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 3)
+        self.assertEqual(meta["llm_calls"], 7)
         self.assertEqual(meta["repairs"], 1)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
@@ -390,6 +431,11 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
             ]),
+            # Hard track walks its three positions before the finals below.
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            json.dumps(final),
             json.dumps(final),
             json.dumps(final),
             json.dumps(final),
@@ -400,8 +446,9 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, scenario=scenario)
         # Comprehension is deterministic and validation stops after the
-        # bounded repair budget; no legacy extra narration turns are spent.
-        self.assertEqual(meta["llm_calls"], 5)
+        # bounded repair budget; the hard track spends its positions first
+        # (the unwalked forward-scenario link costs one extra steered pass).
+        self.assertEqual(meta["llm_calls"], 10)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
         self.assertIsNone(artifact.interpretation)
@@ -457,6 +504,12 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
             ]),
+            # Hard track walks its three positions before closing.
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _staged_narration("P6", final=True),
+            _track_tools(*_TRACK_DISCIPLINE),
             _staged_narration("P6", final=True),
         ])
         _artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
@@ -795,9 +848,12 @@ class FinalValidationTests(unittest.TestCase):
 
 class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_error_never_kills_cycle(self):
-        # market.read has no fake backing → error payload, cycle continues;
-        # coverage still completes via the other tools and final passes.
-        engine, _s, _p, _m = _engine(llm_responses=[
+        # market.derivatives has its cache knocked out → error payload,
+        # cycle continues; coverage still completes via the other tools
+        # and final passes. (market.read now null-returns against the fake
+        # tape world instead of erroring, so the outage is injected on the
+        # derivatives read to preserve this test's error-path premise.)
+        engine, store, _p, _m = _engine(llm_responses=[
             _staged_narration("P1", tools=[
                 {"name": "market.read", "args": {}},
                 {"name": "calc.ofi.intervals", "args": {}},
@@ -807,8 +863,19 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
                 {"name": "market.derivatives", "args": {}},
             ]),
+            # Hard track walks its three positions before closing.
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _staged_narration("P6", final=True),
+            _track_tools(*_TRACK_DISCIPLINE),
             _staged_narration("P6", final=True),
         ])
+
+        async def _outage(symbol):
+            raise RuntimeError("derivatives cache down")
+
+        store.read_derivative_evidence = _outage  # type: ignore[method-assign]
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
         self.assertTrue(any(
@@ -867,6 +934,15 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
             payload["tool_calls"] = [{"tool": c["name"], "args": c.get("args", {})}
                                       for c in (tools or [])]
             return _json.dumps(payload)
+
+        def _trackkey(*names, hypothesis_id=None):
+            import json as _json
+            payload = _json.loads(
+                _track_tools(*names, hypothesis_id=hypothesis_id))
+            payload["tool_calls"] = [{"tool": c["name"],
+                                        "args": c.get("args", {})}
+                                      for c in payload["tool_calls"]]
+            return _json.dumps(payload)
         engine, _s, _p, _m = _engine(llm_responses=[
             _toolkey("P1", tools=[
                 {"name": "calc.ofi.intervals", "args": {}},
@@ -879,6 +955,13 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
             ]),
+            # Hard track walks its three positions before closing
+            # (keyed calls coerce identically inside positions).
+            _trackkey(*_TRACK_ASSEMBLE),
+            _trackkey(*_TRACK_INTERPRET),
+            _trackkey(*_TRACK_HYPOTHESIZE),
+            _toolkey("P6", final=True),
+            _trackkey(*_TRACK_DISCIPLINE),
             _toolkey("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
@@ -1117,7 +1200,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_e2e_refused_scenario_no_redispatch(self):
         # Live-proven shape made correct: tool refuses → model's final cites
-        # the refusal → PASS on the first validation. No repair, no re-call.
+        # the refusal → PASS after the discipline repair. No re-call.
         from market_service.nooa_harness.engine import InferenceEngine
 
         refusal = {
@@ -1139,6 +1222,13 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "calc.scenario.evaluate",
                  "args": {"target_price": "100.50", "horizon": "15m"}},
             ]),
+            # Hard track positions (forward scenario refuses cleanly
+            # against the fake tape world — an attempted finding).
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario"),
+            json.dumps(self._refused_final_turn()),
+            _track_tools(*_TRACK_DISCIPLINE),
             json.dumps(self._refused_final_turn()),
         ])
         engine_run = engine
@@ -1162,7 +1252,8 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             core_mod.context.execute_tool = real_execute
         self.assertTrue(meta["final_validation"]["passed"],
                         meta["final_validation"])
-        self.assertEqual(meta["repairs"], 0)
+        # Discipline is a later loop, so one bounded repair rides along.
+        self.assertEqual(meta["repairs"], 1)
         # Exactly ONE scenario.evaluate dispatch; no suppression needed.
         scen_entries = [
             e for e in artifact.capability_log
@@ -1188,6 +1279,11 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
         re_call["tool_calls"] = [
             {"name": "calc.scenario.evaluate",
              "args": {"target_price": "100.50", "horizon": "15m"}}]
+        # Repair also pulls the discipline audit (later loop, same repair).
+        re_call_discipline = dict(good_final)
+        re_call_discipline["tool_calls"] = list(re_call["tool_calls"]) + [
+            {"name": "calc.discipline.audit",
+             "args": {"symbol": "BTCUSDT", "venue": "spot"}}]
         engine, _s, _p, _m = _engine(llm_responses=[
             _staged_narration("P1", tools=[
                 {"name": "calc.ofi.intervals", "args": {}}]),
@@ -1201,8 +1297,13 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "calc.scenario.evaluate",
                  "args": {"target_price": "100.50", "horizon": "15m"}},
             ]),
+            # Hard track positions before the close.
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario"),
             json.dumps(bad_final),    # final without refusal citation → repair
-            json.dumps(re_call),      # repair re-calls → suppressed, citation ok
+            json.dumps(re_call_discipline),  # re-call suppressed + audit pulled
+            json.dumps(good_final),   # repair followup close → pass
         ])
         real_execute = core_mod.context.execute_tool
 

@@ -7,27 +7,74 @@ from unittest.mock import patch
 import pytest
 
 from tests.test_governance import _engine, _wake, _staged_narration
+from tests.test_engine import (
+    _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
+    _TRACK_INTERPRET, _track_tools,
+)
 from market_service.nooa_harness.engine import core
 
 FIXTURE = Path(__file__).with_name("fixtures") / "cycle_characterization.json"
 
 
 async def capture(case, stage_trace=None):
-    turns = [
-        _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"}]),
-        _staged_narration("P2", tools=[{"name": "calc.depth.average"}]),
-        _staged_narration("P3", tools=[{"name": "market.derivatives"}]),
-        _staged_narration("P5", tools=[{"name": "memory.recall_paper"}, {"name": "calc.price.delta"}]),
+    # The engine now runs an output composition pass (core/output.py) which
+    # makes one more LLM call. The success case needs 6 turns: 5 stage +
+    # 1 output composition. Other cases terminate before output or fail.
+    # Mirrors tests/test_engine's proven staged walk: evidence turns gather
+    # the read-plane substrates, then the three hard-track reasoning
+    # positions walk in order, discipline closes, and the last P6 is the
+    # non-agentic output composition pass.
+    # Repair-path note: the FIRST final (P6 after the track walk) is rejected
+    # on the missing discipline citation — the repair turn dispatches
+    # calc.discipline.audit in the validation home, then the final passes.
+    # The spare trailing P6 is the output-composition pass's scripted turn.
+    success_turns = [
+        _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"},
+                                       {"name": "micro.ofi_intervals"}]),
+        _staged_narration("P2", tools=[{"name": "calc.depth.average"},
+                                       {"name": "market.derivatives"}]),
+        _staged_narration("P5", tools=[{"name": "memory.recall_paper"},
+                                       {"name": "calc.price.delta"}]),
+        _staged_narration("P6", final=True),
+        _track_tools(*_TRACK_ASSEMBLE),
+        _track_tools(*_TRACK_INTERPRET),
+        _track_tools(*_TRACK_HYPOTHESIZE),
+        _staged_narration("P6", final=True),
+        _track_tools(*_TRACK_DISCIPLINE),
+        _staged_narration("P6", final=True),
         _staged_narration("P6", final=True),
     ]
     if case == "repair":
-        turns.insert(0, _staged_narration("P6", final=True))
+        # Repair flow: the first final is rejected on the missing discipline
+        # citation; the repair turn dispatches the audit in the validation
+        # home; the next final passes. Mirrors the proven staged walk — an
+        # early P6-final cannot be scripted first (final-ness only binds at
+        # validation, and an unwalked track is not repairable mid-recovery).
+        turns = [
+            _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"},
+                                           {"name": "micro.ofi_intervals"}]),
+            _staged_narration("P2", tools=[{"name": "calc.depth.average"},
+                                           {"name": "market.derivatives"}]),
+            _staged_narration("P5", tools=[{"name": "memory.recall_paper"},
+                                           {"name": "calc.price.delta"}]),
+            _staged_narration("P6", final=True),
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _staged_narration("P6", final=True),
+            _track_tools(*_TRACK_DISCIPLINE),
+            _staged_narration("P6", final=True),
+            _staged_narration("P6", final=True),
+            _staged_narration("P6", final=True),
+        ]
     elif case == "parse":
         turns = ["not json"]
     elif case in ("transport", "gate"):
         turns = []
     elif case == "budget":
         turns = [_staged_narration("P6", final=True)] * 12
+    else:
+        turns = success_turns
     engine, store, postgres, memory = _engine(llm_responses=turns)
     effects = []
 
@@ -121,8 +168,12 @@ def test_cycle_characterization(case):
 def test_staged_cycle_converges_and_preserves_placement_order():
     stages = []
     result = asyncio.run(capture("success", stages))
+    # run_validation appears TWICE: the first pass rejects the final on the
+    # missing discipline citation, the recovery turn dispatches the audit,
+    # and validation re-runs to accept the repaired final. That two-phase
+    # entry is the repair mechanics the settlement depends on.
     assert stages == ["run_wake", "run_gather", "run_comprehension", "run_evidence",
-                    "run_reasoning", "run_validation", "run_output"]
+                    "run_reasoning", "run_validation", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
     assert result["meta"]["final_validation"]["passed"]
     # Pending projection, memory disposition, final projection, and the

@@ -8,6 +8,14 @@ from typing import Any
 
 MICROSTRUCTURE_SCHEMA_VERSION = 1
 
+# FROZEN label of the L2 ladder projection carried on tape events. The
+# ladder is ADDITIVE evidence: it never enters the best-quote hash domains
+# (OFI intervals, feature vectors, fits), so old payloads replay
+# bit-identically and old fits keep their input_hash. A BookL2State without
+# this exact label in its own hash domain must not be joined against a fit
+# that expects a different projection.
+L2_LADDER_VERSION = "l2-topn-v1"
+
 
 def decimal(value: Any) -> Decimal:
     """Parse source values without introducing binary floating-point error."""
@@ -154,13 +162,115 @@ class DepthDelta:
 
 
 @dataclass(frozen=True)
+class BookL2State:
+    """Top-of-book-plus-N depth ladder snapshot (frozen transport projection).
+
+    Encapsulates the L2 evidence the analysis planes need at event grain:
+    the top ``n`` price levels per side of the reconstructed book, ordered
+    canonically (bids price-DESCENDING, asks price-ASCENDING). This is a
+    READ-ONLY projection captured at publish time — it is not a fit input
+    and carries its own versioned hash domain (``state_hash``).
+
+    Determinism rules:
+    - prices/quantities are Decimal, stringified fixed-point in transport;
+    - empty sides are legal (degenerate book); ordering validation only
+      applies within a non-empty side;
+    - ``update_id`` is the book sequence id the projection reflects.
+    """
+
+    symbol: str
+    venue: str
+    update_id: int
+    exchange_ts_ms: int
+    received_ts_ms: int
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    ladder_version: str = L2_LADDER_VERSION
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+
+    def validate(self) -> None:
+        if not self.symbol or not self.venue:
+            raise ValueError("symbol and venue are required")
+        if self.update_id < 0 or self.exchange_ts_ms < 0 or self.received_ts_ms < 0:
+            raise ValueError("update and timestamp fields must be non-negative")
+        for side in (self.bids, self.asks):
+            for price, qty in side:
+                if price <= 0 or qty < 0:
+                    raise ValueError("ladder level must have positive price and non-negative qty")
+        bid_prices = [p for p, _q in self.bids]
+        ask_prices = [p for p, _q in self.asks]
+        if any(a <= b for b, a in zip(bid_prices, bid_prices[1:])):
+            raise ValueError("ladder bids must be strictly price-descending")
+        if any(b >= a for b, a in zip(ask_prices, ask_prices[1:])):
+            raise ValueError("ladder asks must be strictly price-ascending")
+        if bid_prices and ask_prices and bid_prices[0] >= ask_prices[0]:
+            raise ValueError("crossed or locked ladder best book")
+
+    @property
+    def state_hash(self) -> str:
+        """Versioned hash over the ladder content (own domain — additive)."""
+        import hashlib
+        import json as _json
+        payload = {
+            "ladder_version": self.ladder_version,
+            "schema_version": self.schema_version,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "update_id": self.update_id,
+            "exchange_ts_ms": self.exchange_ts_ms,
+            "received_ts_ms": self.received_ts_ms,
+            "bids": [[_d(p), _d(q)] for p, q in self.bids],
+            "asks": [[_d(p), _d(q)] for p, q in self.asks],
+        }
+        return hashlib.sha256(
+            _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "schema_version": self.schema_version,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "update_id": self.update_id,
+            "exchange_ts_ms": self.exchange_ts_ms,
+            "received_ts_ms": self.received_ts_ms,
+            "bids": [[_d(p), _d(q)] for p, q in self.bids],
+            "asks": [[_d(p), _d(q)] for p, q in self.asks],
+            "ladder_version": self.ladder_version,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> BookL2State:
+        """Rebuild one ladder projection from its transport form (replay seam)."""
+        return cls(
+            symbol=str(payload["symbol"]),
+            venue=str(payload["venue"]),
+            update_id=int(payload["update_id"]),
+            exchange_ts_ms=int(payload["exchange_ts_ms"]),
+            received_ts_ms=int(payload["received_ts_ms"]),
+            bids=tuple((decimal(p), decimal(q)) for p, q in payload.get("bids") or ()),
+            asks=tuple((decimal(p), decimal(q)) for p, q in payload.get("asks") or ()),
+            ladder_version=str(payload.get("ladder_version", L2_LADDER_VERSION)),
+            schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+        )
+
+
+@dataclass(frozen=True)
 class OrderBookEvent:
-    """One deterministic best-quote transition and its paper contribution e_n."""
+    """One deterministic best-quote transition and its paper contribution e_n.
+
+    ``l2`` is the ADDITIVE top-N ladder projection of the book state AFTER
+    the transition (None when the capture runs without L2 projection or the
+    payload predates the projection). It never participates in best-quote
+    hash domains; replay of old payloads is unchanged.
+    """
 
     previous: BestQuoteState
     current: BestQuoteState
     contribution: Decimal
     source_quality: str = "exact_feed"
+    l2: BookL2State | None = None
     schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
 
     @property
@@ -176,7 +286,7 @@ class OrderBookEvent:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "schema_version": self.schema_version,
             "event_type": "best_quote_transition",
             "source_quality": self.source_quality,
@@ -184,15 +294,20 @@ class OrderBookEvent:
             "previous": self.previous.to_dict(),
             "current": self.current.to_dict(),
         }
+        if self.l2 is not None:
+            out["l2"] = self.l2.to_dict()
+        return out
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> OrderBookEvent:
         """Rebuild one event from its transport form (replay seam)."""
+        l2_raw = payload.get("l2")
         return cls(
             previous=BestQuoteState.from_dict(payload["previous"]),
             current=BestQuoteState.from_dict(payload["current"]),
             contribution=decimal(payload["contribution"]),
             source_quality=str(payload.get("source_quality", "exact_feed")),
+            l2=BookL2State.from_dict(l2_raw) if isinstance(l2_raw, dict) else None,
             schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
         )
 

@@ -354,6 +354,16 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
     deterministic_state — the graceful-failure contract end to end."""
 
     async def test_success_cycle_terminals_settled(self):
+        def _track(*names, hypothesis_id=None):
+            calls = []
+            for name in names:
+                args: dict[str, Any] = {"symbol": "BTCUSDT", "venue": "spot"}
+                if name == "calc.hypothesis.test":
+                    args.update({"hypothesis_id": hypothesis_id or "H-track",
+                                 "horizon_ms": 5000, "m_tests": 1})
+                calls.append({"name": name, "args": args})
+            return _staged_narration("P5", tools=calls)
+
         engine, _s, _p, _m = _engine(llm_responses=[
             _staged_narration("P1", tools=[
                 {"name": "calc.ofi.intervals",
@@ -373,6 +383,17 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "calc.price.delta",
                  "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
             ]),
+            _staged_narration("P6", final=True),
+            # Hard track: three forced reasoning positions, then close;
+            # validation rejects on the missing discipline audit and the
+            # bounded repair pulls it before settling.
+            _track("calc.ofi.intervals", "calc.depth.average",
+                   "calc.forward.join"),
+            _track("calc.forward.fit", "calc.forward.distribution",
+                   "calc.decay.report"),
+            _track("calc.hypothesis.test"),
+            _staged_narration("P6", final=True),
+            _track("calc.discipline.audit"),
             _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})

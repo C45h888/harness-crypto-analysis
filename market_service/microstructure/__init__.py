@@ -11,9 +11,9 @@ full inference API (Route A, Route B, Route C, composer, and common).
 """
 
 from .contracts import (
-    BestQuoteState, DepthDelta, EVIDENCE_V2_VERSION, HYPOTHESIS_VERSION,
+    BestQuoteState, BookL2State, DepthDelta, EVIDENCE_V2_VERSION, HYPOTHESIS_VERSION,
     FeatureVector, ForecastResult, ForwardFit, ForwardObservation,
-    HypothesisEvidence, HypothesisLedger, MicrostructureEvidenceV2,
+    HypothesisEvidence, HypothesisLedger, L2_LADDER_VERSION, MicrostructureEvidenceV2,
     OFIInterval, OrderBookEvent, QuoteMeasurement,
 )
 from .discipline import (
@@ -33,6 +33,7 @@ from .fitting_common import (
 from .fitting_route_a import build_observations, fit_price_impact
 from .fitting_route_b import fit_depth_scaling
 from .fitting_route_c import (
+    FORWARD_HORIZONS_MS,
     FORWARD_SCENARIO_VERSION,
     build_feature_vector, build_forward_observations,
     calibration_report, evaluate_forward_scenario, feature_schema_hash,
@@ -48,7 +49,7 @@ from .microprice import (
     MICROPRICE_ESTIMATOR, displacement, displacement_bps, microprice, mid,
 )
 from .tick import TICK_TABLE, TICK_TABLE_VERSION, resolve_tick_size
-from .ofi import OFIAggregator, event_contribution
+from .ofi import DEPTH_ESTIMATOR, OFIAggregator, event_contribution
 from .orderbook import BookGapError, OrderBookReconstructor
 
 __all__ = [
@@ -56,15 +57,19 @@ __all__ = [
     "AbsorptionEvent",
     "BestQuoteState",
     "BookGapError",
+    "BookL2State",
+    "L2_LADDER_VERSION",
     "COST_STATEMENT_TEMPLATE",
     "DISCIPLINE_CHECKLIST",
     "DISCIPLINE_VERSION",
+    "DEPTH_ESTIMATOR",
     "DepthDelta",
     "EVENT_ENVELOPE_VERSION",
     "EVIDENCE_V2_VERSION",
     "EventEnvelope",
     "FeatureVector",
     "ForecastResult",
+    "FORWARD_HORIZONS_MS",
     "FORWARD_SCENARIO_VERSION",
     "ForwardFit",
     "ForwardObservation",

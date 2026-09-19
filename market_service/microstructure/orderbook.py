@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from .contracts import BestQuoteState, DepthDelta, OrderBookEvent, decimal
+from .contracts import BookL2State, BestQuoteState, DepthDelta, OrderBookEvent, decimal
 from .ofi import event_contribution
 
 
@@ -14,11 +14,18 @@ class BookGapError(ValueError):
 
 
 class OrderBookReconstructor:
-    """Mutable local book whose outputs are immutable quote-event objects."""
+    """Mutable local book whose outputs are immutable quote-event objects.
 
-    def __init__(self, symbol: str, venue: str):
+    ``l2_depth_levels`` > 0 additionally projects the top-N price levels per
+    side onto every published event (``OrderBookEvent.l2``, additive — never
+    part of best-quote hash domains). 0 disables the projection and replays
+    exactly as before.
+    """
+
+    def __init__(self, symbol: str, venue: str, *, l2_depth_levels: int = 0):
         self.symbol = symbol.upper()
         self.venue = venue
+        self.l2_depth_levels = max(0, int(l2_depth_levels))
         self.bids: dict[Decimal, Decimal] = {}
         self.asks: dict[Decimal, Decimal] = {}
         self.last_update_id: int | None = None
@@ -95,7 +102,9 @@ class OrderBookReconstructor:
         if self._same_quote(previous, current):
             return None
         return OrderBookEvent(previous=previous, current=current,
-                              contribution=event_contribution(previous, current))
+                              contribution=event_contribution(previous, current),
+                              l2=self._l2_state(delta.final_update_id,
+                                                delta.exchange_ts_ms, delta.received_ts_ms))
 
     @staticmethod
     def _levels(levels: Any) -> dict[Decimal, Decimal]:
@@ -132,6 +141,19 @@ class OrderBookReconstructor:
         )
         quote.validate()
         return quote
+
+    def _l2_state(self, update_id: int, exchange_ts_ms: int, received_ts_ms: int) -> BookL2State | None:
+        """Project the top-N ladder of the CURRENT book state (additive read view)."""
+        if self.l2_depth_levels <= 0:
+            return None
+        n = self.l2_depth_levels
+        top_bids = sorted(self.bids.items(), key=lambda row: row[0], reverse=True)[:n]
+        top_asks = sorted(self.asks.items(), key=lambda row: row[0])[:n]
+        return BookL2State(
+            symbol=self.symbol, venue=self.venue, update_id=update_id,
+            exchange_ts_ms=exchange_ts_ms, received_ts_ms=received_ts_ms,
+            bids=tuple(top_bids), asks=tuple(top_asks),
+        )
 
     @staticmethod
     def _same_quote(left: BestQuoteState, right: BestQuoteState) -> bool:

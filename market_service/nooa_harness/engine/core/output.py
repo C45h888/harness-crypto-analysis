@@ -52,6 +52,18 @@ async def run_output(
     staged_final = parsed_final
     task_workflow = (deterministic_state.get("task_workflow")
                      or build_task_workflow(task, scenario))
+    # Re-anchor the composition to the question asked: the task and the
+    # bound directive (with its parse refusals) ride the synthesis material
+    # so the final pass answers the task, not just summarizes evidence.
+    directive_block = ""
+    if task:
+        directive_block = (
+            "TASK (the question this output answers):\n" f"{task[:2_000]}\n\n"
+            "TASK DIRECTIVE (deterministic parse + assessment disposal — cite "
+            "these as deterministic_state.task_directive / forward_scenario "
+            "paths; preserve refusals as findings, never paraphrased numbers):\n"
+            f"{json.dumps(deterministic_state.get('task_directive'), default=str)[:6_000]}\n\n"
+        )
     compose_prompt = (
         "OUTPUT COMPOSITION PASS (no tools available — any tool_calls you "
         "return will be dropped): compose the FINAL artifact JSON strictly "
@@ -59,8 +71,9 @@ async def run_output(
         "EXACTLY {summary, evidence, confidence, limitations, "
         "model_separation, hypothesis, scenario, memory_proposals} — every "
         "numeric claim already cited; invent no values.\n\n"
+        f"{directive_block}"
         "SYNTHESIS MATERIAL:\n"
-        f"{json.dumps({'summary': staged_final.get('summary'), 'evidence': staged_final.get('evidence'), 'confidence': staged_final.get('confidence'), 'limitations': staged_final.get('limitations'), 'model_separation': staged_final.get('model_separation'), 'hypothesis': staged_final.get('hypothesis'), 'scenario': staged_final.get('scenario'), 'forecast_result': deterministic_state.get('forecast_result')}, default=str)[:30_000]}\n\n"
+        f"{json.dumps({'summary': staged_final.get('summary'), 'evidence': staged_final.get('evidence'), 'confidence': staged_final.get('confidence'), 'limitations': staged_final.get('limitations'), 'model_separation': staged_final.get('model_separation'), 'hypothesis': staged_final.get('hypothesis'), 'scenario': staged_final.get('scenario'), 'forecast_result': deterministic_state.get('forecast_result'), 'forward_scenario': deterministic_state.get('forward_scenario'), 'task_directive': deterministic_state.get('task_directive')}, default=str)[:30_000]}\n\n"
         "The canonical ForecastResult is deterministic evidence. Preserve its "
         "forecast_type, validation_state, probability_status, assumptions, and "
         "route disagreement in evidence/limitations; do not recreate numbers.\n"
@@ -135,7 +148,8 @@ async def run_output(
     # verdict/probability/rationale over the deterministic requirement.
     if scenario is not None and isinstance(parsed_final.get("scenario"), dict):
         interpretation["scenario"] = parsed_final["scenario"]
-    # Pass C: hypothesis formed via memory.recall_paper + calc.* tools,
+    # Pass C: hypothesis formed from the track's own evidence + calc.* tools
+    # (memory node pruned from the track — transport retained),
     # final DeltaP is derived diagnostic heteroskedastic ν·OFI.
     # Scenario cycles ALWAYS take their verdict from the deterministic
     # tool payload — even when the agent formed no H0/H1 (live-proven:
@@ -153,7 +167,7 @@ async def run_output(
     beta = (evidence or {}).get("price_impact_fit", {}).get("beta") if isinstance(evidence, dict) else None
     betastr = str(beta)[:12] if beta is not None else "unknown"
     if hypothesis is None:
-        hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "paper_refs": ["Cont 1011.6402 OFI_k, AD_i, derived ΔP diagnostic"], "evidence_refs": ["calc.ofi.intervals","calc.depth.average","memory.recall_paper"]}
+        hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "paper_refs": ["Cont 1011.6402 OFI_k, AD_i, derived ΔP diagnostic"], "evidence_refs": ["calc.ofi.intervals","calc.depth.average"]}
         if scenario_verdict is not None:
             hypothesis_verdict, verdict_reason = (
                 scenario_verdict[0],
@@ -161,7 +175,7 @@ async def run_output(
             )
         else:
             hypothesis_verdict = "inconclusive"
-            verdict_reason = "Agent did not explicitly form H0/H1 via memory.recall_paper; calculations split but hypothesis implicit"
+            verdict_reason = "Agent did not explicitly form H0/H1; calculations split but hypothesis implicit"
     elif scenario_verdict is not None:
         # Scenario cycles: reachability verdict computed deterministically
         # from the accumulated scenario tool payload — never from LLM text.
@@ -180,7 +194,7 @@ async def run_output(
             hypothesis_verdict = "invalidated"
             verdict_reason = "; ".join(gate_reasons)
         if isinstance(hypothesis, dict) and "H0" in hypothesis:
-            verdict_reason += " ; H0 paper-grounded via memory.recall_paper"
+            verdict_reason += " ; H0 grounded in track evidence (position-3 formation)"
     # Read-plane state assembly: the artifact's calculations block is the
     # controller-classified calc-family outcomes the agent pulled during
     # the loop — no pre-gather spine exists anymore.

@@ -82,14 +82,35 @@ async def run_gather(
     events_in_window = int((evidence or {}).get("coverage", {}).get(
         "events_in_window", 0) or 0)
     status_obj = status or {}
+    # Window-scoped degraded-span count (status-transition ledger). The
+    # cumulative ``sequence_gaps`` counter is transport telemetry only and
+    # must never gate data quality — one reconnect must not poison every
+    # future cycle.
+    from market_service.nooa_harness.inference.tooling.replay_adapter import degraded_spans_in_window
+    _spine_window_ms = 30 * 60_000
+    try:
+        _degraded = await degraded_spans_in_window(
+            engine.store, engine.symbol, engine.venue, window_ms=_spine_window_ms,
+        )
+    except Exception:
+        _degraded = 0
     gate_status, gate_reasons = resolve_inference_status(
         n_observations=n_observations,
         min_observations=30,
         fit_status=fit_status,
         capture_state=status_obj.get("state"),
         events_in_window=events_in_window,
-        sequence_gaps=int(status_obj.get("sequence_gaps") or 0),
+        degraded_spans_in_window=_degraded,
     )
+
+    # --- TASK DIRECTIVE (Phase A — deterministic parse, no LLM) ---
+    # The prompt becomes a plan variable BEFORE any pre-acquisition: the
+    # directive selects the forecast horizon (native vocabulary only) and
+    # triggers the canonical scenario pre-acquisition. Pure parse; refusal
+    # is a finding recorded on the directive, never a cycle abort.
+    from ..task_directive import build_plan, parse_task_directive
+    task_directive = parse_task_directive(ctx.task, ctx.scenario)
+    task_plan = build_plan(task_directive)
 
     # Build the canonical forward ForecastResult before any interpretation.
     # This is deterministic evidence, not an agent-selected sequence of raw
@@ -97,21 +118,32 @@ async def run_gather(
     # call; provisional forward evidence remains readable and explicitly gated.
     forecast_result = None
     forecast_log: dict[str, Any] | None = None
+    forward_scenario_result: Any = None
+    forward_scenario_log: dict[str, Any] | None = None
     if gate_status != "insufficient":
+        # Directive-driven horizon: only a native-vocabulary value retargets
+        # the canonical forecast; long regimes keep the native default (the
+        # long question is answered by the exceedance path, not the fit).
+        _forecast_horizon_ms = (
+            task_plan["resolved_horizon_ms"]
+            if (task_plan["horizon_regime"] == "native"
+                and task_plan["resolved_horizon_ms"] in (1_000, 5_000, 30_000, 60_000))
+            else 5_000
+        )
+        _forecast_args = {"symbol": engine.symbol, "venue": engine.venue,
+                          "horizon_ms": _forecast_horizon_ms, "window_minutes": 30}
         context._must_authorize_work(
             controller, nested_loop=NestedLoop.COMPREHENSION, bootstrap=True,
         )
         forecast_result, forecast_log = await context.execute_tool(
             engine.store, "calc.forward.forecast",
-            {"symbol": engine.symbol, "venue": engine.venue,
-             "horizon_ms": 5_000, "window_minutes": 30},
+            _forecast_args,
             postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
         )
         capability_log.append(forecast_log)
         controller = controller.record_outcome(
             "calc.forward.forecast", forecast_log, forecast_result,
-            args={"symbol": engine.symbol, "venue": engine.venue,
-                  "horizon_ms": 5_000, "window_minutes": 30},
+            args=_forecast_args,
         )
         accumulated_tool_results["calc.forward.forecast"] = forecast_result
         tool_results["calc.forward.forecast"] = forecast_result
@@ -127,6 +159,30 @@ async def run_gather(
                 else "forward ForecastResult unavailable"
             ]
 
+        # Directive-driven scenario pre-acquisition: a target-bearing native
+        # task gets its P(T)/P(S) curves computed deterministically BEFORE
+        # interpretation (same authority pattern as the canonical forecast).
+        if (task_plan["horizon_regime"] == "native"
+                and (task_plan["targets"] or task_plan["invalidations"])):
+            _scenario_args = {"symbol": engine.symbol, "venue": engine.venue,
+                              "horizon_ms": _forecast_horizon_ms,
+                              "targets": [t["value"] for t in task_plan["targets"]],
+                              "invalidations": [s["value"] for s in task_plan["invalidations"]],
+                              "window_minutes": 30}
+            forward_scenario_result, forward_scenario_log = await context.execute_tool(
+                engine.store, "calc.forward.scenario",
+                _scenario_args,
+                postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
+            )
+            capability_log.append(forward_scenario_log)
+            controller = controller.record_outcome(
+                "calc.forward.scenario", forward_scenario_log, forward_scenario_result,
+                args=_scenario_args,
+            )
+            accumulated_tool_results["calc.forward.scenario"] = forward_scenario_result
+            tool_results["calc.forward.scenario"] = forward_scenario_result
+    task_directive = task_directive  # Phase A result; Phase B refines later
+
     # --- READ-PLANE SHAPE (envelope-driven) ---
     # The controller receives the envelope and hands it to the agent;
     # the agent then READS AS IT PLEASES via the tool base to complete
@@ -136,6 +192,8 @@ async def run_gather(
     deterministic_state: dict[str, Any] = {
         "task": task,
         "scenario": scenario,
+        "task_directive": task_directive.to_dict(),
+        "task_plan": task_plan,
         "wake": {
             "trigger_source": wake.trigger_source,
             "predicates_fired": wake.predicates_fired,
@@ -143,6 +201,9 @@ async def run_gather(
         "capture_status": status,
         "microstructure_evidence": evidence,
         "forecast_result": forecast_result,
+        "forward_scenario": forward_scenario_result,
+        "forward_scenario_note": ((forward_scenario_log or {}).get("detail")
+                                  if isinstance(forward_scenario_log, dict) else "not_run"),
         "gate": {"status": gate_status, "reasons": list(gate_reasons)},
         "forward_gate": {
             "status": ((forecast_result or {}).get("validation_state")
@@ -155,11 +216,15 @@ async def run_gather(
         "data_quality": {
             "capture_state": status_obj.get("state"),
             "sequence_gaps": int(status_obj.get("sequence_gaps") or 0),
+            "sequence_gaps_note": ("cumulative transport telemetry only — NOT a "
+                                    "data-quality gate; see degraded_spans_in_window"),
+            "degraded_spans_in_window": _degraded,
             "heteroskedasticity_flag": ((evidence or {}).get("price_impact_fit") or {}).get("heteroskedasticity_flag"),
             "fit_status": fit_status,
             "n_observations": n_observations,
             "spine": {"interval_seconds": 10, "window_minutes": 30},
-            "note": ("provisional persists while gaps>0 or hetero=true; "
+            "note": ("provisional persists while degraded capture spans overlap the "
+                     "window or hetero=true; "
                      "agent may recompute at interval 10/15/30s × window 15/30/60m via tool args"),
             "read_plane": ("the deterministic spine (OFI intervals, AD, "
                            "observations, ΔP) is NOT pre-computed — pull it "

@@ -494,6 +494,16 @@ CHAIN_SUBLOOP: dict[str, tuple[SubLoop, LoopStep]] = {
     "calc.decay.report": (SubLoop.ANALYSIS, LoopStep.COMPARE),
     "calc.discipline.audit": (SubLoop.GATE, LoopStep.VALIDATE),
     "output.compose": (SubLoop.COMPOSITION, LoopStep.ASSEMBLE),
+    # Pass-1 assembly substrates (re-derivation surface, TEST position).
+    "calc.ofi.intervals": (SubLoop.ANALYSIS, LoopStep.TEST),
+    "calc.depth.average": (SubLoop.ANALYSIS, LoopStep.TEST),
+    "calc.observation.build": (SubLoop.ANALYSIS, LoopStep.TEST),
+    "calc.fit.price_impact": (SubLoop.ANALYSIS, LoopStep.TEST),
+    "calc.fit.depth_scaling": (SubLoop.ANALYSIS, LoopStep.TEST),
+    "calc.forward.join": (SubLoop.ANALYSIS, LoopStep.TEST),
+    # Pass-2 interpretation surface (equation + distribution).
+    "calc.forward.fit": (SubLoop.ANALYSIS, LoopStep.TEST),
+    "calc.forward.distribution": (SubLoop.ANALYSIS, LoopStep.COMPARE),
 }
 
 

@@ -11,14 +11,49 @@ from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
 from . import context
-from .context import _CycleContext, _stable_session_id
+from .context import (
+    CycleRuntimeState,
+    _CycleContext,
+    _stable_session_id,
+    freeze_chain,
+)
 from ..controller import CycleController
 from ..fsm import GOVERNANCE_MEMBRANE, GovernanceEvent, GovernanceEventKind
 from . import gather, output, reasoning
-from ..kb import SystemPromptCache, build_output_format, build_system_prompt
+from .. import kb
+from ..kb import (
+    SystemPromptCache,
+    build_output_format,
+    build_system_prompt,
+)
+from ..narration import (
+    coerce_turn,
+    extract_json_object,
+    next_uncovered_phase,
+)
+from ..loop_states import NestedLoop, SubLoop, TaskIntent
+from .chain import (
+    FORWARD_SCENARIO_TOOL,
+    POSITION_ORDER,
+    POSITION_TOOLS,
+    TOOL_POSITION,
+    chain_completion,
+    chain_steer,
+    halt_steer,
+    position_status,
+    position_steer,
+)
 from ..llm import call_narration_llm
+from market_service.nooa_harness.inference import (
+    _normalize_tool_name,
+    capability_log_entry,
+    tool_homes,
+)
 from ..config import (
+    AGENTIC_MAX_LLM_TURNS,
     AGENTIC_MAX_TOOL_ROUNDS,
+    LOOP_PASS_BUDGET,
+    MAX_DISPATCHES_PER_PASS,
     MEMORY_CONTEXT_BUDGET,
     MEMORY_RECALL_LIMIT,
     MAX_MEMORY_PROPOSALS,
@@ -226,6 +261,303 @@ class InferenceEngine:
             self.llm, user_prompt,
             system_prompt=self._system_prompt_cache.get(),
         )
+
+    # ------------------------------------------------------------------
+    # Pass-loop mechanics
+    # ------------------------------------------------------------------
+    # These three methods are the bounded per-pass primitives every loop
+    # body in ``reasoning.py`` re-uses. They live on the engine because
+    # they consume engine state (``self.symbol``, ``self.venue``,
+    # ``self.store``, etc.) and call ``self._call_llm`` — the engine *is*
+    # the cycle transport, so the per-pass primitives belong here.
+
+    async def _dispatch_turn(self, ctx: Any, st: CycleRuntimeState) -> None:
+        """Dispatch ``st.parsed_current``'s tool_calls under the pass ceiling.
+
+        Operates against the same per-round cap the agent's contract sees
+        (MAX_DISPATCHES_PER_PASS); overflow is named on ``unexecuted``,
+        never silently dropped. Each candidate is routed through the FSM
+        (work authorization + redundancy suppression) and recorded back
+        on the controller as a successor.
+        """
+        st._round_had_execution = False  # type: ignore[attr-defined]
+        tool_calls = st.parsed_current.get("tool_calls")
+        if not (isinstance(tool_calls, list) and tool_calls):
+            return
+        pass_remaining = MAX_DISPATCHES_PER_PASS - st.dispatched_in_pass
+        dict_calls = [c for c in tool_calls if isinstance(c, dict)]
+        if st.tool_rounds_used >= AGENTIC_MAX_TOOL_ROUNDS or pass_remaining <= 0:
+            # Budget spent: name everything pending (never silently dropped).
+            for call in dict_calls:
+                raw_name = str(call.get("name") or call.get("tool") or "").strip()
+                if raw_name:
+                    st.unexecuted.append(raw_name)
+            return
+        # The canonical per-round cap is enforced here; overflow is named on
+        # unexecuted, never silently dropped.
+        to_execute = dict_calls[:pass_remaining]
+        for call in dict_calls[pass_remaining:]:
+            raw_name = str(call.get("name") or call.get("tool") or "").strip()
+            if raw_name:
+                st.unexecuted.append(raw_name)
+                log.warning("pass ceiling: deferring %s to unexecuted", raw_name)
+        if not to_execute:
+            return
+        st.tool_rounds_used += 1
+        round_results: dict[str, Any] = {}
+        for call in to_execute:
+            raw_name = str(call.get("name", ""))
+            args = dict(call.get("args") or {})
+            args.setdefault("symbol", self.symbol)
+            args.setdefault("venue", self.venue)
+            canonical = _normalize_tool_name(raw_name) or raw_name
+            # Hard-track positions (reasoning only): a tool belonging to a
+            # LATER position than the active one is denied as an
+            # out-of-position finding — logged only, never dispatched, never
+            # classified (no controller outcome: no work was requested of
+            # the deterministic plane, so there is nothing to classify and
+            # the tool stays NOT_CALLED until its position is active).
+            # Named on unexecuted: it is genuinely pending, not dropped.
+            if (st.loop_tag == "reasoning" and st.chain_halt is None
+                    and st.reason_position < len(POSITION_ORDER)):
+                active_position = POSITION_ORDER[st.reason_position]
+                wanted_position = TOOL_POSITION.get(canonical)
+                if (wanted_position is not None
+                        and POSITION_ORDER.index(wanted_position)
+                        > POSITION_ORDER.index(active_position)):
+                    oop_log = capability_log_entry(
+                        f"tool.out_of_position:{canonical}",
+                        {"symbol": self.symbol, "venue": self.venue},
+                        "denied",
+                        detail={"reason": "later_track_position",
+                                "active_position": active_position,
+                                "tool_position": wanted_position},
+                    )
+                    st.dispatched_in_pass += 1
+                    st.capability_log.append(oop_log)
+                    if raw_name and raw_name not in st.unexecuted:
+                        st.unexecuted.append(raw_name)
+                    round_results[canonical] = None
+                    continue
+            expected_loop = {
+                "evidence": NestedLoop.EVIDENCE,
+                "reasoning": NestedLoop.REASONING,
+                "validation": NestedLoop.VALIDATION,
+            }.get(st.loop_tag, NestedLoop.REASONING)
+            expected_sub_loop = {
+                "evidence": SubLoop.ACQUISITION,
+                "reasoning": SubLoop.ANALYSIS,
+                "validation": SubLoop.RECOVERY,
+            }.get(st.loop_tag)
+            # The dispatch registry owns the allowed work homes; the FSM owns
+            # whether the current observation is one of them.  A model cannot
+            # move a tool into a convenient phase by naming it differently.
+            authorization = None
+            for home_loop, home_sub_loop in tool_homes(canonical):
+                try:
+                    home_nested_loop = NestedLoop(home_loop)
+                    home_sub_loop_enum = SubLoop(home_sub_loop)
+                except ValueError:
+                    continue
+                candidate = context._authorize_work(
+                    st.controller,
+                    nested_loop=home_nested_loop,
+                    sub_loop=home_sub_loop_enum,
+                )
+                if candidate.allowed:
+                    authorization = candidate
+                    break
+            if authorization is None:
+                authorization = context._authorize_work(
+                    st.controller,
+                    nested_loop=expected_loop,
+                    sub_loop=expected_sub_loop,
+                )
+            if not authorization.allowed:
+                # The FSM is the work boundary.  A model request made from the
+                # wrong loop becomes an explicit finding and is never dispatched.
+                tool_log = capability_log_entry(
+                    f"tool.denied:{canonical}",
+                    {"symbol": self.symbol, "venue": self.venue},
+                    "denied",
+                    detail={"reason": "unauthorized_loop_work", "fsm": authorization.reason},
+                )
+                st.dispatched_in_pass += 1
+                st.capability_log.append(tool_log)
+                st.controller = st.controller.record_outcome(
+                    canonical, tool_log, None, raw_name=raw_name, args=args,
+                )
+                round_results[canonical] = None
+                st.accumulated_tool_results[canonical] = None
+                continue
+            # Controller authority: redundant re-dispatch of a tool with
+            # IDENTICAL args that already refused this cycle is suppressed
+            # structurally (logged, never executed). Reformulated args are
+            # new work and flow through (budgets + predicates still gate).
+            if st.controller.is_redundant(canonical, args):
+                log.warning(
+                    "pass loop: suppressing redundant dispatch of "
+                    "%s (refused earlier this cycle)", canonical,
+                )
+                _supp_log = capability_log_entry(
+                    f"tool.suppressed:{canonical}",
+                    {"symbol": self.symbol, "venue": self.venue},
+                    "denied",
+                    detail={"reason": "refused_deterministically",
+                            "refusal_reason": st.controller.scenario_refusal_reason()},
+                )
+                st.capability_log.append(_supp_log)
+                st.controller = st.controller.record_outcome(
+                    canonical, _supp_log, None, raw_name=raw_name, args=args,
+                )
+                st.dispatched_in_pass += 1
+                round_results[canonical] = None
+                st.accumulated_tool_results[canonical] = None
+                continue
+            try:
+                st._round_had_execution = True  # type: ignore[attr-defined]
+                result, tool_log = await context.execute_tool(
+                    self.store, raw_name, args, postgres=self.postgres,
+                    memory=self.memory, settings=self.settings,
+                )
+            except Exception as exc:  # one bad tool never kills the cycle
+                log.exception("pass loop: tool %s raised", raw_name)
+                result, tool_log = None, capability_log_entry(
+                    f"tool.error:{canonical}",
+                    {"symbol": self.symbol, "venue": self.venue},
+                    "error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            st.dispatched_in_pass += 1
+            st.capability_log.append(tool_log)
+            # Hard-track hits: an executed in-position tool call counts
+            # toward its position's ≥1-dispatch floor (denials and errors
+            # never count — only real executions do).
+            if (st.loop_tag == "reasoning" and tool_log.get("result") == "ok"
+                    and st.reason_position < len(POSITION_ORDER)):
+                active_position = POSITION_ORDER[st.reason_position]
+                active_tools = set(POSITION_TOOLS.get(active_position, ()))
+                if active_position == "hypothesize":
+                    active_tools = active_tools | {FORWARD_SCENARIO_TOOL}
+                if canonical in active_tools:
+                    st.position_hits[active_position] = \
+                        st.position_hits.get(active_position, 0) + 1
+            # Controller classifies the outcome (the ONLY place the
+            # ok-with-refused-detail null-discipline shape is
+            # interpreted), applies phase-coverage credit, and returns
+            # a NEW immutable controller — rebound here.
+            st.controller = st.controller.record_outcome(
+                canonical, tool_log, result,
+                raw_name=raw_name, args=args,
+            )
+            if result is None:
+                result_payload = None
+            else:
+                rendered = json.dumps(result, default=str)
+                if len(rendered) < 40_000:
+                    result_payload = json.loads(rendered)
+                else:
+                    result_payload = {"_truncated": True, "preview": rendered[:4_000]}
+            round_results[canonical] = result_payload
+            st.accumulated_tool_results[canonical] = result_payload
+        st.tool_results.update(round_results)
+        st._round_results = round_results  # type: ignore[attr-defined]
+
+    async def _followup_turn(self, ctx: Any, st: CycleRuntimeState) -> dict[str, Any] | None:
+        """One follow-up LLM turn for ``st.loop_tag``. Returns parsed or None.
+
+        On failure the carrier is annotated with ``failure_kind`` /
+        ``failure_detail`` and ``None`` is returned; callers route through
+        ``context.run_runtime_failure``. On parse failure the carrier is
+        similarly annotated.
+        """
+        coverage = st.controller.phase_coverage
+        next_phase = next_uncovered_phase(coverage)
+        # P1–P6 remain coverage/provenance labels only.  They do not retask the
+        # FSM observation; the prompt below derives its actual intent from the
+        # controller and uses the next phase only for evidence guidance.
+        chain = (st.task_workflow or {}).get("chain") or []
+        round_results = getattr(st, "_round_results", {})
+        chain_block = ""
+        if st.loop_tag == "reasoning":
+            freeze_chain(st, ctx.task, ctx.scenario)
+            st_chain = st.deterministic_state["statistical_chain"]
+            st_render = chain_completion(
+                st.controller, task=ctx.task, scenario=ctx.scenario,
+            )
+            st_chain["links"] = st_render["links"]
+            st_chain["missing"] = st_render["missing"]
+            st_chain["refused"] = st_render["refused"]
+            st_chain["complete"] = st_render["complete"]
+            chain_block = f"\n{st_render['render']}\n"
+            steer = chain_steer(st_render)
+            if steer:
+                chain_block += f"{steer}\n"
+            # Hard-track position: the agent's current third of the track
+            # (core-computed from outcomes, never agent claims).
+            # Halted track: render the reformulation steer instead of the
+            # position block (positions are frozen; only the halted tool
+            # with new args, or closing, moves the cycle).
+            if st.chain_halt is not None:
+                chain_block += f"\n{halt_steer(st.chain_halt)}\n"
+            elif st.reason_position < len(POSITION_ORDER):
+                active_position = POSITION_ORDER[st.reason_position]
+                pstat = position_status(
+                    st.controller.outcomes, active_position,
+                    task=ctx.task, scenario=ctx.scenario)
+                chain_block += (
+                    f"\nREASONING POSITION {st.reason_position + 1}/3: "
+                    f"{active_position}\n{position_steer(pstat)}\n"
+                )
+        # Compose the follow-up prompt via the prompt-ecosystem composer so
+        # follow-up layout stays in lock-step with the narrate-1 and repair
+        # composers.
+        user_prompt_next = kb.compose_followup_prompt(
+            controller=st.controller,
+            loop=st.loop_tag,
+            sub_loop=("acquisition" if st.loop_tag == "evidence"
+                      else "analysis" if st.loop_tag == "reasoning"
+                      else "recovery"),
+            passes_spent=st.passes_per_loop.get(st.loop_tag, 0),
+            pass_budget=LOOP_PASS_BUDGET.get(st.loop_tag, 0),
+            dispatches_left=MAX_DISPATCHES_PER_PASS - st.dispatched_in_pass,
+            chain=chain,
+            accumulated=st.accumulated_tool_results,
+            round_results=round_results,
+            task_reminder=st.task_reminder,
+            scenario_reminder=st.scenario_reminder,
+            phase_guidance=st.phase_guidance,
+            next_phase=next_phase,
+            chain_block=chain_block,
+        )
+        try:
+            raw_next = await self._call_llm(user_prompt_next)
+        except Exception as exc:
+            log.exception("pass narration round failed; ending loop early")
+            st.failure_kind = "narration_failed"
+            st.failure_detail = f"{type(exc).__name__}: {exc}"
+            return None
+        st.llm_calls += 1
+        st.passes_per_loop[st.loop_tag] = st.passes_per_loop.get(st.loop_tag, 0) + 1
+        parsed_next = coerce_turn(extract_json_object(raw_next))
+        if parsed_next is None:
+            log.warning("pass round parse failed, ending loop")
+            st.failure_kind = "parse_failed"
+            st.failure_detail = "no JSON object in follow-up narration"
+            return None
+        st.parsed_current = parsed_next
+        st.controller = context._mark_declared(st.controller, parsed_next)
+        return parsed_next
+
+    def _name_pending(self, st: CycleRuntimeState) -> None:
+        """Name undispatched calls on a loop that ends with work pending."""
+        pending = st.parsed_current.get("tool_calls")
+        if isinstance(pending, list):
+            for call in pending:
+                if isinstance(call, dict):
+                    raw_name = str(call.get("name") or call.get("tool") or "").strip()
+                    if raw_name and raw_name not in st.unexecuted:
+                        st.unexecuted.append(raw_name)
 
     # ------------------------------------------------------------------
     # Memory proposal resolution (LLM proposes; engine disposes)

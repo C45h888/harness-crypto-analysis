@@ -133,15 +133,15 @@ async def execute_tool(
             store, symbol, target, postgres=postgres, venue=venue,
         )
     if name == "calc.ofi.intervals":
-        return await dispatch_calc_ofi_intervals(store, symbol, venue, interval_ms=int(args.get("interval_ms") or args.get("interval_seconds", 10)*1000 if "interval_seconds" in args else 10_000), window_minutes=int(args.get("window_minutes") or 30))
+        return await dispatch_calc_ofi_intervals(store, symbol, venue, interval_ms=int(args.get("interval_ms") or args.get("interval_seconds", 10)*1000 if "interval_seconds" in args else 10_000), window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.depth.average":
-        return await dispatch_calc_ad_average(store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30))
+        return await dispatch_calc_ad_average(store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.observation.build":
-        return await dispatch_calc_observation_build(store, symbol, venue, interval_seconds=int(args.get("interval_seconds") or 10), window_minutes=int(args.get("window_minutes") or 30))
+        return await dispatch_calc_observation_build(store, symbol, venue, interval_seconds=int(args.get("interval_seconds") or 10), window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.fit.price_impact":
-        return await dispatch_calc_fit_price_impact(store, symbol, venue, interval_seconds=int(args.get("interval_seconds") or 10), window_minutes=int(args.get("window_minutes") or 30))
+        return await dispatch_calc_fit_price_impact(store, symbol, venue, interval_seconds=int(args.get("interval_seconds") or 10), window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.fit.depth_scaling":
-        return await dispatch_calc_fit_depth_scaling(store, symbol, venue)
+        return await dispatch_calc_fit_depth_scaling(store, symbol, venue, postgres=postgres)
     if name in ("calc.derived_diagnostic", "calc.price.delta"):
         return await dispatch_calc_derived_diagnostic(
             store, symbol, venue,
@@ -161,28 +161,28 @@ async def execute_tool(
         )
     if name == "calc.feature.build":
         return await dispatch_calc_feature_build(
-            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30))
+            store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.forward.join":
         return await dispatch_calc_forward_join(
             store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
-            tick_size=_resolved_tick_for_dispatch(symbol, venue, args))
+            tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name == "calc.forward.fit":
         return await dispatch_calc_forward_fit(
             store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
             horizon_ms=int(args.get("horizon_ms") or 5000),
-            tick_size=_resolved_tick_for_dispatch(symbol, venue, args))
+            tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name == "calc.forward.distribution":
         theta = args.get("theta_ticks")
         return await dispatch_calc_forward_distribution(
             store, symbol, venue, horizon_ms=int(args.get("horizon_ms") or 5000),
             theta_ticks=theta, window_minutes=int(args.get("window_minutes") or 30),
-            tick_size=_resolved_tick_for_dispatch(symbol, venue, args))
+            tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name == "calc.forward.scenario":
         return await dispatch_calc_forward_scenario(
             store, symbol, venue, horizon_ms=int(args.get("horizon_ms") or 5000),
             targets=list(args.get("targets") or []), invalidations=list(args.get("invalidations") or []),
             window_minutes=int(args.get("window_minutes") or 30),
-            tick_size=_resolved_tick_for_dispatch(symbol, venue, args))
+            tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name == "calc.forward.forecast":
         return await dispatch_calc_forward_forecast(
             store, symbol, venue, horizon_ms=int(args.get("horizon_ms") or 5000),
@@ -194,21 +194,21 @@ async def execute_tool(
             horizon_ms=int(args.get("horizon_ms") or 5000),
             m_tests=int(args.get("m_tests") or 1),
             window_minutes=int(args.get("window_minutes") or 30),
-            tick_size=_resolved_tick_for_dispatch(symbol, venue, args))
+            tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name in ("calc.events.absorption", "calc.events.walls"):
         kind = "absorption" if name.endswith("absorption") else "walls"
         return await dispatch_calc_events(
             store, symbol, venue, kind=kind,
-            window_minutes=int(args.get("window_minutes") or 30))
+            window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.decay.report":
         return await dispatch_calc_decay_report(
             store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
-            tick_size=_resolved_tick_for_dispatch(symbol, venue, args))
+            tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name == "calc.discipline.audit":
         return await dispatch_calc_discipline_audit(
             store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
             tick_size=_resolved_tick_for_dispatch(symbol, venue, args),
-            cost_statement=args.get("cost_statement"))
+            cost_statement=args.get("cost_statement"), postgres=postgres)
     if name == "memory.recall_paper":
         return await dispatch_memory_recall_paper(
             symbol, venue, query=str(args.get("query") or "Cont OFI AD beta"),

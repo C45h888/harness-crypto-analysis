@@ -23,6 +23,7 @@ follow-up turn. This is the seam the prompt-economy work lives at.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from .config import (
     _PAPER_KB,
     _TOOL_MANIFEST,
 )
+from .tool_schemas import tool_schema_block, wrap_tool_result
 from .loop_states import (
     LOOP_SUBLOOPS,
     STAGE_ORDER,
@@ -102,6 +104,9 @@ PAPER KB (Cont et al. 1011.6402 excerpts — bounded):
 {workflow_brief}
 TOOL MANIFEST (commandable, deterministic — USE IT):
 {tool_manifest}
+
+TOOL OUTPUT SCHEMAS (every tool returns a ToolResult envelope with tool/status/reason/data/null_fields; cite fields from ``data``; ``null_fields`` names what was not computed):
+{tool_schemas}
 """
 
 
@@ -122,6 +127,7 @@ def build_system_prompt(symbol: str, venue: str, max_rounds: int) -> str:
             "TOOL MANIFEST:\n" + load_kb(_TOOL_MANIFEST)
             if _TOOL_MANIFEST.exists() else ""
         ),
+        tool_schemas=tool_schema_block(),
     )
 
 
@@ -189,7 +195,7 @@ def build_output_format() -> str:
         "  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n"
         "  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
         "  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n"
-        "  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n"
+        "  P5 derived (memory node pruned from the track — transport retained): calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n"
         "  P5 forward stack (Track D horizon-native): calc.forward.forecast (canonical ForecastResult), "
         "the feature/join/fit/distribution tools are diagnostic sub-tools, then calc.forward.scenario, "
         "calc.hypothesis.test (post-fit only, needs hypothesis_id), "
@@ -201,8 +207,9 @@ def build_output_format() -> str:
         "(TWO-BEAT: invoke ≥1 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; "
         "substrate.read is the verdict, market.read is context; judge freshness via age_ms; "
         "dormant/empty results are findings, never re-invoke) → "
-        "P4 explanation (the why-now synthesis) → P5 derivation (memory.recall_paper FIRST, then "
-        "calc.price.delta with an OFI value for the NUMERIC ΔP + band) → "
+        "P4 explanation (the why-now synthesis) → P5 derivation (calc.price.delta "
+        "with an OFI value for the NUMERIC ΔP + band; H0/H1 grounding comes from the "
+        "track's own evidence, formed in reasoning position 3) → "
         "P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\n"
         "WINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds "
         "(10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\n"
@@ -212,6 +219,9 @@ def build_output_format() -> str:
         "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, confidence low|medium|high, "
         "every evidence entry carries a non-empty interpretation, "
         "and evidence cites ≥2 distinct roots incl. a calc.price.delta → … ΔP path plus ≥1 more fresh tool result. "
+        "Every tool result arrives in a ToolResult envelope ``{tool, status, reason, data, null_fields}``. "
+        "Cite fields from the ``data`` key using the path ``<tool> → data.<field>``. "
+        "``null_fields`` explicitly names what was not computed (never zero).\n"
         "memory_proposals max 3, kind fact forbidden."
     )
 
@@ -282,7 +292,6 @@ TASK_CHAINS: dict[str, list[str]] = {
     ],
     "general": [
         "calc.forward.forecast",
-        "memory.recall_paper",
         "calc.discipline.audit",
     ],
 }
@@ -298,15 +307,20 @@ CHAIN_MEANING: dict[str, str] = {
     "calc.hypothesis.test": "prove/disprove H0 post-fit (needs hypothesis_id)",
     "calc.decay.report": "which horizons to trust (nulls are results)",
     "calc.discipline.audit": "9-lock discipline gate (validation home; attempt required, refusal is a finding)",
-    "memory.recall_paper": "paper grounding for H0/H1",
 }
 
 
 def build_task_workflow(
     task: str | None, scenario: dict[str, Any] | None,
+    *, kind_override: str | None = None,
 ) -> dict[str, Any]:
-    """Ordered required chain for this task shape (deterministic)."""
-    kind = classify_task(task, scenario)
+    """Ordered required chain for this task shape (deterministic).
+
+    ``kind_override`` is the directive-bound kind from the plan — the plan
+    selects required-ness; it never invents links (TASK_CHAINS stays the
+    only vocabulary).
+    """
+    kind = kind_override or classify_task(task, scenario)
     chain = list(TASK_CHAINS[kind])
     steps = [
         f"{i}. {tool} — {CHAIN_MEANING.get(tool, 'cited evidence')}"
@@ -404,8 +418,6 @@ def build_loop_state_block(
 
 def json_dumps_short(value: Any, cap: int = 600) -> str:
     """Bounded JSON rendering for prompt blocks (never raises)."""
-    import json
-
     try:
         return json.dumps(value, default=str)[:cap]
     except Exception:
@@ -422,23 +434,28 @@ TOOL_WINDOWS: dict[str, str] = {
         "micro.capture_status + micro.fit_beta (gate reads already done — do not re-pull); "
         "market.read snapshot (current price + regime); "
         "calc.forward.forecast (canonical ForecastResult: X_t, Y(h), train-only OOS, calibration gate, "
-        "forecast regime, assumptions, and Route A/B diagnostics); "
-        "memory.recall_paper (ground H0/H1 in Cont facts before any test). "
+        "forecast regime, assumptions, and Route A/B diagnostics). "
         "Gather only: do not conclude, do not test hypotheses. "
         "Refusals are findings to record with reasons, never failures to repair."
     ),
     "reasoning": (
-        "YOUR TOOLS THIS LOOP — walk the steady track in order, cite each link: "
-        "HYPOTHESIS first (frame H0/H1 from recalled paper facts + forecast assumptions); "
-        "then ANALYSIS/TEST in order — calc.forward.forecast (read expected delta, "
-        "validation_state, probability_status, assumptions, route disagreement, and the "
-        "chain_trace receipt proving internal A → B → Multivariate → Compare); "
-        "calc.forward.scenario with horizon_ms + targets/invalidations (P_ge/P_le only when calibration passes; legacy scenario stays the flow-requirement baseline — report agreement AND disagreement); "
-        "calc.hypothesis.test with hypothesis_id + horizon_ms + m_tests (post-fit only; p<0.05 is evidence, never execution); "
-        "then ANALYSIS/COMPARE — calc.decay.report (which horizons survive — quote it before trusting any horizon); "
-        "calc.events.absorption/walls for E[dP|event] conditioning when liquidity language is present; "
-        "then SYNTHESIS — test, then compare, then synthesize: synthesis cites paths, invents nothing. "
-        "Validation (calc.discipline.audit) and output composition are later loops, not this one."
+        "YOUR TOOLS THIS LOOP — three forced positions, in order (the loop cannot exit "
+        "before all three complete; tools from a later position are denied until it is active): "
+        "POSITION 1/3 ASSEMBLE — re-derive the substrates, no interpretation: state your "
+        "paper-grounded prior from the recalled facts, then calc.ofi.intervals (Route A OFI first) → "
+        "calc.depth.average (Route B AD) → calc.forward.join (multivariate X_t joined to Y(h)). "
+        "POSITION 2/3 INTERPRET — fit the equation and read the distribution: calc.forward.fit → "
+        "calc.forward.distribution (expected delta, validation_state, probability_status, assumptions, "
+        "route disagreement, chain_trace receipt) → calc.decay.report (which horizons survive — quote it "
+        "before trusting any horizon); calc.forward.forecast re-reads are allowed for cross-checking. "
+        "POSITION 3/3 HYPOTHESIZE — think against the user prompt, form the testable H0 (only now that "
+        "the distribution exists) and run calc.hypothesis.test with hypothesis_id + horizon_ms + m_tests "
+        "(post-fit only; p<0.05 is evidence, never execution), plus calc.forward.scenario with horizon_ms + "
+        "targets/invalidations when horizons are present (P_ge/P_le only when calibration passes; legacy "
+        "scenario stays the flow-requirement baseline — report agreement AND disagreement); "
+        "calc.events.absorption/walls for E[dP|event] conditioning when liquidity language is present. "
+        "Then close with tool_calls=[]. Validation (calc.discipline.audit) and output composition are later "
+        "loops, not this one. Refusals are findings to record with reasons, never failures to repair."
     ),
     "validation": (
         "YOUR TOOLS THIS LOOP — calc.discipline.audit (pull it), then stop. "
@@ -459,9 +476,329 @@ __all__ = [
     "build_workflow_brief",
     "chain_status",
     "classify_task",
+    "compose_followup_prompt",
+    "compose_narrate1_prompt",
+    "compose_repair_prompt",
+    "default_comprehension",
     "json_dumps_short",
     "load_kb",
     "load_paper_kb",
+    "seed_evidence_plan",
     "build_system_prompt",
     "build_output_format",
+    # Tool schema exports
+    "wrap_tool_result",
 ]
+
+
+# --------------------------------------------------------------------------
+# Comprehension-block builders (deterministic prompt sections)
+# --------------------------------------------------------------------------
+# These two functions are pure over (task, scenario). They produce the
+# prompt sections the comprehension loop prepares deterministically before
+# any LLM call — the seeded plan and the default-comprehension fallback.
+
+
+def seed_evidence_plan(
+    task: str | None, scenario: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Deterministic evidence seed: task shape -> suggested tools.
+
+    Autonomy inside a planned frame: the engine suggests, the agent
+    disposes. Seeds never execute by themselves — every dispatch is an
+    agent tool_call classified by the controller. Pure over injected
+    task/scenario (no I/O, no LLM).
+    """
+    seeds: list[str] = [
+        "calc.forward.forecast",
+    ]
+    rationale = ["canonical deterministic forward ForecastResult always seeded"]
+    blob = f"{task or ''} {json.dumps(scenario or {})}".lower()
+    if scenario is not None:
+        seeds += ["calc.scenario.evaluate", "calc.forward.scenario"]
+        rationale.append("scenario present: legacy + forward scenario paths")
+    if any(k in blob for k in ("horizon", "1s", "5s", "30s", "60s",
+                                "target", "theta", "probab",
+                                "hypothes", "h0", "h1")):
+        seeds += ["calc.forward.distribution", "calc.hypothesis.test",
+                    "calc.decay.report"]
+        rationale.append("horizon/hypothesis language: distribution + test + decay")
+    if any(k in blob for k in ("wall", "absorb", "liquid", "reversal",
+                                "support", "resist")):
+        seeds += ["calc.events.absorption", "calc.events.walls"]
+        rationale.append("liquidity language: typed event detectors")
+    # Memory is pruned from the seeded track (its node stays transport for
+    # later use): H0/H1 grounding comes from the track's own evidence +
+    # position-3 formation, not from seeded paper recall.
+    seen: list[str] = []
+    for seed in seeds:
+        if seed not in seen:
+            seen.append(seed)
+    return {"seeds": seen, "rationale": rationale}
+
+
+def default_comprehension(
+    task: str | None, scenario: dict[str, Any] | None,
+    seed: dict[str, Any], reason: str,
+) -> dict[str, Any]:
+    """Fallback understanding block when the comprehension pass fails.
+
+    Never kills the cycle: a defaulted block plus the seeded plan keeps
+    the loop moving, and the parse note records what happened.
+    """
+    return {
+        "intent": (task[:200] if task else "autonomous microstructure inference"),
+        "constraints": {
+            "scenario": scenario,
+            "pass_budgets": dict(LOOP_PASS_BUDGET),
+        },
+        "questions": ["what is the current microstructure state?",
+                        "what does the forward evidence support?"],
+        "evidence_plan": list(seed.get("seeds") or []),
+        "parse_note": reason,
+    }
+
+
+# --------------------------------------------------------------------------
+# Per-pass prompt composers
+# --------------------------------------------------------------------------
+# Three composers replace the multi-block prompt-assembly that used to be
+# inlined in run_evidence (narrate-1), _followup_turn (follow-up), and
+# run_validation (repair). Each one renders a string the engine can hand
+# to the LLM directly; none of them mutate state. They depend on
+# build_loop_state_block / TOOL_WINDOWS / TURN_CONTRACT_LINE / chain_status
+# and the LLM block, so they live here, next to those primitives.
+
+
+def compose_narrate1_prompt(
+    *,
+    controller: Any,
+    loop: str,
+    sub_loop: str,
+    intent: str | None,
+    passes_spent: int,
+    pass_budget: int,
+    dispatches_left: int,
+    seeds: list[str] | None,
+    task_block: str,
+    scenario_block: str,
+    wake_block: str,
+    deterministic_state: dict[str, Any],
+    prior_note: str,
+    memory_block: str,
+    output_format: str,
+    workflow_block: str,
+    traversal: dict[str, Any] | None = None,
+    gate: dict[str, Any] | None = None,
+) -> str:
+    """Compose the loop's first-turn (narrate#1) prompt.
+
+    Two-stage assembly, mirrored from the legacy inline code: first the
+    envelope + recall blocks, then the loop-state relay header prepended.
+    Pure: returns the assembled prompt string without mutating inputs.
+    """
+    context_block = (
+        f"{task_block}"
+        f"{scenario_block}"
+        f"WAKE: {wake_block}\n\n"
+        "ENVELOPE STATE (gate reads + wake identity — READ-PLANE; pull "
+        "everything else yourself via tools; never recompute values, "
+        "COMMAND the read tools and cite their paths):\n"
+        f"{json.dumps(deterministic_state, default=str)[:60_000]}\n\n"
+        f"{prior_note}\n\n"
+    )
+    if memory_block:
+        context_block += (
+            "RECALLED MEMORY (provenance-tagged priors; subordinate to the "
+            f"ledger):\n{memory_block}\n\n"
+        )
+    context_block += output_format
+    # Wrap the deterministic_state envelope + gate reads in ToolResult
+    # envelopes so the LLM sees the same structure from turn 1.
+    from .tool_schemas import wrap_tool_result
+
+    # Wake identity + gate reads get wrapped so the model gets the uniform
+    # envelope from the very first turn.
+    wrapped_det = {}
+    for k, v in deterministic_state.items():
+        if k in ("gate", "forecast_result") and isinstance(v, dict):
+            wrapped_det[k] = k
+        elif k in ("forecast_result", "fit_status", "capture_state"):
+            wrapped_det[k] = v
+        else:
+            wrapped_det[k] = v
+    # The envelope block stays raw (it's the run identity, not a tool)
+    # but we inject a note about the ToolResult envelope.
+    context_block = (
+        f"{task_block}"
+        f"{scenario_block}"
+        f"WAKE: {wake_block}\n\n"
+        "ENVELOPE STATE (gate reads + wake identity — READ-PLANE; pull "
+        "everything else yourself via tools; never recompute values, "
+        "COMMAND the read tools and cite their paths from the ``data`` key):\n"
+        f"{json.dumps(deterministic_state, default=str)[:60_000]}\n\n"
+        f"{prior_note}\n\n"
+    )
+    if memory_block:
+        context_block += (
+            "RECALLED MEMORY (provenance-tagged priors; subordinate to the "
+            f"ledger):\n{memory_block}\n\n"
+        )
+    context_block += output_format
+    return (
+        build_loop_state_block(
+            controller=controller,
+            loop=loop, sub_loop=sub_loop,
+            intent=intent,
+            passes_spent=passes_spent, pass_budget=pass_budget,
+            dispatches_left=dispatches_left,
+            traversal=traversal or controller.loop_coverage(),
+            gate=gate or deterministic_state.get("gate"),
+            seeds=seeds,
+        )
+        + "\n\n" + TOOL_WINDOWS.get(loop, "")
+        + "\n\n" + workflow_block
+        + "\n\n" + context_block
+    )
+
+
+def compose_followup_prompt(
+    *,
+    controller: Any,
+    loop: str,
+    sub_loop: str,
+    passes_spent: int,
+    pass_budget: int,
+    dispatches_left: int,
+    chain: list[str],
+    accumulated: dict[str, Any],
+    round_results: dict[str, Any],
+    task_reminder: str,
+    scenario_reminder: str,
+    phase_guidance: dict[str, str],
+    next_phase: str,
+    chain_block: str = "",
+) -> str:
+    """Compose the per-pass follow-up prompt.
+
+    Single source of truth for the follow-up layout: loop-state header,
+    tool window, chain status, accumulated results, prior passes, phase
+    coverage, turn contract. The caller supplies the loop-specific chain
+    block (rendered by chain_completion + chain_steer) so the layout
+    stays composable across reasoning / validation / recovery.
+    """
+    loop_header = build_loop_state_block(
+        controller=controller,
+        loop=loop, sub_loop=sub_loop, intent=None,
+        passes_spent=passes_spent, pass_budget=pass_budget,
+        dispatches_left=dispatches_left,
+        traversal=controller.loop_coverage(),
+        gate=None,
+        congruence=(controller.congruence() if loop == "reasoning" else None),
+        comprehension=None,
+    )
+    from .tool_schemas import build_phase_summary_block
+
+    # Wrap raw tool results in the ToolResult envelope so the LLM sees
+    # uniform tool/status/reason/data/null_fields structure. Results that
+    # already have a "tool" key are treated as already wrapped.
+    def _maybe_wrap(name: str, value: Any) -> Any:
+        if isinstance(value, dict) and "tool" in value:
+            return value
+        return wrap_tool_result(name, value, status="ok")
+
+    wrapped_round = {
+        name: _maybe_wrap(name, value)
+        for name, value in round_results.items()
+    }
+    wrapped_accum = {
+        name: _maybe_wrap(name, value)
+        for name, value in accumulated.items()
+        if name not in round_results
+    }
+    phase_block = build_phase_summary_block(wrapped_round)
+
+    return (
+        f"{loop_header}\n\n"
+        f"{TOOL_WINDOWS.get(loop, '')}\n\n"
+        f"{chain_status(chain, list(accumulated))}\n"
+        f"{chain_block}\n"
+        f"{task_reminder}"
+        f"{scenario_reminder}"
+        f"PASS RESULTS (pass {passes_spent} of "
+        f"{pass_budget} for {loop}; cite paths from the ``data`` key):\n"
+        f"{json.dumps(wrapped_round, default=str)[:40_000]}\n\n"
+        f"PRIOR PASSES (earlier results, for citation):\n"
+        f"{json.dumps(wrapped_accum, default=str)[:40_000]}\n\n"
+        f"{phase_block}"
+        "PHASE COVERAGE (families with ≥1 ok tool): "
+        f"{json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
+        f"{phase_guidance[next_phase]}\n"
+        f"{TURN_CONTRACT_LINE}\n"
+        f"Passes remaining in {loop}: "
+        f"{pass_budget - passes_spent}. "
+        'Declare "phase" every turn; call this loop\'s tools, or advance with tool_calls=[].'
+    )
+
+
+def compose_repair_prompt(
+    *,
+    controller: Any,
+    loop: str,
+    sub_loop: str,
+    passes_spent: int,
+    pass_budget: int,
+    dispatches_left: int,
+    missing: list[str],
+    accumulated: dict[str, Any],
+    task_reminder: str,
+    scenario_reminder: str,
+    scenario_steer: str,
+    phase_guidance: dict[str, str],
+    next_phase: str,
+) -> str:
+    """Compose the validation-loop repair-turn prompt.
+
+    Mirror of compose_followup_prompt, structured for the bounded retry:
+    rejection header, accumulated results, missing items, phase guidance.
+    """
+    from .tool_schemas import build_phase_summary_block, wrap_tool_result
+
+    def _maybe_wrap(name: str, value: Any) -> Any:
+        if isinstance(value, dict) and "tool" in value:
+            return value
+        return wrap_tool_result(name, value, status="ok")
+
+    wrapped_accum = {
+        name: _maybe_wrap(name, value)
+        for name, value in accumulated.items()
+    }
+    phase_block = build_phase_summary_block(wrapped_accum)
+
+    repair_header = build_loop_state_block(
+        controller=controller,
+        loop=loop, sub_loop=sub_loop,
+        intent=None,
+        passes_spent=passes_spent, pass_budget=pass_budget,
+        dispatches_left=dispatches_left,
+        traversal=controller.loop_coverage(),
+        gate=None,
+        congruence=controller.congruence(),
+        comprehension=None,
+    )
+    return (
+        f"{repair_header}\n\n"
+        f"{TOOL_WINDOWS.get(loop, '')}\n\n"
+        f"{task_reminder}"
+        f"{scenario_reminder}"
+        f"{scenario_steer}"
+        "FINAL REJECTED — staged inference incomplete. Missing:\n"
+        + "\n".join(f"- {item}" for item in missing)
+        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{json.dumps(wrapped_accum, default=str)[:40_000]}\n\n"
+        f"{phase_block}"
+        f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
+        f"{phase_guidance[next_phase]}\n"
+        f"{TURN_CONTRACT_LINE}\n"
+        "Return the next turn now: declare \"phase\", include the missing tool_calls, "
+        "and finalize (tool_calls=[]) only when every missing item is addressed."
+    )

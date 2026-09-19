@@ -144,10 +144,10 @@ class ResolveInferenceStatusTests(unittest.TestCase):
         self.assertEqual(status, "provisional")
         self.assertTrue(any("provisional" in r for r in reasons))
 
-    def test_provisional_when_sequence_gaps(self):
+    def test_provisional_when_degraded_spans(self):
         status, _ = resolve_inference_status(
             n_observations=80, min_observations=30, fit_status="validated",
-            capture_state="running", events_in_window=500, sequence_gaps=2,
+            capture_state="running", events_in_window=500, degraded_spans_in_window=2,
         )
         self.assertEqual(status, "provisional")
 

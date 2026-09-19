@@ -9,11 +9,13 @@ from .history_adapter import (
     _price_fit_from_dict,
     _tool_fit_beta,
 )
+from .replay_adapter import _read_tape_payloads
 from .registry import _bounded
 from .tick_guard import _frozen_tick
 
 async def dispatch_calc_ofi_intervals(
     store: RedisRuntimeStore, symbol: str, venue: str, *, interval_ms: int = 10_000, window_minutes: int = 30,
+    postgres: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Tool: calc.ofi.intervals — deterministic OFI per interval (no AD)."""
     import market_service.microstructure as fm
@@ -21,7 +23,7 @@ async def dispatch_calc_ofi_intervals(
     scope = {"symbol": symbol.upper(), "venue": venue, "interval_ms": interval_ms, "window_minutes": window_minutes}
     try:
         cap.validate_scope(symbol, venue)
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, dropped = fm.replay_events_from_payloads(payloads)
         window_ms = window_minutes * 60_000
         end_ts = events[-1].current.exchange_ts_ms if events else 0
@@ -38,6 +40,7 @@ async def dispatch_calc_ofi_intervals(
 
 async def dispatch_calc_ad_average(
     store: RedisRuntimeStore, symbol: str, venue: str, *, window_minutes: int = 30,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.depth.average — AD per block, separate from OFI (paper AD_i)."""
     from decimal import Decimal
@@ -47,7 +50,7 @@ async def dispatch_calc_ad_average(
     scope = {"symbol": symbol.upper(), "venue": venue, "window_minutes": window_minutes}
     try:
         cap.validate_scope(symbol, venue)
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, dropped = fm.replay_events_from_payloads(payloads)
         window_ms = window_minutes * 60_000
         end_ts = events[-1].current.exchange_ts_ms if events else 0
@@ -67,6 +70,7 @@ async def dispatch_calc_ad_average(
 
 async def dispatch_calc_observation_build(
     store: RedisRuntimeStore, symbol: str, venue: str, *, interval_seconds: int = 10, window_minutes: int = 30,
+    postgres: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Tool: calc.observation.build — join OFI+AD+ΔP → observations (ΔP ticks vs OFI)."""
     from decimal import Decimal
@@ -76,7 +80,7 @@ async def dispatch_calc_observation_build(
     scope = {"symbol": symbol.upper(), "venue": venue, "interval_seconds": interval_seconds, "window_minutes": window_minutes}
     try:
         cap.validate_scope(symbol, venue)
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, dropped = fm.replay_events_from_payloads(payloads)
         window_ms = window_minutes * 60_000
         end_ts = events[-1].current.exchange_ts_ms if events else 0
@@ -94,6 +98,7 @@ async def dispatch_calc_observation_build(
 
 async def dispatch_calc_fit_price_impact(
     store: RedisRuntimeStore, symbol: str, venue: str, *, interval_seconds: int = 10, window_minutes: int = 30,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.fit.price_impact — OLS ΔP=α+β·OFI (HC0), takes split observations."""
     from decimal import Decimal
@@ -103,7 +108,7 @@ async def dispatch_calc_fit_price_impact(
     scope = {"symbol": symbol.upper(), "venue": venue, "interval_seconds": interval_seconds}
     try:
         cap.validate_scope(symbol, venue)
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, _ = fm.replay_events_from_payloads(payloads)
         windowed = [e for e in events if e.current.exchange_ts_ms >= (events[-1].current.exchange_ts_ms - window_minutes*60_000)] if events else []
         intervals = fm.replay_intervals(windowed, interval_ms=interval_seconds*1000)
@@ -118,6 +123,7 @@ async def dispatch_calc_fit_price_impact(
 
 async def dispatch_calc_fit_depth_scaling(
     store: RedisRuntimeStore, symbol: str, venue: str,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.fit.depth_scaling — lnβ = ln c - λ ln AD, needs ≥3 blocks. Derived diagnostic."""
     import market_service.microstructure as fm
@@ -126,7 +132,7 @@ async def dispatch_calc_fit_depth_scaling(
     try:
         cap.validate_scope(symbol, venue)
         # For split discipline, we can only fit depth scaling from history — single window gives n_blocks=1 → insufficient by design
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, _ = fm.replay_events_from_payloads(payloads)
         intervals = fm.replay_intervals(events, interval_ms=10_000)
         from market_service.microstructure.tick import resolve_tick_size
@@ -197,7 +203,7 @@ async def dispatch_calc_derived_diagnostic(
                 )
             ofi_source = "scenario_arg"
         else:
-            payloads = await store.read_microstructure_events(venue, symbol.upper())
+            payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
             events, _dropped = fm.replay_events_from_payloads(payloads)
             intervals = fm.replay_intervals(events, interval_ms=interval_seconds * 1_000)
             if not intervals:
@@ -343,7 +349,7 @@ async def dispatch_calc_scenario_evaluate(
                 cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "snapshot price non-positive"},
             )
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, _dropped = fm.replay_events_from_payloads(payloads)
         intervals = fm.replay_intervals(events, interval_ms=interval_seconds * 1_000)
         tick_dec = Decimal(_frozen_tick(symbol, venue, tick_size))

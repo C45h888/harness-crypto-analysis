@@ -130,6 +130,25 @@ def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     return parsed
 
 
+def has_directive_verdict(parsed: dict[str, Any] | None) -> bool:
+    """Task-conformance read (pure): did the final surface the verdict?
+
+    True when the final's evidence cites the task directive or a scenario
+    verdict path (forward scenario / legacy exceedance) — the deterministic
+    directive/scenario surface the plan bound. Used by the validation gate
+    for target-bearing directives; the repair steer names the citation.
+    """
+    evidence = (parsed or {}).get("evidence") or []
+    for entry in evidence if isinstance(evidence, list) else []:
+        path = (str((entry or {}).get("path", ""))
+                if isinstance(entry, dict) else str(entry or ""))
+        if ("task_directive" in path or "forward_scenario" in path
+                or "calc.forward.scenario" in path
+                or "calc.scenario.evaluate" in path):
+            return True
+    return False
+
+
 def validate_final_turn(
     parsed: dict[str, Any],
     coverage: dict[str, set[str]],
@@ -427,8 +446,8 @@ PHASE_GUIDANCE: dict[str, str] = {
     "P4": ("PHASE P4 — EXPLAIN: no new tools required. Write the synthesis: what the fits show "
            f"(≥{SUMMARY_MIN_CHARS} chars in summary) AND why it is happening now — regime, capture quality, "
            "flow/positioning drivers. Then proceed to P5."),
-    "P5": ("PHASE P5 — DERIVE: call memory.recall_paper FIRST (ground H0/H1 in Cont 1011.6402 facts), "
-           "then calc.price.delta (alias calc.derived_diagnostic) with an OFI value — scenario arg or "
+    "P5": ("PHASE P5 — DERIVE: calc.price.delta (alias calc.derived_diagnostic) with an OFI value — scenario arg or "
+           "latest-interval default — for the NUMERIC derived ΔP (route A direct + route B when c/λ exist, "
            "latest-interval default — for the NUMERIC derived ΔP (route A direct + route B when c/λ exist, "
            "with 95% band). A refusal (insufficient fit) is a finding, not a failure: report it. "
            "Forward stack (Track D, horizon-native): call calc.forward.forecast first for the canonical "
@@ -463,6 +482,7 @@ def next_uncovered_phase(coverage: dict[str, set[str]]) -> str:
 __all__ = [
     "extract_json_object",
     "coerce_turn",
+    "has_directive_verdict",
     "validate_final_turn",
     "scenario_verdict",
     "PHASE_GUIDANCE",

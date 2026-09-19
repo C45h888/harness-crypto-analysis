@@ -88,6 +88,7 @@ class ToolOutcome:
     refused: bool               # detail.status == 'refused' (null discipline)
     refusal_reason: str | None
     payload: Any                # None when refused/denied/error
+    args: dict[str, Any] | None = None  # dispatch args (suppression is args-aware)
 
 
 @dataclass(frozen=True)
@@ -323,6 +324,7 @@ class CycleController:
             refused=refused,
             refusal_reason=refusal_reason,
             payload=(result if outcome_result == "ok" and not refused else None),
+            args=dict(args) if isinstance(args, dict) else None,
         )
         # Coverage credit is atomic with classification: refusal/denied/error
         # never credits (refusal is a finding, not coverage).
@@ -409,24 +411,30 @@ class CycleController:
     def tool_state(self, tool: str) -> ScenarioEvalStatus:
         """Generic tri-state for any deterministic scenario/test tool.
 
-        Same semantics as scenario_state: REFUSED covers policy refusals
-        and non-ok dispatches; EVALUATED needs an ok non-refused payload.
+        Only genuine executions classify: REFUSED is an ok dispatch with a
+        deterministic refusal; EVALUATED needs an ok non-refused payload.
+        Authorization denials (wrong loop, out-of-position, suppression)
+        and transport errors are SKIPPED — the tool was never attempted, so
+        it stays NOT_CALLED (retryable) instead of masquerading as a
+        refused finding. That distinction is what keeps the chain gate
+        honest: a never-executed discipline audit can never read as
+        "refused" and slip past the required-links check.
         """
         for outcome in reversed(self.outcomes):
             if outcome.canonical != tool:
                 continue
+            if outcome.result != "ok":
+                continue
             if outcome.refused:
                 return ScenarioEvalStatus.REFUSED
-            if outcome.result == "ok":
-                # A dispatch that returned no payload is still a dispatch. It
-                # must not fall back to NOT_CALLED, otherwise the repair loop
-                # can ask the model to repeat an already exhausted tool.
-                return (
-                    ScenarioEvalStatus.EVALUATED
-                    if outcome.payload is not None
-                    else ScenarioEvalStatus.REFUSED
-                )
-            return ScenarioEvalStatus.REFUSED
+            # A dispatch that returned no payload is still a dispatch. It
+            # must not fall back to NOT_CALLED, otherwise the repair loop
+            # can ask the model to repeat an already exhausted tool.
+            return (
+                ScenarioEvalStatus.EVALUATED
+                if outcome.payload is not None
+                else ScenarioEvalStatus.REFUSED
+            )
         return ScenarioEvalStatus.NOT_CALLED
 
     def forward_scenario_state(self) -> ScenarioEvalStatus:
@@ -510,15 +518,20 @@ class CycleController:
     # Redundant-dispatch suppression (refusal is terminal per tool/cycle)
     # ------------------------------------------------------------------
 
-    def is_redundant(self, canonical: str) -> bool:
-        """True when this tool already refused this cycle (terminal).
+    def is_redundant(self, canonical: str, args: dict[str, Any] | None = None) -> bool:
+        """True when this tool already refused this cycle with the same args.
 
-        A refused deterministic tool cannot change its answer within a
-        cycle: re-dispatching is a contract violation (manifest
-        anti-pattern 5) the controller now enforces structurally.
+        Suppression is args-aware: a deterministic refusal is terminal only
+        for identical inputs. A re-call with materially different args
+        (window, interval, horizon) is new work the track may attempt —
+        budgets and predicates still gate it. No-args callers match only
+        no-args refusals, preserving the legacy call shape exactly.
         """
+        wanted = dict(args) if isinstance(args, dict) else {}
         return any(
-            o.canonical == canonical and o.refused for o in self.outcomes
+            o.canonical == canonical and o.refused
+            and (dict(o.args) if isinstance(o.args, dict) else {}) == wanted
+            for o in self.outcomes
         )
 
     # ------------------------------------------------------------------

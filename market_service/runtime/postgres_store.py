@@ -638,6 +638,106 @@ class PostgresRuntimeStore:
         return out
 
     # ------------------------------------------------------------------
+    # Durable microstructure EVENT TAPE (postgres-first, append-only).
+    # Capture appends every published best-quote transition here (best-effort)
+    # so tape reads are no longer bounded by the volatile Redis stream maxlen.
+    # The payload is the SAME serialized OrderBookEvent dict the live stream
+    # carries — one semantic, two media.
+    # ------------------------------------------------------------------
+
+    async def ensure_microstructure_tape(self) -> None:
+        """Idempotent tape table creation (capture bootstraps its own seam)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS microstructure_event_tape (
+                id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                update_id BIGINT NOT NULL,
+                exchange_ts_ms BIGINT NOT NULL,
+                received_ts_ms BIGINT NOT NULL,
+                payload JSONB NOT NULL,
+                captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (symbol, venue, update_id, exchange_ts_ms)
+            );
+            """
+        )
+        await self.pool.execute(
+            """
+            CREATE INDEX IF NOT EXISTS microstructure_event_tape_window_idx
+                ON microstructure_event_tape (symbol, venue, exchange_ts_ms);
+            """
+        )
+
+    async def insert_microstructure_tape_event(self, event_payload: dict[str, Any]) -> bool:
+        """Append one tape event; returns True on a new row (deduped on conflict)."""
+        current = event_payload.get("current") or {}
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO microstructure_event_tape
+               (symbol, venue, update_id, exchange_ts_ms, received_ts_ms, payload)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT (symbol, venue, update_id, exchange_ts_ms) DO NOTHING
+               RETURNING id""",
+            str(event_payload["symbol"]).upper() if event_payload.get("symbol")
+                else str(current.get("symbol") or "").upper(),
+            str(event_payload.get("venue") or current.get("venue") or ""),
+            int(current.get("update_id") or 0),
+            int(current.get("exchange_ts_ms") or 0),
+            int(current.get("received_ts_ms") or 0),
+            json.dumps(event_payload, default=str, separators=(",", ":")),
+        )
+        return row is not None
+
+    async def read_microstructure_tape_events(
+        self, symbol: str, venue: str, *,
+        start_ts_ms: int | None = None, end_ts_ms: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Durable tape read: payloads ordered (exchange_ts_ms, update_id)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        query = """SELECT payload FROM microstructure_event_tape
+                   WHERE symbol = $1 AND venue = $2
+                   AND ($3::BIGINT IS NULL OR exchange_ts_ms >= $3)
+                   AND ($4::BIGINT IS NULL OR exchange_ts_ms <= $4)
+                   ORDER BY exchange_ts_ms ASC, update_id ASC"""
+        if limit is not None:
+            query += " LIMIT $5"
+        rows = await self.pool.fetch(
+            query, symbol.upper(), venue, start_ts_ms, end_ts_ms, limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+            if isinstance(payload, dict):
+                out.append(payload)
+        return out
+
+    async def latest_microstructure_tape_ts(self, symbol: str, venue: str) -> int | None:
+        """Highest durable exchange_ts_ms — the durable/live merge watermark."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        val = await self.pool.fetchval(
+            """SELECT MAX(exchange_ts_ms) FROM microstructure_event_tape
+               WHERE symbol = $1 AND venue = $2""",
+            symbol.upper(), venue,
+        )
+        return int(val) if val is not None else None
+
+    # ------------------------------------------------------------------
     # Inference-engine artifact ledger (postgres-first durable layer).
     # Redis latest-inference keys are projections of these rows only.
     # ------------------------------------------------------------------

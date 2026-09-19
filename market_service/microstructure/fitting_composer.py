@@ -439,17 +439,26 @@ def assemble_forecast_result(
             model_version = FORWARD_MODEL_VERSION
             input_hash = ""
         else:
-            dist = distribution or predict_distribution(fit, x, calibration=calibration) if x else distribution or {}
-            multivariate = dict(dist or {})
+            # Guard: only predict from validated/provisional fits.
+            # An insufficient fit is a finding, not an error — the composer
+            # returns a ForecastResult with multivariate=None and the fit's
+            # own status as validation_state. This avoids the ValueError
+            # from predict_distribution which would turn a clean refusal
+            # into a tool.error (breaking the null-discipline contract).
+            if fit.status in ("validated", "provisional"):
+                dist = distribution or predict_distribution(fit, x, calibration=calibration) if x else distribution or {}
+                multivariate = dict(dist or {})
+                if calibration is not None:
+                    multivariate["calibration"] = calibration
+                    multivariate["probability_status"] = (
+                        "validated" if calibration.get("status") == "passed" else "refused"
+                    )
+            else:
+                multivariate = None
             validation_state = str(fit.validation_status or fit.status)
             horizon_ms = fit.horizon_ms
             model_version = fit.model_version
             input_hash = fit.input_hash
-            if calibration is not None:
-                multivariate["calibration"] = calibration
-                multivariate["probability_status"] = (
-                    "validated" if calibration.get("status") == "passed" else "refused"
-                )
         if x is not None:
             horizon_ms = fit.horizon_ms if fit is not None else horizon_ms
     information_set: dict[str, Any] = {

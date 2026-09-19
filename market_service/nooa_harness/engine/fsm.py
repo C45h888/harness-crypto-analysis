@@ -86,6 +86,39 @@ from market_service.nooa_harness.engine.loop_states import (
 
 
 # ---------------------------------------------------------------------------
+# Failure worker assignment — maps each GovernanceEventKind to the worker
+# that should remediate it.  This is the FSM's constitution for failure
+# handling: the membrane designates BOTH the terminal AND the worker.
+# ---------------------------------------------------------------------------
+
+# Reuse the classification from the failure substrate.  The mapping from
+# GovernanceEventKind -> terminal is already in _FAILURE_KIND_TERMINAL;
+# this companion dict maps the same kinds to worker names and severities.
+# The canonical source of worker metadata is the failure substrate;
+# the FSM imports it to stay the sole authority.
+
+def _resolve_worker(
+    kind: GovernanceEventKind, detail: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve (worker_name, severity, reason) for a failure kind.
+
+    This is a PURE function.  It uses the FAILURE_CLASSIFICATION mapping
+    from the failure substrate to deterministically assign a worker.
+    Unknown kinds get the 'infra' worker as fallback.
+    """
+    from .failure_substrate.membrane import FAILURE_CLASSIFICATION, FailureSeverity
+
+    entry = FAILURE_CLASSIFICATION.get(
+        kind.value, (None, "infra", FailureSeverity.TRANSIENT)
+    )
+    _, worker_name, severity = entry
+    reason = f"failure {kind.value} assigned to worker {worker_name} ({severity.value})"
+    if detail:
+        reason += f": {detail}"
+    return worker_name, severity.value, reason
+
+
+# ---------------------------------------------------------------------------
 # Governance events
 # ---------------------------------------------------------------------------
 
@@ -138,9 +171,23 @@ _FAILURE_KIND_TERMINAL: dict[GovernanceEventKind, LoopTerminal] = {
     GovernanceEventKind.INFRA_FAILED: LoopTerminal.INFRA_FAILED,
 }
 
+# The same kinds, with their assigned worker names.  The FSM always assigns
+# a worker when it routes a failure — the runtime reads it from the verdict.
+_FAILURE_KIND_WORKER: dict[GovernanceEventKind, str] = {
+    GovernanceEventKind.GATE_REFUSED: "gate",
+    GovernanceEventKind.NARRATION_FAILED: "narration",
+    GovernanceEventKind.PARSE_FAILED: "narration",
+    GovernanceEventKind.VALIDATION_FAILED: "validation",
+    GovernanceEventKind.BUDGET_EXHAUSTED: "dispatch",
+    GovernanceEventKind.INFRA_FAILED: "infra",
+}
+
 FAILURE_EVENT_KINDS: tuple[GovernanceEventKind, ...] = tuple(
     _FAILURE_KIND_TERMINAL
 )
+
+# Export the worker assignment dict so the runtime can read it directly.
+FAILURE_EVENT_WORKERS: dict[GovernanceEventKind, str] = dict(_FAILURE_KIND_WORKER)
 
 
 # ---------------------------------------------------------------------------
@@ -159,12 +206,15 @@ class MembraneVerdict:
     ``terminal`` — the ``LoopTerminal`` reached when the move ends the
                    cycle (success or graceful failure); else ``None``.
     ``reason``   — a human-readable justification (also the denial reason).
+    ``assigned_worker`` — the failure worker assigned by the FSM; ``None``
+                          for progress events and non-failure terminals.
     """
 
     allowed: bool
     next: LoopObservation | None = None
     terminal: LoopTerminal | None = None
     reason: str = ""
+    assigned_worker: str | None = None  # worker name for failure remediation
 
 
 # ---------------------------------------------------------------------------
@@ -375,10 +425,15 @@ class AgenticLoopMembrane:
                     reason="failure event requires a live loop observation",
                 )
             terminal = _FAILURE_KIND_TERMINAL[kind]
+            # The FSM assigns the worker deterministically from the
+            # _FAILURE_KIND_WORKER mapping.  The runtime reads this from
+            # the verdict to dispatch the correct failure worker.
+            worker_name = _FAILURE_KIND_WORKER.get(kind, "infra")
             return MembraneVerdict(
                 allowed=True,
                 terminal=terminal,
-                reason=f"graceful failure routed to terminal {terminal.value}",
+                assigned_worker=worker_name,
+                reason=f"graceful failure routed to terminal {terminal.value}, worker={worker_name}",
             )
 
         if not self.is_legal_state(observation):
@@ -635,4 +690,5 @@ __all__ = [
     "MembraneVerdict",
     "GOVERNANCE_MEMBRANE",
     "FAILURE_EVENT_KINDS",
+    "FAILURE_EVENT_WORKERS",
 ]

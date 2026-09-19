@@ -2,417 +2,86 @@
 
 Comprehension understands once; evidence gathers (narrate#1 + budgeted
 follow-ups); reasoning tests and compares; validation gates with one bounded
-retry then emits to the FSM terminal. Shared mechanics (dispatch round,
-follow-up turn) live in _dispatch_turn/_followup_turn so every loop spends
-passes the same way: tool packing is bounded by the canonical per-round
-call cap and overflow is recorded as unexecuted.
+retry then emits to the FSM terminal. Per-pass mechanics (dispatch round,
+follow-up turn, name-pending, FSM-string helpers, terminal emitters, and
+the cycle carrier itself) live next to their owning modules:
+
+  CycleRuntimeState, _open_once, _mark_declared, freeze_chain,
+  run_runtime_failure, run_validation_terminal
+        → engine.core.context
+  _dispatch_turn, _followup_turn, _name_pending
+        → InferenceEngine (engine.core.driver)
+  seed_evidence_plan, default_comprehension, prompt composers
+        → engine.kb
+
+This module owns only the four run_* loop bodies; everything else is a
+re-export kept on this module purely for backward-compatible imports.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
 from typing import Any
 
 from . import context
 from .. import narration as narration_mod
 from ..config import (
     AGENTIC_MAX_LLM_TURNS,
-    AGENTIC_MAX_TOOL_ROUNDS,
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
     VALIDATION_RETRY_PASSES,
 )
-from .context import _CycleContext, _ReasonedCycle, _PHASE_INTENT
-from ..controller import CycleController
+from .context import (
+    CycleRuntimeState,
+    _ReasonedCycle,
+    _open_once,
+    _mark_declared,
+    freeze_chain,
+    run_runtime_failure,
+    run_validation_terminal,
+)
 from ..fsm import GovernanceEvent, GovernanceEventKind
+from .. import kb
 from ..kb import (
-    TURN_CONTRACT_LINE,
-    TOOL_WINDOWS,
-    build_loop_state_block,
     build_output_format,
     build_task_workflow,
-    chain_status,
+    compose_narrate1_prompt,
+    compose_repair_prompt,
+    default_comprehension,
+    seed_evidence_plan,
 )
-from .chain import chain_completion, chain_steer
+from .chain import (
+    FORWARD_SCENARIO_TOOL,
+    POSITION_ORDER,
+    POSITION_TOOLS,
+    TOOL_POSITION,
+    chain_completion,
+    chain_halt_for,
+    chain_steer,
+    position_status,
+    position_steer,
+)
 from ..loop_states import NestedLoop, SubLoop, TaskIntent
 
 log = logging.getLogger(__name__)
 
 
-def seed_evidence_plan(
-    task: str | None, scenario: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Deterministic evidence seed: task shape -> suggested tools.
+# --------------------------------------------------------------------------
+# Re-exports for backward compatibility with call sites that historically
+# imported the carrier / FSM helpers / terminal emitters from this module.
+# The four run_* loop bodies are the public surface tested by the cycle
+# characterization suite; everything else is an internal carrier helper
+# that lives in context now.
+# --------------------------------------------------------------------------
+__all__ = [
+    "CycleRuntimeState",
+    "run_comprehension",
+    "run_evidence",
+    "run_reasoning",
+    "run_validation",
+]
 
-    Autonomy inside a planned frame: the engine suggests, the agent
-    disposes. Seeds never execute by themselves — every dispatch is an
-    agent tool_call classified by the controller. Pure over injected
-    task/scenario (no I/O, no LLM).
-    """
-    seeds: list[str] = [
-        "calc.forward.forecast",
-    ]
-    rationale = ["canonical deterministic forward ForecastResult always seeded"]
-    blob = f"{task or ''} {json.dumps(scenario or {})}".lower()
-    if scenario is not None:
-        seeds += ["calc.scenario.evaluate", "calc.forward.scenario"]
-        rationale.append("scenario present: legacy + forward scenario paths")
-    if any(k in blob for k in ("horizon", "1s", "5s", "30s", "60s",
-                                "target", "theta", "probab",
-                                "hypothes", "h0", "h1")):
-        seeds += ["calc.forward.distribution", "calc.hypothesis.test",
-                    "calc.decay.report"]
-        rationale.append("horizon/hypothesis language: distribution + test + decay")
-    if any(k in blob for k in ("wall", "absorb", "liquid", "reversal",
-                                "support", "resist")):
-        seeds += ["calc.events.absorption", "calc.events.walls"]
-        rationale.append("liquidity language: typed event detectors")
-    seeds.append("memory.recall_paper")
-    rationale.append("paper grounding always seeded (evidence home)")
-    seen: list[str] = []
-    for seed in seeds:
-        if seed not in seen:
-            seen.append(seed)
-    return {"seeds": seen, "rationale": rationale}
-
-
-def default_comprehension(
-    task: str | None, scenario: dict[str, Any] | None,
-    seed: dict[str, Any], reason: str,
-) -> dict[str, Any]:
-    """Fallback understanding block when the comprehension pass fails.
-
-    Never kills the cycle: a defaulted block plus the seeded plan keeps
-    the loop moving, and the parse note records what happened.
-    """
-    return {
-        "intent": (task[:200] if task else "autonomous microstructure inference"),
-        "constraints": {
-            "scenario": scenario,
-            "pass_budgets": dict(LOOP_PASS_BUDGET),
-        },
-        "questions": ["what is the current microstructure state?",
-                        "what does the forward evidence support?"],
-        "evidence_plan": list(seed.get("seeds") or []),
-        "parse_note": reason,
-    }
-
-
-@dataclass
-class CycleRuntimeState:
-    """Mutable carrier threading one reason-stage run through its loops."""
-
-    controller: Any
-    capability_log: list[dict[str, Any]]
-    deterministic_state: dict[str, Any]
-    accumulated_tool_results: dict[str, Any]
-    tool_results: dict[str, Any]
-    parsed_current: dict[str, Any]
-    parsed_1: dict[str, Any] | None = None
-    llm_calls: int = 0
-    # Dispatch rounds remain separately visible from LLM/pass budgets.
-    tool_rounds_used: int = 0
-    repairs_sent: int = 0
-    validation_retries_used: int = 0
-    validation_entered: bool = False
-    opened_subs: set[str] = field(default_factory=set)
-    passes_per_loop: dict[str, int] = field(default_factory=lambda: {
-        "comprehension": 0, "evidence": 0, "reasoning": 0,
-        "validation": 0, "output": 0,
-    })
-    dispatched_in_pass: int = 0
-    loop_tag: str = "evidence"
-    unexecuted: list[str] = field(default_factory=list)
-    task_reminder: str = ""
-    scenario_reminder: str = ""
-    phase_guidance: dict[str, str] = field(default_factory=dict)
-    comprehension: dict[str, Any] | None = None
-    seed_plan: dict[str, Any] | None = None
-    task_workflow: dict[str, Any] | None = None
-    finalize_now: bool = False
-    final_validation: dict[str, Any] = field(default_factory=lambda: {
-        "passed": False, "missing": ["loop_not_run"],
-    })
-    failure_kind: str | None = None
-    failure_detail: str | None = None
-
-    def to_reasoned(self) -> _ReasonedCycle:
-        """Freeze the handoff the OUTPUT loop consumes."""
-        return _ReasonedCycle(
-            parsed_first=self.parsed_1 or {},
-            parsed_final=self.parsed_current,
-            llm_calls=self.llm_calls,
-            tool_rounds_used=self.tool_rounds_used,
-            repairs_sent=self.repairs_sent,
-            finalize_now=self.finalize_now,
-            final_validation=self.final_validation,
-            unexecuted=list(self.unexecuted),
-            tool_results=self.tool_results,
-            comprehension=self.comprehension,
-            passes_per_loop=dict(self.passes_per_loop),
-        )
-
-
-def _mark_declared(
-    ctrl: CycleController, parsed: dict[str, Any],
-) -> CycleController:
-    # PURE helper — returns the successor controller; the caller rebinds.
-    return ctrl.mark_declared(parsed)
-
-
-def _open_once(st: CycleRuntimeState, sub: SubLoop) -> None:
-    """Open a sub-loop unless already opened (membrane advances siblings)."""
-    if sub.value in st.opened_subs:
-        return
-    st.controller, _ = context._must_govern(
-        st.controller, GovernanceEventKind.OPEN_SUBLOOP, sub,
-    )
-    st.opened_subs.add(sub.value)
-
-
-async def _dispatch_turn(engine: Any, ctx: Any, st: CycleRuntimeState) -> None:
-    """Dispatch st.parsed_current's tool_calls under the pass ceiling."""
-    st._round_had_execution = False  # type: ignore[attr-defined]
-    from market_service.nooa_harness.inference import (
-        _normalize_tool_name,
-        capability_log_entry,
-        tool_homes,
-    )
-
-    tool_calls = st.parsed_current.get("tool_calls")
-    if not (isinstance(tool_calls, list) and tool_calls):
-        return
-    pass_remaining = MAX_DISPATCHES_PER_PASS - st.dispatched_in_pass
-    dict_calls = [c for c in tool_calls if isinstance(c, dict)]
-    if st.tool_rounds_used >= AGENTIC_MAX_TOOL_ROUNDS or pass_remaining <= 0:
-        # Budget spent: name everything pending (never silently dropped).
-        for call in dict_calls:
-            raw_name = str(call.get("name") or call.get("tool") or "").strip()
-            if raw_name:
-                st.unexecuted.append(raw_name)
-        return
-    # The canonical per-round cap is enforced here; overflow is named on
-    # unexecuted, never silently dropped.
-    to_execute = dict_calls[:pass_remaining]
-    for call in dict_calls[pass_remaining:]:
-        raw_name = str(call.get("name") or call.get("tool") or "").strip()
-        if raw_name:
-            st.unexecuted.append(raw_name)
-            log.warning("pass ceiling: deferring %s to unexecuted", raw_name)
-    if not to_execute:
-        return
-    st.tool_rounds_used += 1
-    round_results: dict[str, Any] = {}
-    for call in to_execute:
-        raw_name = str(call.get("name", ""))
-        args = dict(call.get("args") or {})
-        args.setdefault("symbol", engine.symbol)
-        args.setdefault("venue", engine.venue)
-        canonical = _normalize_tool_name(raw_name) or raw_name
-        expected_loop = {
-            "evidence": NestedLoop.EVIDENCE,
-            "reasoning": NestedLoop.REASONING,
-            "validation": NestedLoop.VALIDATION,
-        }.get(st.loop_tag, NestedLoop.REASONING)
-        expected_sub_loop = {
-            "evidence": SubLoop.ACQUISITION,
-            "reasoning": SubLoop.ANALYSIS,
-            "validation": SubLoop.RECOVERY,
-        }.get(st.loop_tag)
-        # The dispatch registry owns the allowed work homes; the FSM owns
-        # whether the current observation is one of them.  A model cannot
-        # move a tool into a convenient phase by naming it differently.
-        authorization = None
-        for home_loop, home_sub_loop in tool_homes(canonical):
-            try:
-                home_nested_loop = NestedLoop(home_loop)
-                home_sub_loop_enum = SubLoop(home_sub_loop)
-            except ValueError:
-                continue
-            candidate = context._authorize_work(
-                st.controller,
-                nested_loop=home_nested_loop,
-                sub_loop=home_sub_loop_enum,
-            )
-            if candidate.allowed:
-                authorization = candidate
-                break
-        if authorization is None:
-            authorization = context._authorize_work(
-                st.controller,
-                nested_loop=expected_loop,
-                sub_loop=expected_sub_loop,
-            )
-        if not authorization.allowed:
-            # The FSM is the work boundary.  A model request made from the
-            # wrong loop becomes an explicit finding and is never dispatched.
-            tool_log = capability_log_entry(
-                f"tool.denied:{canonical}",
-                {"symbol": engine.symbol, "venue": engine.venue},
-                "denied",
-                detail={"reason": "unauthorized_loop_work", "fsm": authorization.reason},
-            )
-            st.dispatched_in_pass += 1
-            st.capability_log.append(tool_log)
-            st.controller = st.controller.record_outcome(
-                canonical, tool_log, None, raw_name=raw_name, args=args,
-            )
-            round_results[canonical] = None
-            st.accumulated_tool_results[canonical] = None
-            continue
-        # Controller authority: redundant re-dispatch of a tool
-        # that already refused this cycle is suppressed
-        # structurally (logged, never executed).
-        if st.controller.is_redundant(canonical):
-            log.warning(
-                "pass loop: suppressing redundant dispatch of "
-                "%s (refused earlier this cycle)", canonical,
-            )
-            _supp_log = capability_log_entry(
-                f"tool.suppressed:{canonical}",
-                {"symbol": engine.symbol, "venue": engine.venue},
-                "denied",
-                detail={"reason": "refused_deterministically",
-                        "refusal_reason": st.controller.scenario_refusal_reason()},
-            )
-            st.capability_log.append(_supp_log)
-            st.controller = st.controller.record_outcome(
-                canonical, _supp_log, None, raw_name=raw_name, args=args,
-            )
-            st.dispatched_in_pass += 1
-            round_results[canonical] = None
-            st.accumulated_tool_results[canonical] = None
-            continue
-        try:
-            st._round_had_execution = True  # type: ignore[attr-defined]
-            result, tool_log = await context.execute_tool(
-                engine.store, raw_name, args, postgres=engine.postgres,
-                memory=engine.memory, settings=engine.settings,
-            )
-        except Exception as exc:  # one bad tool never kills the cycle
-            log.exception("pass loop: tool %s raised", raw_name)
-            result, tool_log = None, capability_log_entry(
-                f"tool.error:{canonical}",
-                {"symbol": engine.symbol, "venue": engine.venue},
-                "error",
-                detail=f"{type(exc).__name__}: {exc}",
-            )
-        st.dispatched_in_pass += 1
-        st.capability_log.append(tool_log)
-        # Controller classifies the outcome (the ONLY place the
-        # ok-with-refused-detail null-discipline shape is
-        # interpreted), applies phase-coverage credit, and returns
-        # a NEW immutable controller — rebound here.
-        st.controller = st.controller.record_outcome(
-            canonical, tool_log, result,
-            raw_name=raw_name, args=args,
-        )
-        if result is None:
-            result_payload = None
-        else:
-            rendered = json.dumps(result, default=str)
-            if len(rendered) < 40_000:
-                result_payload = json.loads(rendered)
-            else:
-                result_payload = {"_truncated": True, "preview": rendered[:4_000]}
-        round_results[canonical] = result_payload
-        st.accumulated_tool_results[canonical] = result_payload
-    st.tool_results.update(round_results)
-    st._round_results = round_results  # type: ignore[attr-defined]
-
-
-async def _followup_turn(engine: Any, ctx: Any, st: CycleRuntimeState) -> dict[str, Any] | None:
-    """One follow-up LLM turn for st.loop_tag. Returns parsed or None."""
-    coverage = st.controller.phase_coverage
-    next_phase = narration_mod.next_uncovered_phase(coverage)
-    # P1–P6 remain coverage/provenance labels only.  They do not retask the
-    # FSM observation; the prompt below derives its actual intent from the
-    # controller and uses the next phase only for evidence guidance.
-    # Phase labels guide evidence selection, but never become the prompt's
-    # semantic state.  The controller observation supplies the intent.
-    # LOOP STATE relay: the agent sees its loop, budget, and what
-    # came before — observation-backed via the controller ledger.
-    loop_header = build_loop_state_block(
-        controller=st.controller,
-        loop=st.loop_tag,
-        sub_loop=("acquisition" if st.loop_tag == "evidence"
-                  else "analysis" if st.loop_tag == "reasoning"
-                  else "recovery"),
-        intent=None,
-        passes_spent=st.passes_per_loop.get(st.loop_tag, 0),
-        pass_budget=LOOP_PASS_BUDGET.get(st.loop_tag, 0),
-        dispatches_left=MAX_DISPATCHES_PER_PASS - st.dispatched_in_pass,
-        traversal=st.controller.loop_coverage(),
-        gate=st.deterministic_state.get("gate"),
-        congruence=st.controller.congruence() if st.loop_tag == "reasoning" else None,
-        comprehension=(st.deterministic_state.get("comprehension")
-                       if st.loop_tag == "reasoning" else None),
-    )
-    chain = (st.task_workflow or {}).get("chain") or []
-    round_results = getattr(st, "_round_results", {})
-    chain_block = ""
-    if st.loop_tag == "reasoning":
-        st_chain = chain_completion(
-            st.controller, task=ctx.task, scenario=ctx.scenario)
-        st.deterministic_state["statistical_chain"] = {
-            "links": st_chain["links"], "missing": st_chain["missing"],
-            "refused": st_chain["refused"], "complete": st_chain["complete"],
-        }
-        chain_block = f"\n{st_chain['render']}\n"
-        steer = chain_steer(st_chain)
-        if steer:
-            chain_block += f"{steer}\n"
-    user_prompt_next = (
-        f"{loop_header}\n\n"
-        f"{TOOL_WINDOWS.get(st.loop_tag, '')}\n\n"
-        f"{chain_status(chain, list(st.accumulated_tool_results))}\n"
-        f"{chain_block}\n"
-        f"{st.task_reminder}"
-        f"{st.scenario_reminder}"
-        f"PASS RESULTS (pass {st.passes_per_loop.get(st.loop_tag, 0)} of "
-        f"{LOOP_PASS_BUDGET.get(st.loop_tag, 0)} for {st.loop_tag}; cite paths):\n"
-        f"{json.dumps(round_results, default=str)[:40_000]}\n\n"
-        f"PRIOR PASSES (earlier results, for citation):\n"
-        f"{json.dumps({k: v for k, v in st.accumulated_tool_results.items() if k not in round_results}, default=str)[:40_000]}\n\n"
-        "PHASE COVERAGE (families with ≥1 ok tool): "
-        f"{json.dumps({p: sorted(s) for p, s in coverage.items()})}\n"
-        f"{st.phase_guidance[next_phase]}\n"
-        f"{TURN_CONTRACT_LINE}\n"
-        f"Passes remaining in {st.loop_tag}: "
-        f"{LOOP_PASS_BUDGET.get(st.loop_tag, 0) - st.passes_per_loop.get(st.loop_tag, 0)}. "
-        "Declare \"phase\" every turn; call this loop's tools, or advance with tool_calls=[]."
-    )
-    try:
-        raw_next = await engine._call_llm(user_prompt_next)
-    except Exception as exc:
-        log.exception("pass narration round failed; ending loop early")
-        st.failure_kind = "narration_failed"
-        st.failure_detail = f"{type(exc).__name__}: {exc}"
-        return None
-    st.llm_calls += 1
-    st.passes_per_loop[st.loop_tag] = st.passes_per_loop.get(st.loop_tag, 0) + 1
-    parsed_next = narration_mod.coerce_turn(narration_mod.extract_json_object(raw_next))
-    if parsed_next is None:
-        log.warning("pass round parse failed, ending loop")
-        st.failure_kind = "parse_failed"
-        st.failure_detail = "no JSON object in follow-up narration"
-        return None
-    st.parsed_current = parsed_next
-    st.controller = _mark_declared(st.controller, parsed_next)
-    return parsed_next
-
-
-def _name_pending(st: CycleRuntimeState) -> None:
-    """Name undispatched calls on a loop that ends with work pending."""
-    pending = st.parsed_current.get("tool_calls")
-    if isinstance(pending, list):
-        for call in pending:
-            if isinstance(call, dict):
-                raw_name = str(call.get("name") or call.get("tool") or "").strip()
-                if raw_name and raw_name not in st.unexecuted:
-                    st.unexecuted.append(raw_name)
 
 
 async def run_comprehension(
@@ -432,9 +101,9 @@ async def run_comprehension(
         parsed_current={},
     )
 
-    # --- CONTEXT: memory + prior diff ---
-    _memories, memory_block = await engine._recall_memory()
-    prior_note = await engine._prior_change_note()
+    # --- CONTEXT: memory node pruned from the track (transport retained on
+    # the driver for later use) — no recall read feeds the prompts; H0/H1
+    # grounding comes from the track's own evidence.
 
     wake_block = json.dumps(
         {"trigger_source": wake.trigger_source,
@@ -460,8 +129,8 @@ async def run_comprehension(
     st.task_block = task_block  # type: ignore[attr-defined]
     st.scenario_block = scenario_block  # type: ignore[attr-defined]
     st.wake_block = wake_block  # type: ignore[attr-defined]
-    st.memory_block = memory_block  # type: ignore[attr-defined]
-    st.prior_note = prior_note  # type: ignore[attr-defined]
+    st.memory_block = ""  # type: ignore[attr-defined]
+    st.prior_note = ""  # type: ignore[attr-defined]
     st.scenario_reminder = (
         f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
         f"given horizon; frame H0/H1 as not-reachable/reachable): "
@@ -474,7 +143,7 @@ async def run_comprehension(
             st.phase_guidance["P5"]
             + f" SCENARIO GIVEN ({json.dumps(scenario)}): call "
             "calc.scenario.evaluate with that target_price/horizon IN ADDITION "
-            "to recall_paper + price.delta — the scenario verdict is the primary output. "
+            "to price.delta — the scenario verdict is the primary output. "
             "The final scenario block must echo fit_status + n_windows_usable + r2 "
             "and its rationale (≥80 chars) must name them beside the verdict."
         )
@@ -486,20 +155,64 @@ async def run_comprehension(
         "everything else yourself via tools; never recompute values, "
         "COMMAND the read tools and cite their paths):\n"
         f"{json.dumps(st.deterministic_state, default=str)[:60_000]}\n\n"
-        f"{prior_note}\n\n"
     )
-    if memory_block:
-        user_prompt_1 += (
-            "RECALLED MEMORY (provenance-tagged priors; subordinate to the "
-            f"ledger):\n{memory_block}\n\n"
-        )
-    user_prompt_1 += engine._output_format()
     st.user_prompt_1 = user_prompt_1  # type: ignore[attr-defined]
 
     # --- COMPREHENSION PASS (1 LLM call, no tools) ---
+    # --- TASK DIRECTIVE (Phase A reparse + Phase B assessment) ---
+    # Phase A already ran in gather (deterministic, drove the pre-acquired
+    # forecast horizon + scenario). Here the LLM gets ONE bounded assessment
+    # turn at the primitive intake stage: it assesses the prompt and
+    # PROPOSES amendments strictly within the frozen vocabularies; the
+    # engine disposes — validated proposals bind, rejects are recorded, the
+    # track is never amended by them (controller doctrine).
+    from ..task_directive import (
+        assessment_prompt, build_plan, dispose_assessment,
+        parse_task_directive,
+    )
+    directive = parse_task_directive(task, scenario)
+    assessment_note: str | None = None
+    # Phase B trigger (budget guardrail): only prompts that carry directive-
+    # relevant language the deterministic parse could not fully bind —
+    # recorded refusals, or general-kind text hinting at targets/hypotheses.
+    # A fully-bound directive (or a plain "explain" task) skips the turn;
+    # placement (primitive intake) and disposal semantics are unchanged.
+    from ..kb import PRICE_TARGET_HINTS
+    from ..task_directive import _HYPOTHESIS_WORDS
+    _task_blob = (task or "").lower()
+    _hinted = any(h in _task_blob for h in PRICE_TARGET_HINTS) or any(
+        w in _task_blob for w in _HYPOTHESIS_WORDS)
+    _assessment_due = bool(task and task.strip()) and (
+        bool(directive.refusals)
+        or (directive.kind == "general" and _hinted))
+    if _assessment_due:
+        try:
+            raw_assessment = await engine._call_llm(
+                assessment_prompt(task, directive))
+            st.llm_calls += 1
+            parsed_assessment = narration_mod.coerce_turn(
+                narration_mod.extract_json_object(raw_assessment))
+            if parsed_assessment is None:
+                assessment_note = "assessment_unparseable; deterministic parse stands"
+            else:
+                directive, rejects = dispose_assessment(directive, parsed_assessment)
+                if rejects:
+                    assessment_note = (
+                        "assessment rejects: "
+                        + "; ".join(f"{r['field']}: {r['reason']}" for r in rejects))
+        except Exception as exc:
+            assessment_note = f"assessment_unavailable: {type(exc).__name__}"
+    plan = build_plan(directive)
+    st.task_directive = directive.to_dict()
+    st.task_plan = plan
+    st.deterministic_state["task_directive"] = st.task_directive
+    st.deterministic_state["task_plan"] = plan
+    st.deterministic_state["assessment_note"] = assessment_note
+
     st.seed_plan = seed_evidence_plan(task, scenario)
     st.deterministic_state["seeded_plan"] = st.seed_plan
-    st.task_workflow = build_task_workflow(task, scenario)
+    st.task_workflow = build_task_workflow(task, scenario,
+                                            kind_override=plan["kind"])
     st.deterministic_state["task_workflow"] = st.task_workflow
     workflow_block = (
         f"REQUIRED WORKFLOW FOR THIS TASK (kind: {st.task_workflow['kind']} — "
@@ -554,40 +267,24 @@ async def run_evidence(
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.ACQUISITION
     )
-    # First-turn prompt: envelope state + output contract + seeded plan +
-    # required workflow, headed by this loop's relayed state.
-    user_prompt_1 = (
-        f"{st.task_block}"
-        f"{st.scenario_block}"
-        f"WAKE: {st.wake_block}\n\n"
-        "ENVELOPE STATE (gate reads + wake identity — READ-PLANE; pull "
-        "everything else yourself via tools; never recompute values, "
-        "COMMAND the read tools and cite their paths):\n"
-        f"{json.dumps(st.deterministic_state, default=str)[:60_000]}\n\n"
-        f"{st.prior_note}\n\n"
-    )
-    if st.memory_block:
-        user_prompt_1 += (
-            "RECALLED MEMORY (provenance-tagged priors; subordinate to the "
-            f"ledger):\n{st.memory_block}\n\n"
-        )
-    user_prompt_1 += engine._output_format()
-    st.user_prompt_1 = user_prompt_1  # type: ignore[attr-defined]
-    # LOOP STATE relay (evidence pass 1) + seeded plan + required workflow.
-    user_prompt_1 = (
-        build_loop_state_block(
-            controller=st.controller,
-            loop="evidence", sub_loop="acquisition",
-            intent=TaskIntent.INFER_ORDER_FLOW.value,
-            passes_spent=0, pass_budget=LOOP_PASS_BUDGET["evidence"],
-            dispatches_left=MAX_DISPATCHES_PER_PASS,
-            traversal=st.controller.loop_coverage(),
-            gate=st.deterministic_state.get("gate"),
-            seeds=list(st.seed_plan["seeds"]),
-        )
-        + "\n\n" + TOOL_WINDOWS["evidence"]
-        + "\n\n" + st.workflow_block  # type: ignore[attr-defined]
-        + "\n\n" + st.user_prompt_1  # type: ignore[attr-defined]
+    # First-turn prompt: composed once by kb.compose_narrate1_prompt.
+    user_prompt_1 = kb.compose_narrate1_prompt(
+        controller=st.controller,
+        loop="evidence", sub_loop="acquisition",
+        intent=TaskIntent.INFER_ORDER_FLOW.value,
+        passes_spent=0, pass_budget=LOOP_PASS_BUDGET["evidence"],
+        dispatches_left=MAX_DISPATCHES_PER_PASS,
+        seeds=list(st.seed_plan["seeds"]),
+        task_block=st.task_block,
+        scenario_block=st.scenario_block,
+        wake_block=st.wake_block,
+        deterministic_state=st.deterministic_state,
+        prior_note=st.prior_note,
+        memory_block=st.memory_block,
+        output_format=engine._output_format(),
+        workflow_block=st.workflow_block,
+        traversal=st.controller.loop_coverage(),
+        gate=st.deterministic_state.get("gate"),
     )
     try:
         raw_1 = await engine._call_llm(user_prompt_1)
@@ -633,12 +330,12 @@ async def run_evidence(
                 and st.parsed_current.get("tool_calls")):
             break  # candidate stands; reasoning may still pull
         st.dispatched_in_pass = 0
-        await _dispatch_turn(engine, ctx, st)
-        if await _followup_turn(engine, ctx, st) is None:
+        await engine._dispatch_turn(ctx, st)
+        if await engine._followup_turn(ctx, st) is None:
             if st.failure_kind:
                 return await run_runtime_failure(engine, ctx, st)
             break
-    _name_pending(st)
+    engine._name_pending(st)
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.VERIFICATION
     )
@@ -656,7 +353,14 @@ async def run_evidence(
 async def run_reasoning(
     engine: Any, ctx: Any, st: CycleRuntimeState,
 ) -> tuple | None:
-    """REASONING loop: budgeted follow-ups (test → compare → synthesize)."""
+    """REASONING loop: hard-tracked positions assemble → interpret → hypothesize.
+
+    Three forced positions, one per pass minimum: each needs ≥1 in-position
+    dispatch and its predicate met, advancing at most one position per pass.
+    Empty tool_calls before all positions complete steer-continue instead of
+    breaking. A refused required link halts the track into chain_halt for
+    the FSM retry decision (no synthesis, visit marked incomplete).
+    """
     st.loop_tag = "reasoning"
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING
@@ -671,22 +375,80 @@ async def run_reasoning(
            and st.llm_calls < AGENTIC_MAX_LLM_TURNS):
         if not (isinstance(st.parsed_current.get("tool_calls"), list)
                 and st.parsed_current.get("tool_calls")):
-            break  # candidate stands; validation decides
+            if st.reason_position >= len(POSITION_ORDER):
+                break  # track complete; candidate stands; validation decides
+            # Floor: the track is unwalked — steer into another positioned
+            # pass instead of breaking (bounded by the pass/turn ceilings).
+            st.dispatched_in_pass = 0
+            if await engine._followup_turn(ctx, st) is None:
+                if st.failure_kind:
+                    return await run_runtime_failure(engine, ctx, st)
+                break
+            continue
         st.dispatched_in_pass = 0
-        await _dispatch_turn(engine, ctx, st)
-        if await _followup_turn(engine, ctx, st) is None:
+        await engine._dispatch_turn(ctx, st)
+        if st.reason_position < len(POSITION_ORDER):
+            active_position = POSITION_ORDER[st.reason_position]
+            halt = chain_halt_for(
+                st.controller.outcomes, active_position,
+                task=ctx.task, scenario=ctx.scenario)
+            if halt is not None and st.chain_halt is None:
+                st.chain_halt = halt
+                st.deterministic_state["chain_halt"] = dict(halt)
+                freeze_chain(st, ctx.task, ctx.scenario)
+                # Bounded reformulation offer: one followup turn where ONLY
+                # a materially-different re-call of the halted tool can move
+                # the cycle (suppression lifts for new args; everything else
+                # stays denied or frozen). An empty close exits halted.
+                st.dispatched_in_pass = 0
+                reform = await engine._followup_turn(ctx, st)
+
+                if reform is None:
+                    if st.failure_kind:
+                        return await run_runtime_failure(engine, ctx, st)
+                    break
+                if isinstance(reform.get("tool_calls"), list) and reform.get("tool_calls"):
+                    st.dispatched_in_pass = 0
+                    await engine._dispatch_turn(ctx, st)
+                    if chain_halt_for(
+                        st.controller.outcomes, active_position,
+                        task=ctx.task, scenario=ctx.scenario,
+                    ) is None:
+                        st.chain_halt = None
+                        st.deterministic_state["chain_halt"] = None
+                        freeze_chain(st, ctx.task, ctx.scenario)
+                        continue  # halt cleared by re-evaluation; resume track
+                engine._name_pending(st)
+                # Leaving the loop with a sub-loop open is illegal under
+                # the membrane (ENTER_LOOP would be denied) — close ANALYSIS
+                # explicitly. This closes the position, not the track: the
+                # visit below is marked incomplete and validation records
+                # the halt for the FSM retry decision.
+                st.controller, _ = context._must_govern(
+                    st.controller, GovernanceEventKind.COMPLETE_SUBLOOP
+                )
+                st.controller = st.controller.record_loop_visit(
+                    "reasoning", st.passes_per_loop["reasoning"],
+                    ("hypothesis", "analysis", "synthesis"),
+                    completed=False,
+                )
+                return None  # validation records the halt; FSM decides retry
+            status = position_status(
+                st.controller.outcomes, active_position,
+                task=ctx.task, scenario=ctx.scenario)
+            # Advance on no-missing: assemble refusals already halted above;
+            # interpret/hypothesize refusals ride forward as findings.
+            if not status["missing"] and st.position_hits.get(active_position, 0) >= 1:
+                st.reason_position += 1
+        if await engine._followup_turn(ctx, st) is None:
             if st.failure_kind:
                 return await run_runtime_failure(engine, ctx, st)
             break
-    _name_pending(st)
+    engine._name_pending(st)
     _open_once(st, SubLoop.SYNTHESIS)
     # Freeze the steady-track reading at reasoning exit: the validator
     # judges this, not the agent's self-report.
-    st_chain = chain_completion(st.controller, task=ctx.task, scenario=ctx.scenario)
-    st.deterministic_state["statistical_chain"] = {
-        "links": st_chain["links"], "missing": st_chain["missing"],
-        "refused": st_chain["refused"], "complete": st_chain["complete"],
-    }
+    freeze_chain(st, ctx.task, ctx.scenario)
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )
@@ -731,17 +493,55 @@ async def run_validation(
     # are findings — they never block, and the controller already
     # suppresses their re-dispatch structurally.
     st_chain = chain_completion(st.controller, task=ctx.task, scenario=ctx.scenario)
-    st.deterministic_state["statistical_chain"] = {
-        "links": st_chain["links"], "missing": st_chain["missing"],
-        "refused": st_chain["refused"], "complete": st_chain["complete"],
-    }
+    freeze_chain(st, ctx.task, ctx.scenario)
     missing = list(missing)
     for tool in st_chain["missing"]:
+        if tool == "calc.discipline.audit":
+            # The audit is validation-homed: the repair turn can pull it.
+            missing.append(
+                "statistical chain: calc.discipline.audit never attempted — "
+                "call it now (validation home) before finalizing"
+            )
+        else:
+            # Every other chain link lives in an earlier loop and cannot be
+            # pulled from validation: record the unwalked link honestly so
+            # the repair budget terminates instead of demanding uncallable
+            # tools from the agent.
+            missing.append(
+                f"statistical chain: {tool} never attempted in its loop — "
+                "recorded unwalked; the track cannot pass this cycle"
+            )
+    # Task-conformance (core-owned): a target-bearing directive must surface
+    # its verdict — the band membership / scenario citation or its refusal —
+    # before the gate passes. This closes the prompt→answer loop: the final
+    # must answer the question the directive parsed, not merely cite tools.
+    if (st.task_plan is not None
+            and (st.task_plan.get("targets") or st.task_plan.get("invalidations"))
+            and not narration_mod.has_directive_verdict(st.parsed_current)):
         missing.append(
-            f"statistical chain: {tool} never attempted — walk the steady "
-            "track in order (forecast → scenario → hypothesis → decay → "
-            "discipline audit) and call each missing link before finalizing"
+            "task directive verdict not cited — cite the deterministic "
+            "directive/scenario paths (deterministic_state.task_directive "
+            "or forward_scenario/calc.forward.scenario) with the band "
+            "verdict or its refusal before finalizing"
         )
+    # Halted track (core-owned): a refused required link stopped reasoning
+    # for the FSM retry decision. The halt never clears itself here — the
+    # missing entry below forces the validation_failed terminal with the
+    # halt preserved on the artifact; only an FSM retry grant resumes it.
+    halt = st.chain_halt or st.deterministic_state.get("chain_halt")
+    halted = isinstance(halt, dict) and bool(halt.get("tool"))
+    if halted:
+        missing.append(
+            f"statistical chain halted at {halt.get('position')} on "
+            f"{halt.get('tool')} ({halt.get('reason')}) — FSM retry "
+            "decision required before the track can resume; do not re-call "
+            "the halted tool"
+        )
+    # The chain merge above only matters if it can actually hold the gate:
+    # an unwalked track or an undecided halt fails validation even when the
+    # phase checks pass (refused links stay findings — only never-attempted
+    # links and halts block here).
+    passed = passed and not st_chain["missing"] and not halted
     if passed:
         st.final_validation = {"passed": True, "missing": []}
         st.finalize_now = True
@@ -766,32 +566,19 @@ async def run_validation(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.RECOVERY
     )
     scenario_steer = st.controller.scenario_steer()
-    repair_header = build_loop_state_block(
+    repair_prompt = compose_repair_prompt(
         controller=st.controller,
         loop="validation", sub_loop="recovery",
-        intent=TaskIntent.VALIDATE_FINAL.value,
         passes_spent=st.passes_per_loop.get("validation", 0),
         pass_budget=LOOP_PASS_BUDGET["validation"],
         dispatches_left=MAX_DISPATCHES_PER_PASS,
-        traversal=st.controller.loop_coverage(),
-        gate=st.deterministic_state.get("gate"),
-        congruence=st.controller.congruence(),
-        comprehension=st.deterministic_state.get("comprehension"),
-    )
-    repair_prompt = (
-        f"{repair_header}\n\n"
-        f"{TOOL_WINDOWS['validation']}\n\n"
-        f"{st.task_reminder if ctx.task else ''}"
-        f"{st.scenario_reminder if ctx.scenario else ''}"
-        f"{scenario_steer}"
-        "FINAL REJECTED — staged inference incomplete. Missing:\n"
-        + "\n".join(f"- {item}" for item in missing)
-        + f"\n\nACCUMULATED TOOL RESULTS:\n{json.dumps(st.accumulated_tool_results, default=str)[:40_000]}\n\n"
-        f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in st.controller.phase_coverage.items()})}\n"
-        f"{st.phase_guidance[narration_mod.next_uncovered_phase(st.controller.phase_coverage)]}\n"
-        f"{TURN_CONTRACT_LINE}\n"
-        "Return the next turn now: declare \"phase\", include the missing tool_calls, "
-        "and finalize (tool_calls=[]) only when every missing item is addressed."
+        missing=list(missing),
+        accumulated=st.accumulated_tool_results,
+        task_reminder=st.task_reminder if ctx.task else "",
+        scenario_reminder=st.scenario_reminder if ctx.scenario else "",
+        scenario_steer=scenario_steer,
+        phase_guidance=st.phase_guidance,
+        next_phase=narration_mod.next_uncovered_phase(st.controller.phase_coverage),
     )
     try:
         raw_repair = await engine._call_llm(repair_prompt)
@@ -811,107 +598,13 @@ async def run_validation(
     st.parsed_current = parsed_repair
     st.controller = _mark_declared(st.controller, parsed_repair)
     st.dispatched_in_pass = 0
-    await _dispatch_turn(engine, ctx, st)
+    await engine._dispatch_turn(ctx, st)
     # A repair that only repeats a deterministically refused/suppressed tool
     # already contains the candidate final.  Do not spend an unbounded extra
     # narration turn merely to report that no work executed.
     if getattr(st, "_round_had_execution", False):
-        if await _followup_turn(engine, ctx, st) is None:
+        if await engine._followup_turn(ctx, st) is None:
             if st.failure_kind:
                 return await run_runtime_failure(engine, ctx, st)
             log.warning("repair follow-up unavailable; judging repair turn as it stands")
     return await run_validation(engine, ctx, st)
-
-
-async def run_runtime_failure(
-    engine: Any, ctx: Any, st: CycleRuntimeState,
-) -> tuple:
-    """Route a transport/parse failure through the canonical FSM terminal."""
-    kind = st.failure_kind or "infra_failed"
-    event_kind = {
-        "narration_failed": GovernanceEventKind.NARRATION_FAILED,
-        "parse_failed": GovernanceEventKind.PARSE_FAILED,
-        "budget_exhausted": GovernanceEventKind.BUDGET_EXHAUSTED,
-    }.get(kind, GovernanceEventKind.INFRA_FAILED)
-    st.controller = st.controller.advance(GovernanceEvent(event_kind))
-    terminal = st.controller.terminal.value if st.controller.terminal else kind
-    st.deterministic_state["terminal"] = terminal
-    st.deterministic_state["failure"] = {
-        "kind": kind, "detail": st.failure_detail,
-    }
-    st.deterministic_state["loop_traversal"] = st.controller.loop_coverage()
-    st.deterministic_state["governance_trace"] = st.controller.transition_trace()
-    return await engine._degraded_artifact(
-        st.deterministic_state, st.capability_log,
-        f"{kind}: {st.failure_detail or 'runtime failure'}",
-    ), {
-        "llm_calls": st.llm_calls,
-        "terminal": terminal,
-        "failure": st.deterministic_state["failure"],
-        "final_validation": st.final_validation,
-        "repairs": st.repairs_sent,
-        "tool_round": bool(st.tool_results),
-        "tool_rounds": st.tool_rounds_used,
-        "phase_coverage": {
-            phase: sorted(tools)
-            for phase, tools in st.controller.phase_coverage.items()
-        },
-    }
-
-
-async def run_validation_terminal(
-    engine: Any, ctx: Any, st: CycleRuntimeState, missing: list[str],
-) -> tuple:
-    """Shared terminal path: structured issue → FSM → degraded artifact."""
-    validation_issue = {
-        "loop": "validation",
-        "missing": list(missing),
-        "congruence": st.controller.congruence(),
-        "loop_traversal": st.controller.loop_coverage(),
-        "passes_per_loop": dict(st.passes_per_loop),
-    }
-    _covered = set(st.controller.loop_coverage())
-    if st.passes_per_loop.get("evidence", 0) > 0 and "evidence" not in _covered:
-        st.controller = st.controller.record_loop_visit(
-            "evidence", st.passes_per_loop["evidence"],
-            ("sourcing", "acquisition", "verification"),
-            completed=False,
-        )
-    if st.passes_per_loop.get("reasoning", 0) > 0 and "reasoning" not in _covered:
-        st.controller = st.controller.record_loop_visit(
-            "reasoning", st.passes_per_loop["reasoning"],
-            ("hypothesis", "analysis", "synthesis"),
-            completed=False,
-        )
-    st.controller = st.controller.record_loop_visit(
-        "validation", st.passes_per_loop.get("validation", 0),
-        ("gate", "recovery"), completed=False,
-    )
-    st.controller = st.controller.advance(
-        GovernanceEvent(GovernanceEventKind.VALIDATION_FAILED)
-    )
-    terminal = (
-        st.controller.terminal.value if st.controller.terminal
-        else "validation_failed"
-    )
-    ctx.controller = st.controller
-    st.deterministic_state["terminal"] = terminal
-    st.deterministic_state["validation_issue"] = validation_issue
-    st.deterministic_state["loop_traversal"] = st.controller.loop_coverage()
-    st.deterministic_state["congruence"] = st.controller.congruence()
-    return await engine._degraded_artifact(
-        st.deterministic_state, st.capability_log,
-        f"validation_failed: {'; '.join(missing)[:500]}",
-    ), {
-        "llm_calls": st.llm_calls,
-        "terminal": terminal,
-        "validation_issue": validation_issue,
-        "final_validation": {"passed": False, "missing": list(missing)},
-        "repairs": st.repairs_sent,
-        "tool_round": bool(st.tool_results),
-        "tool_rounds": st.tool_rounds_used,
-        "phase_coverage": {
-            phase: sorted(tools)
-            for phase, tools in st.controller.phase_coverage.items()
-        },
-    }

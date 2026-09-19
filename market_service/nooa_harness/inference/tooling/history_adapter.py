@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..capability import CAPABILITIES, CapabilityDenied, capability_log_entry
+from .replay_adapter import _read_tape_payloads
 from .tick_guard import _frozen_tick
 
 def _price_fit_from_dict(data: dict[str, Any]) -> Any | None:
@@ -148,7 +149,7 @@ async def _tool_fit_beta(
         window_m = int(args.get("window_minutes") or 30)
         tick = Decimal(_frozen_tick(symbol, venue, args.get("tick_size")) or "0")
 
-        payloads = await store.read_microstructure_events(venue, symbol.upper())
+        payloads = await _read_tape_payloads(store, symbol, venue, postgres=postgres)
         events, dropped = fitting_mod.replay_events_from_payloads(payloads)
         if len(events) < 2:
             return None, capability_log_entry(
