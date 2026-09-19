@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
@@ -469,8 +469,8 @@ class MicrostructureEvidence:
 # Track D (D1-D5) — additive only. Existing dataclasses above are frozen.
 # ---------------------------------------------------------------------------
 
-FEATURE_VECTOR_VERSION = "xt-v1"
-FORWARD_MODEL_VERSION = "forward-ols-v1"
+FEATURE_VECTOR_VERSION = "xt-v2"
+FORWARD_MODEL_VERSION = "forward-ols-v2"
 HYPOTHESIS_VERSION = "hyp-v1"
 EVIDENCE_V2_VERSION = "evidence-v2"
 
@@ -495,7 +495,12 @@ class QuoteMeasurement:
 
 @dataclass(frozen=True)
 class FeatureVector:
-    """Versioned D2 feature vector X_t (Decimal canonical strings)."""
+    """Versioned D2 feature vector X_t (Decimal canonical strings).
+
+    ``feature_keys`` and ``feature_schema_hash`` make the information set
+    explicit.  A model trained on one set of fields must not silently consume
+    a vector with a different set of fields.
+    """
 
     symbol: str
     venue: str
@@ -506,6 +511,8 @@ class FeatureVector:
     quality: str
     input_hash: str
     schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+    feature_keys: tuple[str, ...] = ()
+    feature_schema_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -516,6 +523,8 @@ class FeatureVector:
             "vector_version": self.vector_version,
             "fields": dict(self.fields),
             "def_versions": dict(self.def_versions),
+            "feature_keys": list(self.feature_keys),
+            "feature_schema_hash": self.feature_schema_hash,
             "quality": self.quality,
             "input_hash": self.input_hash,
         }
@@ -533,6 +542,8 @@ class FeatureVector:
             quality=str(payload.get("quality", "exact_feed")),
             input_hash=str(payload["input_hash"]),
             schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+            feature_keys=tuple(str(k) for k in (payload.get("feature_keys") or (payload.get("fields") or {}).keys())),
+            feature_schema_hash=str(payload.get("feature_schema_hash") or ""),
         )
 
 
@@ -572,7 +583,13 @@ class ForwardObservation:
 
 @dataclass(frozen=True)
 class ForwardFit:
-    """D4 per-horizon multivariate OLS fit with trichotomy status."""
+    """D4 per-horizon multivariate OLS fit with explicit validation state.
+
+    ``status`` is retained as the compatibility projection used by the older
+    inference surface.  The forward plane must use the more precise fields:
+    estimation status, validation status, probability status, schema identity,
+    and train/OOS metrics.
+    """
 
     fit_id: str
     symbol: str
@@ -591,6 +608,24 @@ class ForwardFit:
     model_version: str
     status: str
     schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+    feature_keys: tuple[str, ...] = ()
+    feature_schema_hash: str = ""
+    feature_definition_versions: dict[str, str] = field(default_factory=dict)
+    n_train: int = 0
+    n_oos: int = 0
+    split_method: str = ""
+    train_r2: str | None = None
+    oos_r2: str | None = None
+    oos_mae: str | None = None
+    oos_rmse: str | None = None
+    baseline_oos_r2: str | None = None
+    baseline_oos_mae: str | None = None
+    estimation_status: str = "insufficient"
+    validation_status: str = "unvalidated"
+    probability_status: str = "not_requested"
+    oos_betas: dict[str, str] = field(default_factory=dict)
+    oos_resid_std: str | None = None
+    oos_cut: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -611,6 +646,24 @@ class ForwardFit:
             "input_hash": self.input_hash,
             "model_version": self.model_version,
             "status": self.status,
+            "feature_keys": list(self.feature_keys),
+            "feature_schema_hash": self.feature_schema_hash,
+            "feature_definition_versions": dict(self.feature_definition_versions),
+            "n_train": self.n_train,
+            "n_oos": self.n_oos,
+            "split_method": self.split_method,
+            "train_r2": self.train_r2,
+            "oos_r2": self.oos_r2,
+            "oos_mae": self.oos_mae,
+            "oos_rmse": self.oos_rmse,
+            "baseline_oos_r2": self.baseline_oos_r2,
+            "baseline_oos_mae": self.baseline_oos_mae,
+            "estimation_status": self.estimation_status,
+            "validation_status": self.validation_status,
+            "probability_status": self.probability_status,
+            "oos_betas": dict(self.oos_betas),
+            "oos_resid_std": self.oos_resid_std,
+            "oos_cut": self.oos_cut,
         }
 
     @classmethod
@@ -634,6 +687,24 @@ class ForwardFit:
             model_version=str(payload.get("model_version", FORWARD_MODEL_VERSION)),
             status=str(payload.get("status", "insufficient")),
             schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
+            feature_keys=tuple(str(k) for k in (payload.get("feature_keys") or ())),
+            feature_schema_hash=str(payload.get("feature_schema_hash") or ""),
+            feature_definition_versions={str(k): str(v) for k, v in (payload.get("feature_definition_versions") or {}).items()},
+            n_train=int(payload.get("n_train") or 0),
+            n_oos=int(payload.get("n_oos") or 0),
+            split_method=str(payload.get("split_method") or ""),
+            train_r2=payload.get("train_r2"),
+            oos_r2=payload.get("oos_r2"),
+            oos_mae=payload.get("oos_mae"),
+            oos_rmse=payload.get("oos_rmse"),
+            baseline_oos_r2=payload.get("baseline_oos_r2"),
+            baseline_oos_mae=payload.get("baseline_oos_mae"),
+            estimation_status=str(payload.get("estimation_status") or ("fitted" if payload.get("status") in ("validated", "provisional") else "insufficient")),
+            validation_status=str(payload.get("validation_status") or ("validated" if payload.get("status") == "validated" else "provisional" if payload.get("status") == "provisional" else "unvalidated")),
+            probability_status=str(payload.get("probability_status") or "not_requested"),
+            oos_betas={str(k): str(v) for k, v in (payload.get("oos_betas") or {}).items()},
+            oos_resid_std=payload.get("oos_resid_std"),
+            oos_cut=int(payload.get("oos_cut") or 0),
         )
 
 
@@ -755,6 +826,56 @@ class HypothesisLedger:
             ledger_version=str(payload.get("ledger_version", "hyp-ledger-v1")),
             schema_version=int(payload.get("schema_version", MICROSTRUCTURE_SCHEMA_VERSION)),
         )
+
+
+@dataclass(frozen=True)
+class ForecastResult:
+    """Canonical deterministic result consumed by the inference plane.
+
+    Route A, Route B, and the forward model remain separate estimands. The
+    composer stores their outputs without asking an agent to merge them.
+    """
+
+    symbol: str
+    venue: str
+    generated_at_ms: int
+    horizon_ms: int | None
+    forecast_type: str
+    horizon_regime: str
+    information_set: dict[str, Any]
+    route_a: dict[str, Any] | None
+    route_b: dict[str, Any] | None
+    multivariate: dict[str, Any] | None
+    agreement: dict[str, Any]
+    diagnostics: dict[str, Any]
+    assumptions: dict[str, Any]
+    validation_state: str
+    model_version: str
+    input_hash: str
+    schema_version: int = MICROSTRUCTURE_SCHEMA_VERSION
+    forecast_version: str = "forecast-result-v1"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "generated_at_ms": self.generated_at_ms,
+            "horizon_ms": self.horizon_ms,
+            "forecast_type": self.forecast_type,
+            "horizon_regime": self.horizon_regime,
+            "information_set": self.information_set,
+            "route_a": self.route_a,
+            "route_b": self.route_b,
+            "multivariate": self.multivariate,
+            "agreement": self.agreement,
+            "diagnostics": self.diagnostics,
+            "assumptions": self.assumptions,
+            "validation_state": self.validation_state,
+            "model_version": self.model_version,
+            "input_hash": self.input_hash,
+            "forecast_version": self.forecast_version,
+        }
 
 
 @dataclass(frozen=True)

@@ -11,11 +11,11 @@ from typing import Any
 
 from .contracts import ForwardFit, ForwardObservation
 
-DISCIPLINE_VERSION = "discipline-v1"
+DISCIPLINE_VERSION = "discipline-v2"
 DISCIPLINE_CHECKLIST = (
-    "leakage", "time_order", "horizon_separation", "regime_separation",
-    "baseline_comparison", "cost_statement", "calibration",
-    "multiplicity", "version_pins",
+    "leakage", "estimation", "time_order", "horizon_separation",
+    "regime_separation", "baseline_comparison", "cost_statement",
+    "calibration", "multiplicity", "version_pins",
 )
 
 COST_STATEMENT_TEMPLATE = (
@@ -34,7 +34,7 @@ def discipline_audit(
     pooled_horizons: bool = False,
     regime_qualified: bool = True,
 ) -> dict[str, Any]:
-    """Check the nine discipline locks; return verdict + stop/go memo skeleton."""
+    """Check the ten discipline locks; return verdict + stop/go memo skeleton."""
     checks: dict[str, dict[str, Any]] = {}
 
     # leakage: spot-check that feature bytes do not embed forward values —
@@ -45,11 +45,24 @@ def discipline_audit(
                          "detail": f"{len(forward_pairs)} pairs with exclusion logs"
                          if leak_ok else "missing exclusion accounting"}
 
-    # time_order: every fit must carry OOS skill from time-ordered split.
-    to_ok = bool(fits) and all(f.oos_skill is not None for f in fits.values())
+    # estimation: every fit must at least be estimable with enough training
+    # data before validation semantics apply at all.
+    est_ok = bool(fits) and all(f.estimation_status == "fitted" for f in fits.values())
+    checks["estimation"] = {"pass": bool(est_ok),
+                            "detail": "all fits carry fitted estimation status"
+                            if est_ok else "one or more fits are not estimable"}
+
+    # time_order: OOS skill must come from a held-out segment with enough
+    # observations; a non-null field alone is not evidence of a valid split.
+    to_ok = bool(fits) and all(
+        f.oos_skill is not None and f.n_oos >= 30
+        and f.split_method == "time-ordered-70/30"
+        and f.validation_status == "validated"
+        for f in fits.values()
+    )
     checks["time_order"] = {"pass": bool(to_ok),
-                            "detail": "all fits carry time-ordered oos_skill"
-                            if to_ok else "oos_skill missing (shuffled splits rejected)"}
+                            "detail": "all fits carry validated time-ordered OOS evidence"
+                            if to_ok else "OOS validation missing, thin, or not promoted"}
 
     checks["horizon_separation"] = {"pass": not pooled_horizons,
                                     "detail": "per-horizon fits" if not pooled_horizons
@@ -87,8 +100,11 @@ def discipline_audit(
                                   "detail": "m_tests + adjustment named" if mult_ok
                                   else "multiplicity accounting missing"}
 
-    pins_ok = bool(fits) and all(bool(f.model_version) and bool(f.input_hash)
-                                 for f in fits.values())
+    pins_ok = bool(fits) and all(
+        bool(f.model_version) and bool(f.input_hash)
+        and bool(f.feature_schema_hash) and bool(f.feature_keys)
+        for f in fits.values()
+    )
     checks["version_pins"] = {"pass": bool(pins_ok),
                               "detail": "model_version + input_hash pinned" if pins_ok
                               else "version pins missing"}
