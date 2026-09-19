@@ -43,7 +43,9 @@ _MICROSTRUCTURE_EVIDENCE_SCHEMA = json.dumps(
         "evidence_id": "ev-<hash-prefix>",
         "input_hash": "<sha256>",
         "model_version": "ofi-depth-v1",
-        "forward_stack": "MicrostructureEvidenceV2 (evidence-v2): x_t/vector_version, horizon_ms, "
+        "forward_stack": "MicrostructureEvidenceV2 (evidence-v2) plus ForecastResult (forecast-result-v1): "
+        "forecast_type/horizon_regime, feature schema, route_a/route_b/agreement, validation and probability status, "
+        "x_t/vector_version, horizon_ms, "
         "expected_dP_ticks, variance_ticks, interval_lo/hi_95, p_positive, p_target/p_invalidation curves, "
         "hypothesis/effect/evidence/n/split/multiplicity_adj, oos_info, events — unproven field is null, never 0",
         "hypothesis_ledger": "hyp-ledger-v1 entries {hypothesis_id, h0, h1, effect, se, ci, p_value, n, split, oos_skill, multiplicity_adj}",
@@ -87,11 +89,13 @@ class MicrostructureInterpretationAgent:
     """Read-only interpreter of one persisted MicrostructureEvidence."""
 
     remit: str = (
-        "Interpret fitted microstructure evidence without recomputing any "
-        "value. The deterministic fitter is the only producer of coefficients. "
-        "Reads MicrostructureEvidence (ofi-depth-v1) and MicrostructureEvidenceV2 "
-        "(evidence-v2: forward E/Var/P(T)/P(S), hypothesis ledger, events) — "
-        "unproven v2 fields are null, never 0."
+        "Interpret fitted microstructure evidence without recomputing or repairing "
+        "any value. The deterministic fitter is the only producer of coefficients. "
+        "Reads MicrostructureEvidence (ofi-depth-v1), ForecastResult (forecast-result-v1), "
+        "and MicrostructureEvidenceV2 (evidence-v2: forward E/Var/P(T)/P(S), "
+        "hypothesis ledger, events). Unproven fields are null, never 0. Do not "
+        "replace Gaussian assumptions with another distribution; report the "
+        "deterministic probability status and calibration refusal instead."
     )
 
     _MAX_LLM_ENVELOPE_CHARS = 190_000

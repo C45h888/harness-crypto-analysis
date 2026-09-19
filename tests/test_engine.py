@@ -270,9 +270,11 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("engine.wake", capabilities)
         self.assertIn("redis.read_capture_status", capabilities)
         self.assertIn("fitting.assemble_evidence", capabilities)
-        # PG-first ordering: postgres insert before redis publish
+        # PG-first pending write, final durable update, and final-trace
+        # projection are all visible; Redis is never published before PG.
         self.assertEqual(len(postgres.inserted), 1)
-        self.assertEqual(len(store.published), 1)
+        self.assertEqual(len(store.published), 3)
+        assert store.published[0].deterministic_state["terminal"] == "pending_settlement"
         # Memory proposal accepted and written
         self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
 
@@ -327,8 +329,8 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plain.deterministic_state.get("scenario"))
 
     async def test_thin_final_triggers_repair_then_finalizes(self):
-        # narrate#1 finalizes with zero validation → REJECTED for repair;
-        # the repair turn covers P1/P2/P3, the next covers P5, then final passes.
+        # narrate#1 finalizes with zero validation → one bounded repair path;
+        # the canonical runtime does not add legacy extra narration turns.
         engine, _s, _p, _m = _engine(llm_responses=[
             _good_narration(),  # thin, no tools → repair
             _staged_narration("P1", tools=[
@@ -343,10 +345,11 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 4)
+        self.assertEqual(meta["llm_calls"], 3)
         self.assertEqual(meta["repairs"], 1)
-        self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
-        self.assertIsNotNone(artifact.interpretation)
+        self.assertFalse(meta["final_validation"]["passed"])
+        self.assertEqual(meta["terminal"], "validation_failed")
+        self.assertIsNone(artifact.interpretation)
 
     async def test_scenario_verdict_without_agent_hypothesis(self):
         # Live-proven shape: budget spent, agent formed no H0/H1, scenario
@@ -396,13 +399,13 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         scenario = {"target_price": "100.50", "horizon": "15m"}
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, scenario=scenario)
-        self.assertEqual(meta["llm_calls"], 8)
+        # Comprehension is deterministic and validation stops after the
+        # bounded repair budget; no legacy extra narration turns are spent.
+        self.assertEqual(meta["llm_calls"], 5)
         self.assertFalse(meta["final_validation"]["passed"])
-        self.assertEqual(artifact.hypothesis_verdict, "inconclusive")
-        self.assertIn("scenario unevaluated", artifact.verdict_reason)
-        self.assertIn("agent formed no H0/H1", artifact.verdict_reason)
-        self.assertNotIn("calculations split but hypothesis implicit",
-                         artifact.verdict_reason)
+        self.assertEqual(meta["terminal"], "validation_failed")
+        self.assertIsNone(artifact.interpretation)
+        self.assertIsNone(artifact.hypothesis_verdict)
 
     async def test_narration_failure_produces_degraded_artifact(self):
         # LLM raises on the first call → degraded artifact, NULL interpretation,
@@ -470,16 +473,17 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
 
     async def test_budget_limited_narrate2_even_when_tool_called(self):
-        # narrate#1 requests tools, narrate#2 output unparseable → fall back
-        # to narrate#1's parsed output (never a third call).
+        # narrate#1 requests tools, narrate#2 output is unparseable.  The
+        # runtime preserves the failure terminal and intentionally does not
+        # claim a composed interpretation.
         engine, _s, _p, _m = _engine(llm_responses=[
             _good_narration(with_tools=True),
             "unparseable",
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 2)
-        self.assertIsNotNone(artifact.interpretation)
-        # Parse failure mid-loop falls back without repair: the record is honest.
+        self.assertIsNone(artifact.interpretation)
+        self.assertEqual(meta["terminal"], "parse_failed")
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["repairs"], 0)
 
@@ -1142,20 +1146,20 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
         # error); we need a deterministic refusal. Intercept execute_tool.
         import market_service.nooa_harness.engine.core as core_mod
 
-        real_execute = core_mod.execute_tool
+        real_execute = core_mod.context.execute_tool
 
         async def refusing_execute(store, name, args, **kwargs):
             if name == "calc.scenario.evaluate":
                 return None, dict(refusal)
             return await real_execute(store, name, args, **kwargs)
 
-        core_mod.execute_tool = refusing_execute
+        core_mod.context.execute_tool = refusing_execute
         try:
             artifact, meta = await engine_run.narrate_cycle(
                 _wake(), {"decision": "fire"},
                 scenario={"target_price": "100.50", "horizon": "15m"})
         finally:
-            core_mod.execute_tool = real_execute
+            core_mod.context.execute_tool = real_execute
         self.assertTrue(meta["final_validation"]["passed"],
                         meta["final_validation"])
         self.assertEqual(meta["repairs"], 0)
@@ -1200,20 +1204,20 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(bad_final),    # final without refusal citation → repair
             json.dumps(re_call),      # repair re-calls → suppressed, citation ok
         ])
-        real_execute = core_mod.execute_tool
+        real_execute = core_mod.context.execute_tool
 
         async def refusing_execute(store, name, args, **kwargs):
             if name == "calc.scenario.evaluate":
                 return None, dict(refusal)
             return await real_execute(store, name, args, **kwargs)
 
-        core_mod.execute_tool = refusing_execute
+        core_mod.context.execute_tool = refusing_execute
         try:
             artifact, meta = await engine.narrate_cycle(
                 _wake(), {"decision": "fire"},
                 scenario={"target_price": "100.50", "horizon": "15m"})
         finally:
-            core_mod.execute_tool = real_execute
+            core_mod.context.execute_tool = real_execute
         self.assertTrue(meta["final_validation"]["passed"],
                         meta["final_validation"])
         self.assertEqual(meta["repairs"], 1)

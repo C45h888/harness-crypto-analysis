@@ -309,14 +309,14 @@ class ControllerGovernanceUnitTests(unittest.TestCase):
 
 
 class EvidenceBoundaryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pre_gate_reads_run_inside_acquisition(self):
+    async def test_pre_gate_reads_use_initial_comprehension_bootstrap(self):
         from unittest.mock import patch
 
         from market_service.nooa_harness.engine import core
 
         engine, _s, _p, _m = _engine(llm_responses=[], capture_state="starting")
-        govern = core._govern
-        execute = core.execute_tool
+        govern = core.context._govern
+        execute = core.context.execute_tool
         observation = None
         requests = []
         reads = []
@@ -332,20 +332,19 @@ class EvidenceBoundaryTests(unittest.IsolatedAsyncioTestCase):
             reads.append((name, observation))
             return await execute(store, name, args, **kwargs)
 
-        with patch.object(core, "_govern", side_effect=observe_govern), patch.object(
-            core, "execute_tool", side_effect=observe_read,
+        with patch.object(core.context, "_govern", side_effect=observe_govern), patch.object(
+            core.context, "execute_tool", side_effect=observe_read,
         ):
             artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
 
-        self.assertIn(
-            (GovernanceEventKind.OPEN_SUBLOOP, SubLoop.ACQUISITION, True), requests,
-        )
+        # Gate reads are explicitly authorized as wake bootstrap work.  They
+        # do not fabricate an EVIDENCE/ACQUISITION observation before the
+        # agentic traversal opens that loop.
+        self.assertEqual(requests, [])
         self.assertEqual([name for name, _ in reads], [
             "micro.capture_status", "micro.fit_beta",
         ])
-        for name, position in reads:
-            self.assertIs(position.nested_loop, NestedLoop.EVIDENCE, name)
-            self.assertIs(position.sub_loop, SubLoop.ACQUISITION, name)
+        self.assertTrue(all(position is None for _, position in reads))
         self.assertEqual(meta["llm_calls"], 0)
         self.assertEqual(artifact.deterministic_state["terminal"], meta["terminal"])
 
@@ -409,16 +408,16 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.deterministic_state.get("terminal"), "narration_failed")
 
     async def test_budget_exhaustion_terminals_budget_exhausted(self):
-        # Round follow-up is unparseable -> the loop breaks without a passing
-        # final -> BUDGET_EXHAUSTED, honestly recorded beside the meta + state.
+        # Round follow-up is unparseable.  Parse failure is a distinct
+        # terminal; it must not be relabeled as budget exhaustion.
         engine, _s, _p, _m = _engine(llm_responses=[
             _good_narration(with_tools=True),
             "unparseable",
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["terminal"], "budget_exhausted")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "budget_exhausted")
-        self.assertFalse(meta["final_validation"]["passed"])
+        self.assertEqual(meta["terminal"], "parse_failed")
+        self.assertEqual(artifact.deterministic_state.get("terminal"), "parse_failed")
+        self.assertEqual(artifact.deterministic_state["failure"]["kind"], "parse_failed")
 
 
 if __name__ == "__main__":

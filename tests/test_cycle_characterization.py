@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from test_governance import _engine, _wake, _staged_narration
+from tests.test_governance import _engine, _wake, _staged_narration
 from market_service.nooa_harness.engine import core
 
 FIXTURE = Path(__file__).with_name("fixtures") / "cycle_characterization.json"
@@ -52,20 +52,28 @@ async def capture(case, stage_trace=None):
             raise AssertionError("LLM called more times than scripted") from None
 
     if stage_trace is not None:
-        wake_stage = engine._stage_wake
+        wake_stage = engine.run_wake
         def wake_spy(*args, **kwargs):
-            stage_trace.append("_stage_wake")
+            stage_trace.append("run_wake")
             return wake_stage(*args, **kwargs)
-        engine._stage_wake = wake_spy
-        for name in ("_stage_gather", "_stage_reason_and_check", "_stage_output"):
-            original = getattr(engine, name)
-            async def stage_spy(ctx, _name=name, _original=original):
-                stage_trace.append(_name)
-                result = await _original(ctx)
-                if _name == "_stage_output":
+        engine.run_wake = wake_spy
+        def _wrap_stage(label, original):
+            async def _spy(*args, **kwargs):
+                stage_trace.append(label)
+                result = await original(*args, **kwargs)
+                if label == "run_output":
+                    ctx = args[1]
                     assert ctx.controller.terminal.value == result[1]["terminal"]
                 return result
-            setattr(engine, name, stage_spy)
+            return _spy
+        _stage_wraps = [
+            (core.gather, "run_gather"),
+            (core.reasoning, "run_comprehension"),
+            (core.reasoning, "run_evidence"),
+            (core.reasoning, "run_reasoning"),
+            (core.reasoning, "run_validation"),
+            (core.output, "run_output"),
+        ]
 
     async def persist_pg(artifact):
         effects.append(["postgres", artifact.to_dict()])
@@ -80,14 +88,27 @@ async def capture(case, stage_trace=None):
         effects.append(["memory", args, kwargs])
         return await remember(*args, **kwargs)
 
-    with patch.object(core, "execute_tool", side_effect=execute), patch.object(
-        core, "_utc_now_iso", return_value="2026-01-01T00:00:00+00:00",
+    _extra_patchers = []
+    if stage_trace is not None:
+        for _mod, _name in _stage_wraps:
+            _orig = getattr(_mod, _name)
+            _extra_patchers.append(
+                patch.object(_mod, _name, side_effect=_wrap_stage(_name, _orig))
+            )
+    for _p in _extra_patchers:
+        _p.start()
+    try:
+        with patch.object(core.context, "execute_tool", side_effect=execute), patch.object(
+        core.context, "_utc_now_iso", return_value="2026-01-01T00:00:00+00:00",
     ), patch("market_service.runtime.contracts.uuid.uuid4", return_value="00000000-0000-0000-0000-000000000001"), patch.object(
         engine, "_call_llm", side_effect=llm,
     ), patch.object(postgres, "insert_inference_artifact", side_effect=persist_pg), patch.object(
         store, "publish_inference_artifact", side_effect=persist_redis,
     ), patch.object(memory, "remember", side_effect=remember_spy):
-        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"}, task="Explain the evidence")
+            artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"}, task="Explain the evidence")
+    finally:
+        for _p in reversed(_extra_patchers):
+            _p.stop()
     return json.loads(json.dumps({"artifact": artifact.to_dict(), "meta": meta, "effects": effects}, default=str))
 
 
@@ -100,16 +121,19 @@ def test_cycle_characterization(case):
 def test_staged_cycle_converges_and_preserves_placement_order():
     stages = []
     result = asyncio.run(capture("success", stages))
-    assert stages == ["_stage_wake", "_stage_gather", "_stage_reason_and_check", "_stage_output"]
+    assert stages == ["run_wake", "run_gather", "run_comprehension", "run_evidence",
+                    "run_reasoning", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
     assert result["meta"]["final_validation"]["passed"]
+    # Pending projection, memory disposition, final projection, and the
+    # final-trace refresh are explicit side effects of two-phase settlement.
     assert [effect[0] for effect in result["effects"] if effect[0] in ("postgres", "redis", "memory")] == [
-        "postgres", "redis", "memory",
+        "postgres", "redis", "memory", "redis", "redis",
     ]
 
 
 def test_gate_refusal_stops_stage_execution():
     stages = []
     result = asyncio.run(capture("gate", stages))
-    assert stages == ["_stage_wake", "_stage_gather"]
+    assert stages == ["run_wake", "run_gather"]
     assert result["meta"]["llm_calls"] == 0

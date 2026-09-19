@@ -72,10 +72,10 @@ LOOP_PASS_BUDGET: dict[str, int] = {
 # revalidate). Persistent failure emits a structured issue to the FSM
 # terminal; terminal stewardship is a later FSM pass.
 VALIDATION_RETRY_PASSES = 1
-# Anti-runaway dispatch ceiling per pass (directive band 10-15). Steering
-# lives in guidance, never in this number; excess calls are named on the
-# cycle's unexecuted list (existing transparency mechanism).
-MAX_DISPATCHES_PER_PASS = 12
+# One tool-call batch is bounded by the public per-round contract.  The
+# runtime and prompt use the same number; excess calls are named on the
+# cycle's unexecuted list rather than silently dropped.
+MAX_DISPATCHES_PER_PASS = AGENTIC_PER_ROUND_CALL_CAP
 # P4 explanation floor — thinner finals are repaired.
 SUMMARY_MIN_CHARS = 200
 

@@ -40,9 +40,10 @@ Boundary rules:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from market_service.nooa_harness.inference import (
     TOOL_PHASE,
@@ -90,12 +91,26 @@ class ToolOutcome:
 
 
 @dataclass(frozen=True)
+class GovernanceRecord:
+    """One FSM-authorized transition in the cycle trace."""
+
+    kind: str
+    target: str | None
+    allowed: bool
+    reason: str
+    before_loop: str | None
+    before_sub_loop: str | None
+    after_loop: str | None
+    after_sub_loop: str | None
+
+
+@dataclass(frozen=True)
 class LoopVisit:
     """One nested loop's traversal record (Track A congruence shape).
 
     Which loop ran, how many LLM passes it spent, which sub-loops the
     driver opened, and whether it completed (vs budget spent). The
-    controller classifies the visit; the loop driver in core.py reports it.
+    controller classifies the visit; the loop driver in core/driver.py reports it.
     """
 
     loop: str
@@ -130,11 +145,12 @@ class CycleController:
     scenario: dict[str, Any] | None = None
     outcomes: tuple[ToolOutcome, ...] = ()
     loop_visits: tuple[LoopVisit, ...] = ()
-    phase_coverage: dict[str, frozenset[str]] = field(
-        default_factory=lambda: {
+    transitions: tuple[GovernanceRecord, ...] = ()
+    phase_coverage: Mapping[str, frozenset[str]] = field(
+        default_factory=lambda: MappingProxyType({
             p: frozenset() for p in
             ("P1", "P2", "P3", "P4", "P5", "P6")
-        }
+        })
     )
     # Governance coupling — defaulted OFF so existing behavior/tests are
     # untouched; ``compare/repr=False`` keeps value/hash semantics stable.
@@ -154,27 +170,11 @@ class CycleController:
 
     def with_membrane(self, membrane: AgenticLoopMembrane) -> "CycleController":
         """A new controller governing under ``membrane`` (immutable setter)."""
-        return CycleController(
-            scenario=self.scenario,
-            outcomes=self.outcomes,
-            loop_visits=self.loop_visits,
-            phase_coverage=self.phase_coverage,
-            membrane=membrane,
-            observation=self.observation,
-            terminal=self.terminal,
-        )
+        return replace(self, membrane=membrane)
 
     def with_observation(self, observation: LoopObservation) -> "CycleController":
         """A new controller carrying ``observation`` (immutable setter)."""
-        return CycleController(
-            scenario=self.scenario,
-            outcomes=self.outcomes,
-            loop_visits=self.loop_visits,
-            phase_coverage=self.phase_coverage,
-            membrane=self.membrane,
-            observation=observation,
-            terminal=self.terminal,
-        )
+        return replace(self, observation=observation)
 
     def govern(self, event: GovernanceEvent) -> MembraneVerdict:
         """Consult the membrane: may this move happen? NEVER raises.
@@ -184,6 +184,11 @@ class CycleController:
         and an observation, the verdict is the membrane's. Without an
         observation the move is denied (nothing to govern).
         """
+        if self.terminal is not None:
+            return MembraneVerdict(
+                allowed=False,
+                reason=f"cycle already terminated at {self.terminal.value}",
+            )
         if self.membrane is None:
             return MembraneVerdict(
                 allowed=True,
@@ -206,26 +211,81 @@ class CycleController:
         verdict = self.govern(event)
         if not verdict.allowed:
             return self
+        before = self.observation
+        after = verdict.next
+        record = GovernanceRecord(
+            kind=event.kind.value,
+            target=(event.target.value if hasattr(event.target, "value") else None),
+            allowed=True,
+            reason=verdict.reason,
+            before_loop=(before.nested_loop.value if before else None),
+            before_sub_loop=(before.sub_loop.value if before and before.sub_loop else None),
+            after_loop=(after.nested_loop.value if after else None),
+            after_sub_loop=(after.sub_loop.value if after and after.sub_loop else None),
+        )
         if verdict.terminal is not None:
-            return CycleController(
-                scenario=self.scenario,
-                outcomes=self.outcomes,
-                loop_visits=self.loop_visits,
-                phase_coverage=self.phase_coverage,
-                membrane=self.membrane,
+            return replace(
+                self,
+                transitions=self.transitions + (record,),
                 observation=None,
                 terminal=verdict.terminal,
             )
         if verdict.next is None:
             return self
-        return CycleController(
-            scenario=self.scenario,
-            outcomes=self.outcomes,
-            loop_visits=self.loop_visits,
-            phase_coverage=self.phase_coverage,
-            membrane=self.membrane,
+        return replace(
+            self,
+            transitions=self.transitions + (record,),
             observation=verdict.next,
-            terminal=self.terminal,
+        )
+
+    def transition(self, event: GovernanceEvent) -> tuple["CycleController", MembraneVerdict]:
+        """Authorize and apply exactly one transition.
+
+        This is the only runtime transition seam.  A denied event returns the
+        same observation with an appended denial record; it never closes or
+        advances another state implicitly.
+        """
+        verdict = self.govern(event)
+        if verdict.allowed:
+            return self.advance(event), verdict
+        return self.record_denial(event, verdict), verdict
+
+    def record_denial(
+        self, event: GovernanceEvent, verdict: MembraneVerdict,
+    ) -> "CycleController":
+        """Record a denied FSM request without changing runtime position."""
+        before = self.observation
+        record = GovernanceRecord(
+            kind=event.kind.value,
+            target=(event.target.value if hasattr(event.target, "value") else None),
+            allowed=False,
+            reason=verdict.reason,
+            before_loop=(before.nested_loop.value if before else None),
+            before_sub_loop=(before.sub_loop.value if before and before.sub_loop else None),
+            after_loop=(before.nested_loop.value if before else None),
+            after_sub_loop=(before.sub_loop.value if before and before.sub_loop else None),
+        )
+        return replace(self, transitions=self.transitions + (record,))
+
+    def authorize_work(
+        self,
+        *,
+        nested_loop: Any,
+        sub_loop: Any | None = None,
+        bootstrap: bool = False,
+    ) -> MembraneVerdict:
+        """Ask the FSM whether work may execute at the current observation."""
+        if self.terminal is not None:
+            return MembraneVerdict(False, reason=f"cycle already terminated at {self.terminal.value}")
+        if self.membrane is None:
+            return MembraneVerdict(True, reason="no membrane instantiated (legacy controller authority)")
+        if self.observation is None:
+            return MembraneVerdict(False, reason="controller has no live observation")
+        return self.membrane.authorize_work(
+            self.observation,
+            nested_loop=nested_loop,
+            sub_loop=sub_loop,
+            bootstrap=bootstrap,
         )
 
     # ------------------------------------------------------------------
@@ -262,7 +322,7 @@ class CycleController:
             result=outcome_result,
             refused=refused,
             refusal_reason=refusal_reason,
-            payload=result,
+            payload=(result if outcome_result == "ok" and not refused else None),
         )
         # Coverage credit is atomic with classification: refusal/denied/error
         # never credits (refusal is a finding, not coverage).
@@ -271,16 +331,10 @@ class CycleController:
             phase = TOOL_PHASE.get(canonical)
             if phase is not None:
                 coverage[phase] = coverage.get(phase, frozenset()) | {canonical}
-        return CycleController(
-            scenario=self.scenario,
+        return replace(
+            self,
             outcomes=self.outcomes + (outcome,),
-            loop_visits=self.loop_visits,
-            phase_coverage=coverage,
-            # Governance coupling — an immutable controller must carry its
-            # membrane/observation/terminal through every successor.
-            membrane=self.membrane,
-            observation=self.observation,
-            terminal=self.terminal,
+            phase_coverage=MappingProxyType(coverage),
         )
 
     def mark_declared(self, parsed: dict[str, Any]) -> "CycleController":
@@ -290,15 +344,7 @@ class CycleController:
             return self
         coverage = dict(self.phase_coverage)
         coverage[declared] = coverage.get(declared, frozenset()) | {"declared"}
-        return CycleController(
-            scenario=self.scenario,
-            outcomes=self.outcomes,
-            loop_visits=self.loop_visits,
-            phase_coverage=coverage,
-            membrane=self.membrane,
-            observation=self.observation,
-            terminal=self.terminal,
-        )
+        return replace(self, phase_coverage=MappingProxyType(coverage))
 
     # ------------------------------------------------------------------
     # Loop-traversal ledger (Track A congruence shape: traversal is
@@ -310,17 +356,21 @@ class CycleController:
         sub_loops: tuple[str, ...] = (), completed: bool = False,
     ) -> "CycleController":
         """Append one nested loop's traversal record (immutable)."""
-        return CycleController(
-            scenario=self.scenario,
-            outcomes=self.outcomes,
+        # A visit is a projection of the authorized transition trace.  Never
+        # claim a sub-loop that the FSM did not actually open.
+        opened = {
+            record.after_sub_loop
+            for record in self.transitions
+            if record.kind == "open_subloop" and record.after_sub_loop
+        }
+        actual_sub_loops = tuple(name for name in sub_loops if name in opened)
+        actual_completed = completed and set(actual_sub_loops) == set(sub_loops)
+        return replace(
+            self,
             loop_visits=self.loop_visits + (LoopVisit(
                 loop=loop, passes_spent=passes_spent,
-                sub_loops=tuple(sub_loops), completed=completed,
+                sub_loops=actual_sub_loops, completed=actual_completed,
             ),),
-            phase_coverage=self.phase_coverage,
-            membrane=self.membrane,
-            observation=self.observation,
-            terminal=self.terminal,
         )
 
     def loop_coverage(self) -> dict[str, dict[str, Any]]:
@@ -333,6 +383,20 @@ class CycleController:
             }
             for visit in self.loop_visits
         }
+
+    def transition_trace(self) -> list[dict[str, Any]]:
+        """Serializable FSM-authorized transition trace for the artifact."""
+        return [
+            {
+                "kind": record.kind,
+                "target": record.target,
+                "allowed": record.allowed,
+                "reason": record.reason,
+                "before": {"loop": record.before_loop, "sub_loop": record.before_sub_loop},
+                "after": {"loop": record.after_loop, "sub_loop": record.after_sub_loop},
+            }
+            for record in self.transitions
+        ]
 
     # ------------------------------------------------------------------
     # Scenario tri-state (one answer, all consumers)
@@ -353,12 +417,16 @@ class CycleController:
                 continue
             if outcome.refused:
                 return ScenarioEvalStatus.REFUSED
-            if outcome.result == "ok" and outcome.payload is not None:
-                return ScenarioEvalStatus.EVALUATED
-            # ok with null payload but not policy-refused (e.g. tool.error
-            # path): treat as refusal-shaped for steer purposes.
-            if outcome.result != "ok":
-                return ScenarioEvalStatus.REFUSED
+            if outcome.result == "ok":
+                # A dispatch that returned no payload is still a dispatch. It
+                # must not fall back to NOT_CALLED, otherwise the repair loop
+                # can ask the model to repeat an already exhausted tool.
+                return (
+                    ScenarioEvalStatus.EVALUATED
+                    if outcome.payload is not None
+                    else ScenarioEvalStatus.REFUSED
+                )
+            return ScenarioEvalStatus.REFUSED
         return ScenarioEvalStatus.NOT_CALLED
 
     def forward_scenario_state(self) -> ScenarioEvalStatus:
@@ -513,6 +581,7 @@ __all__ = [
     "FORWARD_SCENARIO_TOOL",
     "HYPOTHESIS_TOOL",
     "CycleController",
+    "GovernanceRecord",
     "LoopVisit",
     "ScenarioEvalStatus",
     "ToolOutcome",

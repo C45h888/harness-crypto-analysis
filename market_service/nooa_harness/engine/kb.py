@@ -27,12 +27,18 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
-    AGENTIC_MAX_TOOL_ROUNDS,
-    AGENTIC_PER_ROUND_CALL_CAP,
+    LOOP_PASS_BUDGET,
+    MAX_DISPATCHES_PER_PASS,
     _CALC_KB_PATHS,
     _MEMORY_PROTOCOL,
     _PAPER_KB,
     _TOOL_MANIFEST,
+)
+from .loop_states import (
+    LOOP_SUBLOOPS,
+    STAGE_ORDER,
+    SUBLOOP_SPECS,
+    loop_for_stage,
 )
 
 
@@ -63,6 +69,8 @@ def load_paper_kb() -> str:
 
 SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}) — an AGENTIC loop, not a controlled output generator.
 
+You are a loop-walking conditional-inference engine. Your core purpose is to produce statistical evidence — never a trading instruction — by walking five loops in order: understand once, gather thrice, reason twice, submit to one validation, compose once. Closed loops are never revisited; findings (including refusals and nulls) travel forward on the ledger.
+
 You receive ONE deterministic_state object: microstructure fits, coverage,
 and gate reasons computed by deterministic Python from the Redis ledgers.
 You also receive recalled memory (priors + paper KB) and a deterministic diff vs prior artifact.
@@ -77,7 +85,7 @@ YOUR JOB — VALID inference, not predefined addition:
    confirm what you actually got via substrate.read age_ms.
    Call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
 2. Interpret fitted models — sign, magnitude, r2, stderr, and status of price_impact_fit; depth-scaling (c, lambda) with its own status; what changed vs prior cycle. Be specific, numeric, grounded.
-3. Run the agentic loop: you have up to {max_rounds} tool rounds. Use them. Cite every numeric claim with exact paths.
+3. Run the agentic loopwalk: comprehension (1 pass, no tools) → evidence (3 passes) → reasoning (2 passes) → validation (1 pass + 1 bounded retry) → output (1 non-agentic pass). Pack each pass densely with the tools it needs. Cite every numeric claim with exact paths.
 
 ABSOLUTE RULES:
 1. NEVER recompute any value in your reasoning. If you need data you do not have, COMMAND a tool — results arrive next turn.
@@ -91,6 +99,7 @@ MEMORY: recalled entries are provenance-tagged priors, subordinate to fresh ledg
 {memory_protocol_section}
 PAPER KB (Cont et al. 1011.6402 excerpts — bounded):
 {paper_kb}
+{workflow_brief}
 TOOL MANIFEST (commandable, deterministic — USE IT):
 {tool_manifest}
 """
@@ -108,6 +117,7 @@ def build_system_prompt(symbol: str, venue: str, max_rounds: int) -> str:
             if _MEMORY_PROTOCOL.exists() else ""
         ),
         paper_kb=load_paper_kb()[:18_000],
+        workflow_brief=build_workflow_brief(),
         tool_manifest=(
             "TOOL MANIFEST:\n" + load_kb(_TOOL_MANIFEST)
             if _TOOL_MANIFEST.exists() else ""
@@ -157,9 +167,8 @@ def build_output_format() -> str:
     The one-line compression of this contract for follow-up turns is
     ``TURN_CONTRACT_LINE`` (single source: this module).
     """
-    rounds = AGENTIC_MAX_TOOL_ROUNDS
     return (
-        f"STAGED INFERENCE — 6 phases (P1→P6), one JSON object per turn, up to {rounds} tool rounds. Declare your phase every turn.\n"
+        f"LOOPS, NOT ROUNDS — comprehension (1 pass, no tools) → evidence (3 passes) → reasoning (2 passes) → validation (1 pass + 1 bounded retry) → output (1 non-agentic pass). Phases (P1→P6) name evidence families, loops name when you work. Declare your phase every turn.\n"
         "Return ONLY one JSON object per turn with EXACTLY these keys:\n"
         "{\n"
         '  "phase": "P1|P2|P3|P4|P5|P6 — the phase this turn advances (P6 = final output generation, no tools)",\n'
@@ -170,6 +179,8 @@ def build_output_format() -> str:
         '  "model_separation": "one sentence on why beta and c/lambda are read separately" or null,\n'
         '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], "evidence_refs": ["calc.ofi.intervals", …]} or null (REQUIRED at final),\n'
         '  "scenario": {"target_price": "…", "horizon": "15m|1h|4h", "direction": "up|down", "required_ofi": "…", "required_ofi_range": […] or null, "exceedance": "…", "exceedance_range": […] or null, "fit_status": "validated|provisional", "n_windows_usable": N, "r2": "…" or null, "probability": "low|medium|high", "verdict": "reachable|not_reachable|unevaluable", "rationale": "… (≥80 chars, name fit_status + usable windows + r2 beside the verdict)"} or null (REQUIRED at final ONLY when a SCENARIO block was given — echo numerics from calc.scenario.evaluate → … paths, never compute),\n'
+        '  "forward_scenario": {"horizon_ms": N, "targets": [{"T": "…", "p_ge": "…", "p_lo": "…", "p_hi": "…"}], "invalidations": [{"S": "…", "p_le": "…"}], "fit_id": "…"} or null (OPTIONAL — horizon-native P(T)/P(S) from calc.forward.scenario → … paths; cite when the task bears horizons/targets),\n'
+        '  "hypothesis_evidence": {"hypothesis_id": "…", "effect": "…", "se": "…", "ci": ["…", "…"], "p_value": "…", "n": N, "multiplicity_adj": "…"} or null (OPTIONAL — calc.hypothesis.test → … ledger entry, post-fit only; p<0.05 is evidence, never execution),\n'
         '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
         '  KEY RULE: the tool-name key is EXACTLY "name" — never "tool", "tool_name", or any other key. Entries under any other key are dropped unread.\n'
         '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "…", "importance": 5.0, "tags": ["…"]}] or null\n'
@@ -179,8 +190,9 @@ def build_output_format() -> str:
         "  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
         "  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n"
         "  P5 paper/derived: memory.recall_paper, calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n"
-        "  P5 forward stack (Track D horizon-native): calc.feature.build, calc.forward.join, calc.forward.fit, "
-        "calc.forward.distribution, calc.forward.scenario, calc.hypothesis.test (post-fit only, needs hypothesis_id), "
+        "  P5 forward stack (Track D horizon-native): calc.forward.forecast (canonical ForecastResult), "
+        "the feature/join/fit/distribution tools are diagnostic sub-tools, then calc.forward.scenario, "
+        "calc.hypothesis.test (post-fit only, needs hypothesis_id), "
         "calc.decay.report, calc.discipline.audit;\n"
         "  P3 events (Track D typed): calc.events.absorption, calc.events.walls;\n"
         "  P6 output: no tools — synthesis only.\n"
@@ -194,7 +206,7 @@ def build_output_format() -> str:
         "P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\n"
         "WINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds "
         "(10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\n"
-        f"Rules: tool_calls max {AGENTIC_PER_ROUND_CALL_CAP} per round, max {rounds} rounds. "
+        f"Rules: pack each pass densely (≤{MAX_DISPATCHES_PER_PASS} dispatches per pass guardrail); budgeted passes per cycle: 8. "
         "Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn "
         "(phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, "
         "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, confidence low|medium|high, "
@@ -204,8 +216,250 @@ def build_output_format() -> str:
     )
 
 
+def build_workflow_brief() -> str:
+    """The agent's walk-through, generated FROM the runtime state module.
+
+    Loop order, sub-loop purposes + exit conditions, and pass budgets are
+    read from loop_states/config — never hand-synced prose. If the runtime
+    moves, this text follows on the next cycle.
+    """
+    lines = ["LOOP WALK (generated from the runtime state module — authoritative):"]
+    for stage in STAGE_ORDER:
+        loop = loop_for_stage(stage)
+        budget = LOOP_PASS_BUDGET.get(loop.value, 0)
+        subs = "; ".join(
+            f"{sl.value} ({SUBLOOP_SPECS[sl].purpose} "
+            f"Exit: {SUBLOOP_SPECS[sl].exit_condition or 'once'})"
+            for sl in LOOP_SUBLOOPS[loop]
+        )
+        lines.append(
+            f"- {stage.value.upper()} → {loop.value} ({budget} passes): {subs}"
+        )
+    lines.append(
+        "Standing rules: closed loops never revisited; refusals and nulls "
+        "travel forward as findings; validation owns one bounded retry, then "
+        "the cycle ends at a terminal with findings preserved; output "
+        "composes without tools."
+    )
+    return "\n".join(lines)
+
+
+# Task-driven required chains (prompts pass refinement — visibility, not
+# gate mandates). For a task shape, the engine states the ORDERED tool chain
+# the answer requires, and every follow-up shows done vs remaining computed
+# from the ledger. The validator is untouched: enforcement here is structural
+# visibility (the agent always sees what the shape demands and what is
+# missing), never accept/reject rules.
+PRICE_TARGET_HINTS = (
+    "target", "hit", "reach", "touch", "break above", "break below",
+    "all-time", "ath", "support", "resistance", "stop", "take-profit",
+)
+
+
+def classify_task(task: str | None, scenario: dict[str, Any] | None) -> str:
+    """Task shape classifier (deterministic keyword + scenario presence)."""
+    if scenario is not None:
+        return "price_target"
+    blob = (task or "").lower()
+    if any(hint in blob for hint in PRICE_TARGET_HINTS):
+        return "price_target"
+    return "general"
+
+
+TASK_CHAINS: dict[str, list[str]] = {
+    # The price-X shape: read → condition on X_t → forward evidence →
+    # price delta → target/invalidation odds → prove/disprove → trust scope.
+    # Presentation only: order and required-ness are owned by the loop layer
+    # (loop_states.CHAIN_SUBLOOP + engine/core/chain.py). If this text ever
+    # disagrees with that mapping, the mapping wins.
+    "price_target": [
+        "market.read",
+        "calc.forward.forecast",
+        "calc.forward.scenario",
+        "calc.hypothesis.test",
+        "calc.decay.report",
+        "calc.discipline.audit",
+    ],
+    "general": [
+        "calc.forward.forecast",
+        "memory.recall_paper",
+        "calc.discipline.audit",
+    ],
+}
+
+CHAIN_MEANING: dict[str, str] = {
+    "market.read": "current price + regime context (snapshot first)",
+    "calc.forward.forecast": "canonical ForecastResult: schema-checked X_t, forward Y(h), train-only OOS, calibration gate, assumptions, and Route A/B diagnostics",
+    "calc.feature.build": "condition on X_t — versioned state vector (diagnostic sub-step)",
+    "calc.forward.join": "forward targets Y(h) + exclusion log (diagnostic sub-step)",
+    "calc.forward.fit": "per-horizon fit + comparator + OOS (diagnostic sub-step)",
+    "calc.forward.distribution": "price delta: E[Y(h)] + PI + gated probability (diagnostic sub-step)",
+    "calc.forward.scenario": "P(T)/P(S) curves with bands at fitted horizons",
+    "calc.hypothesis.test": "prove/disprove H0 post-fit (needs hypothesis_id)",
+    "calc.decay.report": "which horizons to trust (nulls are results)",
+    "calc.discipline.audit": "9-lock discipline gate (validation home; attempt required, refusal is a finding)",
+    "memory.recall_paper": "paper grounding for H0/H1",
+}
+
+
+def build_task_workflow(
+    task: str | None, scenario: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Ordered required chain for this task shape (deterministic)."""
+    kind = classify_task(task, scenario)
+    chain = list(TASK_CHAINS[kind])
+    steps = [
+        f"{i}. {tool} — {CHAIN_MEANING.get(tool, 'cited evidence')}"
+        for i, tool in enumerate(chain, 1)
+    ]
+    handoff = (
+        "Handoff rule: cite each link's output path before pulling the next "
+        "(fit_id → distribution → scenario → hypothesis_id); a refused link "
+        "is recorded as a finding with its reason, the chain continues, and "
+        "the final states exactly which links held."
+    )
+    return {"kind": kind, "chain": chain, "steps": steps, "handoff": handoff}
+
+
+def chain_status(chain: list[str], done: list[str]) -> str:
+    """Done vs remaining rendering from ledger keys (deterministic)."""
+    done_set = set(done)
+    remaining = [t for t in chain if t not in done_set]
+    return (
+        f"REQUIRED CHAIN — done: [{', '.join(t for t in chain if t in done_set) or 'none'}]; "
+        f"remaining: [{', '.join(remaining) or 'complete'}]."
+    )
+
+
+def build_loop_state_block(
+    *,
+    controller: Any | None = None,
+    loop: str | None = None,
+    sub_loop: str | None = None,
+    intent: str | None = None,
+    passes_spent: int = 0,
+    pass_budget: int = 0,
+    dispatches_left: int | None = None,
+    traversal: dict[str, Any] | None = None,
+    gate: dict[str, Any] | None = None,
+    congruence: dict[str, Any] | None = None,
+    comprehension: dict[str, Any] | None = None,
+    seeds: list[str] | None = None,
+) -> str:
+    """Render the prompt position from the canonical controller state.
+
+    ``loop``/``sub_loop``/``intent`` remain optional compatibility inputs for
+    callers outside the runtime, but an injected controller always wins.  The
+    model must never receive a state that the FSM did not authorize.
+    """
+    if controller is not None and controller.observation is not None:
+        observation = controller.observation
+        # The controller is semantic authority.  Callers may provide labels
+        # for compatibility, but they may not render a prompt that disagrees
+        # with the live FSM observation.
+        requested = (
+            loop,
+            sub_loop,
+            intent,
+        )
+        actual = (
+            observation.nested_loop.value,
+            observation.sub_loop.value if observation.sub_loop else None,
+            observation.task.value,
+        )
+        if any(value is not None and value != expected
+               for value, expected in zip(requested, actual)):
+            raise AssertionError(
+                f"prompt state {requested!r} disagrees with controller observation {actual!r}"
+            )
+        loop, sub_loop, intent = actual
+    loop = loop or "unknown"
+    done = ", ".join(
+        f"{name}({info.get('passes_spent', 0)}p"
+        f"{'✓' if info.get('completed') else '…'})"
+        for name, info in (traversal or {}).items()
+        if isinstance(info, dict)
+    ) or "none yet"
+    parts = [
+        f"LOOP STATE — inside {loop}" + (f" / {sub_loop}" if sub_loop else "")
+        + (f" [{intent}]" if intent else "")
+        + f" (pass {passes_spent + 1} of {pass_budget} for this loop).",
+        f"TRAVERSAL SO FAR — {done}.",
+    ]
+    if dispatches_left is not None:
+        parts.append(f"DISPATCH CEILING — {dispatches_left} calls left this pass (guardrail, not target).")
+    if comprehension and loop in ("reasoning", "validation", "output"):
+        parts.append(
+            "YOUR COMPREHENSION (binding — conclusions answer it): "
+            f"{json_dumps_short(comprehension)}"
+        )
+    if seeds and loop == "evidence":
+        parts.append(f"SEEDED PLAN (dispose freely): {', '.join(seeds)}.")
+    if gate:
+        parts.append(f"GATE — {json_dumps_short(gate)}.")
+    if congruence and loop in ("reasoning", "validation"):
+        parts.append(f"CONGRUENCE — {json_dumps_short(congruence)}.")
+    return "\n".join(parts)
+
+
+def json_dumps_short(value: Any, cap: int = 600) -> str:
+    """Bounded JSON rendering for prompt blocks (never raises)."""
+    import json
+
+    try:
+        return json.dumps(value, default=str)[:cap]
+    except Exception:
+        return str(value)[:cap]
+
+
+# Per-loop tool windows (turns carry their loop's window; the full packages
+# live in the manifest, loaded once in the system prompt). Entries mirror
+# the manifest's ≤4-line discipline by reference, not by duplication.
+TOOL_WINDOWS: dict[str, str] = {
+    "comprehension": "No tools this pass — understand and plan only.",
+    "evidence": (
+        "YOUR TOOLS THIS LOOP — gather in this order, cite each link: "
+        "micro.capture_status + micro.fit_beta (gate reads already done — do not re-pull); "
+        "market.read snapshot (current price + regime); "
+        "calc.forward.forecast (canonical ForecastResult: X_t, Y(h), train-only OOS, calibration gate, "
+        "forecast regime, assumptions, and Route A/B diagnostics); "
+        "memory.recall_paper (ground H0/H1 in Cont facts before any test). "
+        "Gather only: do not conclude, do not test hypotheses. "
+        "Refusals are findings to record with reasons, never failures to repair."
+    ),
+    "reasoning": (
+        "YOUR TOOLS THIS LOOP — walk the steady track in order, cite each link: "
+        "HYPOTHESIS first (frame H0/H1 from recalled paper facts + forecast assumptions); "
+        "then ANALYSIS/TEST in order — calc.forward.forecast (read expected delta, "
+        "validation_state, probability_status, assumptions, route disagreement, and the "
+        "chain_trace receipt proving internal A → B → Multivariate → Compare); "
+        "calc.forward.scenario with horizon_ms + targets/invalidations (P_ge/P_le only when calibration passes; legacy scenario stays the flow-requirement baseline — report agreement AND disagreement); "
+        "calc.hypothesis.test with hypothesis_id + horizon_ms + m_tests (post-fit only; p<0.05 is evidence, never execution); "
+        "then ANALYSIS/COMPARE — calc.decay.report (which horizons survive — quote it before trusting any horizon); "
+        "calc.events.absorption/walls for E[dP|event] conditioning when liquidity language is present; "
+        "then SYNTHESIS — test, then compare, then synthesize: synthesis cites paths, invents nothing. "
+        "Validation (calc.discipline.audit) and output composition are later loops, not this one."
+    ),
+    "validation": (
+        "YOUR TOOLS THIS LOOP — calc.discipline.audit (pull it), then stop. "
+        "Cite refusals as `tool → refusal` findings with verdict unevaluable. "
+        "One repair round exists; a second rejection ends the cycle with "
+        "findings preserved — do not thrash."
+    ),
+    "output": "No tools this pass — compose only. Any tool_calls returned are dropped unread.",
+}
+
+
 __all__ = [
     "SYSTEM_PROMPT_TEMPLATE",
+    "TOOL_WINDOWS",
+    "TASK_CHAINS",
+    "build_loop_state_block",
+    "build_task_workflow",
+    "build_workflow_brief",
+    "chain_status",
+    "classify_task",
+    "json_dumps_short",
     "load_kb",
     "load_paper_kb",
     "build_system_prompt",

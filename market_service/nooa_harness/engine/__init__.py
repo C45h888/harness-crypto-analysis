@@ -93,11 +93,8 @@ from .controller import (
     ToolOutcome,
 )
 # --- Loop states (Layer 1 of the agentic surface: the workflow) ---
-# The hierarchical workflow the agentic loop traverses. The old
-# AgentLoopFSM (LoopState / LoopEvent / AgentLoopFSM) was DELETED entirely;
-# its transition-table shape did not match the controller-ledger design and
-# it is superseded by this Layer-1 vocabulary. The governance membrane
-# (Layer 2) that OBSERVES (NestedLoop, TaskIntent) is a later pass.
+# The hierarchical workflow the agentic loop traverses.  The immutable
+# controller ledger and governance membrane are the sole runtime authorities.
 from .loop_states import (
     AgenticStage,
     NestedLoop,

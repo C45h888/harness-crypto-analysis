@@ -59,8 +59,8 @@ Constitution (the rules, so the table is derivable and viewable):
   - ``SETTLE`` ends the cycle; legal only from OUTPUT.
   - success is exactly one terminal (SETTLED); failures partition the rest.
 
-The old ``LoopState`` / ``LoopEvent`` / ``AgentLoopFSM`` vocabulary is DEAD
-and must not return. The membrane is the replacement constitution.
+The retired mutable-loop vocabulary is not part of the runtime. The membrane
+is the replacement constitution.
 """
 
 from __future__ import annotations
@@ -105,6 +105,7 @@ class GovernanceEventKind(str, Enum):
     ENTER_LOOP = "enter_loop"
     SET_TASK = "set_task"
     OPEN_SUBLOOP = "open_subloop"
+    COMPLETE_SUBLOOP = "complete_subloop"
     CLOSE_SUBLOOP = "close_subloop"
     SETTLE = "settle"
     GATE_REFUSED = "gate_refused"
@@ -238,6 +239,48 @@ class AgenticLoopMembrane:
             return order[idx + 1]
         return None
 
+    def authorize_work(
+        self,
+        observation: LoopObservation,
+        *,
+        nested_loop: NestedLoop,
+        sub_loop: SubLoop | None = None,
+        bootstrap: bool = False,
+    ) -> MembraneVerdict:
+        """Authorize work at the current membrane-visible position.
+
+        Work authorization is deliberately narrower than transition legality:
+        the FSM does not know tool semantics, but it does know whether the
+        runtime is currently in the loop/sub-loop that owns the work.  The
+        only exception is the two deterministic gate reads, which are an
+        explicit wake bootstrap and are allowed before COMPREHENSION opens
+        its first sub-loop.
+        """
+        if not self.is_legal_state(observation):
+            return MembraneVerdict(False, reason="work requested from an illegal observation")
+        if bootstrap:
+            if (
+                nested_loop is NestedLoop.COMPREHENSION
+                and observation.nested_loop is NestedLoop.COMPREHENSION
+                and observation.task is TaskIntent.UNDERSTAND_TASK
+                and observation.sub_loop is None
+            ):
+                return MembraneVerdict(True, next=observation, reason="authorized wake bootstrap work")
+            return MembraneVerdict(False, reason="bootstrap work is only legal at initial comprehension")
+        if observation.nested_loop is not nested_loop:
+            return MembraneVerdict(
+                False,
+                reason=(f"work belongs to {nested_loop.value}, current loop is "
+                        f"{observation.nested_loop.value}"),
+            )
+        if sub_loop is not None and observation.sub_loop is not sub_loop:
+            return MembraneVerdict(
+                False,
+                reason=(f"work belongs to sub-loop {sub_loop.value}, current sub-loop is "
+                        f"{observation.sub_loop.value if observation.sub_loop else 'none'}"),
+            )
+        return MembraneVerdict(True, next=observation, reason="work authorized at current observation")
+
     def terminal_for(self, kind: GovernanceEventKind) -> LoopTerminal | None:
         """The terminal a failure kind routes to; ``None`` for progress kinds.
 
@@ -295,6 +338,7 @@ class AgenticLoopMembrane:
         if nxt is not None:
             events.append(GovernanceEvent(GovernanceEventKind.OPEN_SUBLOOP, nxt))
         if sub_loop is not None:
+            events.append(GovernanceEvent(GovernanceEventKind.COMPLETE_SUBLOOP))
             events.append(GovernanceEvent(GovernanceEventKind.CLOSE_SUBLOOP))
         if loop is NestedLoop.OUTPUT:
             events.append(GovernanceEvent(GovernanceEventKind.SETTLE))
@@ -321,6 +365,15 @@ class AgenticLoopMembrane:
 
         # Graceful failure — first-class, legal from every state.
         if kind in _FAILURE_KIND_TERMINAL:
+            # Failure routing is total over admissible observations, but a
+            # terminal/absent observation is not a live cycle state.  Keeping
+            # this check here prevents a second failure from overwriting an
+            # already-settled controller.
+            if not isinstance(observation, LoopObservation):
+                return MembraneVerdict(
+                    allowed=False,
+                    reason="failure event requires a live loop observation",
+                )
             terminal = _FAILURE_KIND_TERMINAL[kind]
             return MembraneVerdict(
                 allowed=True,
@@ -416,15 +469,23 @@ class AgenticLoopMembrane:
                 reason=f"opened sub-loop {target.value}",
             )
 
-        if kind is GovernanceEventKind.CLOSE_SUBLOOP:
+        if kind in (
+            GovernanceEventKind.COMPLETE_SUBLOOP,
+            GovernanceEventKind.CLOSE_SUBLOOP,
+        ):
             if observation.sub_loop is None:
                 return MembraneVerdict(
-                    allowed=False, reason="no sub-loop is open to close"
+                    allowed=False, reason="no sub-loop is open to complete/close"
                 )
+            reason = (
+                "completed sub-loop"
+                if kind is GovernanceEventKind.COMPLETE_SUBLOOP
+                else "closed sub-loop"
+            )
             return MembraneVerdict(
                 allowed=True,
                 next=LoopObservation(observation.nested_loop, observation.task, None),
-                reason="closed sub-loop",
+                reason=reason,
             )
 
         return MembraneVerdict(
@@ -550,6 +611,7 @@ class AgenticLoopMembrane:
             GovernanceEventKind.ENTER_LOOP,
             GovernanceEventKind.SET_TASK,
             GovernanceEventKind.OPEN_SUBLOOP,
+            GovernanceEventKind.COMPLETE_SUBLOOP,
             GovernanceEventKind.CLOSE_SUBLOOP,
             GovernanceEventKind.SETTLE,
         ):
