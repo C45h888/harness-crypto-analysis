@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from market_service.microstructure import fitting as fm
+import market_service.microstructure as fm
 from market_service.microstructure.contracts import OFIInterval, PriceImpactFit
 
 

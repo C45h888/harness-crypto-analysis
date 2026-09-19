@@ -688,6 +688,42 @@ class PostgresRuntimeStore:
         )
         return row is not None
 
+    async def update_inference_artifact(self, artifact: InferenceArtifact) -> bool:
+        """Finalize an existing inference artifact row in place.
+
+        The inference runtime writes a pending artifact before memory
+        disposition, then updates the same immutable-by-id row with the final
+        terminal/provenance state.  This prevents the controller from claiming
+        ``SETTLED`` while the durable row still says pending.
+        """
+        artifact.validate()
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        status = await self.pool.execute(
+            """UPDATE inference_artifact SET
+                completed_at=$2, status=$3, deterministic_state=$4,
+                capability_log=$5, interpretation=$6, errors=$7,
+                hypothesis=$8, hypothesis_verdict=$9, verdict_reason=$10,
+                calculations=$11
+               WHERE artifact_id=$1""",
+            uuid.UUID(artifact.artifact_id),
+            datetime.fromisoformat(artifact.completed_at.replace("Z", "+00:00")),
+            artifact.status,
+            json.dumps(artifact.deterministic_state, default=str),
+            json.dumps(list(artifact.capability_log), default=str),
+            json.dumps(artifact.interpretation, default=str)
+            if artifact.interpretation is not None else None,
+            json.dumps(list(artifact.errors), default=str),
+            json.dumps(artifact.hypothesis, default=str)
+            if artifact.hypothesis is not None else None,
+            artifact.hypothesis_verdict,
+            artifact.verdict_reason,
+            json.dumps(artifact.calculations, default=str)
+            if artifact.calculations is not None else None,
+        )
+        return status.endswith("1")
+
     async def read_inference_artifact(
         self, symbol: str | None = None, artifact_id: str | None = None,
     ) -> dict[str, Any] | None:

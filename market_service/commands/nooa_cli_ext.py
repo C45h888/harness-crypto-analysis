@@ -293,7 +293,6 @@ _MICRO_ALLOWED_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
 _MICRO_ALLOWED_VENUES = frozenset({"spot"})
 _MICRO_ALLOWED_INTERVALS_S = frozenset({10, 15, 30})
 _MICRO_ALLOWED_WINDOWS_M = frozenset({15, 30, 60})
-_MICRO_DEFAULT_TICK_SIZES = {"BTCUSDT": "0.01", "SOLUSDT": "0.01", "ETHUSDT": "0.01"}
 
 
 def _parse_duration_ms(text: str) -> int:
@@ -362,11 +361,20 @@ def micro_fit(symbol: str, venue: str, interval_s: int, window_m: int,
     """
     from decimal import Decimal
 
-    from market_service.microstructure import fitting
+    import market_service.microstructure as fitting
+    from market_service.microstructure.tick import resolve_tick_size
 
     symbol = symbol.upper()
     _validate_micro_request(symbol, venue, interval_s, window_m)
-    tick = Decimal(tick_size or _MICRO_DEFAULT_TICK_SIZES.get(symbol, "0"))
+    try:
+        frozen_tick = resolve_tick_size(symbol, venue)
+    except KeyError:
+        frozen_tick = Decimal("0")
+    if tick_size is not None and Decimal(str(tick_size)) != frozen_tick:
+        raise click.ClickException(
+            f"tick size {tick_size} does not match frozen registry value {frozen_tick}"
+        )
+    tick = frozen_tick
     if tick <= 0:
         raise click.ClickException(
             f"no tick size resolved for {symbol}; pass --tick-size explicitly"

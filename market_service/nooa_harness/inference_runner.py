@@ -96,11 +96,11 @@ async def run_inference_once(
     """One engine cycle: invoke → run → return artifact + meta.
 
     ``envelope`` — a caller-constructed ``WakeEnvelope`` dispatched straight
-    to ``run_cycle`` (no stream, no worker).
+    to ``narrate_cycle`` (no stream, no worker).
     ``force`` — synthesize a manual invocation (CLI ``--force`` trigger).
     ``task`` — interactive-plane directive (``harness.py --task``): the trade
     hypothesis / question the cycle must answer. Threaded into
-    ``acquire_manual_wake`` (predicate preview) and ``run_cycle`` (full
+    ``acquire_manual_wake`` (predicate preview) and ``narrate_cycle`` (full
     prompt steering + ``deterministic_state["task"]`` persistence).
     ``scenario`` — ``{"target_price": str, "horizon": "15m|1h|4h"}``
     (CLI ``--target/--horizon``): the 'can price hit X?' level evaluated

@@ -3,7 +3,7 @@
 This module owns the interpretation-plane surface that used to live in
 ``pipeline.py``: envelope assembly, the on-demand Binance derivative fetch,
 and the cross-cycle wall/keystone payload builders. Computation cycles
-(``run_cycle`` / ``run_group_cycle``) were removed with the tool-first
+(the former cycle wrappers) were removed with the tool-first
 migration: agents and operators invoke substrate workers as tools
 (``substrate_worker.tools``) instead of running cycles.
 

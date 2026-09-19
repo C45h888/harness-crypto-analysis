@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 
-from market_service.microstructure import fitting
+import market_service.microstructure as fitting
 from market_service.microstructure.contracts import (
     FIT_MODEL_VERSION,
     BestQuoteState,
