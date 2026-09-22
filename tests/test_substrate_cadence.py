@@ -204,6 +204,22 @@ class RecoveryTests(unittest.TestCase):
             {"from_state": "running", "state": "running"}))
         self.assertIsNone(w._status_transition_recovery({}))
 
+    def test_status_transition_payload_string_decodes(self):
+        # Regression: the payload branch calls json.loads, but reader.py
+        # did not import json — every ws_input worker (delta/tape/large_print)
+        # crashed with NameError on EVERY loop iteration before it could
+        # fire, leaving those substrate projections permanently empty.
+        import json as _json
+        w = _make_worker(cls=_WsWorker)
+        detail = w._status_transition_recovery({
+            "payload": _json.dumps({"from_state": "gap", "to_state": "running"}),
+        })
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["from_state"], "gap")
+        self.assertEqual(detail["to_state"], "running")
+        # Malformed payload string must not crash — falls through to None.
+        self.assertIsNone(w._status_transition_recovery({"payload": "{not-json"}))
+
     def test_entry_ms_parsing(self):
         w = _make_worker()
         self.assertEqual(w._entry_ms("1700000000000-0"), 1_700_000_000_000)

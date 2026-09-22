@@ -20,7 +20,10 @@ def rolling_density(levels: Iterable[Sequence[float]], width: float, side: str) 
 
     bid side: window = [p - width, p] (levels at or below the base).
     ask side: window = [p, p + width] (levels at or above the base).
-    Returns [{price, qty, window_qty}] sorted by window_qty descending.
+    Returns [{price, qty, window_qty, notional}] sorted by window_qty
+    descending. ``notional`` is the USD value of the WHOLE window
+    (sum of price*qty over the window levels) — NOT the base price times
+    window_qty (an approximation that misprices wide windows).
     """
     if width <= 0:
         raise ValueError("width must be positive")
@@ -28,10 +31,14 @@ def rolling_density(levels: Iterable[Sequence[float]], width: float, side: str) 
     rows: list[dict] = []
     for price, qty in levels:
         if side == "bid":
-            window_qty = sum(q for p, q in levels if price - width <= p <= price)
+            window = [(p, q) for p, q in levels if price - width <= p <= price]
         else:
-            window_qty = sum(q for p, q in levels if price <= p <= price + width)
-        rows.append({"price": price, "qty": qty, "window_qty": window_qty})
+            window = [(p, q) for p, q in levels if price <= p <= price + width]
+        rows.append({
+            "price": price, "qty": qty,
+            "window_qty": sum(q for _, q in window),
+            "notional": sum(p * q for p, q in window),
+        })
     rows.sort(key=lambda r: r["window_qty"], reverse=True)
     return rows
 

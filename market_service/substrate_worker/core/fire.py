@@ -178,9 +178,11 @@ class FireMixin(SubstrateBase):
         """Compute the substrate and persist the state payload (never raises)."""
         try:
             evidence = await build_raw_window(self.store, self.symbol, self.window_minutes)
+            deriv_reason: str | None = None
             try:
-                await self._attach_derivatives(evidence, now_ms)
+                deriv_reason = await self._attach_derivatives(evidence, now_ms)
             except Exception as exc:
+                deriv_reason = f"derivative attach error: {exc!r}"
                 log.warning("substrate %s derivative attach failed: %s",
                             self.SUBSTRATE_NAME, exc)
             dependencies = await self._load_dependencies()
@@ -192,9 +194,18 @@ class FireMixin(SubstrateBase):
             output = self.compute(evidence, self.depth if self.depth is not None else evidence.get("depth_levels") or 20)
             missing: list[str] = []
             status = "healthy"
+            # Precise provenance: when the derivative cache was missing/stale
+            # at fire time, name THAT (not a generic "output empty") so the
+            # projection tells the operator which cache surface degraded.
+            if deriv_reason is not None:
+                missing.append(deriv_reason)
             if not output:
                 status = "insufficient_data"
-                missing = ["substrate output empty"]
+                missing.append("substrate output empty")
+            elif missing:
+                # Output computed, but some declared inputs were absent —
+                # partially degraded, never silently healthy.
+                status = "degraded"
             payload = SubstrateStatePayload.create(
                 substrate=self.SUBSTRATE_NAME,
                 symbol=self.symbol,

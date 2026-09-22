@@ -193,6 +193,17 @@ class BidTierBalanceUsdTests(unittest.TestCase):
         self.assertEqual(result["mega_asks"], 0.5)
         self.assertEqual(result["verdict"], "INSTITUTIONAL-BID-HEAVY")
 
+    def test_mega_threshold_mirror_on_usd_path(self):
+        # Regression: the USD path used to emit mega_threshold=None while
+        # mega_threshold_usd carried the value. Downstream readers of the
+        # legacy field coerce NULL to 0 → every level reads as MEGA. Both
+        # fields now mirror the USD threshold (units: USD on this path).
+        cfg = TierConfig(mega_usd=30_000.0, large_usd=10_000.0, medium_usd=1_000.0)
+        result = bid_tier_balance([[65000.0, 2.0]], [[65000.0, 0.5]], tier_config=cfg)
+        self.assertEqual(result["mega_threshold"], cfg.mega_usd)
+        self.assertEqual(result["mega_threshold_usd"], cfg.mega_usd)
+        self.assertEqual(result["one_sided_threshold"], float("inf"))
+
     def test_legacy_raw_qty_path_still_works(self):
         bids = [[100.0, 6000.0]]
         asks = [[101.0, 100.0]]

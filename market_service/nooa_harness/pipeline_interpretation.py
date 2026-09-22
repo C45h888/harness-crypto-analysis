@@ -277,7 +277,10 @@ MACRO_SYMBOLS: tuple[str, ...] = (
 def _unwrap(x: Any) -> Any:
     """Treat BaseException as None so one failed Binance call doesn't kill the batch."""
     if isinstance(x, BaseException):
-        log.warning("derivative fetch returned exception: %s", x)
+        # %r (repr) — bare %s renders as an empty string for exceptions
+        # with no message (e.g. CancelledError, some client errors),
+        # making /futures/data batch failures undiagnosable.
+        log.warning("derivative fetch returned exception: %r", x)
         return None
     return x
 

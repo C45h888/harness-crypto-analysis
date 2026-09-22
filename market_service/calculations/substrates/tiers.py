@@ -213,6 +213,14 @@ def bid_tier_balance(
     legacy raw-qty value of 5000 for backwards compatibility; new
     callers should pass a ``TierConfig``.
 
+    Output field units: on the USD path BOTH ``mega_threshold`` and
+    ``mega_threshold_usd`` carry the USD threshold (the legacy raw-qty
+    interpretation does NOT apply — ``q >= mega_threshold`` would be a
+    unit error). The mirror exists so readers of the legacy field never
+    see NULL and coerce it to 0 (which would classify every level as
+    MEGA). Classification itself stays USD-notional; the legacy raw-qty
+    threshold only applies on the no-tier_config path.
+
     Legacy source: institutional_buyers.py:167-171 (institutional bid vs ask balance).
     """
     def _pairs(rows):
@@ -232,20 +240,22 @@ def bid_tier_balance(
     if tier_config is not None:
         mega_usd = tier_config.mega_usd
         threshold_used_usd = mega_usd
-        legacy_qty = None
+        # Mirror field: mega_threshold carries the USD threshold so the
+        # legacy field is never NULL on the USD path (NULL coerced to 0
+        # downstream reads as "everything is MEGA"). Units: USD — see
+        # the docstring. Classification stays USD-notional.
+        legacy_qty = mega_usd
         mega_bids = sum(q for p, q in bids_p if p * q >= mega_usd)
         mega_asks = sum(q for p, q in asks_p if p * q >= mega_usd)
+        one_sided_threshold = float("inf")  # USD path is always bidirectional
     else:
         legacy_qty = 5000.0 if mega_threshold is None else float(mega_threshold)
         mega_bids = sum(q for _, q in bids_p if q >= legacy_qty)
         mega_asks = sum(q for _, q in asks_p if q >= legacy_qty)
         threshold_used_usd = None
+        one_sided_threshold = legacy_qty
 
     delta = mega_bids - mega_asks
-    if legacy_qty is not None:
-        one_sided_threshold = legacy_qty
-    else:
-        one_sided_threshold = float("inf")  # USD path is always bidirectional
 
     ratio = (mega_bids / mega_asks) if mega_asks > 0 else (None if mega_bids == 0 else float("inf"))
     if mega_asks == 0 and mega_bids > 0:

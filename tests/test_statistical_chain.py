@@ -110,21 +110,31 @@ def test_forecast_result_carries_chain_trace():
 
 
 def test_chain_bound_to_loop_vocabulary():
+    # The chain vocabulary moved out of loop_states into the engine core
+    # (loop_states no longer owns the tool→(sub-loop, step) binding; the
+    # authoritative completion check lives in engine/core/chain.py).
+    # What must still hold: every enforced link's tool is a REGISTERED
+    # tool (the chain binds to real loop vocabulary, not floating names),
+    # and the ANALYSIS sub-loop still walks TEST/COMPARE — the positions
+    # the steady-track chain executes in.
+    from market_service.nooa_harness.engine.core.chain import CHAIN_LINKS
     from market_service.nooa_harness.engine.loop_states import (
-        CHAIN_SUBLOOP,
         SUBLOOP_SPECS,
+        LoopStep,
         SubLoop,
     )
+    from market_service.nooa_harness.inference.tooling.registry import tool_homes
 
-    # Every enforced link executes in exactly one (sub-loop, step).
-    assert CHAIN_SUBLOOP["calc.forward.forecast"][0] is SubLoop.ANALYSIS
-    assert CHAIN_SUBLOOP["calc.decay.report"][0] is SubLoop.ANALYSIS
-    assert CHAIN_SUBLOOP["calc.discipline.audit"][0] is SubLoop.GATE
-    assert CHAIN_SUBLOOP["output.compose"][0] is SubLoop.COMPOSITION
-    for tool, (sub_loop, step) in CHAIN_SUBLOOP.items():
-        assert step in SUBLOOP_SPECS[sub_loop].steps, tool
-    # ANALYSIS cannot exit with the track unwalked (text gate).
-    assert "statistical chain" in SUBLOOP_SPECS[SubLoop.ANALYSIS].exit_condition
+    assert len(CHAIN_LINKS) >= 5  # forecast, scenario, hypothesis, decay, discipline
+    tools = [tool for _, tool, _ in CHAIN_LINKS]
+    assert len(tools) == len(set(tools)), "chain links must be unique tools"
+    for tool in tools:
+        homes = tool_homes(tool)
+        assert homes, f"chain tool {tool!r} has no registered home"
+    # The chain's home positions exist in the loop vocabulary.
+    analysis = SUBLOOP_SPECS[SubLoop.ANALYSIS]
+    assert LoopStep.TEST in analysis.steps
+    assert LoopStep.COMPARE in analysis.steps
 
 
 def test_forecast_reachable_from_both_track_positions():

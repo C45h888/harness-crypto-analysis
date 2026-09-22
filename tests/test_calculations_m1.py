@@ -87,6 +87,23 @@ class OrderbookTests(unittest.TestCase):
         # densest window should be the largest summed window
         self.assertGreaterEqual(tops[0]["window_qty"], tops[1]["window_qty"])
 
+    def test_top_density_windows_notional_is_window_sum(self):
+        # Regression: density windows used to omit ``notional`` entirely;
+        # downstream consumers coerced the missing field to $0 (no-op
+        # sort). Notional is the WHOLE-window USD value sum(p*q), not
+        # the base price times window_qty.
+        bids = [[100.0, 500.0], [99.9, 100.0], [99.8, 200.0]]
+        tops = top_density_windows({"bids": bids}, width=0.20, side="bid", top_n=3)
+        densest = tops[0]
+        window_levels = [(p, q) for p, q in bids if densest["price"] - 0.20 <= p <= densest["price"]]
+        self.assertAlmostEqual(
+            densest["notional"],
+            sum(p * q for p, q in window_levels),
+        )
+        self.assertNotEqual(
+            densest["notional"], densest["price"] * densest["window_qty"],
+        )
+
     def test_find_keystone_within_band(self):
         ks = find_keystone(self.book["bids"], price=100.1, lo_offset=-0.30, hi_offset=-0.05)
         self.assertIn("keystone", ks)

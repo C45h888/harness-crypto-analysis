@@ -430,10 +430,7 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
         steps=(LoopStep.TEST, LoopStep.COMPARE),
         iterates=True,
         purpose="Test the hypothesis against the evidence and compare sources.",
-        exit_condition=("the hypothesis is settled or refinement stops adding "
-                        "signal, and the statistical chain is complete (every "
-                        "required link evaluated or its refusal recorded as a "
-                        "finding)"),
+        exit_condition="the hypothesis is settled or refinement stops adding signal",
     ),
     SubLoop.SYNTHESIS: SubLoopSpec(
         steps=(LoopStep.INTERPRET, LoopStep.RECONCILE),
@@ -478,34 +475,6 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
         exit_condition="every proposal is resolved and the cycle is settled",
     ),
 }
-
-# The steady-track statistical chain bound to the loop vocabulary.
-# Each statistical link executes in exactly one (sub-loop, step): the agent
-# walks Run A → Run B → Run Multivariate inside forecast's TEST execution,
-# COMPAREs in ANALYSIS/COMPARE, validates in GATE, and composes the common
-# output in COMPOSITION. Hypothesis framing happens in HYPOTHESIS/FRAME (see
-# INTENT_SUBLOOP[DERIVE_HYPOTHESIS]); execution stays in ANALYSIS/TEST.
-# Keys are tool names (plain strings — this layer owns vocabulary, not
-# imports); the authoritative completion check lives in engine/core/chain.py.
-CHAIN_SUBLOOP: dict[str, tuple[SubLoop, LoopStep]] = {
-    "calc.forward.forecast": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.forward.scenario": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.hypothesis.test": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.decay.report": (SubLoop.ANALYSIS, LoopStep.COMPARE),
-    "calc.discipline.audit": (SubLoop.GATE, LoopStep.VALIDATE),
-    "output.compose": (SubLoop.COMPOSITION, LoopStep.ASSEMBLE),
-    # Pass-1 assembly substrates (re-derivation surface, TEST position).
-    "calc.ofi.intervals": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.depth.average": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.observation.build": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.fit.price_impact": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.fit.depth_scaling": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.forward.join": (SubLoop.ANALYSIS, LoopStep.TEST),
-    # Pass-2 interpretation surface (equation + distribution).
-    "calc.forward.fit": (SubLoop.ANALYSIS, LoopStep.TEST),
-    "calc.forward.distribution": (SubLoop.ANALYSIS, LoopStep.COMPARE),
-}
-
 
 # Derived: the ordered steps of each sub-loop (flat accessor).
 SUBLOOP_STEPS: dict[SubLoop, tuple[LoopStep, ...]] = {
@@ -730,17 +699,6 @@ def self_check() -> None:
     if SUCCESS_TERMINALS & FAILURE_TERMINALS:
         raise ValueError("success and failure terminals must be disjoint")
 
-    for tool, (sub_loop, step) in CHAIN_SUBLOOP.items():
-        if sub_loop not in SUBLOOP_SPECS:
-            raise ValueError(
-                f"CHAIN_SUBLOOP[{tool!r}] sub-loop {sub_loop.value!r} has no spec"
-            )
-        if step not in SUBLOOP_SPECS[sub_loop].steps:
-            raise ValueError(
-                f"CHAIN_SUBLOOP[{tool!r}] step {step.value!r} is not a step "
-                f"of sub-loop {sub_loop.value!r}"
-            )
-
 
 self_check()
 
@@ -762,7 +720,6 @@ __all__ = [
     "FAILURE_TERMINALS",
     # mappings
     "STAGE_ORDER",
-    "CHAIN_SUBLOOP",
     "STAGE_LOOP",
     "LOOP_STAGE",
     "LOOP_SUBLOOPS",

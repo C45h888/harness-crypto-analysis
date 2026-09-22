@@ -15,6 +15,7 @@ supervisor heartbeat. Those live in ``fire.py`` / ``supervisor.py``.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
