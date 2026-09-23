@@ -199,7 +199,7 @@ class BookL2State:
                     raise ValueError("ladder level must have positive price and non-negative qty")
         bid_prices = [p for p, _q in self.bids]
         ask_prices = [p for p, _q in self.asks]
-        if any(a <= b for b, a in zip(bid_prices, bid_prices[1:])):
+        if any(b <= a for b, a in zip(bid_prices, bid_prices[1:])):
             raise ValueError("ladder bids must be strictly price-descending")
         if any(b >= a for b, a in zip(ask_prices, ask_prices[1:])):
             raise ValueError("ladder asks must be strictly price-ascending")

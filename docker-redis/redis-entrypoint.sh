@@ -5,6 +5,7 @@
 #
 #   redis-server  ← the real redis (PID 1)
 #   telemetry_hygiene_local.py  ← the cleaner (background)
+#   redis_prune_local.py        ← the retention worker (background)
 
 set -e
 
@@ -38,8 +39,14 @@ python3 /usr/local/bin/telemetry_hygiene_local.py \
   >/proc/1/fd/2 2>&1 &
 CLEANER_PID=$!
 
+# Start the retention worker in the background (time-vector pruning).
+python3 /usr/local/bin/redis_prune_local.py \
+  >/proc/1/fd/2 2>&1 &
+PRUNE_PID=$!
+
 # Forward SIGTERM/SIGINT to both children, then wait.
 shutdown() {
+  kill -TERM "$PRUNE_PID"  2>/dev/null || true
   kill -TERM "$CLEANER_PID" 2>/dev/null || true
   kill -TERM "$REDIS_PID"   2>/dev/null || true
   wait "$REDIS_PID" 2>/dev/null || true
@@ -52,5 +59,6 @@ trap shutdown TERM INT
 wait "$REDIS_PID"
 RC=$?
 
+kill -TERM "$PRUNE_PID"  2>/dev/null || true
 kill -TERM "$CLEANER_PID" 2>/dev/null || true
 exit $RC

@@ -14,6 +14,7 @@ RUN apk add --no-cache python3 py3-pip py3-redis 2>/dev/null \
  || pip install --no-cache-dir --break-system-packages redis==5.0.4
 
 COPY telemetry_hygiene_local.py /usr/local/bin/telemetry_hygiene_local.py
+COPY redis_prune_local.py      /usr/local/bin/redis_prune_local.py
 COPY redis-entrypoint.sh      /usr/local/bin/redis-entrypoint.sh
 RUN chmod +x /usr/local/bin/redis-entrypoint.sh
 
@@ -21,7 +22,15 @@ RUN chmod +x /usr/local/bin/redis-entrypoint.sh
 ENV TELEMETRY_HYGIENE_INTERVAL_S=300 \
     TELEMETRY_HYGIENE_MIN_AGE_S=3600 \
     REDIS_HYGIENE_URL=unix:///tmp/redis.sock \
-    TELEMETRY_HYGIENE_DRY_RUN=false
+    TELEMETRY_HYGIENE_DRY_RUN=false \
+    REDIS_PRUNE_INTERVAL_S=300 \
+    REDIS_PRUNE_DRY_RUN=true \
+    REDIS_PRUNE_RAW_RETENTION_S=14400 \
+    REDIS_PRUNE_CALC_RETENTION_S=86400 \
+    REDIS_PRUNE_RAW_ENTRIES=90 \
+    REDIS_PRUNE_RAW_MAX=4096 \
+    REDIS_PRUNE_POLL_CADENCE_S=5 \
+    REDIS_PRUNE_URL=unix:///tmp/redis.sock
 
 EXPOSE 6379
 CMD ["/usr/local/bin/redis-entrypoint.sh"]

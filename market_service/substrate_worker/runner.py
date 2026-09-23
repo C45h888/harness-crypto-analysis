@@ -32,6 +32,7 @@ from typing import Any
 from market_service.config import default_depth_levels
 from market_service.runtime.redis_store import RedisRuntimeStore
 from market_service.substrate_worker import WORKER_REGISTRY, SubstrateWorkerCore
+from market_service.substrate_worker.core.base import SUPERVISOR_MS
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +69,11 @@ def build_workers(
     cooldown_s = int(_cooldown_raw) if _cooldown_raw else None
     staleness_s = int(_staleness_raw) if _staleness_raw else None
     depth = int(os.getenv("DEPTH_LEVELS") or default_depth_levels())
+    # Liveness TTL (ms). Worker cycles on deep production streams can exceed
+    # the 5s default (cycle >> heartbeat TTL reads as UNHEALTHY while workers
+    # compute fine). Explicit env wins; unset keeps the 5s default so local
+    # dev and all contract tests are unchanged. Env: SUBSTRATE_SUPERVISOR_MS.
+    supervisor_ms = int(os.getenv("SUBSTRATE_SUPERVISOR_MS") or SUPERVISOR_MS)
 
     workers: list[SubstrateWorkerCore] = []
     for name in selected:
@@ -84,6 +90,7 @@ def build_workers(
                 depth=depth,
                 cooldown_s=cooldown_s,
                 staleness_s=staleness_s,
+                supervisor_ms=supervisor_ms,
                 pg_store=pg_store,
                 pg_strict=pg_strict,
             ))

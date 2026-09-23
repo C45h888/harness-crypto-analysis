@@ -14,6 +14,15 @@ services:
       TELEMETRY_HYGIENE_MIN_AGE_S: "3600"
       REDIS_HYGIENE_URL: "unix:///tmp/redis.sock"
       TELEMETRY_HYGIENE_DRY_RUN: "false"
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_PRUNE_INTERVAL_S: ${REDIS_PRUNE_INTERVAL_S:-300}
+      REDIS_PRUNE_DRY_RUN: ${REDIS_PRUNE_DRY_RUN:-false}
+      REDIS_PRUNE_RAW_RETENTION_S: ${REDIS_PRUNE_RAW_RETENTION_S:-14400}
+      REDIS_PRUNE_CALC_RETENTION_S: ${REDIS_PRUNE_CALC_RETENTION_S:-86400}
+      REDIS_PRUNE_RAW_ENTRIES: ${REDIS_PRUNE_RAW_ENTRIES:-90}
+      REDIS_PRUNE_RAW_MAX: ${REDIS_PRUNE_RAW_MAX:-4096}
+      REDIS_PRUNE_POLL_CADENCE_S: ${REDIS_PRUNE_POLL_CADENCE_S:-5}
+      REDIS_PRUNE_URL: "unix:///tmp/redis.sock"
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
@@ -23,6 +32,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    # No auto-resurrect — see the RESTART_POLICY note on `poller`.
+    restart: ${RESTART_POLICY:-no}
 
   postgres:
     image: postgres:16-alpine
@@ -40,6 +51,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    # No auto-resurrect — see the RESTART_POLICY note on `poller`.
+    restart: ${RESTART_POLICY:-no}
 
   # One-shot schema bootstrap via Alembic. Runs once on `up`, exits.
   db-init:
@@ -94,7 +107,13 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
-    restart: unless-stopped
+    # NEVER auto-resurrect. `restart: unless-stopped` + Docker Desktop's
+    # socket-activation auto-start meant every `docker` invocation (or login)
+    # silently booted this whole stack on its own. The pipeline must only run
+    # when an operator explicitly runs `docker compose up`.
+    # On a VPS where resilience matters, set RESTART_POLICY=unless-stopped
+    # in .env to opt back into supervised restarts.
+    restart: ${RESTART_POLICY:-no}
 
   # Optional, isolated event-level source for the paper-derived OFI work.
   # This is deliberately separate from `poller`: a depth-stream reconnect or
@@ -122,7 +141,8 @@ services:
       redis:
         condition: service_healthy
     profiles: ["microstructure"]
-    restart: unless-stopped
+    # Auto-resurrect disabled — see the RESTART_POLICY note on `poller`.
+    restart: ${RESTART_POLICY:-no}
 
   # OOAgent container — the interaction plane inside docker. The OO
   # inference engine (market_service.nooa_harness.engine.InferenceEngine)
@@ -215,7 +235,8 @@ services:
       retries: 3
       start_period: 60s
     profiles: ["substrates"]
-    restart: unless-stopped
+    # Auto-resurrect disabled — see the RESTART_POLICY note on `poller`.
+    restart: ${RESTART_POLICY:-no}
 
 volumes:
   postgres_data:
