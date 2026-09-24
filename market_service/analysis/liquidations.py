@@ -19,7 +19,11 @@ def liquidation_signal(oi_change: float, price_change: float) -> str:
 
 
 def oi_price_divergence(oi_hist: list[dict], klines: list[list]) -> dict:
-    oi = sorted((int(x["timestamp"]), float(x["sum_open_interest"])) for x in oi_hist)
+    # Bucket the OI timestamp onto the SAME 5m grid as the price keys (// 300000)
+    # so the join `bucket(oi_ts) == bucket(price_ts)` always lands. Keeping the OI
+    # side raw made prices.get(raw_ts) miss on unaligned input, silently flattening
+    # price_change to 0.0 and the signal to a false MIXED_RANGE_BOUND.
+    oi = sorted((int(x["timestamp"]) // 300000 * 300000, float(x["sum_open_interest"])) for x in oi_hist)
     prices = {int(k[0]) // 300000 * 300000: (float(k[1]), float(k[4])) for k in klines}
     oi_changes, price_changes, rows = [], [], []
     for previous, current in zip(oi, oi[1:]):

@@ -47,11 +47,11 @@ def _rows(n=1, start_ms=1_700_000_000_000):
     return [{"id": f"{start_ms + i}-0", "fields": {}} for i in range(n)]
 
 
-# ---- shared 5m-aligned series (bucket T0, T1).
-# Timestamps sit on 5m boundaries (real Binance 5m OI/kline alignment) —
-# ``oi_price_divergence`` buckets prices to 5m and compares to raw OI timestamps,
-# so the series must be 5m-aligned for the join to land.
-T0 = 1_700_000_100_000  # divisible by 300000 (a 5m boundary)
+# ---- shared series (bucket T0, T1).
+# Timestamps are deliberately NOT on a 5m boundary: this regression-proofs that
+# OI-vs-price joins on the symmetric 5m grid (both sides bucketed) so unaligned
+# input cannot silently flatten price_change to 0.0.
+T0 = 1_700_000_000_000  # NOT divisible by 300000 (deliberately unaligned)
 T1 = T0 + 300_000
 
 OI_HIST = [
@@ -114,6 +114,21 @@ class LiquidationSubstrateTests(unittest.TestCase):
         result = oi_price_divergence(oi, klines)
         self.assertLess(result["cumulative_oi_change_pct"], 0)
         self.assertLess(result["cumulative_price_change_pct"], 0)
+        self.assertEqual(result["signal"], "LONG_LIQUIDATION_LIKELY")
+
+    def test_oi_price_divergence_joins_on_unaligned_timestamps(self):
+        """Regression: the OI side is bucketed to the same 5m grid as prices, so
+        an unaligned OI timestamp still joins. (Previously the raw OI ts missed
+        the bucketed price keys -> price_change silently 0.0 -> false
+        MIXED_RANGE_BOUND instead of a real divergence signal.)"""
+        base = 1_700_000_000_000  # deliberately NOT a 5m boundary
+        t0, t1 = base, base + 300_000
+        oi = [{"timestamp": t0, "sum_open_interest": 100.0},
+              {"timestamp": t1, "sum_open_interest": 95.0}]
+        klines = [[t0, 100.0, 101.0, 99.0, 102.0, 50.0],
+                  [t1, 102.0, 103.0, 96.0, 97.0, 60.0]]
+        result = oi_price_divergence(oi, klines)
+        self.assertLess(result["cumulative_price_change_pct"], 0)  # real move, not 0.0
         self.assertEqual(result["signal"], "LONG_LIQUIDATION_LIKELY")
 
     def test_oi_price_divergence_none_safe(self):
