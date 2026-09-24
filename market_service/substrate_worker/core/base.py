@@ -33,7 +33,12 @@ log = logging.getLogger(__name__)
 DEFAULT_COOLDOWN_S = 30
 DEFAULT_STALENESS_S = 120
 READ_BLOCK_MS = 1_000
-SUPERVISOR_MS = 5_000
+# Heartbeat TTL. The heartbeat refreshes once per completed read cycle, but
+# a busy loop (big fire tasks, GC, PG pressure) can delay the refresh past a
+# tight TTL — observed as /health flapping degraded on healthy workers under
+# fire pressure. 12s tick = 14s TTL absorbs multi-second loop stalls without
+# masking a genuinely dead task (a dead loop never refreshes at all).
+SUPERVISOR_MS = 12_000
 
 
 def _now_ms() -> int:
@@ -58,6 +63,18 @@ class SubstrateBase:
     DERIVATIVE_INPUTS: tuple[str, ...] = ()
     DERIVATIVE_FRESH_MS: int = 300_000
 
+    # Plane identity. "substrate" = the calculation plane (wakes on raw
+    # REST evidence). "analysis" = the analysis plane — it binds a
+    # substrate state stream ("substrate:<name>" in INPUT_STREAMS: the
+    # calculation plane's own publishes ARE the deterministic trigger)
+    # and projects into the analysis: keyspace. The core machinery (fire
+    # cascade, reader, supervisor) is shared byte-for-byte; the plane
+    # only redirects WHICH stream/keys the worker touches.
+    PLANE: str = "substrate"
+    # Consumer-group prefix (groups are namespaced per stream; this keeps
+    # analysis groups identifiable on the substrate state streams).
+    GROUP_PREFIX: str = "substrate"
+
     def __init__(
         self,
         store: RedisRuntimeStore,
@@ -78,11 +95,17 @@ class SubstrateBase:
             raise ValueError(
                 f"{type(self).__name__} must define a non-empty SUBSTRATE_NAME"
             )
-        if "raw" not in self.INPUT_STREAMS:
+        if "raw" not in self.INPUT_STREAMS and not any(
+            isinstance(s, str) and s.startswith("substrate:")
+            for s in self.INPUT_STREAMS
+        ):
             raise ValueError(
-                f"{type(self).__name__}: Phase 1 requires the raw input stream"
+                f"{type(self).__name__}: INPUT_STREAMS must bind 'raw' "
+                f"(calculation plane) or a 'substrate:<name>' state stream "
+                f"(analysis plane)"
             )
         self.store = store
+        self._plane = getattr(type(self), "PLANE", "substrate")
         self.symbol = symbol.upper()
         self.window_minutes = window_minutes
         self.depth = depth
@@ -105,12 +128,20 @@ class SubstrateBase:
         self.pg_store = pg_store
         self.pg_strict = pg_strict
 
-        self._stream = store.raw_stream(self.symbol)
-        self._group = f"substrate:{self.SUBSTRATE_NAME}:{self.symbol}"
-        self._consumer = f"substrate-{self.SUBSTRATE_NAME}-{os.getpid()}-{int(time.time())}"
-        self._supervisor_key = store.substrate_supervisor_key(
-            self.SUBSTRATE_NAME, self.symbol,
+        self._stream = self._resolve_input_stream(store)
+        self._group = (
+            f"{getattr(type(self), 'GROUP_PREFIX', 'substrate')}"
+            f":{self.SUBSTRATE_NAME}:{self.symbol}"
         )
+        self._consumer = f"substrate-{self.SUBSTRATE_NAME}-{os.getpid()}-{int(time.time())}"
+        if self._plane == "analysis":
+            self._supervisor_key = store.analysis_supervisor_key(
+                self.SUBSTRATE_NAME, self.symbol,
+            )
+        else:
+            self._supervisor_key = store.substrate_supervisor_key(
+                self.SUBSTRATE_NAME, self.symbol,
+            )
         # WS input surface (Phase 2): a second consumer group per
         # (worker, symbol) on the shared microstructure event stream, plus
         # the status-transition stream tail (wake-worker "$" pattern).
@@ -140,6 +171,41 @@ class SubstrateBase:
         self._tasks: set[Any] = set()
 
     # ---- hooks (worker file implements) ----
+
+    def _resolve_input_stream(self, store: RedisRuntimeStore) -> str:
+        """Bind the worker's blocking read to its trigger stream.
+
+        "raw" (calculation plane) binds the poller's raw evidence stream.
+        "substrate:<name>" (analysis plane) binds that substrate's STATE
+        stream — the calculation plane's own publishes, which ARE the
+        deterministic trigger. First substrate: entry is the primary
+        blocking wake; secondary dependencies ride the staleness gate.
+        """
+        streams = self.INPUT_STREAMS
+        if "raw" in streams:
+            return store.raw_stream(self.symbol)
+        for s in streams:
+            if isinstance(s, str) and s.startswith("substrate:"):
+                return store.substrate_stream(s.split(":", 1)[1], self.symbol)
+        raise ValueError(
+            f"{type(self).__name__}: no bindable trigger stream in {streams}"
+        )
+
+    async def _read_own_state(self) -> dict[str, Any] | None:
+        """Read this worker's last persisted projection (plane-routed)."""
+        if self._plane == "analysis":
+            return await self.store.read_analysis_latest(
+                self.SUBSTRATE_NAME, self.symbol)
+        return await self.store.read_substrate_latest(
+            self.SUBSTRATE_NAME, self.symbol)
+
+    async def _publish_own_state(self, payload: dict[str, Any]) -> str:
+        """Publish this worker's projection (plane-routed; atomic SET+XADD)."""
+        if self._plane == "analysis":
+            return await self.store.publish_analysis_state(
+                self.SUBSTRATE_NAME, self.symbol, payload)
+        return await self.store.publish_substrate_state(
+            self.SUBSTRATE_NAME, self.symbol, payload)
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,

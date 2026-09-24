@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -14,6 +15,9 @@ from .contracts import (
     InferenceArtifact,
     _json_safe,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 class PostgresRuntimeStore:
@@ -1002,7 +1006,64 @@ class PostgresRuntimeStore:
             json.dumps(body),
             int(payload.get("schema_version") or 1),
         )
+        # Curated ledger: when this fire is a signals substrate state, also
+        # persist each tripped signal to ``signal_event`` (the schema has
+        # always existed but had no writer). Done after the substrate row so
+        # the two ledgers stay 1:1; failures here never abort the substrate
+        # write (the signal_event ledger is a derived audit, not the source).
+        if (substrate or "").lower() == "signals":
+            try:
+                await self.record_signal_events(
+                    symbol, payload,
+                    observed_at_ms=payload.get("observed_at_ms"),
+                )
+            except Exception:
+                # Never let a curated-ledger failure roll back the substrate
+                # durable write that already succeeded.
+                log.warning("signal_event persist failed for %s", symbol, exc_info=True)
         return int(row["id"])
+
+    async def record_signal_events(
+        self, symbol: str, payload: dict[str, Any], *, observed_at_ms: Any = None,
+    ) -> int:
+        """Persist tripped signals to the ``signal_event`` ledger.
+
+        ``payload`` is a ``SubstrateStatePayload`` dict whose ``output``
+        holds ``signals`` (list of {signal_type, severity, summary, evidence})
+        and ``snapshot`` (dict). Each tripped signal becomes one ``signal_event``
+        row. The ``snapshot_id`` FK is left NULL (nullable) — the embedded
+        snapshot is a re-derivable dict and we never fabricate a market_snapshot
+        id. Dedup is enforced by the table's UNIQUE (symbol, observed_at,
+        signal_type). Returns rows written.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        output = payload.get("output") or {}
+        signals = output.get("signals") or []
+        if not isinstance(signals, list) or not signals:
+            return 0
+        observed = self._ms_to_ts(observed_at_ms) or datetime.now(tz=UTC)
+        written = 0
+        for s in signals:
+            if not isinstance(s, dict):
+                continue
+            sig_type = str(s.get("signal_type") or "").strip()
+            if not sig_type:
+                continue
+            severity = int(s.get("severity") or 1)
+            severity = max(1, min(5, severity))
+            ev = _json_safe(s.get("evidence") or {})
+            await self.pool.execute(
+                """INSERT INTO signal_event
+                   (observed_at, symbol, signal_type, severity, summary, evidence)
+                   VALUES ($1,$2,$3,$4,$5,$6)
+                   ON CONFLICT (symbol, observed_at, signal_type) DO NOTHING""",
+                observed, symbol.upper(), sig_type, severity,
+                str(s.get("summary") or ""), json.dumps(ev),
+            )
+            written += 1
+        return written
 
     async def read_substrate_history(
         self, symbol: str, substrate: str, limit: int = 100,

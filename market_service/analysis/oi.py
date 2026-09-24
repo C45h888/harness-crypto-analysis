@@ -39,7 +39,7 @@ PROACT_SCORE = {
 }
 
 
-def _aligned_rows(oi_hist: list[dict], tbr_hist: list[dict], klines: list[list]) -> list[dict]:
+def align_oi_rows(oi_hist: list[dict], tbr_hist: list[dict], klines: list[list]) -> list[dict]:
     oi_map = {int(r["timestamp"]) // 300000 * 300000: r for r in oi_hist}
     tbr_map = {int(r["timestamp"]) // 300000 * 300000: r for r in tbr_hist}
     px_map = {int(k[0]) // 300000 * 300000: k for k in klines}
@@ -66,13 +66,26 @@ def _aligned_rows(oi_hist: list[dict], tbr_hist: list[dict], klines: list[list])
     return rows
 
 
-def _verdict(rows: list[dict]) -> dict:
+def proactiveness_verdict(rows: list[dict]) -> dict:
     score = sum(row["proactiveness"] for row in rows[-3:]) if rows else 0
     if score >= 7: label, confidence = "PROACTIVE", "HIGH"
     elif score >= 4: label, confidence = "WARMING", "MEDIUM"
     elif score >= 1: label, confidence = "PASSIVE", "MEDIUM"
     else: label, confidence = "ABSENT", "HIGH"
     return {"score": score, "label": label, "confidence": confidence, "window_bars": min(3, len(rows))}
+
+
+def latest_oi_bar(
+    oi_hist: list[dict], tbr_hist: list[dict], klines: list[list],
+) -> dict[str, Any] | None:
+    """Most recent aligned OI bar (None when no bar can be aligned).
+
+    Convenience seam for the oi_analysis worker: the bar already carries its
+    ``classify_bar`` class + ``PROACT_SCORE`` proactiveness, so a worker never
+    re-implements the classification grid.
+    """
+    rows = align_oi_rows(oi_hist, tbr_hist, klines)
+    return rows[-1] if rows else None
 
 
 async def analyze_open_interest(client: Binance, symbol: str, lookback_bars: int = 48) -> dict:
@@ -82,12 +95,12 @@ async def analyze_open_interest(client: Binance, symbol: str, lookback_bars: int
         client.fut_taker_buy_sell(symbol, period="5m", limit=lookback_bars),
         client.fut_klines(symbol, interval="5m", limit=lookback_bars),
     )
-    rows = _aligned_rows(oi, tbr, klines)
+    rows = align_oi_rows(oi, tbr, klines)
     return {
         "parameters": {"lookback_bars": lookback_bars, "period": "5m"},
         "evidence": {"open_interest_history": oi, "taker_buy_sell": tbr, "klines_5m": klines},
         "bars": rows,
-        "verdict": _verdict(rows),
+        "verdict": proactiveness_verdict(rows),
         "coverage": {"requested_bars": lookback_bars, "aligned_bars": len(rows)},
     }
 

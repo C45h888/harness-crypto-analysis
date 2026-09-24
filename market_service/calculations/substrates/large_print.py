@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import Any
+import time
 
 _TIERS_DEFAULT = (("large", 50.0), ("huge", 200.0), ("whale", 500.0))
 
@@ -22,14 +23,16 @@ _TIERS_DEFAULT = (("large", 50.0), ("huge", 200.0), ("whale", 500.0))
 def tiered_large_flow(
     trades: Iterable[dict],
     now_ms: int | None = None,
-    windows_min: Sequence[int] = (5, 15),
+    windows_min: Sequence[int] = (5, 15, 240),
     tiers: Sequence[tuple[str, float]] = _TIERS_DEFAULT,
 ) -> dict[str, dict]:
     """Aggregate taker notional by tier (large/huge/whale) over trailing windows.
 
-    ``trades`` are normalized dicts with ``ts``, ``qty``, ``price``,
-    ``is_buyer_maker``. Returns {f"flow_{w}min": {...}} plus the per-minute
-    buckets. Each window item carries ``large_sell_to_buy_ratio``.
+    Filter-centered: trades are first FILTERED by tier size (large >= 50,
+    huge >= 200, whale >= 500) then aggregated by notional + count over each
+    trailing window (5m / 15m / 4h). ``trades`` are normalized dicts with
+    ``ts``, ``qty``, ``price``, ``is_buyer_maker``. Returns
+    {f"flow_{w}min": {...}} plus the per-minute buckets.
     """
     if now_ms is None:
         now_ms = max((int(t["ts"]) for t in trades), default=0)
@@ -159,3 +162,26 @@ def seller_aggression_classify(
         "sell_ratio": sell_ratio,
         "classification": classification,
     }
+
+
+def multi_window_aggression(
+    trades: Iterable[dict],
+    now_ms: int | None = None,
+    windows_min: Sequence[int] = (5, 15, 240),
+    min_print_qty: float = 100.0,
+) -> dict[str, Any]:
+    """Filter-centered seller-aggression across 5m / 15m / 4h windows.
+
+    Each window filters the tape to big prints (``>= min_print_qty``) and
+    classifies HIGH/MEDIUM/LOW per the legacy discriminator. Multi-timeframe
+    companion to ``seller_aggression_classify`` so the large_print worker
+    can report aggression regime per horizon, not only the single 5m view.
+    """
+    if now_ms is None:
+        now_ms = max((int(t["ts"]) for t in trades), default=int(time.time() * 1000))
+    out: dict[str, Any] = {}
+    for w in windows_min:
+        out[w] = seller_aggression_classify(
+            trades, now_ms=now_ms, window_min=w, min_print_qty=min_print_qty,
+        )
+    return out

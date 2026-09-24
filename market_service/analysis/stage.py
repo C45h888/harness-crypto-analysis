@@ -24,6 +24,33 @@ def vol_direction_split(klines: list[list]) -> tuple[float, float, float]:
     return up_vol, down_vol, (up_vol / total * 100 if total > 0 else 0.0)
 
 
+def stage_window_inputs(klines: list[list], oi_hist: list[dict]) -> dict:
+    """Derive the 4h-window scalars ``infer_stage`` consumes.
+
+    The derivative cache carries 48 x 5m klines — exactly a 4h span — so the
+    4h price change, 4h OI change, and up-bar volume share are derived HERE
+    (the window convention lives in the substrate, never re-implemented in a
+    worker). Returns ``{px_chg_4h, oi_chg_4h, up_pct_4h}`` matching the first
+    three ``infer_stage`` parameters.
+    """
+    _up, _down, up_pct = vol_direction_split(klines)
+    px_chg = 0.0
+    if klines:
+        first_open = float(klines[0][1])
+        last_close = float(klines[-1][4])
+        if first_open:
+            px_chg = (last_close - first_open) / first_open * 100.0
+    oi_vals = [
+        float(r["sum_open_interest"])
+        for r in (oi_hist or [])
+        if isinstance(r, dict) and r.get("sum_open_interest") is not None
+    ]
+    oi_chg = 0.0
+    if len(oi_vals) >= 2 and oi_vals[0]:
+        oi_chg = (oi_vals[-1] - oi_vals[0]) / oi_vals[0] * 100.0
+    return {"px_chg_4h": px_chg, "oi_chg_4h": oi_chg, "up_pct_4h": up_pct}
+
+
 def infer_stage(
     px_chg_4h: float,
     oi_chg_4h: float,

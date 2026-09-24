@@ -23,7 +23,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from market_service.calculations.substrates.delta import delta_state, delta_variable
+from market_service.calculations.substrates.delta import (
+    multi_timeframe_delta,
+)
 from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
@@ -68,18 +70,27 @@ def _tbr_side(tbr: float | None) -> int | None:
 
 
 def _delta_of(window: dict[str, Any]) -> dict[str, Any] | None:
-    """Pure DELTA evaluation over a window (probe + compute share it)."""
+    """Pure DELTA evaluation over a window (probe + compute share it).
+
+    Combines the fused poller+WS book with the WS delta series, computing
+    the multi-timeframe (5m/15m/4h) DELTA aggregation when WS evidence is
+    present and falling back to the single live book when it is not.
+    """
     fut = window.get("futures") or {}
     book = fut.get("order_book") or {}
+    ws_deltas = fut.get("ws_deltas") or (window.get("ws") or {}).get("deltas") or []
     mid = _mid(_pairs(book.get("bids")), _pairs(book.get("asks")))
     if mid is None or mid <= 0:
         return None
     tbr_series = fut.get("taker_buy_sell")
     try:
-        payload = delta_variable(book, tbr_series, mid, half_range=0.75, band_step=0.10)
+        payload = multi_timeframe_delta(
+            book, tbr_series, mid,
+            half_range=0.75, band_step=0.10,
+            ws_deltas=ws_deltas or None,
+        )
     except (ValueError, TypeError):
         return None
-    payload["state"] = delta_state(payload["delta"])
     return payload
 
 
@@ -118,8 +129,23 @@ class DeltaWorker(SubstrateWorkerCore):
                 "band": list(TBR_BAND),
             }
 
+        # Multi-timeframe: ANY horizon state flip is a fire condition.
+        cur_windows = current.get("deltas") or {}
+        prev_windows = prev_output.get("deltas") or {}
+        for h, d in cur_windows.items():
+            if not isinstance(d, dict):
+                continue
+            p = prev_windows.get(h)
+            p_state = (p or {}).get("state") if isinstance(p, dict) else None
+            if p_state is not None and p_state != d.get("state"):
+                predicates[f"delta_state_flip:{h}min"] = {
+                    "from": p_state, "to": d.get("state"),
+                    "delta": d.get("delta"),
+                }
+
         return TriggerDecision(fired=bool(predicates), source="probe",
                                predicates=predicates)
+
 
     # ------------------------------------------------------------------
     # Compute — delta substrate functions ONLY
@@ -130,7 +156,7 @@ class DeltaWorker(SubstrateWorkerCore):
         if current is None:
             # Null discipline: without a real mid the DELTA math cannot run.
             return {}
-        return {
+        out = {
             "delta": current["delta"],
             "delta_raw": current["delta_raw"],
             "wall_imbalance": current["wall_imbalance"],
@@ -142,3 +168,14 @@ class DeltaWorker(SubstrateWorkerCore):
             "range": current["range"],
             "state": current["state"],
         }
+        # Multi-timeframe aggregate: 5m / 15m / 4h signed DELTA + per-window
+        # state. Sources poller book fused with the WS microstructure series.
+        if isinstance(current.get("deltas"), dict):
+            out["deltas"] = current["deltas"]
+        else:
+            out["deltas"] = {
+                5: {"delta": current["delta"], "state": current["state"], "window_min": 5},
+                15: {"delta": current["delta"], "state": current["state"], "window_min": 15},
+                240: {"delta": current["delta"], "state": current["state"], "window_min": 240},
+            }
+        return out

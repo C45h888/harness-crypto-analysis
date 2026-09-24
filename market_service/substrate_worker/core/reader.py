@@ -235,10 +235,17 @@ class ReaderMixin(SubstrateBase):
                     })
         if self._status_stream is not None:
             try:
+                # Bounded blocking read: ``block=0`` here would block forever
+                # waiting for the NEXT status transition — and in steady state
+                # (no state change) that would wedge the entire worker loop,
+                # starve the supervisor heartbeat, and make the WS-input
+                # workers (delta / large_print / tape) go dark with no log
+                # line. Cap the wait at the read window so the loop stays
+                # responsive and heartbeats keep refreshing.
                 resp = await self._redis.xread(
                     {self._status_stream: "$"},
                     count=_EVT_READ_LIMIT,
-                    block=0,
+                    block=self.read_block_ms,
                 )
             except Exception as exc:
                 if is_recoverable_redis_exc(exc):

@@ -156,3 +156,142 @@ async def build_raw_window(
             "open_interest": latest.get("futures", {}).get("open_interest") or {},
         },
     }
+
+
+def _num_pair(rows: Any) -> list[Any]:
+    """Coerce WS raw price-level rows (strings of the ``["price","qty"]``
+    Delta shape) into the float-pair shape the REST book uses."""
+    out: list[Any] = []
+    for row in rows or ():
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        try:
+            p, q = float(row[0]), float(row[1])
+        except (TypeError, ValueError):
+            continue
+        out.append([p, q])
+    return out
+
+
+def _has_prices(levels: Any) -> bool:
+    """True when a level array carries any usable price/qty pair."""
+    return any(
+        isinstance(r, (list, tuple)) and len(r) >= 2
+        for r in (levels or ())
+    )
+
+
+def _overlay_book(rest_book: dict[str, Any], ws_deltas: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fuse the poller REST book with the latest WS depth delta.
+
+    The poller provides the base level grid (spot/futures REST book); the WS
+    capture provides higher-frequency cumulative price levels. We overlay the
+    MOST RECENT WS delta that actually carries price levels onto the REST
+    book — treating WS as the fresher authority when it has data, and falling
+    back to REST intact when WS is absent. Decode both sides to float pairs;
+    preserve the REST shape when no WS data is available.
+    """
+    if not rest_book:
+        rest_book = {}
+    bids = rest_book.get("bids") or []
+    asks = rest_book.get("asks") or []
+    if not _has_prices(bids) and not _has_prices(asks):
+        # REST book came in nested? guard no-op.
+        pass
+    ws_bids = ws_asks = None
+    for d in ws_deltas:
+        if _has_prices(d.get("bids")) or _has_prices(d.get("asks")):
+            ws_bids = _num_pair(d.get("bids"))
+            ws_asks = _num_pair(d.get("asks"))
+            break  # newest delta carries the freshest cumulative book
+    # Prefer WS levels when present; else keep REST.
+    fused_bids = ws_bids if ws_bids is not None else _num_pair(bids)
+    fused_asks = ws_asks if ws_asks is not None else _num_pair(asks)
+    return {
+        "bids": fused_bids or [],
+        "asks": fused_asks or [],
+        "source": "ws" if ws_bids is not None else "rest",
+    }
+
+
+def ws_evidence_from_deltas(ws_deltas: list[dict[str, Any]], *, now_ms: int) -> dict[str, Any]:
+    """Shape the WS delta surface for the substrate workers.
+
+    Provides the fused book choice (newest cumulative WS book) plus the raw
+    delta series tagged with age, so the multi-timeframe aggregations can
+    bucket WS book deltas into 5m / 15m / 4h windows without re-reading
+    redis. ``now_ms`` anchors the age/timestamp math in one place.
+    """
+    by_ts: list[dict[str, Any]] = []
+    for d in ws_deltas:
+        ts = d.get("exchange_ts_ms") or d.get("received_ts_ms")
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            ts = None
+        by_ts.append({
+            "exchange_ts_ms": ts,
+            "received_ts_ms": d.get("received_ts_ms"),
+            "age_ms": (now_ms - ts) if ts is not None else None,
+            "bids": _num_pair(d.get("bids")),
+            "asks": _num_pair(d.get("asks")),
+        })
+    # Newest-first.
+    by_ts.sort(key=lambda x: (x["exchange_ts_ms"] or 0), reverse=True)
+    return {
+        "source": "microstructure_ws",
+        "delta_count": len(by_ts),
+        "deltas": by_ts,
+    }
+
+
+async def build_ws_surface(
+    redis: RedisRuntimeStore,
+    symbol: str,
+    venue: str = "futures",
+    *, window_minutes: int = 15,
+) -> dict[str, Any]:
+    """Read the WS microstructure raw deltas for ``window_minutes`` back.
+
+    Returns a surface with the fused book overlay + the delta series. When
+    the store/venue/symbol is absent or empty, returns an empty surface
+    (``delta_count=0``) instead of raising — WS is optional evidence that
+    augments, never replaces, the poller REST path.
+    """
+    now_ms = int(time.time() * 1000)
+    try:
+        reader = getattr(redis, "read_microstructure_raw", None)
+        if not callable(reader):
+            return {"source": "microstructure_ws", "delta_count": 0, "deltas": []}
+        # Read the window (oldest-first xrange); bucket via age below.
+        deltas = await reader(venue, symbol, start="-", end="+",
+                              count=int(window_minutes * 60 * 1000 // 100))
+    except Exception:
+        # WS is best-effort; never let an absent WS surface fail a REST fire.
+        return {"source": "microstructure_ws", "delta_count": 0, "deltas": []}
+    return ws_evidence_from_deltas(deltas, now_ms=now_ms)
+
+
+def overlay_ws_into_window(
+    window: dict[str, Any],
+    ws_surface: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge the WS surface into a REST evidence window.
+
+    Attaches ``evidence.ws`` (high-frequency delta series) and swaps the
+    futures book to the fused WS overlay when WS is present. Returns a new
+    dict; does not mutate the caller's window.
+    """
+    out = {**window}
+    fut = dict(window.get("futures") or {})
+    ws_deltas = ws_surface.get("deltas") or []
+    rest_book = fut.get("order_book") or {}
+    fused = _overlay_book(rest_book, ws_deltas)
+    if fused.get("source") == "ws":
+        # Preserve REST depth as the base and record the overlay provenance.
+        fut["order_book"] = fused
+        fut["ws_source"] = fused.get("source")
+    fut["ws_deltas"] = ws_deltas  # full series for multi-timeframe bucketing
+    out["futures"] = fut
+    out["ws"] = ws_surface
+    return out

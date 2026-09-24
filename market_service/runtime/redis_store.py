@@ -755,6 +755,22 @@ class RedisRuntimeStore:
             self.microstructure_ofi_stream(venue, symbol), start=start, end=end, count=count,
         )
 
+    async def read_microstructure_raw(
+        self, venue: str, symbol: str, *, start: str = "-", end: str = "+", count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read raw depth-delta snapshots from the WS microstructure raw stream.
+
+        Each entry is one WS ``@depth`` delta payload with ``exchange_ts_ms``,
+        ``received_ts_ms`` and ``bids``/``asks`` price-level updates. This is
+        the high-frequency surface the substrate workers need to fuse with
+        the five-second REST poller book — it is deliberately isolated from
+        the poller stream (retention + keyspace) so combining them is a read-
+        plane choice made here on demand, never a shared write.
+        """
+        return await self._read_microstructure_stream(
+            self.microstructure_raw_stream(venue, symbol), start=start, end=end, count=count,
+        )
+
     async def _read_microstructure_stream(
         self, key: str, *, start: str, end: str, count: int | None,
     ) -> list[dict[str, Any]]:
@@ -955,3 +971,71 @@ class RedisRuntimeStore:
     async def read_substrate_history_count(self, substrate: str, symbol: str) -> int:
         """Return XLEN of the substrate state stream for diagnostics."""
         return int(await self.redis.xlen(self.substrate_stream(substrate, symbol)))
+
+    # ------------------------------------------------------------------
+    # Analysis worker plane (orthogonal to the substrate plane)
+    # ------------------------------------------------------------------
+
+    # Same atomic publish discipline as the substrate plane, its own
+    # keyspace: analysis workers consume substrate state streams and
+    # publish THEIR projections here. Worker identity is (analysis,
+    # symbol) — never the process. Spec: docs/ANALYSIS_WORKER_SPEC.md.
+
+    def analysis_stream(self, analysis: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:analysis:{analysis.lower()}:{symbol.upper()}"
+
+    def analysis_latest_key(self, analysis: str, symbol: str) -> str:
+        return f"{self.prefix}:latest:analysis:{analysis.lower()}:{symbol.upper()}"
+
+    def analysis_supervisor_key(self, analysis: str, symbol: str) -> str:
+        return f"{self.prefix}:analysis:{analysis.lower()}:{symbol.upper()}:supervisor"
+
+    async def publish_analysis_state(
+        self, analysis: str, symbol: str, payload: dict[str, Any],
+    ) -> str:
+        """Atomic SET(latest) + XADD(state stream) — the substrate publish Lua."""
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        ts = str(payload.get("computed_at_ms") or payload.get("observed_at_ms") or "")
+        maxlen = str(int(self.stream_maxlen))
+        script = """
+        redis.call('SET', KEYS[1], ARGV[1])
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'analysis', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[4], 'payload', ARGV[1])
+        """
+        return str(await self.redis.eval(
+            script, 2,
+            self.analysis_latest_key(analysis, symbol),
+            self.analysis_stream(analysis, symbol),
+            body, analysis.lower(), symbol.upper(), ts, maxlen,
+        ))
+
+    async def read_analysis_latest(self, analysis: str, symbol: str) -> dict[str, Any] | None:
+        """Read the latest analysis projection (None = legitimate cold start)."""
+        raw = await self.redis.get(self.analysis_latest_key(analysis, symbol))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def read_analysis_history(
+        self, analysis: str, symbol: str, count: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read recorded analysis states, newest first."""
+        rows = await self.redis.xrevrange(
+            self.analysis_stream(analysis, symbol), count=count,
+        )
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out

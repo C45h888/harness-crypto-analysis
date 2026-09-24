@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from market_service.calculations.substrates.large_print import (
+    multi_window_aggression,
     seller_aggression_classify,
     tiered_large_flow,
 )
@@ -120,5 +121,7 @@ class LargePrintWorker(SubstrateWorkerCore):
         return {
             "tiered_large_flow": tiered_large_flow(fut_trades),
             "seller_aggression": seller_aggression_classify(fut_trades),
+            # Filter-centered multi-timeframe aggression: 5m / 15m / 4h.
+            "aggression_windows": multi_window_aggression(fut_trades),
             "large_prints": _large_prints(fut_trades),
         }

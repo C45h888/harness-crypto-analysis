@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from typing import Any
+import time
 
 
 def _pairs(levels: Iterable[Sequence[float]] | None) -> list[tuple[float, float]]:
@@ -226,3 +227,112 @@ def delta_state(delta: float) -> str:
     if delta > -1.0:
         return "SELLERS_FAVORED"
     return "SELLERS_IN_CONTROL"
+
+
+def _window_delta(
+    bids: Sequence[Sequence[float]],
+    asks: Sequence[Sequence[float]],
+    price: float,
+    half_range: float,
+    band_step: float,
+) -> dict[str, float]:
+    """Signed wall-imbalance over one book slice — the per-window core."""
+    lo = (int((price - half_range) / band_step)) * band_step
+    hi = (int((price + half_range) / band_step) + 1) * band_step
+    sum_b = sum(q for p, q in _pairs(bids) if lo <= p <= hi)
+    sum_a = sum(q for p, q in _pairs(asks) if lo <= p <= hi)
+    s = sum_b + sum_a
+    wall_imb = (sum_b - sum_a) / s if s > 0 else 0.0
+    return {"wall_imbalance": wall_imb, "bid_qty": sum_b, "ask_qty": sum_a}
+
+
+def multi_timeframe_delta(
+    book: dict[str, Any],
+    taker_buy_sell: list[dict[str, Any]] | None,
+    price: float,
+    *,
+    ws_deltas: list[dict[str, Any]] | None = None,
+    now_ms: int | None = None,
+    horizons_min: Sequence[int] = (5, 15, 240),
+    half_range: float = 0.75,
+    band_step: float = 0.10,
+) -> dict[str, Any]:
+    """Compute DELTA aggregate over 5m / 15m / 4h (240m) horizons.
+
+    The 4h horizon is the delta *movement* over the runtime retention window:
+    because older evidence is pruned at 4h, the 4h delta is exactly the
+    signed DELTA across the in-memory book history — the interval change
+    between the oldest and newest WS book in window, plus the live flow.
+
+    For each horizon:
+      - ``5m``   : aggregate the WS book deltas inside the last 5 minutes;
+                   fall back to the single live book when no WS series.
+      - ``15m``  : aggregate across the last 15 minutes of WS deltas.
+      - ``4h``   : the full retained (pruned-at-4h) history — delta movement
+                   from the oldest usable WS book to the newest.
+
+    Returns a dict keyed by ``deltas: {5m/15m/4h}`` (each signed -2..+2),
+    plus a per-window breakdown. When no WS data exists, every horizon falls
+    back to the live single book delta (the pre-WS behavior), so the delta
+    substrate degrades gracefully rather than fabricating a multi-scale value.
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    live = delta_variable(
+        book, taker_buy_sell, price,
+        half_range=half_range, band_step=band_step,
+    )
+    fa = live["flow_alignment"]
+    live_state = delta_state(live["delta"])
+
+    # Aggregate WS deltas into per-horizon books. Each capture delta is a
+    # CUMULATIVE book snapshot (full $depth level set as of that update), so
+    # the right per-window aggregation is the NEWEST snapshot in-window —
+    # summing level-pairs across successive snapshots would double-count the
+    # same price level. We take the freshest cumulative book per horizon.
+    deltas: dict[str, dict[str, Any]] = {}
+    ws = ws_deltas or []
+    if ws:
+        # ws_deltas are newest-first (build_ws_surface sorts by ts desc).
+        for h in horizons_min:
+            cutoff = now_ms - h * 60 * 1000
+            newest = None
+            for d in ws:
+                if (d.get("exchange_ts_ms") or 0) >= cutoff:
+                    newest = d
+                    break  # first (newest) in-window cumulative book
+                # ws is newest-first; once we pass the cutoff we can stop.
+                break
+            if newest is not None:
+                agg = _window_delta(
+                    newest.get("bids") or [], newest.get("asks") or [],
+                    price, half_range, band_step,
+                )
+                d = agg["wall_imbalance"] + fa
+                deltas[h] = {
+                    "delta": round(d, 4),
+                    "wall_imbalance": round(agg["wall_imbalance"], 4),
+                    "flow_alignment": round(fa, 4),
+                    "window_min": h,
+                    "deltas_in_window": sum(
+                        1 for x in ws if (x.get("exchange_ts_ms") or 0) >= cutoff),
+                    "state": delta_state(d),
+                }
+    # Fallback: any horizon without a WS window uses the live single delta.
+    for h in horizons_min:
+        if h not in deltas:
+            deltas[h] = {
+                "delta": round(live["delta"], 4),
+                "wall_imbalance": round(live["wall_imbalance"], 4),
+                "flow_alignment": round(fa, 4),
+                "window_min": h,
+                "deltas_in_window": 0,
+                "state": live_state,
+            }
+
+    return {
+        **live,
+        "state": live_state,
+        "deltas": deltas,
+        "now_ms": now_ms,
+    }

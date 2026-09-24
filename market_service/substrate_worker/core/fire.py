@@ -19,9 +19,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
-from market_service.runtime.raw_window import build_raw_window
+from market_service.runtime.raw_window import (
+    build_raw_window,
+    build_ws_surface,
+    overlay_ws_into_window,
+)
 from market_service.substrate_worker.core.base import SubstrateBase, _store_fn
 from market_service.substrate_worker.contracts import (
     SUBSTRATE_STATE_SCHEMA_VERSION,
@@ -31,9 +36,22 @@ from market_service.substrate_worker.contracts import (
 
 log = logging.getLogger(__name__)
 
+# Process-global evidence-window cache: every worker for the same symbol builds
+# the SAME raw+WS window, but doing so ~1.4s per worker per arrival on a
+# single asyncio event loop starved the other workers' supervisor heartbeats
+# (their ``_tick`` was delayed past the ~7s TTL). Share one build per symbol
+# across all workers so the heavy window is computed once per TTL slice.
+# Keyed by (symbol, window_minutes).
+_EVIDENCE_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+_EVIDENCE_CACHE_TTL_S = 2.5
+
 
 class FireMixin(SubstrateBase):
     """Fire authority: decision cascade → dedupe → compute → persist."""
+
+    # Bounded durable-ledger insert (seconds): a hung PG must abort the
+    # fire within this window, never stall the worker plane silently.
+    _PG_INSERT_TIMEOUT_S = 10.0
 
     async def _handle_rows(
         self,
@@ -43,9 +61,7 @@ class FireMixin(SubstrateBase):
         ws_rows: list[dict[str, Any]] | None = None,
         recovery: bool = False,
     ) -> None:
-        last_state = await self.store.read_substrate_latest(
-            self.SUBSTRATE_NAME, self.symbol,
-        )
+        last_state = await self._read_own_state()
         # Version-mismatch cold start: never probe against an incompatible
         # prior — treat it as absent (log + overwrite on the next fire).
         if last_state is not None:
@@ -107,7 +123,9 @@ class FireMixin(SubstrateBase):
         if not arrival:
             return
 
-        window = await build_raw_window(self.store, self.symbol, self.window_minutes)
+        # Probe path uses the cached evidence window (shared with the compute
+        # of the same fire) — see ``_cached_evidence``.
+        window = await self._cached_evidence(now_ms)
         deriv_reason = await self._attach_derivatives(window, now_ms)
         if deriv_reason is not None:
             self._last_dormant_reason = deriv_reason
@@ -153,6 +171,7 @@ class FireMixin(SubstrateBase):
         now_ms: int,
         *,
         high_water: str,
+        rows: list[dict[str, Any]] | None = None,
     ) -> None:
         """Dedupe, then dispatch the compute+persist cycle as a task."""
         allowed = await self._dedupe(decision, high_water, now_ms)
@@ -165,19 +184,62 @@ class FireMixin(SubstrateBase):
             "substrate %s FIRED symbol=%s source=%s predicates=%s",
             self.SUBSTRATE_NAME, self.symbol, decision.source, sorted(decision.predicates),
         )
-        task = asyncio.create_task(self._fire_guarded(decision, last_state, now_ms))
+        task = asyncio.create_task(self._fire_guarded(decision, last_state, now_ms, rows=rows))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def _build_evidence(self, now_ms: int, *, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Evidence assembly seam — the raw evidence window (calculation plane).
+
+        Analysis-plane workers override: their evidence is the composed
+        dependency-substrate latests (attached by ``_attach_dependencies``)
+        plus the derivative cache — never a raw REST window.
+
+        For WS-io workers (delta, large_print) the base fuses the poller REST
+        window with the high-frequency microstructure WS surface so compute
+        aggregates poller + WS as one combined input. WS is best-effort: an
+        absent WS surface leaves the REST window intact (pre-WS behavior).
+        """
+        evidence = await build_raw_window(self.store, self.symbol, self.window_minutes)
+        if self.ws_input and "microstructure" in self.INPUT_STREAMS:
+            try:
+                ws = await build_ws_surface(
+                    self.store, self.symbol, self.ws_venue,
+                    window_minutes=self.window_minutes,
+                )
+            except Exception as exc:
+                log.warning("substrate %s ws surface build failed: %s",
+                            self.SUBSTRATE_NAME, exc)
+            else:
+                evidence = overlay_ws_into_window(evidence, ws)
+        return evidence
+
+    async def _cached_evidence(self, now_ms: int) -> dict[str, Any]:
+        """Cached evidence window — one heavy build per (symbol, window) per
+        TTL slice, shared across all workers in this process. Building the
+        ~1.4s raw+WS window per worker per arrival starved the shared event
+        loop and let supervisor heartbeats expire; this thins it to one build
+        per slice. ``_EVIDENCE_CACHE_TTL_S`` bounds reuse."""
+        key = (self.symbol, int(self.window_minutes), self.ws_input and "microstructure" in self.INPUT_STREAMS)
+        cached = _EVIDENCE_CACHE.get(key)
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < _EVIDENCE_CACHE_TTL_S:
+            return cached[1]
+        built = await self._build_evidence(now_ms)
+        _EVIDENCE_CACHE[key] = (time.monotonic(), built)
+        return built
 
     async def _fire_guarded(
         self,
         decision: TriggerDecision,
         last_state: dict[str, Any] | None,
         now_ms: int,
+        *,
+        rows: list[dict[str, Any]] | None = None,
     ) -> None:
         """Compute the substrate and persist the state payload (never raises)."""
         try:
-            evidence = await build_raw_window(self.store, self.symbol, self.window_minutes)
+            evidence = await self._cached_evidence(now_ms)
             deriv_reason: str | None = None
             try:
                 deriv_reason = await self._attach_derivatives(evidence, now_ms)
@@ -225,8 +287,23 @@ class FireMixin(SubstrateBase):
             # Phase 3 PG-first: durable insert precedes the Redis publish.
             if self.pg_store is not None:
                 try:
-                    await self.pg_store.record_substrate_state(
-                        self.symbol, self.SUBSTRATE_NAME, payload.to_dict(),
+                    # Shared durable ledger, plane-namespaced: analysis
+                    # workers record under "analysis:<name>" so calc-plane
+                    # and analysis-plane names can never collide.
+                    ledger_name = (
+                        f"analysis:{self.SUBSTRATE_NAME}"
+                        if self._plane == "analysis" else self.SUBSTRATE_NAME
+                    )
+                    # Bounded insert: a hung PG (dead daemon, network drop)
+                    # must fail FAST — an unbounded await here stalls every
+                    # dispatched fire task, freezes all projections, and
+                    # turns the staleness heartbeats into a fire-storm that
+                    # never lands. Abort loudly inside the strict window.
+                    await asyncio.wait_for(
+                        self.pg_store.record_substrate_state(
+                            self.symbol, ledger_name, payload.to_dict(),
+                        ),
+                        timeout=self._PG_INSERT_TIMEOUT_S,
                     )
                 except Exception as exc:
                     if self.pg_strict:
@@ -237,9 +314,7 @@ class FireMixin(SubstrateBase):
                     log.warning("substrate %s PG insert failed (lax: continuing): %s",
                                 self.SUBSTRATE_NAME, exc)
                     self._last_error = f"pg (lax, continuing): {exc}"
-            await self.store.publish_substrate_state(
-                self.SUBSTRATE_NAME, self.symbol, payload.to_dict(),
-            )
+            await self._publish_own_state(payload.to_dict())
         except Exception as exc:
             log.exception("substrate %s fire failed", self.SUBSTRATE_NAME)
             self._last_error = f"fire: {exc}"

@@ -21,13 +21,16 @@ from tests.test_substrate_worker_core import _FakeRedis, _FakeStore
 
 
 class _FakeLedger:
-    """PostgresRuntimeStore-shaped fake (success or raise)."""
+    """PostgresRuntimeStore-shaped fake (success, raise, or hang)."""
 
-    def __init__(self, *, fail: bool = False):
+    def __init__(self, *, fail: bool = False, hang_s: float = 0.0):
         self.fail = fail
+        self.hang_s = hang_s
         self.rows: list[tuple[str, str, dict]] = []
 
     async def record_substrate_state(self, symbol, substrate, payload):
+        if self.hang_s:
+            await asyncio.sleep(self.hang_s)
         if self.fail:
             raise ConnectionError("pg down")
         self.rows.append((symbol, substrate, payload))
@@ -116,6 +119,36 @@ class PgFirstPathTests(unittest.TestCase):
                           "coverage": {}},
         ):
             self._fire(w)
+        self.assertIsNotNone(w.store.redis.latest)
+        self.assertIn("lax", w._last_error or "")
+
+    def test_pg_hang_aborts_within_timeout_strict(self):
+        """A hung PG must fail FAST — an unbounded insert stalls every fire
+        task and freezes all projections (the fire-storm failure mode)."""
+        ledger = _FakeLedger(hang_s=30.0)
+        w = _pg_worker(pg_store=ledger, pg_strict=True)
+        w._PG_INSERT_TIMEOUT_S = 0.05
+        with unittest.mock.patch(
+            "market_service.substrate_worker.core.build_raw_window",
+            return_value={"futures": {"order_book": {}}, "spot": {},
+                          "coverage": {}},
+        ):
+            self._fire(w)
+        self.assertEqual(ledger.rows, [])
+        self.assertIsNone(w.store.redis.latest)
+        self.assertIn("pg:", w._last_error or "")
+
+    def test_pg_hang_timeout_lax_publishes(self):
+        ledger = _FakeLedger(hang_s=30.0)
+        w = _pg_worker(pg_store=ledger, pg_strict=False)
+        w._PG_INSERT_TIMEOUT_S = 0.1
+        with unittest.mock.patch(
+            "market_service.substrate_worker.core.build_raw_window",
+            return_value={"futures": {"order_book": {}}, "spot": {},
+                          "coverage": {}},
+        ):
+            self._fire(w)
+        self.assertEqual(ledger.rows, [])
         self.assertIsNotNone(w.store.redis.latest)
         self.assertIn("lax", w._last_error or "")
 

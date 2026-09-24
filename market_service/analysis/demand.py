@@ -159,6 +159,45 @@ def decompose_demand(d: dict, *, flow_provider: FlowSummaryFn | None = None) -> 
     }
 
 
+def dx_from_flows(spot_flow: dict, fut_flow: dict, derivs: dict | None = None) -> dict:
+    """Compose the ``demand_verdict`` ``dx`` from tape flow summaries + derivs.
+
+    Composition seam: ``decompose_demand`` needs raw spot+futures trades/books
+    (never present in an analysis worker's composed evidence), but the tape
+    substrate already publishes the ``summarize`` flow summaries. This maps
+    those + the derivative cache into the exact ``dx`` shape ``demand_verdict``
+    consumes — composition only, no threshold redefinition.
+    """
+    derivs = derivs or {}
+
+    def _block(flow: dict | None) -> dict:
+        flow = flow or {}
+        return {
+            "last": flow.get("last_price"), "vwap": flow.get("vwap"),
+            "cvd": flow.get("cvd"), "obi": flow.get("obi"),
+            "spread": flow.get("spread_bps"), "trades": flow.get("trade_count"),
+            "buy_notional": flow.get("buy_notional_usd"),
+            "sell_notional": flow.get("sell_notional_usd"),
+            "buy_share": flow.get("buy_share"),
+            "ticker_24h": flow.get("ticker_24h"),
+        }
+
+    return {
+        "latency_ms": derivs.get("latency_ms"),
+        "spot": _block(spot_flow),
+        "futures": {**_block(fut_flow), "mark_price": derivs.get("mark_price")},
+        "derivs": {
+            "oi": derivs.get("oi"),
+            "oi_change_pct": derivs.get("oi_change_pct"),
+            "oi_trend": derivs.get("oi_trend", "n/a"),
+            "funding": derivs.get("funding"),
+            "long_pct": derivs.get("long_pct"),
+            "top_long_pct": derivs.get("top_long_pct"),
+            "taker_buy_ratio": derivs.get("taker_buy_ratio"),
+        },
+    }
+
+
 def demand_verdict(dx: dict) -> tuple[str, list[str]]:
     """Where is the bid coming from? Spot-momentum vs leverage decomposition.
 

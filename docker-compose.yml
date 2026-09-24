@@ -238,6 +238,52 @@ services:
     # Auto-resurrect disabled — see the RESTART_POLICY note on `poller`.
     restart: ${RESTART_POLICY:-no}
 
+  # ANALYSIS CONTAINER — the analysis worker plane as ONE service (orthogonal
+  # to the calculation container). Each analysis worker binds a SUBSTRATE
+  # STATE STREAM (the calculation plane's publishes ARE the deterministic
+  # trigger — blocking XREADGROUP, no polling) and projects into the
+  # analysis: keyspace. Control plane /health /status /invoke on 8042 with
+  # the same invoke-authority rule: only sanctioned fire-tick entry.
+  # Spec: docs/ANALYSIS_WORKER_SPEC.md.
+  analysis:
+    build: .
+    image: crypto-ai-anal-analysis:latest
+    user: "marketflow"
+    command: ["python", "-m", "market_service.analysis_worker.analysis_container"]
+    ports:
+      - "127.0.0.1:${ANALYSIS_CONTROL_PORT:-8042}:${ANALYSIS_CONTROL_PORT:-8042}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1200}
+      ANALYSIS_WORKERS: ${ANALYSIS_WORKERS:-all}
+      ANALYSIS_SYMBOLS: ${ANALYSIS_SYMBOLS:-${MICROSTRUCTURE_SYMBOL:-SOLUSDT}}
+      ANALYSIS_COOLDOWN_S: ${ANALYSIS_COOLDOWN_S:-30}
+      ANALYSIS_STALENESS_S: ${ANALYSIS_STALENESS_S:-600}
+      ANALYSIS_CONTROL_PORT: ${ANALYSIS_CONTROL_PORT:-8042}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
+      SUBSTRATE_PG_STRICT: ${SUBSTRATE_PG_STRICT:-1}
+      DEPTH_LEVELS: ${DEPTH_LEVELS:-500}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "market_service.analysis_worker.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    profiles: ["analysis"]
+    restart: ${RESTART_POLICY:-no}
+
 volumes:
   postgres_data:
   redis_data:

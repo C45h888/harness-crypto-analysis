@@ -406,3 +406,33 @@ async def read_substrate_snapshot(store: Any, symbol: str) -> dict[str, Any]:
         entry = await read_substrate_latest(store, name, symbol.upper())
         snapshot[name] = entry if entry is not None else {"available": False}
     return snapshot
+
+
+async def read_analysis_latest(store: Any, analysis: str, symbol: str) -> dict[str, Any] | None:
+    """Read one analysis worker's latest projection plus its derived age.
+
+    Same discipline as ``read_substrate_latest``: ``{payload, age_ms}`` or
+    ``None`` (null = cold start, never a fabricated payload).
+    """
+    import time as _time
+
+    payload = await store.read_analysis_latest(analysis, symbol.upper())
+    if payload is None:
+        return None
+    computed_at = payload.get("computed_at_ms") if isinstance(payload, dict) else None
+    age_ms = (
+        int(_time.time() * 1000) - int(computed_at)
+        if isinstance(computed_at, (int, float)) else None
+    )
+    return {"payload": payload, "age_ms": age_ms}
+
+
+async def read_analysis_snapshot(store: Any, symbol: str) -> dict[str, Any]:
+    """Read every registered analysis worker's latest projection for a symbol."""
+    from market_service.analysis_worker import ANALYSIS_WORKER_REGISTRY
+
+    snapshot: dict[str, Any] = {}
+    for name in sorted(ANALYSIS_WORKER_REGISTRY):
+        entry = await read_analysis_latest(store, name, symbol.upper())
+        snapshot[name] = entry if entry is not None else {"available": False}
+    return snapshot

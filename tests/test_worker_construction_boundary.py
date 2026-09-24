@@ -31,6 +31,14 @@ import unittest
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _PACKAGE = _REPO / "market_service"
 _WORKER_PLANE = _PACKAGE / "substrate_worker"
+# The analysis plane is a SANCTIONED sibling worker plane: it runs in its own
+# container, binds its own consumer groups (analysis:* on dependency substrate
+# STATE streams — never the raw stream groups), and keys its supervisor
+# heartbeats in the analysis: keyspace. There is no collision with the
+# calculation plane's groups/keys/heartbeats, so constructing workers there
+# cannot corrupt the calculation container. Everything OUTSIDE these two
+# planes must still go through substrate_worker.control_client.
+_SANCTIONED_PLANES = (_WORKER_PLANE, _PACKAGE / "analysis_worker")
 
 # The in-process tool surface. ``control_client.request_invoke`` is
 # deliberately absent — it is the sanctioned seam.
@@ -41,7 +49,7 @@ _TOOL_MODULES = {"tools", "substrate_tools"}
 
 def _python_files_outside_the_worker_plane():
     for path in _PACKAGE.rglob("*.py"):
-        if _WORKER_PLANE in path.parents or path == _WORKER_PLANE:
+        if any(plane in path.parents or path == plane for plane in _SANCTIONED_PLANES):
             continue
         if "__pycache__" in path.parts:
             continue

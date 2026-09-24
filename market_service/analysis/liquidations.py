@@ -8,7 +8,7 @@ from typing import Any
 from market_service.clients.binance import Binance, normalize_fut_trade
 
 
-def _signal(oi_change: float, price_change: float) -> str:
+def liquidation_signal(oi_change: float, price_change: float) -> str:
     if oi_change < -0.3 and price_change < -0.3: return "LONG_LIQUIDATION_LIKELY"
     if oi_change < -0.3 and price_change > 0.3: return "SHORT_LIQUIDATION_LIKELY"
     if abs(oi_change) < 0.2 and price_change < -0.3: return "ORGANIC_SELLING"
@@ -18,7 +18,7 @@ def _signal(oi_change: float, price_change: float) -> str:
     return "MIXED_RANGE_BOUND"
 
 
-def _oi_price(oi_hist: list[dict], klines: list[list]) -> dict:
+def oi_price_divergence(oi_hist: list[dict], klines: list[list]) -> dict:
     oi = sorted((int(x["timestamp"]), float(x["sum_open_interest"])) for x in oi_hist)
     prices = {int(k[0]) // 300000 * 300000: (float(k[1]), float(k[4])) for k in klines}
     oi_changes, price_changes, rows = [], [], []
@@ -29,10 +29,10 @@ def _oi_price(oi_hist: list[dict], klines: list[list]) -> dict:
         oi_changes.append(oi_change); price_changes.append(price_change)
         rows.append({"timestamp": current[0], "oi_change_pct": oi_change, "price_open": open_price, "price_close": close_price, "price_change_pct": price_change})
     oi_cum, price_cum = sum(oi_changes), sum(price_changes)
-    return {"rows": rows, "cumulative_oi_change_pct": oi_cum, "cumulative_price_change_pct": price_cum, "signal": _signal(oi_cum, price_cum)}
+    return {"rows": rows, "cumulative_oi_change_pct": oi_cum, "cumulative_price_change_pct": price_cum, "signal": liquidation_signal(oi_cum, price_cum)}
 
 
-def _clusters(trades: list[dict], cutoff_ms: int) -> list[dict]:
+def trade_clusters(trades: list[dict], cutoff_ms: int) -> list[dict]:
     recent = sorted((t for t in trades if t["ts"] >= cutoff_ms), key=lambda x: x["ts"])
     clusters, i = [], 0
     while i < len(recent):
@@ -58,7 +58,7 @@ async def analyze_liquidation_pressure(client: Binance, symbol: str, lookback_ba
         client.fut_funding(symbol),
     )
     trades = [normalize_fut_trade(t) for t in trades_raw]
-    oi_price = _oi_price(oi, klines)
+    oi_price = oi_price_divergence(oi, klines)
     tbr_rows = [{"timestamp": int(x["timestamp"]), "buy_ratio": float(x["buy_vol"]) / max(float(x["buy_vol"]) + float(x["sell_vol"]), 0.001)} for x in tbr[-12:]]
     avg_tbr = sum(x["buy_ratio"] for x in tbr_rows) / len(tbr_rows) if tbr_rows else 0.5
     mark, index = float(funding["mark_price"]), float(funding["index_price"])
@@ -68,6 +68,6 @@ async def analyze_liquidation_pressure(client: Binance, symbol: str, lookback_ba
         "evidence": {"open_interest_history": oi, "taker_buy_sell": tbr, "trades": trades_raw, "klines_1m": klines, "funding": funding},
         "oi_price": oi_price, "taker_ratio": {"rows": tbr_rows, "average": avg_tbr},
         "funding": {"rate": float(funding["last_funding_rate"]), "bps": funding_bps, "mark_index_spread_bps": (mark - index) / index * 10000 if index else None},
-        "large_trade_clusters": _clusters(trades, max((t["ts"] for t in trades), default=0) - 300000),
+        "large_trade_clusters": trade_clusters(trades, max((t["ts"] for t in trades), default=0) - 300000),
         "status": "proxy_only",
     }
