@@ -478,5 +478,31 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((artifact.interpretation or {}).get("summary"))
 
 
+class StructuredProbeOptInTests(unittest.TestCase):
+    """The structured (output_model) probe is OFF unless explicitly enabled.
+
+    Live 4/4 correlation (2026-09-28): probe succeeded -> tool_calls-only
+    turns -> empty judged interpretation -> validation_failed; probe refused
+    (raw text JSON) -> full summary/evidence/hypothesis -> settled. The
+    engine's contract is TEXT JSON, so the probe is opt-in.
+    """
+
+    def test_probe_is_off_by_default_and_env_opt_in(self):
+        import os
+
+        from market_service.nooa_harness.engine.config import (
+            STRUCTURED_OUTPUT_ENV,
+            structured_output_enabled,
+        )
+        self.assertEqual(STRUCTURED_OUTPUT_ENV, "NOOA_STRUCTURED_OUTPUT")
+        os.environ.pop(STRUCTURED_OUTPUT_ENV, None)
+        self.assertFalse(structured_output_enabled())
+        os.environ[STRUCTURED_OUTPUT_ENV] = "1"
+        try:
+            self.assertTrue(structured_output_enabled())
+        finally:
+            os.environ.pop(STRUCTURED_OUTPUT_ENV, None)
+
+
 if __name__ == "__main__":
     unittest.main()

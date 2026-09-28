@@ -39,6 +39,7 @@ from .config import (
     AGENTIC_MAX_TOOL_ROUNDS,
     _STRUCTURED_OK,
     narration_max_tokens,
+    structured_output_enabled,
 )
 from .schemas import NarrationParseError, NarrationTurn
 
@@ -106,7 +107,8 @@ async def call_narration_llm(
     # attempt on every turn once a backend has refused.
     global _STRUCTURED_OK  # noqa: PLW0603 — process-global, set once per backend
     response = None
-    if NarrationTurn is not None and _STRUCTURED_OK is not False:
+    if (NarrationTurn is not None and _STRUCTURED_OK is not False
+            and structured_output_enabled()):
         try:
             response = await llm.acall(
                 messages=messages,

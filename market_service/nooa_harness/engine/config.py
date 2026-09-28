@@ -98,6 +98,21 @@ _PRIOR_HEADLINE_MAX_CHARS = 4_000
 # Module-level probe flag: once a backend rejects output_model, stop paying
 # the failed structured attempt on every subsequent turn (same process).
 _STRUCTURED_OK: bool | None = None
+# Structured-output probing (output_model=NarrationTurn) is OPT-IN.
+# Live 2026-09-28 (4/4 correlation across full cycles): when the probe SUCCEEDS
+# on openrouter/qwen/qwen3.7-flash the model emits tool_calls-only turns and
+# the judged interpretation is EMPTY (summary 0, evidence 0, hypothesis null
+# in every turn); when the probe is REFUSED and the raw text-JSON path runs,
+# the same model returns full summary/evidence/hypothesis. The engine's real
+# contract is TEXT JSON parsed by extract_json_object — so the probe stays OFF
+# unless NOOA_STRUCTURED_OUTPUT=1.
+STRUCTURED_OUTPUT_ENV = "NOOA_STRUCTURED_OUTPUT"
+
+
+def structured_output_enabled() -> bool:
+    """Whether the structured (output_model) probe may be attempted at all."""
+    return os.getenv(STRUCTURED_OUTPUT_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 # --- Knowledge-base / prompt-payload paths. ---
 # Resolved relative to this file so the package can be imported from any cwd.
