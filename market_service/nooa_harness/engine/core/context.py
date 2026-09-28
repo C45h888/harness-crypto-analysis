@@ -193,6 +193,9 @@ class CycleRuntimeState:
     tool_results: dict[str, Any]
     parsed_current: dict[str, Any]
     parsed_1: dict[str, Any] | None = None
+    # Every parsed narration turn of the cycle, in order. The merged view
+    # (narration.merge_interpretation) is what final validation judges.
+    turn_log: list[dict[str, Any]] = field(default_factory=list)
     llm_calls: int = 0
     # Dispatch rounds remain separately visible from LLM/pass budgets.
     tool_rounds_used: int = 0

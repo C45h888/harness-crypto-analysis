@@ -741,6 +741,8 @@ class ForwardFit:
     oos_betas: dict[str, str] = field(default_factory=dict)
     oos_resid_std: str | None = None
     oos_cut: int = 0
+    # Long-horizon projection receipt (horizon_bridge): None on a native fit.
+    bridge: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -779,6 +781,7 @@ class ForwardFit:
             "oos_betas": dict(self.oos_betas),
             "oos_resid_std": self.oos_resid_std,
             "oos_cut": self.oos_cut,
+            "bridge": dict(self.bridge) if self.bridge else None,
         }
 
     @classmethod
@@ -820,6 +823,7 @@ class ForwardFit:
             oos_betas={str(k): str(v) for k, v in (payload.get("oos_betas") or {}).items()},
             oos_resid_std=payload.get("oos_resid_std"),
             oos_cut=int(payload.get("oos_cut") or 0),
+            bridge=payload.get("bridge"),
         )
 
 

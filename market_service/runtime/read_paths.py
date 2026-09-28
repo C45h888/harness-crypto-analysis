@@ -45,7 +45,25 @@ __all__ = [
     "read_collated_with_fallback",
     "read_substrate_latest",
     "read_substrate_snapshot",
+    "read_surface_inventory",
 ]
+
+
+# The agent-facing read surface map: which tool reads which plane. Rendered
+# into empty-read responses so an empty read always redirects the agent to a
+# surface that DOES hold data instead of leaving it re-calling the same wall.
+READ_SURFACE_TOOLS: dict[str, str] = {
+    "market.read": "collated market run (Redis latest → Postgres fallback)",
+    "market.derivatives": "derivatives/OI state for the symbol",
+    "market.keystone_history": "cross-cycle keystone migration ledger (Redis stream)",
+    "market.wall_history": "cross-cycle seller-wall ledger (Redis stream)",
+    "micro.capture_status": "capture worker state + sequence gaps",
+    "micro.events": "raw tape events (bounded)",
+    "micro.ofi_intervals": "interval-attached OFI series (bounded)",
+    "micro.evidence": "price-impact / depth-scaling fit evidence",
+    "substrate.read": "substrate worker inventory + freshness (age_ms)",
+    "memory.recall_paper": "provenance-tagged paper KB priors",
+}
 
 
 async def read_collated_with_fallback(
@@ -71,7 +89,9 @@ async def read_collated_with_fallback(
         if payload is not None:
             return payload, "redis"
         if postgres is not None:
-            guarded = _guard_dict_payload(await postgres.read_run(run_id))
+            read_run = getattr(postgres, "read_run", None)
+            guarded = (_guard_dict_payload(await read_run(run_id))
+                       if read_run else None)
             return guarded, ("postgres" if guarded is not None else None)
         return None, None
     if symbol is None:
@@ -80,7 +100,11 @@ async def read_collated_with_fallback(
     if payload is not None:
         return payload, "redis"
     if postgres is not None:
-        guarded = _guard_dict_payload(await postgres.latest_run(symbol.upper()))
+        # A store without the durable run table (tests, DATABASE_URL-less
+        # deployments) degrades to Redis-only rather than exploding.
+        latest_run = getattr(postgres, "latest_run", None)
+        guarded = (_guard_dict_payload(await latest_run(symbol.upper()))
+                   if latest_run else None)
         return guarded, ("postgres" if guarded is not None else None)
     return None, None
 
@@ -189,6 +213,124 @@ def _guard_dict_payload(payload: Any) -> dict[str, Any] | None:
             f"(reader is on {MARKET_RUN_SCHEMA_VERSION})"
         )
     return payload
+
+
+def _age_ms(timestamp: Any) -> int | None:
+    """Age of an ISO/epoch timestamp in ms — ``None`` when not provided.
+
+    Null discipline: an unparseable/absent timestamp is None, never 0.
+    """
+    import datetime as _dt
+
+    if timestamp is None:
+        return None
+    try:
+        if isinstance(timestamp, (int, float)):
+            ts_ms = int(timestamp)
+            if ts_ms < 10 ** 12:  # epoch seconds
+                ts_ms *= 1000
+        else:
+            text = str(timestamp).replace("Z", "+00:00")
+            parsed = _dt.datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+            ts_ms = int(parsed.timestamp() * 1000)
+        now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
+        return max(0, now_ms - ts_ms)
+    except Exception:
+        return None
+
+
+async def read_surface_inventory(
+    store: Any, symbol: str, *, postgres: Any | None = None,
+) -> dict[str, Any]:
+    """Which persisted surfaces hold data for this symbol (bounded, cheap).
+
+    The read-surface map: every plane a ``market.*`` / ``micro.*`` read can
+    land on, each with presence, run identity and age. An EMPTY read returns
+    this as DATA — a read failure must leave a citable trace (run id, age,
+    what IS available) instead of a bare null the agent cannot reason about
+    and therefore keeps re-calling.
+    """
+    sym = symbol.upper()
+    rows: list[dict[str, Any]] = []
+
+    async def _value_row(name: str, key: str | None) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "surface": name, "plane": "redis", "key": key,
+            "present": False, "run_id": None,
+            "generated_at": None, "age_ms": None,
+        }
+        if not key:
+            return row
+        raw = await store.redis.get(key)
+        row["present"] = bool(raw)
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                row["run_id"] = payload.get("run_id") or payload.get("id")
+                stamp = payload.get("generated_at") or payload.get("ts_ms")
+                row["generated_at"] = stamp
+                row["age_ms"] = _age_ms(stamp)
+        return row
+
+    async def _stream_row(name: str, key: str | None) -> dict[str, Any]:
+        if not key:
+            return {"surface": name, "plane": "redis", "key": key,
+                    "present": False, "entries": 0}
+        try:
+            entries = int(await store.redis.xlen(key))
+        except Exception:
+            entries = 0
+        return {"surface": name, "plane": "redis", "key": key,
+                "present": entries > 0, "entries": entries}
+
+    def _key(fn_name: str, *args: Any) -> str | None:
+        """Key helper on the store (typed adapter) — absent on minimal fakes."""
+        fn = getattr(store, fn_name, None)
+        if fn is None:
+            return None
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    rows.append(await _value_row(
+        "collated_latest", _key("collated_latest_key", sym)))
+    rows.append(await _stream_row(
+        "collated_stream", _key("collated_stream", sym)))
+    for source in ("data-access", "calculations", "analysis"):
+        rows.append(await _value_row(
+            f"domain_latest:{source}", _key("domain_latest_key", sym, source)))
+    rows.append(await _stream_row(
+        "wall_history", _key("wall_history_stream", sym)))
+    rows.append(await _stream_row(
+        "keystone_history", _key("keystone_history_stream", sym)))
+    if postgres is not None:
+        pg_row: dict[str, Any] = {
+            "surface": "postgres_latest_run", "plane": "postgres", "key": None,
+            "present": False, "run_id": None, "generated_at": None, "age_ms": None,
+        }
+        try:
+            payload = await postgres.latest_run(sym)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            pg_row["present"] = True
+            pg_row["run_id"] = payload.get("run_id") or payload.get("id")
+            stamp = payload.get("generated_at") or payload.get("ts_ms")
+            pg_row["generated_at"] = stamp
+            pg_row["age_ms"] = _age_ms(stamp)
+        rows.append(pg_row)
+    return {
+        "symbol": sym,
+        "surfaces": rows,
+        "available_surfaces": [r["surface"] for r in rows if r.get("present")],
+        "read_tools": dict(READ_SURFACE_TOOLS),
+    }
 
 
 # ---------------------------------------------------------------------------

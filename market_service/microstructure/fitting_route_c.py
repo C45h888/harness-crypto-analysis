@@ -881,11 +881,12 @@ def evaluate_forward_scenario(
             "status": "not_run", "calibrated": calibrated,
             "refusal": "probability refused: calibration report required",
         },
-        "forecast_type": "native_forecast",
-        "horizon_regime": "native",
+        "forecast_type": "native_forecast" if not fit.bridge else "long_horizon_bridge",
+        "horizon_regime": "native" if not fit.bridge else "long_horizon",
         "assumptions": {
             "gaussian_probability": True,
             "linear_impact_scaling": False,
+            **({"bridge": dict(fit.bridge)} if fit.bridge else {}),
         },
         "probability_status": "validated" if not null_probs else "refused",
         "probability_reason": None if not null_probs else dist.get("probability_reason"),
@@ -955,6 +956,27 @@ def skill_decay_report(
     nulls: list[str] = []
     for h in sorted(fits):
         f = fits[h]
+        if f.bridge:
+            # Long-horizon bridge: no in-window labels exist at h. Report the
+            # extrapolation honestly — source labels counted, skill decayed,
+            # never "finalized" (an extrapolation is not a validated fit).
+            src = int(f.bridge.get("source_horizon_ms") or 0)
+            n_src = sum(1 for p in pairs if p.y_ticks.get(src) is not None
+                        and p.x.quality == "exact_feed")
+            per_h[str(h)] = {
+                "oos_skill": f.oos_skill, "n": None, "status": f.status,
+                "validation_status": f.validation_status, "n_oos": f.n_oos,
+                "extrapolated": True,
+                "bridge": dict(f.bridge),
+                "source_horizon_ms": src,
+                "source_n_labels": n_src,
+            }
+            nulls.append(
+                f"{h}: extrapolated from {src}ms via {f.bridge.get('method')} "
+                f"(no in-window labels at {h}ms; sigma scaled, skill decayed) "
+                "— stated, not proven"
+            )
+            continue
         n = sum(1 for p in pairs if p.y_ticks.get(h) is not None
                 and p.x.quality == "exact_feed")
         per_h[str(h)] = {"oos_skill": f.oos_skill, "n": n, "status": f.status,
@@ -967,7 +989,8 @@ def skill_decay_report(
                 f"validation={f.validation_status}, n_oos={f.n_oos}) — null is a result"
             )
     finalized = [h for h in sorted(fits)
-                 if fits[h].status != "insufficient"
+                 if not fits[h].bridge
+                 and fits[h].status != "insufficient"
                  and fits[h].validation_status == "validated"
                  and fits[h].oos_skill is not None]
     per_regime = None

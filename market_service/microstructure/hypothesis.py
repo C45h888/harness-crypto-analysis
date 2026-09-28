@@ -70,8 +70,17 @@ def test_hypothesis(
         raise ValueError("m_tests must be >= 1")
     if fit.status not in ("validated", "provisional"):
         raise ValueError(f"cannot test hypothesis from {fit.status} fit {fit.fit_id}")
+    # Label horizon: a bridged long-horizon fit (horizon_bridge) has no
+    # in-window labels at H — the effect model is evaluated at H but the
+    # usable pairs are the source horizon's labels (mean-x over the same
+    # tape window). Native fits label at their own horizon.
+    label_horizon_ms = fit.horizon_ms
+    if fit.bridge:
+        label_horizon_ms = int(
+            fit.bridge.get("source_horizon_ms") or fit.horizon_ms)
     usable = [p for p in pairs
-              if p.x.quality == "exact_feed" and p.y_ticks.get(fit.horizon_ms) is not None]
+              if p.x.quality == "exact_feed"
+              and p.y_ticks.get(label_horizon_ms) is not None]
     n = len(usable)
     digest = _hypo_input_hash(fit, hypothesis_id, h0, h1, m_tests, method)
     status = fit.status if n >= 30 else "insufficient"

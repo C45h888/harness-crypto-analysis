@@ -281,6 +281,82 @@ def _find_nulls(obj: dict[str, Any], prefix: str = "") -> list[str]:
     return nulls
 
 
+# ---------------------------------------------------------------------------
+# Tool argument contracts — what the agent may PASS to each tool
+# ---------------------------------------------------------------------------
+# Single source for arg domains. Rendered into the system prompt beside the
+# output schemas: before this existed the model saw result shapes only and
+# had to guess arg values (it guessed a 4h horizon the fit layer could not
+# evaluate, twice, and learned nothing from the refusal). Domains are
+# DERIVED at render time from the deterministic base — never restated as
+# prose that can drift.
+
+TOOL_ARG_CONTRACTS: dict[str, str] = {
+    "calc.forward.forecast": (
+        "{horizon_ms: int, window_minutes: 15|30|60}"
+    ),
+    "calc.forward.fit": "{horizon_ms: int, window_minutes: 15|30|60}",
+    "calc.forward.distribution": (
+        "{horizon_ms: int, theta_ticks: str(decimal)|null, window_minutes: 15|30|60}"
+    ),
+    "calc.forward.scenario": (
+        "{horizon_ms: int, targets: [str(decimal)], invalidations: [str(decimal)], "
+        "window_minutes: 15|30|60}"
+    ),
+    "calc.hypothesis.test": (
+        "{hypothesis_id: str (ENGINE-SUPPLIED when omitted — the directive's "
+        "H0/H1 is the pre-registration), horizon_ms: int, h0: str|null, h1: str|null, "
+        "m_tests: int>=1, window_minutes: 15|30|60}"
+    ),
+    "calc.ofi.intervals": (
+        "{interval_ms: int (10000 default)|interval_seconds: 10|15|30, window_minutes: 15|30|60}"
+    ),
+    "calc.depth.average": "{window_minutes: 15|30|60}",
+    "calc.events.absorption|calc.events.walls": "{window_minutes: 15|30|60}",
+    "calc.decay.report": "{window_minutes: 15|30|60}",
+    "calc.discipline.audit": (
+        "{window_minutes: 15|30|60, cost_statement: str|null}"
+    ),
+    "market.read": (
+        "{mode: snapshot|inventory|surfaces|full, run_id: str|null} — "
+        "``surfaces`` lists EVERY persisted plane (presence, run_id, age_ms) "
+        "plus the read-tool map; an empty read returns that inventory as data "
+        "(status:\"empty\"), never a bare null"
+    ),
+    "micro.events": "{count: int <= 200}",
+    "micro.ofi_intervals": "{count: int <= 200}",
+    "market.keystone_history|market.wall_history": "{count: int <= 100}",
+    "substrate.read": "{substrate: str|null, mode: compact|full}",
+    "substrate.invoke|substrate.*": "{substrate: str (worker name)}",
+    "memory.recall_paper": "{query: str}",
+}
+
+
+def tool_arg_block() -> str:
+    """Render the argument contracts + the horizon domain (derived)."""
+    from market_service.microstructure.horizon_bridge import (
+        LONG_HORIZONS_MS,
+        NATIVE_HORIZONS_MS,
+    )
+
+    native = ", ".join(str(h) for h in NATIVE_HORIZONS_MS)
+    long_h = ", ".join(str(h) for h in LONG_HORIZONS_MS)
+    lines = [
+        "TOOL ARGUMENT CONTRACTS (pass EXACTLY these keys; values outside a "
+        "domain are refused with the supported set — re-call with a supported "
+        "value, never the same one):",
+        f"  horizon_ms domain: native {{{native}}} ms fit directly; long "
+        f"{{{long_h}}} ms are answered through the LONG-HORIZON BRIDGE "
+        "(native fit projected to H: sigma scaled sqrt(H/h0), drift carried, "
+        "skill decayed — stated, not proven, and the fit reports "
+        "status=provisional / extrapolated). Any other horizon_ms is refused "
+        "with supported_horizons_ms listed.",
+    ]
+    for tool_name in sorted(TOOL_ARG_CONTRACTS):
+        lines.append(f"  {tool_name}: {TOOL_ARG_CONTRACTS[tool_name]}")
+    return "\n".join(lines)
+
+
 def tool_schema_block() -> str:
     """Render the tool schemas block for injection into the system prompt.
 
@@ -303,7 +379,7 @@ def tool_schema_block() -> str:
         "unauthorized; ``error`` means an exception occurred. Every numeric "
         "value you cite must name the exact path from ``data``."
     )
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n" + tool_arg_block()
 
 # ---------------------------------------------------------------------------
 # Phase-level summary extraction
@@ -429,8 +505,10 @@ def build_phase_summary_block(results: dict[str, Any]) -> str:
 
 __all__ = [
     "TOOL_OUTPUT_SCHEMAS",
+    "TOOL_ARG_CONTRACTS",
     "wrap_tool_result",
     "tool_schema_block",
+    "tool_arg_block",
     "extract_p1_summary",
     "extract_p2_summary",
     "extract_p3_summary",

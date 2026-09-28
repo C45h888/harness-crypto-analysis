@@ -43,6 +43,25 @@ from .chain import (
     position_status,
     position_steer,
 )
+
+
+def _derived_hypothesis_id(
+    ctx: Any, st: CycleRuntimeState,
+) -> tuple[str, str | None, str | None]:
+    """Deterministic H0 pre-registration identity for ``calc.hypothesis.test``.
+
+    The directive's ``hypothesis_seed`` (or, failing that, the task text) is
+    the pre-registration record; the id is a stable digest of it — never
+    random, never LLM-invented. Returns ``(hypothesis_id, h0, h1)``.
+    """
+    import hashlib
+
+    seed = (st.task_directive or {}).get("hypothesis_seed") or {}
+    h0 = str(seed.get("H0") or "").strip() or None
+    h1 = str(seed.get("H1") or "").strip() or None
+    basis = h0 or (ctx.task or "").strip() or "autonomous-H0"
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
+    return f"hyp-{digest}", h0, h1
 from ..llm import call_narration_llm
 from market_service.nooa_harness.inference import (
     _normalize_tool_name,
@@ -311,6 +330,18 @@ class InferenceEngine:
             args.setdefault("symbol", self.symbol)
             args.setdefault("venue", self.venue)
             canonical = _normalize_tool_name(raw_name) or raw_name
+            if canonical == "calc.hypothesis.test":
+                # Pre-registration is ENGINE-SUPPLIED (deterministic): the
+                # directive's hypothesis_seed (or the task text) IS the
+                # pre-registration, hashed into a stable id. Without this the
+                # tool's hypothesis_id precondition was unsatisfiable and H0
+                # could never be tested. An explicit id still wins.
+                _hid, _h0, _h1 = _derived_hypothesis_id(ctx, st)
+                args.setdefault("hypothesis_id", _hid)
+                if _h0:
+                    args.setdefault("h0", _h0)
+                if _h1:
+                    args.setdefault("h1", _h1)
             # Hard-track positions (reasoning only): a tool belonging to a
             # LATER position than the active one is denied as an
             # out-of-position finding — logged only, never dispatched, never
@@ -546,6 +577,7 @@ class InferenceEngine:
             st.failure_detail = "no JSON object in follow-up narration"
             return None
         st.parsed_current = parsed_next
+        st.turn_log.append(parsed_next)
         st.controller = context._mark_declared(st.controller, parsed_next)
         return parsed_next
 

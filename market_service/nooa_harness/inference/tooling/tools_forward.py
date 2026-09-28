@@ -15,6 +15,45 @@ from .replay_adapter import (
 )
 from .tick_guard import _frozen_tick
 
+from market_service.microstructure.horizon_bridge import (
+    NATIVE_HORIZONS_MS,
+    UnsupportedHorizonError,
+    bridge_forward_fit,
+    require_supported,
+    supported_horizons,
+)
+
+
+def _fit_for_horizon(
+    pairs: Any, symbol: str, venue: str, horizon_ms: int,
+) -> tuple[Any, Any, str]:
+    """Fit at the evaluable horizon and project to the requested one.
+    ``native`` horizons fit directly. ``long`` horizons (15m/1h/4h) fit at
+    the bridge source (longest native horizon) and are projected through
+    ``horizon_bridge`` — so fit → distribution → P(T)/P(S) → hypothesis
+    test all answer the horizon the task actually asked about. Anything
+    else raises ``UnsupportedHorizonError`` carrying the supported set.
+    """
+    import market_service.microstructure as fm
+
+    regime = require_supported(horizon_ms)
+    source_ms = int(horizon_ms) if regime == "native" else max(NATIVE_HORIZONS_MS)
+    fit_native, used = fm.fit_forward_ols(
+        pairs, symbol=symbol, venue=venue, horizon_ms=source_ms)
+    fit = (fit_native if regime == "native"
+           else bridge_forward_fit(fit_native, int(horizon_ms)))
+    return fit, fit_native, regime
+
+
+def _horizon_refusal(cap_name: str, scope: dict[str, Any], exc: UnsupportedHorizonError):
+    """Structured refusal for an unevaluable horizon — names the domain."""
+    return None, capability_log_entry(cap_name, scope, "ok", detail={
+        "status": "refused",
+        "reason": str(exc),
+        "horizon_ms": exc.horizon_ms,
+        "supported_horizons_ms": list(exc.supported),
+    })
+
 
 async def _forward_core(
     store: Any, symbol: str, venue: str, *, horizon_ms: int,
@@ -37,13 +76,17 @@ async def _forward_core(
         postgres=postgres)
     if not windowed or not vectors:
         raise ValueError("no forward observation window")
-    fit, _used = fm.fit_forward_ols(
-        pairs, symbol=symbol, venue=venue, horizon_ms=horizon_ms)
+    fit, fit_native, regime = _fit_for_horizon(
+        pairs, symbol, venue, horizon_ms)
     x = vectors[-1]
     theta = Decimal(str(theta_ticks)) if theta_ticks is not None else None
-    calibration = fm.calibration_report(fit, pairs, theta_ticks=theta)
+    # Calibration is measured at the SOURCE horizon (it scores in-window
+    # labels, which only native horizons have); the bridged fit carries the
+    # scaled sigma/se downstream.
+    calibration = fm.calibration_report(fit_native, pairs, theta_ticks=theta)
     return {"windowed": windowed, "vectors": vectors, "pairs": pairs,
-            "join_log": join_log, "fit": fit, "x": x,
+            "join_log": join_log, "fit": fit, "fit_native": fit_native,
+            "horizon_regime": regime, "x": x,
             "calibration": calibration, "theta": theta,
             "tick_size": frozen}
 
@@ -130,12 +173,15 @@ async def dispatch_calc_forward_fit(
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "no events in ledger"})
         try:
-            fit, _ = fm.fit_forward_ols(pairs, symbol=symbol, venue=venue, horizon_ms=horizon_ms)
+            fit, _fit_native, regime = _fit_for_horizon(pairs, symbol, venue, horizon_ms)
+        except UnsupportedHorizonError as uhex:
+            return _horizon_refusal(cap.name, scope, uhex)
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": str(vex)})
         return fit.to_dict(), capability_log_entry(cap.name, scope, "ok",
-            detail={"status": fit.status, "horizon_ms": horizon_ms, "oos_skill": fit.oos_skill})
+            detail={"status": fit.status, "horizon_ms": horizon_ms,
+                    "horizon_regime": regime, "oos_skill": fit.oos_skill})
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
     except Exception as exc:
@@ -160,6 +206,8 @@ async def dispatch_calc_forward_distribution(
                 store, symbol, venue, horizon_ms=horizon_ms,
                 window_minutes=window_minutes, tick_size=tick_size,
                 theta_ticks=theta_ticks, postgres=postgres)
+        except UnsupportedHorizonError as uhex:
+            return _horizon_refusal(cap.name, scope, uhex)
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": f"no forward fit: {vex}"})
@@ -198,6 +246,8 @@ async def dispatch_calc_forward_scenario(
                 store, symbol, venue, horizon_ms=horizon_ms,
                 window_minutes=window_minutes, tick_size=tick_size,
                 postgres=postgres)
+        except UnsupportedHorizonError as uhex:
+            return _horizon_refusal(cap.name, scope, uhex)
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": f"no distribution: {vex}"})
@@ -252,10 +302,12 @@ async def dispatch_calc_forward_forecast(
                 cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "no forward observation window"},
             )
-        fit, _used = fm.fit_forward_ols(
-            pairs, symbol=symbol, venue=venue, horizon_ms=horizon_ms)
+        fit, fit_native, horizon_regime = _fit_for_horizon(
+            pairs, symbol, venue, horizon_ms)
         x = vectors[-1]
-        calibration = fm.calibration_report(fit, pairs)
+        # Calibration scores in-window labels: measured at the source
+        # horizon, consumed beside the bridged fit.
+        calibration = fm.calibration_report(fit_native, pairs)
         distribution: dict[str, Any] | None = None
         if fit.status in ("validated", "provisional"):
             try:
@@ -293,13 +345,17 @@ async def dispatch_calc_forward_forecast(
             legacy_result=legacy_result,
         ).to_dict()
         result["diagnostics"]["forward_join"] = join_log
+        result["horizon_regime"] = horizon_regime
         return result, capability_log_entry(
             cap.name, scope, "ok",
             detail={"status": result.get("validation_state"),
                     "fit_status": fit.status,
+                    "horizon_regime": horizon_regime,
                     "probability_status": result.get("multivariate", {}).get("probability_status")
                     if isinstance(result.get("multivariate"), dict) else "unavailable"},
         )
+    except UnsupportedHorizonError as uhex:
+        return _horizon_refusal(cap.name, scope, uhex)
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
     except Exception as exc:

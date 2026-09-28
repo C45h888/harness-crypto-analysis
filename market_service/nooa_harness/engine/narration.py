@@ -130,6 +130,76 @@ def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     return parsed
 
 
+def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
+    """Merged interpretation view over a cycle's parsed turns (deterministic).
+
+    The staged loop legitimately leaves interpretation fields null while
+    tools are pending (the contract says so) and the last turn of a cycle is
+    often a bare phase declaration. Judging only that turn zeroes out content
+    the model already produced earlier in the SAME cycle. This view merges
+    what was actually said:
+
+      summary       — longest non-empty across turns (P4 explanation)
+      hypothesis    — first non-null dict
+      evidence      — union, order-preserving, deduped on (path, value)
+      confidence    — first non-null
+      limitations   — union of strings
+      model_separation — first non-null
+      scenario / forward_scenario / hypothesis_evidence — LAST non-null
+                      (most recent statement wins)
+
+    Pure function: no state, no I/O. ``validate_final_turn`` receives the
+    merged view; per-turn shape violations are still repaired per turn.
+    """
+    merged: dict[str, Any] = {
+        "summary": "",
+        "evidence": [],
+        "confidence": None,
+        "limitations": [],
+        "model_separation": None,
+        "hypothesis": None,
+        "scenario": None,
+        "forward_scenario": None,
+        "hypothesis_evidence": None,
+    }
+    seen_evidence: set[tuple[str, str]] = set()
+    seen_limits: set[str] = set()
+    for turn in turns or []:
+        if not isinstance(turn, dict):
+            continue
+        summary = turn.get("summary")
+        if isinstance(summary, str) and len(summary.strip()) > len(merged["summary"]):
+            merged["summary"] = summary
+        hypothesis = turn.get("hypothesis")
+        if merged["hypothesis"] is None and isinstance(hypothesis, dict):
+            merged["hypothesis"] = hypothesis
+        evidence = turn.get("evidence")
+        if isinstance(evidence, list):
+            for entry in evidence:
+                if not isinstance(entry, dict):
+                    continue
+                key = (str(entry.get("path") or ""), str(entry.get("value") or ""))
+                if key in seen_evidence:
+                    continue
+                seen_evidence.add(key)
+                merged["evidence"].append(entry)
+        if merged["confidence"] is None and turn.get("confidence") is not None:
+            merged["confidence"] = turn.get("confidence")
+        limitations = turn.get("limitations")
+        if isinstance(limitations, list):
+            for item in limitations:
+                text = str(item)
+                if text not in seen_limits:
+                    seen_limits.add(text)
+                    merged["limitations"].append(text)
+        if merged["model_separation"] is None and turn.get("model_separation"):
+            merged["model_separation"] = turn.get("model_separation")
+        for key in ("scenario", "forward_scenario", "hypothesis_evidence"):
+            if turn.get(key) is not None:
+                merged[key] = turn[key]
+    return merged
+
+
 def has_directive_verdict(parsed: dict[str, Any] | None) -> bool:
     """Task-conformance read (pure): did the final surface the verdict?
 
@@ -224,9 +294,18 @@ def validate_final_turn(
                     f"{entry.get('path')!r} shows (paths+values cited, readings empty is a violation)"
                 )
             path = str(entry.get("path") or "")
-            head = path.split("→")[0].strip().split(".")[0].strip()
-            if head:
-                roots.add(head)
+            head = path.split("→")[0].strip()
+            # Root identity: the TOOL head (calc.ofi.intervals, market.read, …)
+            # is the root — splitting on "." collapsed every calc.* tool into
+            # the single root "calc", so a perfectly-cited cycle could never
+            # show "≥2 distinct roots". deterministic_state paths collapse to
+            # their namespace (they are not fresh tool results).
+            if head.startswith("deterministic_state"):
+                root = "deterministic_state"
+            else:
+                root = head
+            if root:
+                roots.add(root)
     if len(roots) < 2 or not (roots - {"deterministic_state"}):
         missing.append(
             "evidence must cite ≥2 distinct roots including ≥1 fresh tool result "

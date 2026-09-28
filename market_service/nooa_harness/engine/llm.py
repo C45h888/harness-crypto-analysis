@@ -49,6 +49,18 @@ except ImportError:  # pragma: no cover — narration falls back to raw JSON
 
 log = logging.getLogger(__name__)
 
+# Which extraction tier produced the last narration text (observability):
+# when a cycle ends in a thin/empty parsed turn we need to know whether the
+# structured probe engaged or the raw ladder scraped a fallback surface.
+LAST_EXTRACTION_TIER: str | None = None
+
+
+def _note_tier(tier: str, text: str) -> str:
+    global LAST_EXTRACTION_TIER
+    LAST_EXTRACTION_TIER = tier
+    log.info("narration extraction tier=%s chars=%d", tier, len(text or ""))
+    return text
+
 
 async def call_narration_llm(
     llm: Any,
@@ -114,37 +126,38 @@ async def call_narration_llm(
     # 0) Structured-model surface: already validated, serialize to JSON.
     content = getattr(response, "content", None)
     if BaseModel is not None and isinstance(content, BaseModel):
-        return json.dumps(content.model_dump(), default=str)
+        return _note_tier("structured_model",
+                          json.dumps(content.model_dump(), default=str))
     # 1) The client's parsed text surface (nooa LLMResponse.content) is the
     #    authoritative transport-agnostic extraction.
     content = getattr(response, "content", None)
     if isinstance(content, str) and content.strip():
-        return content
+        return _note_tier("content_str", content)
     if isinstance(content, list):
         parts = [c.get("text", "") for c in content if isinstance(c, dict)]
         if any(p.strip() for p in parts):
-            return "".join(parts)
+            return _note_tier("content_parts", "".join(parts))
     # 2) Reasoning-model fallback: with a reasoning backend, the final JSON
     #    may be parked in ``reasoning`` when the generation budget ran out
     #    in the reasoning preamble before a content block was emitted.
     #    Extract from reasoning rather than serializing the raw response.
     reasoning = getattr(response, "reasoning", None)
     if isinstance(reasoning, str) and reasoning.strip():
-        return reasoning
+        return _note_tier("reasoning", reasoning)
     # 3) Legacy raw-transport extraction (direct litellm/OpenAI shapes).
     raw = getattr(response, "raw_response", response)
     choices = getattr(raw, "choices", None)
     if choices:
         content = getattr(getattr(choices[0], "message", None), "content", None)
         if isinstance(content, str):
-            return content
+            return _note_tier("raw_choices", content)
         if isinstance(content, list):
             parts = [c.get("text", "") for c in content if isinstance(c, dict)]
             if parts:
-                return "".join(parts)
+                return _note_tier("raw_choices_parts", "".join(parts))
     if isinstance(response, str):
-        return response
-    return str(raw)
+        return _note_tier("response_str", response)
+    return _note_tier("str_fallback", str(raw))
 
 
 def bounded_envelope_view(

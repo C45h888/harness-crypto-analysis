@@ -200,5 +200,42 @@ class DirectiveVerdictReadTests(unittest.TestCase):
         self.assertFalse(has_directive_verdict({}))
 
 
+class TaskWorkflowVocabularyTests(unittest.TestCase):
+    """task_directive.KINDS and kb.TASK_CHAINS must not drift.
+
+    Regression: a --task containing H0/H1 parsed to kind 'hypothesis', the
+    plan carried it as kind_override, and build_task_workflow did a bare
+    TASK_CHAINS[kind] -> KeyError: 'hypothesis' killed the cycle in
+    engine/core/reasoning.run_comprehension before a single LLM call.
+    """
+
+    def test_every_directive_kind_has_a_chain(self):
+        from market_service.nooa_harness.engine.kb import TASK_CHAINS
+        from market_service.nooa_harness.engine.task_directive import KINDS
+        for kind in KINDS:
+            self.assertIn(kind, TASK_CHAINS, f"TASK_CHAINS missing kind {kind!r}")
+
+    def test_hypothesis_task_builds_workflow(self):
+        from market_service.nooa_harness.engine.kb import build_task_workflow
+        from market_service.nooa_harness.engine.task_directive import (
+            build_plan, parse_task_directive,
+        )
+        d = parse_task_directive(
+            "does the OFI state favour continuation? frame H0 vs H1", None)
+        self.assertEqual(d.kind, "hypothesis")
+        plan = build_plan(d)
+        wf = build_task_workflow(d.kind, None, kind_override=plan["kind"])
+        self.assertEqual(wf["kind"], "hypothesis")
+        self.assertIn("calc.hypothesis.test", wf["chain"])
+        self.assertTrue(wf["steps"])
+
+    def test_unknown_kind_degrades_to_general_chain(self):
+        from market_service.nooa_harness.engine.kb import (
+            TASK_CHAINS, build_task_workflow,
+        )
+        wf = build_task_workflow(None, None, kind_override="no-such-kind")
+        self.assertEqual(wf["chain"], list(TASK_CHAINS["general"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,7 +101,8 @@ async def execute_tool(
         return await dispatch_market_read(
             store, symbol, mode=str(args.get("mode") or "snapshot"),
             venue=venue,
-        )
+            run_id=(str(args["run_id"]) if args.get("run_id") else None),
+            postgres=postgres)
     if name == "market.derivatives":
         return await dispatch_read_derivatives(store, symbol, venue=venue)
     if name == "market.keystone_history":
@@ -194,6 +195,8 @@ async def execute_tool(
             horizon_ms=int(args.get("horizon_ms") or 5000),
             m_tests=int(args.get("m_tests") or 1),
             window_minutes=int(args.get("window_minutes") or 30),
+            h0=(str(args["h0"]) if args.get("h0") else None),
+            h1=(str(args["h1"]) if args.get("h1") else None),
             tick_size=_resolved_tick_for_dispatch(symbol, venue, args), postgres=postgres)
     if name in ("calc.events.absorption", "calc.events.walls"):
         kind = "absorption" if name.endswith("absorption") else "walls"

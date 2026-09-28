@@ -323,6 +323,7 @@ async def run_evidence(
         ), {"llm_calls": st.llm_calls, "terminal": terminal}
     st.parsed_1 = parsed_1
     st.parsed_current = parsed_1
+    st.turn_log.append(parsed_1)
     st.controller = _mark_declared(st.controller, parsed_1)
     while (st.passes_per_loop["evidence"] < LOOP_PASS_BUDGET["evidence"]
            and st.llm_calls < AGENTIC_MAX_LLM_TURNS):
@@ -483,8 +484,14 @@ async def run_validation(
         st.controller, _ = context._must_govern(
             st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.GATE
         )
+    # Judge the MERGED interpretation across the cycle's turns: the staged
+    # loop legitimately ends on bare declaration turns (the contract allows
+    # null interpretation fields while tools are pending), and content the
+    # model produced earlier in THIS cycle must not be zeroed out because the
+    # last turn only declared a phase.
+    judged = narration_mod.merge_interpretation(st.turn_log)
     passed, missing = narration_mod.validate_final_turn(
-        st.parsed_current, st.controller.phase_coverage, scenario=ctx.scenario,
+        judged, st.controller.phase_coverage, scenario=ctx.scenario,
         scenario_status=st.controller.scenario_state(),
         scenario_refusal_reason=st.controller.scenario_refusal_reason(),
     )
@@ -517,7 +524,7 @@ async def run_validation(
     # must answer the question the directive parsed, not merely cite tools.
     if (st.task_plan is not None
             and (st.task_plan.get("targets") or st.task_plan.get("invalidations"))
-            and not narration_mod.has_directive_verdict(st.parsed_current)):
+            and not narration_mod.has_directive_verdict(judged)):
         missing.append(
             "task directive verdict not cited — cite the deterministic "
             "directive/scenario paths (deterministic_state.task_directive "
@@ -562,9 +569,15 @@ async def run_validation(
         return await run_validation_terminal(engine, ctx, st, list(missing))
     st.repairs_sent += 1
     st.validation_retries_used += 1
-    st.controller, _ = context._must_govern(
-        st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.RECOVERY
-    )
+    # The RECOVERY sub-loop is opened ONCE per validation: further bounded
+    # retries ride the already-open sub-loop. Re-opening it is a governance
+    # denial ("no next sub-loop to open") that used to surface as an
+    # infra_failed terminal the moment VALIDATION_RETRY_PASSES went above 1.
+    if (st.controller.observation is None
+            or st.controller.observation.sub_loop != SubLoop.RECOVERY):
+        st.controller, _ = context._must_govern(
+            st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.RECOVERY
+        )
     scenario_steer = st.controller.scenario_steer()
     repair_prompt = compose_repair_prompt(
         controller=st.controller,
@@ -596,6 +609,7 @@ async def run_validation(
         st.failure_detail = "no JSON object in repair narration"
         return await run_runtime_failure(engine, ctx, st)
     st.parsed_current = parsed_repair
+    st.turn_log.append(parsed_repair)
     st.controller = _mark_declared(st.controller, parsed_repair)
     st.dispatched_in_pass = 0
     await engine._dispatch_turn(ctx, st)

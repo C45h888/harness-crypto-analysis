@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..capability import CAPABILITIES, CapabilityDenied, capability_log_entry
+from market_service.microstructure.horizon_bridge import LONG_HORIZONS_MS
 from .replay_adapter import _forward_replay_inputs, _read_tape_payloads
 from .tick_guard import _frozen_tick
 from .tools_forward import dispatch_calc_forward_fit
@@ -11,6 +12,7 @@ from .tools_forward import dispatch_calc_forward_fit
 async def dispatch_calc_hypothesis_test(
     store: RedisRuntimeStore, symbol: str, venue: str, *, hypothesis_id: str,
     horizon_ms: int = 5_000, m_tests: int = 1, window_minutes: int = 30,
+    h0: str | None = None, h1: str | None = None,
     tick_size: str | None = None, postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: calc.hypothesis.test — independent post-fit test (never auto-called)."""
@@ -40,12 +42,20 @@ async def dispatch_calc_hypothesis_test(
         from market_service.microstructure.contracts import ForwardFit
         fit = ForwardFit.from_dict(fit_dict)
         try:
-            ev = test_hypothesis(fit, pairs, hypothesis_id=hypothesis_id, m_tests=int(m_tests or 1))
+            _extra: dict[str, Any] = {}
+            if h0:
+                _extra["h0"] = h0
+            if h1:
+                _extra["h1"] = h1
+            ev = test_hypothesis(fit, pairs, hypothesis_id=hypothesis_id,
+                                 m_tests=int(m_tests or 1), **_extra)
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": str(vex)})
         return ev.to_dict(), capability_log_entry(cap.name, scope, "ok",
-            detail={"hypothesis_id": hypothesis_id, "p_value": ev.p_value, "status": ev.status})
+            detail={"hypothesis_id": hypothesis_id, "p_value": ev.p_value,
+                    "status": ev.status, "horizon_ms": horizon_ms,
+                    "horizon_bridge": bool(getattr(fit, "bridge", None))})
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
     except Exception as exc:
@@ -98,7 +108,7 @@ async def dispatch_calc_decay_report(
         from market_service.microstructure.contracts import ForwardFit
         fits = {}
         pairs_ref = None
-        for h in fm.FORWARD_HORIZONS_MS:
+        for h in list(fm.FORWARD_HORIZONS_MS) + list(LONG_HORIZONS_MS):
             fit_dict, _ = await dispatch_calc_forward_fit(
                 store, symbol, venue, window_minutes=window_minutes, horizon_ms=h, tick_size=tick_size,
                 postgres=postgres)

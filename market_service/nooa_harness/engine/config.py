@@ -75,7 +75,9 @@ LOOP_PASS_BUDGET: dict[str, int] = {
 # Bounded internal retry inside VALIDATION (diagnose -> steered repair ->
 # revalidate). Persistent failure emits a structured issue to the FSM
 # terminal; terminal stewardship is a later FSM pass.
-VALIDATION_RETRY_PASSES = 1
+# 2026-09-27: 1 -> 2. One repair could not carry four missing final items
+# (hypothesis, P4 explanation, evidence roots, delta path) in a single turn.
+VALIDATION_RETRY_PASSES = 2
 # One tool-call batch is bounded by the public per-round contract.  The
 # runtime and prompt use the same number; excess calls are named on the
 # cycle's unexecuted list rather than silently dropped.

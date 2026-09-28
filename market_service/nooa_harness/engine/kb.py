@@ -28,8 +28,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    AGENTIC_MAX_LLM_TURNS,
+    AGENTIC_MAX_TOOL_ROUNDS,
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
+    VALIDATION_RETRY_PASSES,
     _CALC_KB_PATHS,
     _MEMORY_PROTOCOL,
     _PAPER_KB,
@@ -164,6 +167,26 @@ TURN_CONTRACT_LINE = (
     'tool_calls, memory_proposals} — the tool-name key is EXACTLY "name".'
 )
 
+# The FIELD SHAPES of the final turn — sent on repair/follow-up turns where
+# only the one-line contract used to go out. The model cannot satisfy
+# "hypothesis.H0" / "summary ≥200 chars" / "evidence[…].interpretation" from
+# a key list alone: the shapes belong on every turn that may finalize.
+FINAL_SHAPE_BLOCK = (
+    "FINAL-TURN FIELD SHAPES (validation judges the MERGED interpretation of "
+    "ALL turns in this cycle — a turn that only declares a phase never erases "
+    "what earlier turns said, but do NOT rely on that: finalize with these "
+    "filled):\n"
+    '  "summary": string ≥200 chars — what the fits show AND why it is happening now\n'
+    '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], '
+    '"evidence_refs": ["<tool-name>", …]}  (H0/H1 ground in recalled paper facts)\n'
+    '  "evidence": [{"path": "<tool-name> → data.<field>" | "deterministic_state.…", '
+    '"value": …, "interpretation": "…"}] — ≥2 distinct roots (different tool heads) '
+    "including ≥1 fresh tool result and a calc.price.delta → … ΔP path\n"
+    '  "confidence": "low|medium|high"\n'
+    '  "scenario": {…} REQUIRED at final when a SCENARIO block was given — or '
+    'verdict="unevaluable" with the refusal cited'
+)
+
 
 def build_output_format() -> str:
     """The JSON turn contract + registry tool names + staged workflow.
@@ -174,7 +197,13 @@ def build_output_format() -> str:
     ``TURN_CONTRACT_LINE`` (single source: this module).
     """
     return (
-        f"LOOPS, NOT ROUNDS — comprehension (1 pass, no tools) → evidence (3 passes) → reasoning (2 passes) → validation (1 pass + 1 bounded retry) → output (1 non-agentic pass). Phases (P1→P6) name evidence families, loops name when you work. Declare your phase every turn.\n"
+        f"LOOPS, NOT ROUNDS — comprehension ({LOOP_PASS_BUDGET['comprehension']} pass, no tools) → "
+        f"evidence ({LOOP_PASS_BUDGET['evidence']} passes) → "
+        f"reasoning ({LOOP_PASS_BUDGET['reasoning']} passes) → "
+        f"validation ({LOOP_PASS_BUDGET['validation']} pass + "
+        f"{VALIDATION_RETRY_PASSES} bounded retries) → "
+        f"output ({LOOP_PASS_BUDGET['output']} non-agentic pass). "
+        "Phases (P1→P6) name evidence families, loops name when you work. Declare your phase every turn.\n"
         "Return ONLY one JSON object per turn with EXACTLY these keys:\n"
         "{\n"
         '  "phase": "P1|P2|P3|P4|P5|P6 — the phase this turn advances (P6 = final output generation, no tools)",\n'
@@ -213,7 +242,8 @@ def build_output_format() -> str:
         "P6 OUTPUT GENERATION: the primary inference output from this run's reasoning, tool_calls=[].\n"
         "WINDOW FREEDOM: pre-gather spine is interval 10s / window 30m, but you may pass interval_seconds "
         "(10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\n"
-        f"Rules: pack each pass densely (≤{MAX_DISPATCHES_PER_PASS} dispatches per pass guardrail); budgeted passes per cycle: 8. "
+        f"Rules: pack each pass densely (≤{MAX_DISPATCHES_PER_PASS} dispatches per pass guardrail); "
+        f"budgeted tool rounds per cycle: {AGENTIC_MAX_TOOL_ROUNDS}, LLM turns: {AGENTIC_MAX_LLM_TURNS}. "
         "Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn "
         "(phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, "
         "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, confidence low|medium|high, "
@@ -290,6 +320,16 @@ TASK_CHAINS: dict[str, list[str]] = {
         "calc.decay.report",
         "calc.discipline.audit",
     ],
+    "hypothesis": [
+        # H0/H1-shaped task (task_directive.KINDS 'hypothesis'): the steady
+        # track minus the scenario link — no target/invalidation is bound, so
+        # calc.forward.scenario has nothing to price and would only refuse.
+        "market.read",
+        "calc.forward.forecast",
+        "calc.hypothesis.test",
+        "calc.decay.report",
+        "calc.discipline.audit",
+    ],
     "general": [
         "calc.forward.forecast",
         "calc.discipline.audit",
@@ -321,7 +361,10 @@ def build_task_workflow(
     only vocabulary).
     """
     kind = kind_override or classify_task(task, scenario)
-    chain = list(TASK_CHAINS[kind])
+    # Total lookup: task_directive.KINDS and TASK_CHAINS are two vocabularies
+    # that can drift (build_plan already guards the same way). An unknown kind
+    # degrades to the general chain instead of killing the cycle with KeyError.
+    chain = list(TASK_CHAINS.get(kind, TASK_CHAINS["general"]))
     steps = [
         f"{i}. {tool} — {CHAIN_MEANING.get(tool, 'cited evidence')}"
         for i, tool in enumerate(chain, 1)
@@ -735,6 +778,7 @@ def compose_followup_prompt(
         f"{json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
         f"{phase_guidance[next_phase]}\n"
         f"{TURN_CONTRACT_LINE}\n"
+        f"{FINAL_SHAPE_BLOCK}\n"
         f"Passes remaining in {loop}: "
         f"{pass_budget - passes_spent}. "
         'Declare "phase" every turn; call this loop\'s tools, or advance with tool_calls=[].'
@@ -799,6 +843,7 @@ def compose_repair_prompt(
         f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
         f"{phase_guidance[next_phase]}\n"
         f"{TURN_CONTRACT_LINE}\n"
+        f"{FINAL_SHAPE_BLOCK}\n"
         "Return the next turn now: declare \"phase\", include the missing tool_calls, "
         "and finalize (tool_calls=[]) only when every missing item is addressed."
     )

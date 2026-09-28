@@ -40,6 +40,13 @@ if BaseModel is not None:
         limitations: list[str] | None = None
         model_separation: str | None = None
         hypothesis: dict[str, Any] | None = None
+        # Contract parity with kb.build_output_format: the structured probe
+        # must be able to carry EVERY key the turn contract demands, or a
+        # successful probe silently drops the scenario / P(T)P(S) / H0-test
+        # payloads the validator reads (drift pinned by test).
+        scenario: dict[str, Any] | None = None
+        forward_scenario: dict[str, Any] | None = None
+        hypothesis_evidence: dict[str, Any] | None = None
         phase: str = "P1"
         tool_calls: list[NarrationToolCall] = Field(default_factory=list)
         memory_proposals: list[dict[str, Any]] | None = None

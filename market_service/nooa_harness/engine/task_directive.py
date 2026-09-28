@@ -433,10 +433,23 @@ def build_plan(directive: TaskDirective) -> dict[str, Any]:
             pre_acquire.append("calc.forward.scenario")
         else:
             horizon_note = "native ms outside FORWARD_HORIZONS_MS; default forecast horizon"
-    elif directive.horizon_regime == "long" and directive.has_targets:
-        pre_acquire.append("calc.scenario.evaluate")
+            horizon_for_forecast = None
+    elif directive.horizon_regime == "long":
+        # Long horizon (15m/1h/4h): the deterministic long-horizon bridge
+        # answers it (native fit projected to H — sigma scaled, skill
+        # decayed), so the forecast pre-acquire binds the QUESTION horizon
+        # instead of silently falling back to a native default the task
+        # never asked about. Required-ness is unchanged: the long+targets
+        # route still owns calc.scenario.evaluate.
         if directive.resolved_horizon_ms is not None:
-            horizon_for_forecast = None  # long regime: forecast stays native-default
+            horizon_for_forecast = directive.resolved_horizon_ms
+            horizon_note = (
+                f"long horizon {directive.resolved_horizon_ms}ms answered via "
+                "the long-horizon bridge (native fit projected: sigma scaled "
+                "sqrt(H/h0), drift carried, skill decayed — stated, not proven)"
+            )
+        if directive.has_targets:
+            pre_acquire.append("calc.scenario.evaluate")
     if directive.has_targets and directive.horizon_regime in ("native", "long"):
         if "calc.forward.scenario" not in pre_acquire and directive.horizon_regime == "native":
             pre_acquire.append("calc.forward.scenario")
@@ -454,6 +467,7 @@ def build_plan(directive: TaskDirective) -> dict[str, Any]:
         "invalidations": [dict(s) for s in directive.invalidations],
         "chain": chain,
         "pre_acquire": pre_acquire,
+        "forecast_horizon_ms": horizon_for_forecast,
         "directive_refusals": [dict(r) for r in directive.refusals],
         "notes": [n for n in (horizon_note,) if n],
     }

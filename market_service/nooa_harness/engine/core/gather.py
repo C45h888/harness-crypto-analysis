@@ -121,15 +121,13 @@ async def run_gather(
     forward_scenario_result: Any = None
     forward_scenario_log: dict[str, Any] | None = None
     if gate_status != "insufficient":
-        # Directive-driven horizon: only a native-vocabulary value retargets
-        # the canonical forecast; long regimes keep the native default (the
-        # long question is answered by the exceedance path, not the fit).
-        _forecast_horizon_ms = (
-            task_plan["resolved_horizon_ms"]
-            if (task_plan["horizon_regime"] == "native"
-                and task_plan["resolved_horizon_ms"] in (1_000, 5_000, 30_000, 60_000))
-            else 5_000
-        )
+        # Directive-driven horizon: the plan binds the horizon the task asked
+        # about. Native horizons fit directly; long horizons (15m/1h/4h) are
+        # answered through the deterministic long-horizon bridge (native fit
+        # projected to H — sigma scaled, skill decayed). Anything outside the
+        # vocabulary is refused by the tool with the supported set attached.
+        _planned_horizon = task_plan.get("forecast_horizon_ms")
+        _forecast_horizon_ms = int(_planned_horizon) if _planned_horizon else 5_000
         _forecast_args = {"symbol": engine.symbol, "venue": engine.venue,
                           "horizon_ms": _forecast_horizon_ms, "window_minutes": 30}
         context._must_authorize_work(

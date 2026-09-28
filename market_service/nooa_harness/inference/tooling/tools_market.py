@@ -120,19 +120,33 @@ async def dispatch_read_evidence(
 
 async def dispatch_market_read(
     store: RedisRuntimeStore, symbol: str, *, mode: str = "snapshot",
-    venue: str = "spot",
+    venue: str = "spot", run_id: str | None = None,
+    postgres: Any | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Tool: market.read — latest collated market run, raw from Redis.
+    """Tool: market.read — collated market run across BOTH persisted planes.
 
-    Post-envelope deviation: no dataclass round trip. One GET, one
-    json.loads, one schema-version guard (read_paths), then a bounded
-    projection. ``mode`` selects the agent-facing shape:
+    Post-envelope deviation: no dataclass round trip. Redis-first with a
+    Postgres fallback (``read_collated_with_fallback``), one schema-version
+    guard (read_paths), then a bounded projection. ``mode`` selects the
+    agent-facing shape:
 
       snapshot  — headline scalars + CVD multi-window sign series (default;
                   small by construction, the primary inference view)
-      inventory — section key inventory + the snapshot
+      inventory — the collated payload's section key inventory + snapshot;
+                  with NO run persisted it becomes the cross-plane SURFACE
+                  inventory (which planes hold data at all)
+      surfaces  — always the cross-plane surface inventory (presence,
+                  run id, age_ms per plane) + the read-tool map
       full      — the raw collated payload (explicit deep-dive; the
                   engine's 40k tool-result gate is the bound)
+
+    ``run_id`` addresses one specific run (``{prefix}:run:{run_id}``).
+
+    EMPTY READS RETURN DATA, NOT NULL: a read that finds nothing returns
+    ``status:"empty"`` with the surface inventory (run id, age, what IS
+    available, which tool reads which plane). The read failure path must
+    leave a citable trace — a bare null is invisible to the agent and the
+    empty read then persists as a re-called wall.
 
     A schema-version mismatch is a structured ``error`` payload, never a
     coercion — the writer is on a different contract and must escalate.
@@ -140,15 +154,44 @@ async def dispatch_market_read(
     from market_service.runtime import read_paths
 
     cap = CAPABILITIES["market.read"]
-    scope = {"symbol": symbol.upper(), "venue": venue, "mode": mode}
+    scope = {"symbol": symbol.upper(), "venue": venue, "mode": mode,
+             "run_id": run_id}
     try:
         cap.validate_scope(symbol, venue)
-        if mode not in ("snapshot", "inventory", "full"):
+        if mode not in ("snapshot", "inventory", "full", "surfaces"):
             raise CapabilityDenied(f"unknown market.read mode: {mode!r}")
-        payload = await read_paths.read_collated(store, symbol.upper())
+        if mode == "surfaces":
+            inv = await read_paths.read_surface_inventory(
+                store, symbol.upper(), postgres=postgres)
+            return inv, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "surfaces",
+                        "available": inv["available_surfaces"]},
+            )
+        if run_id:
+            payload = await read_paths.read_collated_by_run(store, run_id)
+            source = "redis"
+        else:
+            payload, source = await read_paths.read_collated_with_fallback(
+                store, postgres, symbol=symbol.upper())
         if payload is None:
-            return None, capability_log_entry(
-                cap.name, scope, "ok", detail={"status": "no_run_persisted"},
+            inv = await read_paths.read_surface_inventory(
+                store, symbol.upper(), postgres=postgres)
+            empty: dict[str, Any] = {
+                "status": "empty",
+                "reason": ("no collated market run persisted for "
+                           f"{symbol.upper()} on any plane"),
+                "symbol": symbol.upper(), "mode": mode,
+                "run_id": run_id, "source": None,
+                "generated_at": None, "age_ms": None,
+                "checked": inv["surfaces"],
+                "available_surfaces": inv["available_surfaces"],
+                "read_tools": inv["read_tools"],
+            }
+            return empty, capability_log_entry(
+                cap.name, scope, "ok",
+                detail={"status": "empty", "run_id": run_id,
+                        "available": inv["available_surfaces"]},
             )
         if mode == "full":
             result: dict[str, Any] = payload
@@ -161,9 +204,15 @@ async def dispatch_market_read(
         # raw float('nan') (pipeline flow math). The engine's json.loads
         # round trip would choke on a bare NaN token.
         result = read_paths.json_safe(result)
+        if isinstance(result, dict):
+            result.setdefault("source", source)
+            result.setdefault("run_id", payload.get("run_id") or payload.get("id"))
+            result.setdefault("age_ms", read_paths._age_ms(
+                payload.get("generated_at") or payload.get("ts_ms")))
         return result, capability_log_entry(
             cap.name, scope, "ok",
-            detail={"schema_version": payload.get("schema_version")},
+            detail={"schema_version": payload.get("schema_version"),
+                    "source": source},
         )
     except CapabilityDenied as exc:
         return None, capability_log_entry(cap.name, scope, "denied", detail=str(exc))

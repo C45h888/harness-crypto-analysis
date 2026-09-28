@@ -374,20 +374,22 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_thin_final_triggers_repair_then_finalizes(self):
         # narrate#1 finalizes with zero validation → the hard track still
-        # forces three reasoning positions, then one bounded repair path;
-        # the thin final (no H0) cannot pass either gate.
+        # forces three reasoning positions, then the bounded repair path
+        # (VALIDATION_RETRY_PASSES = 2): the thin final (no H0) cannot pass
+        # either gate and every repair budget turn is spent before terminal.
         engine, _s, _p, _m = _engine(llm_responses=[
             _good_narration(),  # thin, no tools → evidence breaks at once
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _good_narration(),  # thin close, still no H0
-            _track_tools(*_TRACK_DISCIPLINE),  # repair pulls the audit
-            _good_narration(),  # repair followup close
+            _track_tools(*_TRACK_DISCIPLINE),  # repair #1 pulls the audit
+            _good_narration(),  # repair #1 followup close
+            _good_narration(),  # repair #2 close (budget 2 since 2026-09-27)
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 7)
-        self.assertEqual(meta["repairs"], 1)
+        self.assertEqual(meta["llm_calls"], 8)
+        self.assertEqual(meta["repairs"], 2)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
         self.assertIsNone(artifact.interpretation)
@@ -446,9 +448,10 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, scenario=scenario)
         # Comprehension is deterministic and validation stops after the
-        # bounded repair budget; the hard track spends its positions first
-        # (the unwalked forward-scenario link costs one extra steered pass).
-        self.assertEqual(meta["llm_calls"], 10)
+        # bounded repair budget (VALIDATION_RETRY_PASSES = 2); the hard track
+        # spends its positions first (the unwalked forward-scenario link costs
+        # one extra steered pass).
+        self.assertEqual(meta["llm_calls"], 11)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
         self.assertIsNone(artifact.interpretation)
