@@ -426,6 +426,56 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FINAL-TURN FIELD SHAPES", prompt)
         self.assertIn("calc.ofi.intervals", prompt)
         self.assertIn("tool_calls: []", prompt)
+        strict = compose_forced_final_prompt(
+            task="t", missing=[], evidence_digest="{}", strict=True)
+        self.assertIn("STRICT RETRY", strict)
+
+    async def test_empty_forced_final_is_discarded_and_retried_strictly(self):
+        """A shell final is discarded; the strict retry supplies the content.
+
+        Live 2026-09-28: the one-shot forced final returned an empty shell on
+        one run and the cycle died with an empty judged view. Bounded retry.
+        """
+        import json as _json
+
+        from tests.test_engine import (
+            _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
+            _TRACK_INTERPRET, _engine, _good_narration, _track_tools, _wake,
+        )
+        shell = _json.dumps({"phase": "P6", "tool_calls": [],
+                             "summary": None, "evidence": [],
+                             "hypothesis": None})
+        final = _json.dumps({
+            "phase": "P6", "tool_calls": [],
+            "summary": "y" * 250,
+            "evidence": [
+                {"path": "calc.price.delta → route_a_direct.delta_ticks",
+                 "value": "0.02", "interpretation": "derived delta P"},
+                {"path": "calc.ofi.intervals → data[0].ofi",
+                 "value": "4.0", "interpretation": "order flow"},
+            ],
+            "confidence": "low",
+            "hypothesis": {"H0": "no continuation", "H1": "continuation"},
+        })
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _good_narration(),
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _good_narration(),
+            _track_tools("market.read", "market.derivatives",
+                         *_TRACK_DISCIPLINE),
+            _good_narration(),
+            _good_narration(),
+            shell,     # FORCED FINAL attempt 1 — empty shell, discarded
+            final,     # FORCED FINAL attempt 2 (strict) — full content
+            final,     # output composition pass
+        ])
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
+        self.assertTrue(
+            meta["final_validation"]["passed"], meta["final_validation"])
+        self.assertIsNotNone(artifact.interpretation)
+        self.assertTrue((artifact.interpretation or {}).get("summary"))
 
 
 if __name__ == "__main__":

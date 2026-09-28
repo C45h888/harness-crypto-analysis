@@ -642,30 +642,52 @@ async def _forced_final_turn(
     """One tool-free FINALIZE turn (the config's promised 'forced-final').
 
     Small context, field shapes inline, every missing item named, bounded
-    digest of this run's tool evidence. Returns the parsed turn (appended to
-    ``st.turn_log``) or ``None`` when the turn failed — the caller then falls
-    through to the validation-failed terminal with the gate unchanged.
+    digest of this run's tool evidence. BOUNDED TO TWO ATTEMPTS: a response
+    that parses but carries no interpretation content is discarded and the
+    strict retry says so (live 2026-09-28: one-shot final returned an empty
+    shell and the cycle died with an empty judged view). Returns the parsed
+    turn (appended to ``st.turn_log``) or ``None`` when nothing usable came
+    back — the caller then falls through to the validation-failed terminal.
     """
     from ..llm import bounded_envelope_view
 
     digest = bounded_envelope_view(
         st.accumulated_tool_results, roof=14_000, list_cap=8)
-    prompt = kb.compose_forced_final_prompt(
-        task=ctx.task, missing=missing, evidence_digest=digest,
-        scenario=ctx.scenario,
-    )
-    try:
-        raw_final = await engine._call_llm(prompt)
-    except Exception as exc:
-        log.warning("forced final turn failed: %s", exc)
-        return None
-    st.llm_calls += 1
-    parsed_final = narration_mod.coerce_turn(
-        narration_mod.extract_json_object(raw_final))
-    if parsed_final is None:
-        log.warning("forced final turn unparseable; judging the cycle as it stands")
-        return None
-    st.parsed_current = parsed_final
-    st.turn_log.append(parsed_final)
-    st.controller = _mark_declared(st.controller, parsed_final)
-    return parsed_final
+    last_parsed: dict[str, Any] | None = None
+    for attempt in (1, 2):
+        prompt = kb.compose_forced_final_prompt(
+            task=ctx.task, missing=missing, evidence_digest=digest,
+            scenario=ctx.scenario, strict=(attempt > 1),
+        )
+        try:
+            raw_final = await engine._call_llm(prompt)
+        except Exception as exc:
+            log.warning("forced final turn (attempt %d) failed: %s", attempt, exc)
+            return last_parsed
+        st.llm_calls += 1
+        parsed_final = narration_mod.coerce_turn(
+            narration_mod.extract_json_object(raw_final))
+        if parsed_final is None:
+            log.warning("forced final turn (attempt %d) unparseable", attempt)
+            continue
+        st.parsed_current = parsed_final
+        st.turn_log.append(parsed_final)
+        st.controller = _mark_declared(st.controller, parsed_final)
+        last_parsed = parsed_final
+        if _has_interpretation(parsed_final):
+            return parsed_final
+        log.warning(
+            "forced final turn (attempt %d) returned an empty interpretation; "
+            "%s", attempt, "retrying strictly" if attempt == 1 else "judging")
+    return last_parsed
+
+
+def _has_interpretation(parsed: dict[str, Any]) -> bool:
+    """Does a parsed turn carry ANY interpretation content? (deterministic)"""
+    summary = parsed.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return True
+    evidence = parsed.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        return True
+    return isinstance(parsed.get("hypothesis"), dict) and bool(parsed.get("hypothesis"))

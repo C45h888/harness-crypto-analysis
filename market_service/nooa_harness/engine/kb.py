@@ -791,6 +791,7 @@ def compose_forced_final_prompt(
     missing: list[str],
     evidence_digest: str,
     scenario: Any | None = None,
+    strict: bool = False,
 ) -> str:
     """The FORCED FINAL turn — the one that actually produces the artifact JSON.
 
@@ -801,8 +802,10 @@ def compose_forced_final_prompt(
     context, no tools, field shapes inline, every missing item named) is the
     shape that reliably returns the full final object.
 
-    Sent at most once per cycle (``forced_final_sent``), after the bounded
-    repair budget is spent and before the validation-failed terminal.
+    Sent at most twice per cycle (``forced_final_sent`` / strict retry), after
+    the bounded repair budget is spent and before the validation-failed
+    terminal. ``strict`` is the second attempt: the first response came back
+    without interpretation content and is named as rejected.
     """
     scenario_block = ""
     if scenario is not None:
@@ -811,10 +814,19 @@ def compose_forced_final_prompt(
             "and cite the refusal — never invent numbers):\n"
             f"{json.dumps(scenario, default=str)[:1_000]}\n\n"
         )
+    strict_block = ""
+    if strict:
+        strict_block = (
+            "STRICT RETRY — your previous turn was DISCARDED: it carried no "
+            "summary, no evidence, no hypothesis. A turn without ALL THREE is "
+            "a failed cycle. Put the JSON first; prose before or after it is "
+            "ignored.\n\n"
+        )
     return (
         "FINALIZE NOW — no tools are available this turn and any tool_calls "
         "you return are dropped. This is the LAST turn of the cycle: return "
         "the FINAL artifact JSON and nothing else.\n\n"
+        f"{strict_block}"
         f"TASK (the question this output answers):\n{(task or '(autonomous microstructure inference)')[:2_000]}\n\n"
         f"{scenario_block}"
         "WHY THE PREVIOUS FINAL WAS REJECTED — EVERY item below must be fixed:\n"
