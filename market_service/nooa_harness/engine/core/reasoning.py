@@ -565,6 +565,18 @@ async def run_validation(
         ctx.controller = st.controller
         ctx.reasoned = st.to_reasoned()
         return None
+    if (st.validation_retries_used >= VALIDATION_RETRY_PASSES
+            and not st.forced_final_sent):
+        # FORCED FINAL — the missing link (config budget comment promised
+        # "narrate#1 + tool follow-ups + repairs + forced-final" but no such
+        # turn existed). Live probe 2026-09-28: 12 in-loop turns returned
+        # tool_calls only — summary/evidence/hypothesis empty in EVERY turn,
+        # while the same model with a dedicated finalize request returns the
+        # complete final object. So spend one tool-free finalize turn (small
+        # context, field shapes inline) and let this gate judge it.
+        st.forced_final_sent = True
+        if await _forced_final_turn(engine, ctx, st, list(missing)) is not None:
+            return await run_validation(engine, ctx, st)
     if st.validation_retries_used >= VALIDATION_RETRY_PASSES:
         return await run_validation_terminal(engine, ctx, st, list(missing))
     st.repairs_sent += 1
@@ -622,3 +634,38 @@ async def run_validation(
                 return await run_runtime_failure(engine, ctx, st)
             log.warning("repair follow-up unavailable; judging repair turn as it stands")
     return await run_validation(engine, ctx, st)
+
+
+async def _forced_final_turn(
+    engine: Any, ctx: Any, st: CycleRuntimeState, missing: list[str],
+) -> dict[str, Any] | None:
+    """One tool-free FINALIZE turn (the config's promised 'forced-final').
+
+    Small context, field shapes inline, every missing item named, bounded
+    digest of this run's tool evidence. Returns the parsed turn (appended to
+    ``st.turn_log``) or ``None`` when the turn failed — the caller then falls
+    through to the validation-failed terminal with the gate unchanged.
+    """
+    from ..llm import bounded_envelope_view
+
+    digest = bounded_envelope_view(
+        st.accumulated_tool_results, roof=14_000, list_cap=8)
+    prompt = kb.compose_forced_final_prompt(
+        task=ctx.task, missing=missing, evidence_digest=digest,
+        scenario=ctx.scenario,
+    )
+    try:
+        raw_final = await engine._call_llm(prompt)
+    except Exception as exc:
+        log.warning("forced final turn failed: %s", exc)
+        return None
+    st.llm_calls += 1
+    parsed_final = narration_mod.coerce_turn(
+        narration_mod.extract_json_object(raw_final))
+    if parsed_final is None:
+        log.warning("forced final turn unparseable; judging the cycle as it stands")
+        return None
+    st.parsed_current = parsed_final
+    st.turn_log.append(parsed_final)
+    st.controller = _mark_declared(st.controller, parsed_final)
+    return parsed_final

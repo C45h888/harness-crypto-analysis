@@ -361,5 +361,72 @@ class ArgContractTests(unittest.TestCase):
         self.assertIn("hypothesis", kb.FINAL_SHAPE_BLOCK)
 
 
+class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
+    """The FORCED FINAL turn: tool-mode loops must still produce an artifact.
+
+    Regression (live 2026-09-28): 12 in-loop turns returned tool_calls only —
+    summary/evidence/hypothesis empty in EVERY turn — while the same model
+    with a dedicated finalize request returns the complete final object.
+    """
+
+    async def test_forced_final_supplies_missing_interpretation(self):
+        import json as _json
+
+        from tests.test_engine import (
+            _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
+            _TRACK_INTERPRET, _engine, _good_narration, _track_tools, _wake,
+        )
+        final = _json.dumps({
+            "phase": "P6", "tool_calls": [],
+            "summary": "x" * 250,
+            "evidence": [
+                {"path": "calc.price.delta → route_a_direct.delta_ticks",
+                 "value": "0.017", "interpretation": "derived delta P"},
+                {"path": "calc.ofi.intervals → data[0].ofi",
+                 "value": "12.5", "interpretation": "order flow"},
+            ],
+            "confidence": "medium",
+            "limitations": ["thin tape"],
+            "model_separation": "beta and c/lambda read separately",
+            "hypothesis": {"H0": "no continuation", "H1": "continuation",
+                           "paper_refs": ["Cont 1011.6402"],
+                           "evidence_refs": ["calc.ofi.intervals"]},
+        })
+        engine, _s, _p, _m = _engine(llm_responses=[
+            _good_narration(),                 # thin, no tools
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _good_narration(),                 # thin close, no H0
+            # repair #1 pulls the audit AND covers P3 (market reads)
+            _track_tools("market.read", "market.derivatives",
+                         *_TRACK_DISCIPLINE),
+            _good_narration(),                 # repair #1 close
+            _good_narration(),                 # repair #2 close (budget 2)
+            final,                             # FORCED FINAL (tool-free)
+            final,                             # output composition pass
+        ])
+        artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
+        self.assertTrue(
+            meta["final_validation"]["passed"], meta["final_validation"])
+        self.assertIsNotNone(artifact.interpretation)
+        self.assertEqual(meta["repairs"], 2)
+
+    def test_forced_final_prompt_names_missing_items_and_shapes(self):
+        from market_service.nooa_harness.engine.kb import (
+            compose_forced_final_prompt,
+        )
+        prompt = compose_forced_final_prompt(
+            task="does 4h continuation hold?",
+            missing=["P4 explanation too thin (0/200 chars)"],
+            evidence_digest='{"calc.ofi.intervals": {"data": []}}',
+        )
+        self.assertIn("FINALIZE NOW", prompt)
+        self.assertIn("P4 explanation too thin", prompt)
+        self.assertIn("FINAL-TURN FIELD SHAPES", prompt)
+        self.assertIn("calc.ofi.intervals", prompt)
+        self.assertIn("tool_calls: []", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

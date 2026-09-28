@@ -785,6 +785,49 @@ def compose_followup_prompt(
     )
 
 
+def compose_forced_final_prompt(
+    *,
+    task: str | None,
+    missing: list[str],
+    evidence_digest: str,
+    scenario: Any | None = None,
+) -> str:
+    """The FORCED FINAL turn — the one that actually produces the artifact JSON.
+
+    Live-proven gap (2026-09-28): across 12 in-loop turns the model returned
+    tool_calls only — zero summary/evidence/hypothesis in ANY turn, because
+    every in-loop prompt ends in "call tools, or advance with tool_calls=[]"
+    and the model stays in tool mode. A dedicated FINALIZE request (small
+    context, no tools, field shapes inline, every missing item named) is the
+    shape that reliably returns the full final object.
+
+    Sent at most once per cycle (``forced_final_sent``), after the bounded
+    repair budget is spent and before the validation-failed terminal.
+    """
+    scenario_block = ""
+    if scenario is not None:
+        scenario_block = (
+            "SCENARIO (given; if the tool refused, set verdict=\"unevaluable\" "
+            "and cite the refusal — never invent numbers):\n"
+            f"{json.dumps(scenario, default=str)[:1_000]}\n\n"
+        )
+    return (
+        "FINALIZE NOW — no tools are available this turn and any tool_calls "
+        "you return are dropped. This is the LAST turn of the cycle: return "
+        "the FINAL artifact JSON and nothing else.\n\n"
+        f"TASK (the question this output answers):\n{(task or '(autonomous microstructure inference)')[:2_000]}\n\n"
+        f"{scenario_block}"
+        "WHY THE PREVIOUS FINAL WAS REJECTED — EVERY item below must be fixed:\n"
+        + "\n".join(f"- {item}" for item in missing)
+        + "\n\nTHIS RUN'S TOOL EVIDENCE (cite these exact paths in evidence):\n"
+        f"{evidence_digest}\n\n"
+        f"{FINAL_SHAPE_BLOCK}\n\n"
+        'Return ONE JSON object with EXACTLY {phase: "P6", summary, evidence, '
+        "confidence, limitations, model_separation, hypothesis, scenario, "
+        'tool_calls: [], memory_proposals}. No prose before or after it.'
+    )
+
+
 def compose_repair_prompt(
     *,
     controller: Any,

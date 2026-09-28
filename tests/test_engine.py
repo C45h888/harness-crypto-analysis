@@ -451,7 +451,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # bounded repair budget (VALIDATION_RETRY_PASSES = 2); the hard track
         # spends its positions first (the unwalked forward-scenario link costs
         # one extra steered pass).
-        self.assertEqual(meta["llm_calls"], 11)
+        self.assertEqual(meta["llm_calls"], 12)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
         self.assertIsNone(artifact.interpretation)

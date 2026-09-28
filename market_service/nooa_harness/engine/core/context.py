@@ -234,6 +234,10 @@ class CycleRuntimeState:
     reason_position: int = 0
     position_hits: dict[str, int] = field(default_factory=dict)
     chain_halt: dict[str, str] | None = None
+    # The FORCED FINAL turn (kb.compose_forced_final_prompt) is spent at most
+    # once per cycle: after the repair budget is exhausted and before the
+    # validation-failed terminal.
+    forced_final_sent: bool = False
 
     def to_reasoned(self) -> _ReasonedCycle:
         """Freeze the handoff the OUTPUT loop consumes."""
