@@ -296,8 +296,15 @@ class MarketReadValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("canonical_state", result)
         self.assertIn("run_id", result)
 
-    async def test_dispatch_market_read_no_run_returns_none(self):
-        """dispatch_market_read on empty Redis returns None + structured log."""
+    async def test_dispatch_market_read_no_run_returns_surface_inventory(self):
+        """Empty read returns the SURFACE INVENTORY as data (2026-09-27).
+
+        The read failure path must leave a citable trace — status:"empty"
+        with every persisted plane (presence / run_id / age_ms) plus the
+        read-tool map — instead of a bare None the agent cannot reason
+        about and therefore keeps re-calling. The old contract (None +
+        "no_run_persisted" log) is retired.
+        """
         from market_service.nooa_harness.inference import dispatch_market_read
 
         # Clear the latest key so no run is persisted for BTCUSDT
@@ -308,9 +315,15 @@ class MarketReadValidationTests(unittest.IsolatedAsyncioTestCase):
             self.store, "BTCUSDT", mode="snapshot"
         )
 
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["symbol"], "BTCUSDT")
+        self.assertIn("checked", result)
+        self.assertTrue(result["checked"])
+        self.assertIn("read_tools", result)
+        self.assertIn("market.read", result["read_tools"])
         self.assertEqual(log_entry["result"], "ok")
-        self.assertIn("no_run_persisted", str(log_entry.get("detail", "")))
+        self.assertEqual(log_entry["detail"]["status"], "empty")
 
 
 if __name__ == "__main__":
