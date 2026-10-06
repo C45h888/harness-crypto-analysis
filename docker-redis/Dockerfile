@@ -19,7 +19,7 @@ COPY redis-entrypoint.sh      /usr/local/bin/redis-entrypoint.sh
 RUN chmod +x /usr/local/bin/redis-entrypoint.sh
 
 # Sane defaults; compose env_file can override.
-ENV TELEMETRY_HYGIENE_INTERVAL_S=300 \
+ENV TELEMETRY_HYGIENE_INTERVAL_S=86400 \
     TELEMETRY_HYGIENE_MIN_AGE_S=3600 \
     REDIS_HYGIENE_URL=unix:///tmp/redis.sock \
     TELEMETRY_HYGIENE_DRY_RUN=false \

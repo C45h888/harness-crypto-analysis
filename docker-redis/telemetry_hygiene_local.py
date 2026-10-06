@@ -41,7 +41,7 @@ except ImportError:
     sys.exit(1)
 
 DATA = Path("/data")
-INTERVAL_S = int(os.environ.get("TELEMETRY_HYGIENE_INTERVAL_S", "300"))
+INTERVAL_S = int(os.environ.get("TELEMETRY_HYGIENE_INTERVAL_S", "86400"))
 MIN_AGE_S = int(os.environ.get("TELEMETRY_HYGIENE_MIN_AGE_S", "3600"))
 REDIS_URL = os.environ.get("REDIS_HYGIENE_URL", "unix:///tmp/redis.sock")
 DRY_RUN = os.environ.get("TELEMETRY_HYGIENE_DRY_RUN", "false").lower() == "true"
