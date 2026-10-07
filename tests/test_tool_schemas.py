@@ -292,7 +292,7 @@ class TestComposeFollowupPromptWithWrapped(unittest.TestCase):
         accumulated = {}
         prompt = compose_followup_prompt(
             controller=self.controller,
-            loop="evidence",
+            loop="context",
             sub_loop="acquisition",
             passes_spent=0,
             pass_budget=3,
@@ -326,7 +326,7 @@ class TestComposeFollowupPromptWithWrapped(unittest.TestCase):
         }
         prompt = compose_followup_prompt(
             controller=self.controller,
-            loop="evidence",
+            loop="context",
             sub_loop="acquisition",
             passes_spent=0,
             pass_budget=3,
@@ -354,7 +354,7 @@ class TestComposeFollowupPromptWithWrapped(unittest.TestCase):
         }
         prompt = compose_followup_prompt(
             controller=self.controller,
-            loop="evidence",
+            loop="context",
             sub_loop="acquisition",
             passes_spent=0,
             pass_budget=3,
@@ -418,7 +418,7 @@ def _mock_controller():
     # build_loop_state_block validates loop/sub_loop/intent against
     # the controller's observation. We need real enum values here.
     class _Obs:
-        nested_loop = NestedLoop.EVIDENCE
+        nested_loop = NestedLoop.CONTEXT
         sub_loop = SubLoop.ACQUISITION
         task = TaskIntent.INFER_ORDER_FLOW
     c.observation = _Obs()

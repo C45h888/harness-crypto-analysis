@@ -31,7 +31,7 @@ SEPARATION OF POWERS (this module vs engine/fsm.py):
 
 Boundary rules:
 - pure over injected state: no I/O, no LLM client, no store access
-- does NOT parse LLM text (engine/narration.py keeps extract/coerce)
+- does NOT parse LLM text (engine/schemas.py keeps extract/coerce)
 - never credits a refused call into phase coverage (refusal is a finding,
   not coverage — the final gate learns about refusals through the
   tri-state, not through coverage)
@@ -40,6 +40,7 @@ Boundary rules:
 from __future__ import annotations
 
 import logging
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -597,5 +598,92 @@ __all__ = [
     "GovernanceRecord",
     "LoopVisit",
     "ScenarioEvalStatus",
+    "next_uncovered_phase",
+    "scenario_verdict",
     "ToolOutcome",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Coverage order + scenario tri-state reads — owned HERE (classification
+# authority), moved from engine/narration.py (Pass-C redistribution).
+# narration.py re-exports these names until its deletion pass.
+# ---------------------------------------------------------------------------
+
+
+def next_uncovered_phase(coverage: dict[str, set[str]]) -> str:
+    """First required phase family with no executed tool yet; then P6."""
+    from market_service.nooa_harness.inference import _REQUIRED_PHASES
+
+    for phase in _REQUIRED_PHASES:
+        if not coverage.get(phase):
+            return phase
+    if not coverage.get("P6"):
+        return "P6"
+    return "P5"
+
+
+
+def scenario_verdict(
+    scenario_result: dict[str, Any] | None,
+    capability_log: list[dict[str, Any]],
+    gate_status: str,
+    gate_reasons: list[str],
+) -> tuple[str, str]:
+    """Deterministic reachability verdict from the scenario tool payload.
+
+    Decided from the accumulated ``calc.scenario.evaluate`` result — never
+    from LLM text. Band-aware cut points: max exceedance across the band
+    == 0 → invalidated (unreachable even on the friendly edge); min
+    exceedance ≥ 0.5 → validated (preponderance through the full band);
+    anything between → inconclusive. The provisional gate always ceilings
+    at inconclusive (reason carries the directional read); refusals and
+    missing evaluations are inconclusive with the cause named.
+    """
+    entry: dict[str, Any] | None = None
+    for row in reversed(capability_log):
+        if isinstance(row, dict) and row.get("capability") == "calc.scenario.evaluate":
+            entry = row
+            break
+    if not isinstance(scenario_result, dict):
+        detail = (entry or {}).get("detail") or {}
+        cause = detail.get("reason", "scenario tool never called") \
+            if isinstance(detail, dict) else "scenario tool never called"
+        return ("inconclusive",
+                f"scenario unevaluated ({cause}); reachability undecided")
+    direction = str(scenario_result.get("direction") or "?")
+    target = str(scenario_result.get("target_price") or "?")
+    windows = scenario_result.get("n_windows_usable")
+    horizon = str(scenario_result.get("horizon") or "?")
+    context = (f"{direction} {target} at {horizon} over {windows} usable windows")
+    if gate_status == "provisional":
+        exc = str(scenario_result.get("exceedance") or "?")
+        return ("inconclusive",
+                f"Gate provisional ({';'.join(gate_reasons)}); scenario reads "
+                f"{context} at {exc} exceedance but held inconclusive — "
+                f"promotion waits for a validated fit")
+    if gate_status != "validated":
+        return ("inconclusive", "; ".join(gate_reasons) or "gate not validated")
+    rng = scenario_result.get("exceedance_range")
+    try:
+        edges = [Decimal(str(v)) for v in rng] if isinstance(rng, list) and len(rng) == 2 \
+            else [Decimal(str(scenario_result.get("exceedance")))]
+    except (InvalidOperation, ValueError, TypeError):
+        return ("inconclusive", f"scenario exceedance unparseable ({context})")
+    if max(edges) == 0:
+        return ("invalidated",
+                f"H0 holds: {context} at 0 exceedance across the full band — "
+                f"required flow outside the observed regime")
+    if min(edges) >= Decimal("0.5"):
+        return ("validated",
+                f"H1 holds: {context} at ≥0.5 exceedance through the full band")
+    return ("inconclusive",
+            f"flow regime straddles the requirement ({context}); "
+            f"band-range exceedance undecided")
+
+
+# Per-phase steering fragments — appended to follow-up prompts so each
+# turn knows what the next uncovered phase demands. Window freedom is
+# stated once here: the agent may vary interval_seconds (10/15/30) and
+# window_minutes (15/30/60) in calc/fit tool args; deterministic code
+# executes, the agent never recomputes.

@@ -72,20 +72,20 @@ class VenueResolutionTests(unittest.IsolatedAsyncioTestCase):
         from market_service.commands.harness import _read_microstructure_status
 
         args = build_parser().parse_args(["SOLUSDT", "--microstructure-status"])
-        store = AsyncMock()
-        store.read_microstructure_status.return_value = {"state": "running"}
-        store.microstructure_status_key.return_value = "k"
-        store.microstructure_raw_stream.return_value = "r"
-        store.microstructure_event_stream.return_value = "e"
-        store.microstructure_ofi_stream.return_value = "o"
-
+        payload = {
+            "symbol": "SOLUSDT", "venue": "futures", "status_key": "k",
+            "raw_stream": "r", "event_stream": "e", "ofi_stream": "o",
+            "status": {"state": "running"},
+        }
         with patch.dict("os.environ", {"MICROSTRUCTURE_VENUE": "futures"}), \
-                patch("market_service.commands.harness.RedisRuntimeStore",
-                      return_value=store):
-            result = await _read_microstructure_status(args)
+                patch("market_service.interaction_plane.reads.read_micro_status",
+                      return_value=(payload, "redis")) as m_read:
+            result, source = await _read_microstructure_status(args)
 
-        self.assertEqual(result["venue"], "futures")
-        store.read_microstructure_status.assert_awaited_once_with("futures", "SOLUSDT")
+        self.assertEqual(source, "redis")
+        self.assertEqual(result["tool"], "micro.capture_status")
+        self.assertEqual(result["data"]["venue"], "futures")
+        m_read.assert_awaited_once_with("SOLUSDT")
 
     def test_inference_route_passes_the_configured_venue(self):
         from market_service.commands.harness import main

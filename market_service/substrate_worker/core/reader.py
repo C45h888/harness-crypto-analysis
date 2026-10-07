@@ -26,6 +26,9 @@ from market_service.substrate_worker.contracts import (
     ROLLOVER_PERIOD_MS,
     TriggerDecision,
 )
+from market_service.runtime.horizons import (
+    IST_ALIGNED_ROLLOVERS, IST_OFFSET_MS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -281,7 +284,17 @@ class ReaderMixin(SubstrateBase):
             length = ROLLOVER_PERIOD_MS.get(period)
             if not length:
                 continue
-            from_bucket, to_bucket = previous_ms // length, newest_ms // length
+            # Phase H1: bar_* periods use IST-aligned bucket identity
+            # (trader-facing day boundaries at IST midnight); the legacy
+            # ``hour`` period keeps its epoch-hour ids (pinned by existing
+            # payloads). bar_5m/bar_15m align identically to the epoch grid
+            # (offset is an exact multiple); bar_1h/bar_4h sit at UTC :30
+            # offsets by design.
+            if period in IST_ALIGNED_ROLLOVERS:
+                from_bucket = self._aligned_bucket(previous_ms, length)
+                to_bucket = self._aligned_bucket(newest_ms, length)
+            else:
+                from_bucket, to_bucket = previous_ms // length, newest_ms // length
             if to_bucket != from_bucket:
                 crossed[period] = {
                     "period": period, "from_bucket": from_bucket, "to_bucket": to_bucket,
@@ -289,6 +302,16 @@ class ReaderMixin(SubstrateBase):
         if not crossed:
             return None
         return TriggerDecision(fired=True, source="rollover", predicates=crossed)
+
+    @staticmethod
+    def _aligned_bucket(t_ms: int, length_ms: int) -> int:
+        """IST-aligned bucket index for one rollover period.
+
+        Consistent with ``horizons.bucket_start_ms``: bucket STARTS sit at
+        IST-anchored boundaries, so the index grid is ``(t + offset) // L``
+        and bucket start = index*L - offset.
+        """
+        return ((int(t_ms) + IST_OFFSET_MS) // length_ms)
 
     @staticmethod
     def _high_water(rows: list[dict[str, Any]]) -> str:

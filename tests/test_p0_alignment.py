@@ -54,10 +54,10 @@ def test_fsm_authorizes_bootstrap_only_at_initial_comprehension() -> None:
     controller = _controller()
 
     assert controller.authorize_work(
-        nested_loop=NestedLoop.COMPREHENSION, bootstrap=True,
+        nested_loop=NestedLoop.CONTEXT, bootstrap=True,
     ).allowed
     assert not controller.authorize_work(
-        nested_loop=NestedLoop.EVIDENCE, bootstrap=True,
+        nested_loop=NestedLoop.REASONING, bootstrap=True,
     ).allowed
 
     opened, verdict = controller.transition(
@@ -69,7 +69,7 @@ def test_fsm_authorizes_bootstrap_only_at_initial_comprehension() -> None:
     assert verdict.allowed
     assert opened.observation.sub_loop is SubLoop.INTAKE
     assert not opened.authorize_work(
-        nested_loop=NestedLoop.EVIDENCE,
+        nested_loop=NestedLoop.CONTEXT,
         sub_loop=SubLoop.ACQUISITION,
     ).allowed
 
@@ -106,7 +106,7 @@ def test_prompt_state_cannot_override_controller_observation() -> None:
         )
 
     block = build_loop_state_block(controller=opened)
-    assert "inside comprehension / intake" in block
+    assert "inside context / intake" in block
     assert "[understand_task]" in block
 
 

@@ -514,7 +514,7 @@ def _build_failure_context():
     )
 
     controller = CycleController().with_observation(
-        LoopObservation(NestedLoop.COMPREHENSION, TaskIntent.UNDERSTAND_TASK, None)
+        LoopObservation(NestedLoop.CONTEXT, TaskIntent.UNDERSTAND_TASK, None)
     )
 
     from tests.test_governance import _FakeStore, _FakePostgres, _FakeMemory, _FakeLLM

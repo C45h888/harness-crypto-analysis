@@ -75,15 +75,11 @@ from .kb import (
     load_paper_kb,
 )
 
-# --- Narration primitives ---
-from .narration import (
-    PHASE_GUIDANCE,
-    coerce_turn,
-    extract_json_object,
-    next_uncovered_phase,
-    scenario_verdict,
-    validate_final_turn,
-)
+# --- Narration primitives (redistributed — narration.py deleted Pass-C) ---
+from .schemas import coerce_turn, extract_json_object
+from .kb import PHASE_GUIDANCE
+from .controller import next_uncovered_phase, scenario_verdict
+from .core.reasoning import validate_final_turn
 
 # --- Cycle controller (the loop's sole deterministic authority) ---
 from .controller import (
@@ -278,21 +274,21 @@ __all__ = [
 # public names; old code keeps working unchanged.
 # ---------------------------------------------------------------------------
 
-# `from .engine import _extract_json_object` -> narration
+# `from .engine import _extract_json_object` -> schemas
 _extract_json_object = extract_json_object
-# `from .engine import _coerce_turn` -> narration
+# `from .engine import _coerce_turn` -> schemas
 _coerce_turn = coerce_turn
-# `from .engine import _validate_final_turn` -> narration
+# `from .engine import _validate_final_turn` -> core.reasoning
 _validate_final_turn = validate_final_turn
-# `from .engine import _scenario_verdict` -> narration
+# `from .engine import _scenario_verdict` -> controller
 _scenario_verdict = scenario_verdict
-# `from .engine import _PHASE_GUIDANCE` -> narration (already a dict, identity re-export)
+# `from .engine import _PHASE_GUIDANCE` -> kb (already a dict, identity re-export)
 _PHASE_GUIDANCE = PHASE_GUIDANCE
 # `from .engine import _SYSTEM_PROMPT_TEMPLATE` -> kb
 _SYSTEM_PROMPT_TEMPLATE = SYSTEM_PROMPT_TEMPLATE
 # `from .engine import _narration_max_tokens` -> config
 _narration_max_tokens = narration_max_tokens
-# `from .engine import _next_uncovered_phase` -> narration
+# `from .engine import _next_uncovered_phase` -> controller
 _next_uncovered_phase = next_uncovered_phase
 # `from .engine import _load_kb` -> kb
 _load_kb = load_kb

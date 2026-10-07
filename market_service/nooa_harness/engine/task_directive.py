@@ -490,3 +490,36 @@ def assessment_prompt(task: str, directive: TaskDirective) -> str:
         "DETERMINISTIC PARSE (Phase A result):\n"
         f"{json.dumps(directive.to_dict(), default=str, indent=1)}\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical understanding entry — sole methodology behind the new plane.
+# Both WAKE consumers (gather provisional, comprehension final) enter here;
+# nobody calls parse/build directly. PromptVariable-shaped input (raw,
+# scenario, is_empty); returns (directive, plan, assessment_due).
+# ---------------------------------------------------------------------------
+
+def understand(
+    prompt: Any,
+) -> tuple["TaskDirective", dict[str, Any], bool]:
+    """Single-entry understanding: Phase-A parse + plan bind + due-gate.
+
+    ``prompt`` is the canonical ``core.wake.PromptVariable`` (duck-typed to
+    avoid a core→engine import cycle: needs ``.raw``, ``.scenario``,
+    ``.is_empty``). Pure — no LLM. The Phase-B disposal turn (when
+    ``assessment_due``) runs only in ``wake.run_comprehension``, whose
+    disposed values are the final authority overwriting gather's
+    provisional write of the same keys.
+    """
+    from .kb import PRICE_TARGET_HINTS
+    raw = prompt.raw if prompt is not None else None
+    scenario = prompt.scenario if prompt is not None else None
+    directive = parse_task_directive(raw, scenario)
+    plan = build_plan(directive)
+    if prompt is None or bool(getattr(prompt, "is_empty", False)):
+        return directive, plan, False
+    blob = (raw or "").lower()
+    hinted = any(h in blob for h in PRICE_TARGET_HINTS) or any(
+        w in blob for w in _HYPOTHESIS_WORDS)
+    due = bool(directive.refusals) or (directive.kind == "general" and hinted)
+    return directive, plan, due

@@ -168,6 +168,14 @@ class _CycleContext:
     capability_log: list[dict[str, Any]]
     gathered: _GatheredEvidence | None = None
     reasoned: _ReasonedCycle | None = None
+    # Canonical prompt variable (owner: core.wake.PromptVariable). Normalized
+    # once in run_wake; loops read fields off it instead of re-slicing raw
+    # task. Compat passthroughs task/scenario retained until Phase-3 cleanup.
+    prompt: Any | None = None
+    # Task-scoped memory segment (state redistribution): a deterministic id
+    # derived from the normalized prompt, threaded to every memory write and
+    # to segment-scoped recall so plan/handoff carry never bleeds across tasks.
+    task_id: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -395,10 +403,14 @@ async def run_validation_terminal(
         "passes_per_loop": dict(st.passes_per_loop),
     }
     _covered = set(st.controller.loop_coverage())
-    if st.passes_per_loop.get("evidence", 0) > 0 and "evidence" not in _covered:
+    if (st.passes_per_loop.get("evidence", 0) > 0
+            and "context" not in _covered):
         st.controller = st.controller.record_loop_visit(
-            "evidence", st.passes_per_loop["evidence"],
-            ("sourcing", "acquisition", "verification"),
+            "context",
+            st.passes_per_loop.get("comprehension", 0)
+            + st.passes_per_loop.get("evidence", 0),
+            ("intake", "interpretation", "framing", "sourcing",
+             "acquisition", "verification"),
             completed=False,
         )
     if st.passes_per_loop.get("reasoning", 0) > 0 and "reasoning" not in _covered:

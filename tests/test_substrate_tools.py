@@ -155,11 +155,16 @@ class HarnessRoutingTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["SOLUSDT", "--invoke", "tape,density"])
 
-    @patch("market_service.commands.harness._read_substrates",
+    @patch("market_service.interaction_plane.cli._read_substrates",
            new_callable=AsyncMock)
     def test_substrate_read_routes_to_handler(self, mock_read):
         from market_service.commands.harness import main
-        mock_read.return_value = {"symbol": "SOLUSDT", "substrates": {}}
+        mock_read.return_value = (
+            {"tool": "substrate.read", "status": "ok", "reason": None,
+             "data": {"symbol": "SOLUSDT", "substrates": {}},
+             "null_fields": [], "budget_receipt": {"truncated": False}},
+            "redis",
+        )
         rc = main(["SOLUSDT", "--substrate-read"])
         self.assertEqual(rc, 0)
         mock_read.assert_awaited_once()

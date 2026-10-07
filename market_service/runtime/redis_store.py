@@ -26,6 +26,31 @@ _AGENT_ARTIFACT_SCHEMA_VERSION: dict[str, int] = {
 }
 
 
+def _slim_stream_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """Slim a raw-evidence snapshot down to what STREAM consumers read.
+
+    Phase H1 (docs/HORIZON_RETENTION_SPEC.md §1.2): ``build_raw_window``
+    reads ONLY ``trades_normalized`` from the stream — book, tickers, and
+    the raw Binance trade arrays all come from the single ``latest``
+    snapshot. Carrying them in every 5s stream entry is the memory cost
+    that made wide (12h) retention impossible. The slimmed body keeps:
+    observed_at(_ms), depth_levels, errors, coverage, trades_normalized,
+    and the tiny funding/OI objects. ``read_raw_latest`` keeps the FULL
+    payload — point-in-time readers are unaffected.
+    """
+    def _side(side: dict[str, Any]) -> dict[str, Any]:
+        return {
+            k: v for k, v in side.items()
+            if k in ("trades_normalized", "funding", "open_interest")
+        }
+
+    return {
+        **{k: v for k, v in payload.items() if k not in ("spot", "futures")},
+        "spot": _side(payload.get("spot") or {}),
+        "futures": _side(payload.get("futures") or {}),
+    }
+
+
 # Default TTL for per-run STRING keys (run:<run_id>, runtime-run:<run_id>:domain:*).
 # 24h bounds growth while keeping a generous re-run guard and replay window.
 _PER_RUN_KEY_TTL_S = 86_400
@@ -36,10 +61,18 @@ class RedisRuntimeStore:
 
     def __init__(self, url: str, prefix: str = "marketflow", stream_maxlen: int = 10_000,
                  postgres_store: Any | None = None,
-                 collated_stream_maxlen: int = 5_000):
+                 collated_stream_maxlen: int = 5_000,
+                 raw_retention_ms: int = 43_200_000):
         self.redis: Redis = Redis.from_url(url, decode_responses=True)
         self.prefix = prefix.strip(":")
         self.stream_maxlen = stream_maxlen
+        # Phase H1 — time-based retention for the raw evidence stream
+        # (docs/HORIZON_RETENTION_SPEC.md). The raw stream is trimmed by
+        # MINID (now - retention) so the observable horizon is TIME-
+        # predictable in an unbounded market; ``stream_maxlen`` remains
+        # only as a pathological-burst memory guardrail. Default 12h
+        # serves the widest declared worker horizon (4h) with margin.
+        self.raw_retention_ms = int(raw_retention_ms)
         # Doctrine §4 leaves the collated stream "intentionally
         # unbounded by default so downstream replay and auditing have
         # the full history". In practice this lets the AOF rewrite
@@ -527,49 +560,69 @@ class RedisRuntimeStore:
         A per-snapshot idempotency guard (keyed on ``observed_at_ms``, with a
         TTL) dedupes a re-delivered snapshot from a concurrent poller.
 
-        Memory discipline (5s cadence): the stream entry carries a *trimmed*
-        payload — ``trades_raw`` is stripped because every stream consumer
-        (``read_raw_window``) reads only ``trades_normalized``; the raw
-        Binance arrays are a byte-for-byte duplicate of the normalized
-        trades inside the same snapshot and account for ~half of the
-        per-entry size. The full untrimmed payload is kept in the
-        ``latest`` projection (the ``trades_raw`` fallback surface).
-        Stream length is bounded by ``self.stream_maxlen`` (the hardcoded
-        5000 ignored the configured cap). At the 5s cadence the cap is a
-        MEMORY budget, not just a history window: ~344 KB/trimmed entry
-        x 1200 entries x 3 symbols ~= 1.2 GB, sized to stay under the
-        1.5 GB maxmemory with room for collated/ledger keys (1200 x 5s
-        = 100 min of stream history; the 15m analysis window needs 180).
+        Memory discipline (Phase H1, docs/HORIZON_RETENTION_SPEC.md):
+
+        * the stream entry carries a *slimmed* body (``_slim_stream_body``):
+          ``trades_raw`` / ``order_book`` / ``ticker_24h`` are stripped —
+          every stream consumer (``read_raw_window``) reads only
+          ``trades_normalized``; the point-in-time surfaces live in the
+          ``latest`` projection, which keeps the FULL payload.
+        * retention is TIME-based: after the XADD the script XTRIMs the
+          stream to ``MINID ~ (now - raw_retention_ms)`` — the observable
+          horizon is a clock contract, not a function of market activity.
+          ``stream_maxlen`` remains in the same script purely as a
+          pathological-burst memory guardrail (a count cap, NOT the
+          retention policy).
 
         Returns the stream id, or ``None`` when the snapshot was a duplicate.
         """
         full_body = json.dumps(payload, default=str, separators=(",", ":"))
-        trimmed = {
-            **payload,
-            "spot": {k: v for k, v in payload.get("spot", {}).items() if k != "trades_raw"},
-            "futures": {k: v for k, v in payload.get("futures", {}).items() if k != "trades_raw"},
-        }
-        stream_body = json.dumps(trimmed, default=str, separators=(",", ":"))
+        stream_body = json.dumps(
+            _slim_stream_body(payload), default=str, separators=(",", ":"))
         ts = str(payload.get("observed_at_ms", ""))
         maxlen = str(int(self.stream_maxlen))
+        # Trim floor: entries older than this are evicted in the same
+        # atomic step that publishes the new one (approximate trim —
+        # exact-mode XTRIM is O(n) and would tax the 5s publish path).
+        minid = str(int(time.time() * 1000) - int(self.raw_retention_ms))
         script = """
         if ARGV[2] ~= '' then
           local guard = redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[3])
           if guard == false then return 'duplicate' end
         end
         redis.call('SET', KEYS[1], ARGV[1])
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+        local id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
             'ts', ARGV[2], 'payload', ARGV[4])
+        redis.call('XTRIM', KEYS[2], 'MINID', '~', ARGV[6])
+        return id
         """
         result = await self.redis.eval(
             script, 3,
             self.raw_latest_key(symbol), self.raw_stream(symbol),
             self.raw_dedupe_key(symbol, ts),
-            full_body, ts, "600", stream_body, maxlen,
+            full_body, ts, "600", stream_body, maxlen, minid,
         )
         if result == "duplicate":
             return None
         return str(result)
+
+    async def read_raw_oldest_ms(self, symbol: str) -> int | None:
+        """Event-time of the OLDEST entry still in the raw stream.
+
+        Phase H1 coverage seam: the retention horizon a window reader can
+        honestly observe ends at this timestamp — anything older has been
+        evicted by the MINID trim. ``None`` when the stream is empty.
+        """
+        rows = await self.redis.xrange(self.raw_stream(symbol), min="-", max="+", count=1)
+        if not rows:
+            return None
+        entry_id = rows[0][0]
+        if isinstance(entry_id, bytes):
+            entry_id = entry_id.decode("utf-8", errors="replace")
+        try:
+            return int(str(entry_id).split("-", 1)[0])
+        except (TypeError, ValueError):
+            return None
 
     async def read_raw_window(
         self, symbol: str, since_ms: int,
@@ -904,6 +957,58 @@ class RedisRuntimeStore:
 
     def substrate_supervisor_key(self, substrate: str, symbol: str) -> str:
         return f"{self.prefix}:substrate:{substrate.lower()}:{symbol.upper()}:supervisor"
+
+    # ------------------------------------------------------------------
+    # Horizon spans — per-horizon deterministic blocks (spec: interaction
+    # plane horizon-vector shape). Sibling projections of the collated
+    # ledger, NOT replacements: the audit unit stays run_id, each span
+    # carries its own run back-pointer. Latest-only streams are bounded;
+    # collated-stream-style unbounded replay is deliberately NOT kept per
+    # horizon (7 unbounded streams would 7x the AOF cost).
+    # ------------------------------------------------------------------
+
+    def horizon_span_stream(self, horizon: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:horizon:{horizon.lower()}:{symbol.upper()}"
+
+    def horizon_span_latest_key(self, horizon: str, symbol: str) -> str:
+        return f"{self.prefix}:latest:{symbol.upper()}:horizon:{horizon.lower()}"
+
+    async def publish_horizon_span(
+        self, horizon: str, symbol: str, payload: dict[str, Any],
+    ) -> str:
+        """Atomically SET(latest) + XADD(bounded span stream) for one horizon."""
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        ts = str(payload.get("computed_at_ms") or "")
+        maxlen = str(int(self.stream_maxlen))
+        script = """
+        redis.call('SET', KEYS[1], ARGV[1])
+        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'horizon', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[4], 'payload', ARGV[1])
+        """
+        return str(await self.redis.eval(
+            script, 2,
+            self.horizon_span_latest_key(horizon, symbol),
+            self.horizon_span_stream(horizon, symbol),
+            body, horizon.lower(), symbol.upper(), ts, maxlen,
+        ))
+
+    async def read_horizon_span_latest(
+        self, horizon: str, symbol: str,
+    ) -> dict[str, Any] | None:
+        """Read one horizon's latest span + schema guard. None = absent."""
+        from market_service.runtime.horizon_spans import guard_span
+
+        raw = await self.redis.get(
+            self.horizon_span_latest_key(horizon, symbol))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        return guard_span(value)
 
     async def publish_substrate_state(
         self, substrate: str, symbol: str, payload: dict[str, Any],

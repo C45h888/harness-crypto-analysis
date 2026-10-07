@@ -935,6 +935,53 @@ class PostgresRuntimeStore:
             )
         return [self._parse_artifact_row(row) for row in rows]
 
+    # ------------------------------------------------------------------
+    # Horizon spans — durable fallback for per-horizon blocks.
+    # Latest-per-(symbol,horizon); absent rows read as empty, never errors.
+    # ------------------------------------------------------------------
+
+    async def insert_horizon_span(self, span: dict[str, Any]) -> bool:
+        """Persist one horizon span (idempotent on symbol/horizon/computed_at)."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO horizon_span
+               (symbol, horizon, run_id, schema_version, regime, status,
+                computed_at_ms, span)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               ON CONFLICT (symbol, horizon, computed_at_ms) DO NOTHING
+               RETURNING id""",
+            str(span["symbol"]).upper(), str(span["horizon"]).lower(),
+            span.get("run_id"),
+            int(span.get("schema_version") or 1),
+            str(span.get("regime") or "native"),
+            str(span.get("status") or "insufficient"),
+            int(span.get("computed_at_ms") or 0),
+            json.dumps(_json_safe(span)),
+        )
+        return row is not None
+
+    async def latest_horizon_span(
+        self, symbol: str, horizon: str,
+    ) -> dict[str, Any] | None:
+        """Durable read: latest span for (symbol, horizon) + guard."""
+        from market_service.runtime.horizon_spans import guard_span
+
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            "SELECT span FROM horizon_span WHERE symbol = $1 AND horizon = $2 "
+            "ORDER BY computed_at_ms DESC LIMIT 1",
+            symbol.upper(), horizon.lower(),
+        )
+        if row is None:
+            return None
+        raw = row["span"]
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        return guard_span(payload)
+
     async def read_inference_history(
         self, symbol: str, limit: int = 50,
     ) -> list[dict[str, Any]]:

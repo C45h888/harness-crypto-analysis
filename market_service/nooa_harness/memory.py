@@ -97,6 +97,7 @@ class MemoryNode:
         importance: float = 5.0,
         tags: tuple[str, ...] = (),
         evidence_refs: tuple[str, ...] = (),
+        segment: str | None = None,
     ) -> AgentMemory:
         """Create and persist one agent memory. Returns the stored memory."""
         memory = AgentMemory(
@@ -104,6 +105,7 @@ class MemoryNode:
             kind=kind,
             content=content,
             run_id=str(run_id) if run_id else None,
+            segment=str(segment) if segment else None,
             title=title,
             importance=importance,
             tags=tuple(tags),
@@ -136,6 +138,7 @@ class MemoryNode:
         *,
         kind: str | None = None,
         run_id: str | None = None,
+        segment: str | None = None,
         query: str | None = None,
         limit: int = 16,
         redis_first: bool = True,
@@ -147,6 +150,9 @@ class MemoryNode:
         ``query`` is given the recalled set is keyword-scored (recency order
         ties broken by importance) so the analyst sees the most relevant
         prior conclusions first.
+
+        ``segment`` scopes recall to one task segment (state redistribution);
+        ``None`` keeps legacy unsegmented recall.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
@@ -157,12 +163,16 @@ class MemoryNode:
                 memories = [m for m in memories if m.kind == kind]
             if run_id is not None:
                 memories = [m for m in memories if m.run_id == run_id]
+            if segment is not None:
+                memories = [m for m in memories if m.segment == segment]
         if not memories:
             memories = await self.postgres.read_recent_memories(
                 session_id, kind=kind, limit=limit * 2,
             )
             if run_id is not None:
                 memories = [m for m in memories if m.run_id == run_id]
+            if segment is not None:
+                memories = [m for m in memories if m.segment == segment]
         if query:
             q = _keywords(query)
             scored = []

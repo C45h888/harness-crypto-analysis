@@ -9,7 +9,8 @@ from typing import Any
 
 from market_service.runtime.contracts import InferenceArtifact
 from . import context
-from .. import narration as narration_mod
+from ..schemas import extract_json_object
+from ..controller import scenario_verdict as _scenario_verdict
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..kb import build_task_workflow, chain_status
 from ..loop_states import NestedLoop, SubLoop
@@ -87,7 +88,7 @@ async def run_output(
         raw_compose = await engine._call_llm(compose_prompt)
         llm_calls += 1
         passes_per_loop["output"] = passes_per_loop.get("output", 0) + 1
-        maybe_composed = narration_mod.extract_json_object(raw_compose)
+        maybe_composed = extract_json_object(raw_compose)
         if isinstance(maybe_composed, dict):
             if maybe_composed.pop("tool_calls", None):
                 log.warning("output pass: tool_calls dropped (non-agentic)")
@@ -157,7 +158,7 @@ async def run_output(
     # turn, and the verdict must not depend on narration surviving).
     scenario_verdict: tuple[str, str] | None = None
     if scenario is not None:
-        scenario_verdict = narration_mod.scenario_verdict(
+        scenario_verdict = _scenario_verdict(
             tool_results.get("calc.scenario.evaluate"), capability_log,
             gate_status, list(gate_reasons),
         )

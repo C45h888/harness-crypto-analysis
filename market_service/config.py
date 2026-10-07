@@ -125,6 +125,12 @@ class Settings:
         "large_usd": 50_000.0,
         "medium_usd": 10_000.0,
     })
+    # Phase H1 — raw-stream time-based retention (docs/HORIZON_RETENTION_SPEC.md).
+    # The raw evidence stream is trimmed by MINID (now - retention), not by
+    # count: the time horizon must be predictable in an unbounded market.
+    # 12h serves the widest declared worker horizon (4h) with 3x margin for
+    # poller gaps / cold-start backfill.
+    redis_raw_retention_ms: int = 43_200_000
     wall_scorecard_weights: dict[str, float] = field(default_factory=lambda: {
         # Each weight scales the corresponding factor's raw contribution
         # (0 / 1 / 2 from the legacy ladder). Default weight 1.0
@@ -192,6 +198,7 @@ class Settings:
             redis_url=redis_url,
             redis_key_prefix=os.getenv("REDIS_KEY_PREFIX", "marketflow"),
             redis_stream_maxlen=_positive_int("REDIS_STREAM_MAXLEN", 1200),
+            redis_raw_retention_ms=_positive_int("RAW_RETENTION_MS", 43_200_000),
             wall_history_maxlen=_positive_int("WALL_HISTORY_MAXLEN", 200),
             symbols=symbols,
             poll_symbols=poll_env or symbols,

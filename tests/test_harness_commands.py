@@ -68,7 +68,7 @@ class HarnessParserTests(unittest.TestCase):
 class HarnessRouteDispatchTests(unittest.TestCase):
     """``main()`` routes flags to the right handler without running anything."""
 
-    @patch("market_service.commands.harness._read_substrates",
+    @patch("market_service.interaction_plane.cli._read_substrates",
            new_callable=AsyncMock)
     def test_default_routes_to_substrate_snapshot(self, mock_read):
         """Default (no flags) reads the warm-plane snapshot.
@@ -78,7 +78,12 @@ class HarnessRouteDispatchTests(unittest.TestCase):
         state, it never computes.
         """
         from market_service.commands.harness import main
-        mock_read.return_value = {"symbol": "SOLUSDT", "substrates": {}}
+        mock_read.return_value = (
+            {"tool": "substrate.read", "status": "ok", "reason": None,
+             "data": {"symbol": "SOLUSDT", "substrates": {}},
+             "null_fields": [], "budget_receipt": {"truncated": False}},
+            "redis",
+        )
         rc = main(["SOLUSDT", "--json"])
         self.assertEqual(rc, 0)
         mock_read.assert_awaited_once()
@@ -230,36 +235,39 @@ class HarnessReadMarketHandlerTests(unittest.IsolatedAsyncioTestCase):
         from tests._nooa_fixtures import _SAMPLE_ENVELOPE
 
         env = dict(_SAMPLE_ENVELOPE)
-        with patch("market_service.runtime.read_paths"
-                   ".read_collated_with_fallback") as m_read, \
-             patch("market_service.commands.harness.RedisRuntimeStore") as m_redis, \
-             patch("market_service.commands.harness.Settings") as m_settings:
-            m_settings.from_redis_env.return_value.database_url = None
-            m_redis.return_value.close = AsyncMock()
-            async def _r(redis, postgres, *, symbol=None, run_id=None):
-                self.assertIsNone(postgres)  # no DATABASE_URL -> pg not opened
-                return env, "redis"
-            m_read.side_effect = _r
-            result = await _read_market(self._args(), "snapshot")
-        self.assertEqual(result["source"], "redis")
-        self.assertEqual(result["mode"], "snapshot")
-        self.assertIn("read", result)
-        self.assertNotIn("errors", result)
+        with patch("market_service.interaction_plane.reads.read_ledger") as m_ledger:
+            async def _ledger(symbol, *, run_id=None, mode="snapshot",
+                              include_errors=False):
+                from market_service.runtime import read_paths as _rp
+                return ({
+                    "symbol": symbol, "run_id": env.get("run_id"),
+                    "source": "redis", "mode": mode,
+                    "read": _rp.market_snapshot(env),
+                }, "redis", None)
+            m_ledger.side_effect = _ledger
+            result, source = await _read_market(self._args(), "snapshot")
+        self.assertEqual(source, "redis")
+        self.assertEqual(result["tool"], "market.read")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("data", result)
+        self.assertIn("budget_receipt", result)
+        self.assertIn("read", result["data"])
 
-    async def test_empty_read_returns_null_source_and_errors(self):
-        with patch("market_service.runtime.read_paths"
-                   ".read_collated_with_fallback") as m_read, \
-             patch("market_service.commands.harness.RedisRuntimeStore") as m_redis, \
-             patch("market_service.commands.harness.Settings") as m_settings:
-            m_settings.from_redis_env.return_value.database_url = None
-            m_redis.return_value.close = AsyncMock()
-            async def _r(redis, postgres, *, symbol=None, run_id=None):
-                return None, None
-            m_read.side_effect = _r
-            result = await _read_market(self._args(), "snapshot")
-        self.assertIsNone(result["source"])
-        self.assertIsNone(result["read"])
-        self.assertTrue(result["errors"])
+    async def test_empty_read_returns_empty_envelope(self):
+        with patch("market_service.interaction_plane.reads.read_ledger") as m_ledger, \
+             patch("market_service.interaction_plane.reads.read_surfaces") as m_surfaces:
+            async def _ledger(symbol, *, run_id=None, mode="snapshot",
+                              include_errors=False):
+                return None, None, None
+            m_ledger.side_effect = _ledger
+            m_surfaces.return_value = {
+                "symbol": "SOLUSDT", "surfaces": [],
+                "available_surfaces": [], "read_tools": {},
+            }
+            result, source = await _read_market(self._args(), "snapshot")
+        self.assertIsNone(source)
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["tool"], "market.read")
 
 
 if __name__ == "__main__":

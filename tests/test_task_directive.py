@@ -164,8 +164,10 @@ class GatherWiringTests(unittest.TestCase):
 
         engine, _store, _postgres, _memory = _engine(llm_responses=[])
         with patch.object(core.context, "execute_tool", side_effect=spy_execute):
-            ctx = engine.run_wake(_wake(), {"decision": "fire"}, task, None)
-            await core.gather.run_gather(engine, ctx)
+            ctx = core.wake.run_wake(engine, _wake(), {"decision": "fire"}, task, None)
+            await core.gather.run_bootstrap(engine, ctx)
+            st, _ = await core.wake.run_comprehension(engine, ctx)
+            await core.gather.run_plan_bound_acquisition(engine, ctx, st)
         return dispatched
 
     def test_native_target_task_pre_acquires_scenario_at_directive_horizon(self):
@@ -190,7 +192,7 @@ class DirectiveVerdictReadTests(unittest.TestCase):
     """Task-conformance read (validator home, pure)."""
 
     def test_directive_path_citation_detected(self):
-        from market_service.nooa_harness.engine.narration import has_directive_verdict
+        from market_service.nooa_harness.engine.core.reasoning import has_directive_verdict
         self.assertTrue(has_directive_verdict({"evidence": [
             {"path": "deterministic_state.task_directive.targets[0]", "value": "220"}]}))
         self.assertTrue(has_directive_verdict({"evidence": [

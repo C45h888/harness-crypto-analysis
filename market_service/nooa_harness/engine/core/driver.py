@@ -1,4 +1,14 @@
-"""InferenceEngine — loop-walk runtime shell."""
+"""InferenceEngine — handle bag + transport (owns no order, no stages).
+
+The outer loop lives in ``core.runner`` (stage order, denial membrane,
+durable writes). Loop bodies live in ``core.wake`` / ``gather`` /
+``reasoning`` / ``output``. Legality lives in ``engine.fsm`` /
+``engine.controller``. This class holds engine state (symbol, venue,
+session, stores, memory, LLM client), transport primitives (``_call_llm``,
+dispatch rounds, snapshot reads), lifecycle (``close``), and pure forwards
+to the canonical owners. Enforced boundary: this module imports no loop
+body module — only ``runner`` (outer loop) and ``wake`` (INTAKE forwards).
+"""
 
 from __future__ import annotations
 
@@ -19,18 +29,16 @@ from .context import (
 )
 from ..controller import CycleController
 from ..fsm import GOVERNANCE_MEMBRANE, GovernanceEvent, GovernanceEventKind
-from . import gather, output, reasoning
+from . import runner
+from . import wake as wake_mod
 from .. import kb
 from ..kb import (
     SystemPromptCache,
     build_output_format,
     build_system_prompt,
 )
-from ..narration import (
-    coerce_turn,
-    extract_json_object,
-    next_uncovered_phase,
-)
+from ..schemas import coerce_turn, extract_json_object
+from ..controller import next_uncovered_phase
 from ..loop_states import NestedLoop, SubLoop, TaskIntent
 from .chain import (
     FORWARD_SCENARIO_TOOL,
@@ -150,37 +158,13 @@ class InferenceEngine:
         }
 
     async def acquire_manual_wake(self, task: str | None = None) -> tuple[WakeEnvelope, dict[str, Any]]:
-        """Synthesize a MANUAL wake (the CLI ``--force`` trigger — the only trigger).
+        """Synthesize a MANUAL wake (the CLI ``--force`` trigger).
 
-        The human trigger IS the invocation — no predicate evaluation, no
-        loop, no worker. A directly-injected envelope (caller-constructed)
-        bypasses this entirely and goes straight to ``narrate_cycle``.
-
-        ``task`` is the interactive-plane directive (trade hypothesis prompt
-        from ``harness.py --task``). It is carried on the manual predicates
-        (truncated preview) so the firing is attributable, and threaded
-        separately into ``narrate_cycle`` for full prompt steering.
+        Pure forward — canonical ownership lives in
+        ``core.wake.build_manual_wake`` (INTAKE plane). This handle owns
+        no logic.
         """
-        snapshot = await self.collect_snapshot()
-        predicates: dict[str, Any] = {"manual": {}}
-        if task:
-            predicates["manual"] = {"task_preview": task[:200]}
-        envelope = WakeEnvelope.create(
-            symbol=self.symbol, venue=self.venue, trigger_source="manual",
-            predicates_fired=predicates,
-            counter_snapshot={
-                "event_stream_len": snapshot["event_stream_len"],
-                "capture_state": snapshot["capture_state"],
-                "last_artifact_events_total": snapshot["last_artifact_events_total"],
-            },
-            high_water={
-                "events_total": snapshot["last_artifact_events_total"],
-                "completed_at_ms": snapshot["last_artifact_completed_at_ms"],
-            },
-        )
-        return envelope, {"decision": "fire", "forced": True,
-                          "source": "manual",
-                          "consumed_wake_ids": [envelope.wake_id]}
+        return await wake_mod.build_manual_wake(self, task)
 
     @staticmethod
     def _prior_headline(prior: dict[str, Any] | None) -> dict[str, Any]:
@@ -211,14 +195,21 @@ class InferenceEngine:
     # Memory (episodic layer)
     # ------------------------------------------------------------------
 
-    async def _recall_memory(self) -> tuple[list[Any], str]:
-        """Recall the engine's own prior conclusions, rendered as a block."""
+    async def _recall_memory(
+        self, *, segment: str | None = None,
+    ) -> tuple[list[Any], str]:
+        """Recall the engine's own prior conclusions, rendered as a block.
+
+        ``segment`` scopes recall to one task segment (state redistribution);
+        ``None`` keeps legacy unsegmented recall.
+        """
         if self.memory is None:
             return [], ""
         try:
             query = f"{self.symbol} beta fit regime capture"
             memories = await self.memory.recall(
-                self.session_id, query=query, limit=MEMORY_RECALL_LIMIT,
+                self.session_id, query=query, segment=segment,
+                limit=MEMORY_RECALL_LIMIT,
             )
         except Exception:
             log.exception("memory recall failed; continuing without memory")
@@ -371,22 +362,35 @@ class InferenceEngine:
                     round_results[canonical] = None
                     continue
             expected_loop = {
-                "evidence": NestedLoop.EVIDENCE,
+                "evidence": NestedLoop.CONTEXT,
+                "context": NestedLoop.CONTEXT,
                 "reasoning": NestedLoop.REASONING,
                 "validation": NestedLoop.VALIDATION,
             }.get(st.loop_tag, NestedLoop.REASONING)
             expected_sub_loop = {
                 "evidence": SubLoop.ACQUISITION,
+                "context": SubLoop.ACQUISITION,
                 "reasoning": SubLoop.ANALYSIS,
                 "validation": SubLoop.RECOVERY,
             }.get(st.loop_tag)
             # The dispatch registry owns the allowed work homes; the FSM owns
             # whether the current observation is one of them.  A model cannot
             # move a tool into a convenient phase by naming it differently.
+            # Legacy home names (comprehension/evidence) resolve to the merged
+            # CONTEXT loop so no registry string rewrite is required.
+            _legacy_loop_names = {
+                "comprehension": NestedLoop.CONTEXT,
+                "evidence": NestedLoop.CONTEXT,
+            }
             authorization = None
             for home_loop, home_sub_loop in tool_homes(canonical):
+                home_nested_loop = _legacy_loop_names.get(home_loop)
+                if home_nested_loop is None:
+                    try:
+                        home_nested_loop = NestedLoop(home_loop)
+                    except ValueError:
+                        continue
                 try:
-                    home_nested_loop = NestedLoop(home_loop)
                     home_sub_loop_enum = SubLoop(home_sub_loop)
                 except ValueError:
                     continue
@@ -545,7 +549,7 @@ class InferenceEngine:
         # composers.
         user_prompt_next = kb.compose_followup_prompt(
             controller=st.controller,
-            loop=st.loop_tag,
+            loop=("context" if st.loop_tag == "evidence" else st.loop_tag),
             sub_loop=("acquisition" if st.loop_tag == "evidence"
                       else "analysis" if st.loop_tag == "reasoning"
                       else "recovery"),
@@ -682,118 +686,11 @@ class InferenceEngine:
     ) -> tuple[InferenceArtifact, dict[str, Any]]:
         """One narration cycle — READ-PLANE, envelope-driven.
 
-        The controller receives the envelope (task, scenario, wake identity)
-        and hands it to the agent via the comprehension pass. The agent then reads as it
-        pleases through the tool base — calc.*/substrate.*/market.*/memory.*
-        read tools — to complete its task; the controller classifies every
-        outcome and the loop persists the artifact. NO deterministic spine is
-        pre-computed here; only the two pre-gate reads serving the zero-token
-        gate contract precede narration.
-
-        ``task`` is the interactive-plane directive: a free-text trade
-        hypothesis / question from the harness caller (``harness.py --task``
-        or ``nooa market inference run --task``). It steers narration — the
-        TASK block opens user_prompt_1 and is repeated on follow-up/repair
-        turns so every phase answers it — and is persisted on
-        ``deterministic_state["task"]`` plus the wake capability detail.
-        ``None`` preserves the legacy autonomous behaviour (agent frames its
-        own generic H0/H1, as seen in pre-task artifacts).
-        ``scenario`` is ``{"target_price": str, "horizon": "15m|1h|4h"}``
-        (CLI ``--target/--horizon``): the 'can price hit X?' level, persisted
-        on ``deterministic_state["scenario"]`` and echoed in the prompt so
-        Phase 3 semantics can evaluate it via ``calc.scenario.evaluate``.
+        Pure forward — the outer loop lives in ``core.runner.narrate_cycle``.
+        This handle owns no order, no stages, no denial handling. See the
+        runner for the ``task``/``scenario`` contract.
         """
-        ctx = self.run_wake(wake, wake_meta, task, scenario)
-        try:
-            completed = await gather.run_gather(self, ctx)
-            if completed is not None:
-                return completed
-            st, completed = await reasoning.run_comprehension(self, ctx)
-            if completed is not None:
-                return completed
-            assert st is not None
-            completed = await reasoning.run_evidence(self, ctx, st)
-            if completed is not None:
-                return completed
-            completed = await reasoning.run_reasoning(self, ctx, st)
-            if completed is not None:
-                return completed
-            completed = await reasoning.run_validation(self, ctx, st)
-            if completed is not None:
-                return completed
-            return await output.run_output(self, ctx)
-        except context.GovernanceDenied as exc:
-            # A governance denial is an infrastructure/contract failure, not
-            # permission to continue under an invented observation.  Preserve
-            # the denial beside the deterministic state and terminate through
-            # the canonical FSM failure route.  The exception carries the
-            # immutable controller successor so the denial trace survives.
-            if exc.controller is not None:
-                ctx.controller = exc.controller
-            ctx.controller = ctx.controller.advance(
-                GovernanceEvent(GovernanceEventKind.INFRA_FAILED)
-            )
-            state = (
-                ctx.gathered.deterministic_state
-                if ctx.gathered is not None
-                else {"task": task, "scenario": scenario}
-            )
-            terminal = ctx.controller.terminal.value if ctx.controller.terminal else "infra_failed"
-            state["terminal"] = terminal
-            state["governance_denial"] = str(exc)
-            state["governance_trace"] = ctx.controller.transition_trace()
-            artifact = await self._degraded_artifact(
-                state, ctx.capability_log, f"governance_denied: {exc}",
-            )
-            return artifact, {
-                "task": task[:200] if task else None,
-                "scenario": scenario,
-                "terminal": terminal,
-                "governance_denial": str(exc),
-            }
-
-    def run_wake(
-        self, wake: WakeEnvelope, wake_meta: dict[str, Any],
-        task: str | None, scenario: dict[str, Any] | None,
-    ) -> _CycleContext:
-        """Initialize the envelope and governed controller (WAKE seam)."""
-        generated_at = context._utc_now_iso()
-        capability_log: list[dict[str, Any]] = [{
-            "capability": "engine.wake",
-            "scope": {"symbol": self.symbol, "venue": self.venue},
-            "result": "ok",
-            "detail": {
-                "trigger_source": wake.trigger_source,
-                "predicates_fired": wake.predicates_fired,
-                "decision": wake_meta.get("decision"),
-                "consumed_wake_ids": wake_meta.get("consumed_wake_ids", []),
-                "task": task[:200] if task else None,
-                "scenario": scenario,
-            },
-        }]
-
-        # --- CYCLE CONTROLLER (constructed at wake, immutable from here) ---
-        # The controller is the loop's sole semantic authority. It RECEIVES
-        # the envelope: cycle context (task, scenario, wake identity) enters
-        # its ledger, it hands the envelope to the agent via narrate#1, and
-        # every outcome the agent produces is classified by IT alone. Every
-        # transition returns a NEW immutable controller; ``controller`` is
-        # rebound in place at each step.
-        #
-        # GOVERNANCE: the controller SITS UNDER the governing membrane. It is
-        # built with GOVERNANCE_MEMBRANE and the initial observation
-        # (COMPREHENSION / UNDERSTAND_TASK) — the membrane's legality governs
-        # every subsequent move.
-        controller = (
-            CycleController(scenario)
-            .with_membrane(GOVERNANCE_MEMBRANE)
-            .with_observation(GOVERNANCE_MEMBRANE.initial())
-        )
-
-        return _CycleContext(
-            wake=wake, task=task, scenario=scenario, generated_at=generated_at,
-            controller=controller, capability_log=capability_log,
-        )
+        return await runner.narrate_cycle(self, wake, wake_meta, task, scenario)
 
     async def _degraded_artifact(
         self,
@@ -801,93 +698,19 @@ class InferenceEngine:
         capability_log: list[dict[str, Any]],
         error: str,
     ) -> InferenceArtifact:
-        """Narration-failure artifact: deterministic state preserved, interpretation NULL."""
-        artifact = InferenceArtifact.create(
-            symbol=self.symbol, venue=self.venue,
-            generated_at=context._utc_now_iso(), completed_at=context._utc_now_iso(),
-            status="provisional", window_minutes=30, interval_seconds=10,
-            deterministic_state=deterministic_state,
-            capability_log=capability_log,
-            input_hash=str(
-                (deterministic_state.get("forecast_result") or {}).get("input_hash")
-                or (deterministic_state.get("microstructure_evidence") or {}).get("input_hash")
-                or "narration-failed"
-            ),
-            model_version=str(
-                (deterministic_state.get("forecast_result") or {}).get("model_version")
-                or "inference-engine-v1"
-            ),
-            interpretation=None,
-            session_id=self.session_id,
-            errors=[{"source": "narration", "error": error}],
-        )
-        await self._persist(artifact)
-        return artifact
+        """Pure forward — implementation lives in ``core.runner``."""
+        return await runner.degraded_artifact(
+            self, deterministic_state, capability_log, error)
 
     async def _persist(self, artifact: InferenceArtifact) -> dict[str, Any]:
-        """Write the pending artifact to the durable authority first.
-
-        Postgres is the canonical durable ledger.  Redis is published only
-        after the primary write succeeds; a projection failure therefore
-        cannot create a live artifact that has no durable source.
-        """
-        persistence: dict[str, Any] = {
-            "postgres": self.postgres is None,
-            "redis": False,
-            "projection_error": None,
-        }
-        if self.postgres is not None:
-            try:
-                persistence["postgres"] = bool(
-                    await self.postgres.insert_inference_artifact(artifact)
-                )
-            except Exception as exc:
-                log.exception("postgres artifact insert failed")
-                persistence["postgres_error"] = f"{type(exc).__name__}: {exc}"
-        if not persistence["postgres"]:
-            persistence["redis_skipped"] = True
-            return persistence
-        try:
-            await self.store.publish_inference_artifact(artifact)
-            persistence["redis"] = True
-        except Exception as exc:
-            log.exception("redis artifact publish failed")
-            persistence["projection_error"] = f"{type(exc).__name__}: {exc}"
-        return persistence
+        """Pure forward — implementation lives in ``core.runner``."""
+        return await runner.persist_artifact(self, artifact)
 
     async def _finalize_persisted(
         self, artifact: InferenceArtifact,
     ) -> dict[str, Any]:
-        """Finalize the pending durable row and refresh its Redis projection.
-
-        The production Postgres adapter exposes an update seam.  The small
-        fallback is retained for lightweight injected test doubles that only
-        implement the historical insert contract; production never uses it.
-        """
-        result: dict[str, Any] = {"postgres": False, "redis": False}
-        if self.postgres is None:
-            result["postgres"] = True
-        else:
-            updater = getattr(self.postgres, "update_inference_artifact", None)
-            if updater is None:
-                # Compatibility for injected legacy fakes; the real adapter
-                # is required to implement the update method.
-                result["postgres"] = True
-            else:
-                try:
-                    result["postgres"] = bool(await updater(artifact))
-                except Exception as exc:
-                    log.exception("postgres artifact finalization failed")
-                    result["postgres_error"] = f"{type(exc).__name__}: {exc}"
-        if not result["postgres"]:
-            return result
-        try:
-            await self.store.publish_inference_artifact(artifact)
-            result["redis"] = True
-        except Exception as exc:
-            log.exception("redis finalized projection failed")
-            result["redis_error"] = f"{type(exc).__name__}: {exc}"
-        return result
+        """Pure forward — implementation lives in ``core.runner``."""
+        return await runner.finalize_persisted(self, artifact)
 
     async def close(self) -> None:
         await self.store.close()

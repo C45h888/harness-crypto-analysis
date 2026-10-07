@@ -119,8 +119,32 @@ async def build_raw_window(
     raw_fut_count = sum(len(s.get("futures", {}).get("trades_normalized") or []) for s in snapshots)
     latest_observed_ms = latest.get("observed_at_ms")
     now_ms = int(time.time() * 1000)
+
+    # Phase H1 — retention honesty (docs/HORIZON_RETENTION_SPEC.md §1.4).
+    # The MINID trim evicts old entries by CLOCK, so a requested window can
+    # legitimately exceed what the stream still holds. Measure the ACTUAL
+    # earliest observable time and mark the window degraded when the stream
+    # cannot cover the requested window start — a window is honest or it is
+    # not returned. Slack absorbs one poller cadence of entry-id/snapshot
+    # timestamp jitter (stream entry ids are write-time, observed_at_ms is
+    # exchange time; the two can differ by seconds).
+    _RETENTION_SLACK_MS = 15_000
+    try:
+        oldest_entry_ms = await redis.read_raw_oldest_ms(symbol)
+    except Exception:
+        oldest_entry_ms = None  # diagnostics-only seam must never fail a window
+    requested_since_ms = now_ms - window_minutes * 60_000
+    horizon_degraded = (
+        oldest_entry_ms is not None
+        and oldest_entry_ms > requested_since_ms + _RETENTION_SLACK_MS
+    )
     coverage = {
         "requested_window_seconds": window_minutes * 60,
+        "requested_since_ms": requested_since_ms,
+        "retention": {
+            "oldest_entry_ms": oldest_entry_ms,
+            "horizon_degraded": horizon_degraded,
+        },
         "snapshots_used": len(snapshots),
         "latest_observed_at_ms": latest_observed_ms,
         "stream_staleness_ms": (
@@ -130,6 +154,11 @@ async def build_raw_window(
         "spot_trades": _trade_coverage(spot_trades, raw_spot_count),
         "futures_trades": _trade_coverage(fut_trades, raw_fut_count),
     }
+    if horizon_degraded:
+        coverage["horizon_note"] = (
+            f"stream oldest entry {oldest_entry_ms} is newer than requested "
+            f"window start {requested_since_ms} — window truncated by retention"
+        )
 
     return {
         # Evidence time: when the source snapshot was observed, not when the

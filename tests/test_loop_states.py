@@ -67,7 +67,7 @@ class StageTraversalTests(unittest.TestCase):
     def test_stage_order_shape(self):
         self.assertEqual(
             [s.value for s in STAGE_ORDER],
-            ["wake", "gather", "reason", "check", "finalize"],
+            ["context", "reason", "check", "finalize"],
         )
 
     def test_stage_loop_is_injective(self):
@@ -75,8 +75,8 @@ class StageTraversalTests(unittest.TestCase):
         self.assertEqual(len(set(STAGE_LOOP.values())), len(AgenticStage))
 
     def test_stage_loop_expected_wiring(self):
-        self.assertIs(STAGE_LOOP[AgenticStage.WAKE], NestedLoop.COMPREHENSION)
-        self.assertIs(STAGE_LOOP[AgenticStage.GATHER], NestedLoop.EVIDENCE)
+        self.assertIs(STAGE_LOOP[AgenticStage.CONTEXT], NestedLoop.CONTEXT)
+        self.assertIs(STAGE_LOOP[AgenticStage.CONTEXT], NestedLoop.CONTEXT)
         self.assertIs(STAGE_LOOP[AgenticStage.REASON], NestedLoop.REASONING)
         self.assertIs(STAGE_LOOP[AgenticStage.CHECK], NestedLoop.VALIDATION)
         self.assertIs(STAGE_LOOP[AgenticStage.FINALIZE], NestedLoop.OUTPUT)
@@ -89,10 +89,10 @@ class StageTraversalTests(unittest.TestCase):
 
 
 class NestedLoopTests(unittest.TestCase):
-    def test_loops_are_the_five_modes(self):
+    def test_loops_are_the_four_modes(self):
         self.assertEqual(
             {l.value for l in NestedLoop},
-            {"comprehension", "evidence", "reasoning", "validation", "output"},
+            {"context", "reasoning", "validation", "output"},
         )
 
     def test_persistence_is_renamed_output(self):
@@ -111,12 +111,9 @@ class SubLoopTests(unittest.TestCase):
 
     def test_expected_subloop_wiring(self):
         self.assertEqual(
-            sub_loops_for(NestedLoop.COMPREHENSION),
-            (SubLoop.INTAKE, SubLoop.INTERPRETATION, SubLoop.FRAMING),
-        )
-        self.assertEqual(
-            sub_loops_for(NestedLoop.EVIDENCE),
-            (SubLoop.SOURCING, SubLoop.ACQUISITION, SubLoop.VERIFICATION),
+            sub_loops_for(NestedLoop.CONTEXT),
+            (SubLoop.INTAKE, SubLoop.INTERPRETATION, SubLoop.FRAMING,
+             SubLoop.SOURCING, SubLoop.ACQUISITION, SubLoop.VERIFICATION),
         )
         self.assertEqual(
             sub_loops_for(NestedLoop.REASONING),
@@ -221,8 +218,7 @@ class PrimarySubLoopTests(unittest.TestCase):
             self.assertIs(primary_sub_loop(loop), sub_loop)
 
     def test_expected_primary_wiring(self):
-        self.assertIs(primary_sub_loop(NestedLoop.COMPREHENSION), SubLoop.INTERPRETATION)
-        self.assertIs(primary_sub_loop(NestedLoop.EVIDENCE), SubLoop.ACQUISITION)
+        self.assertIs(primary_sub_loop(NestedLoop.CONTEXT), SubLoop.ACQUISITION)
         self.assertIs(primary_sub_loop(NestedLoop.REASONING), SubLoop.ANALYSIS)
         self.assertIs(primary_sub_loop(NestedLoop.VALIDATION), SubLoop.RECOVERY)
         self.assertIs(primary_sub_loop(NestedLoop.OUTPUT), SubLoop.PLACEMENT)
@@ -238,8 +234,8 @@ class IteratingSubLoopTests(unittest.TestCase):
 
     def test_evidence_iterating_core(self):
         self.assertEqual(
-            iterating_sub_loops(NestedLoop.EVIDENCE),
-            (SubLoop.ACQUISITION, SubLoop.VERIFICATION),
+            iterating_sub_loops(NestedLoop.CONTEXT),
+            (SubLoop.INTERPRETATION, SubLoop.ACQUISITION, SubLoop.VERIFICATION),
         )
 
     def test_validation_recovery_iterates(self):
@@ -278,7 +274,7 @@ class TaskIntentTests(unittest.TestCase):
             self.assertIs(sub_loop_for_intent(intent), INTENT_SUBLOOP[intent])
 
     def test_expected_intent_wiring(self):
-        self.assertIs(loop_for_intent(TaskIntent.INFER_ORDER_FLOW), NestedLoop.EVIDENCE)
+        self.assertIs(loop_for_intent(TaskIntent.INFER_ORDER_FLOW), NestedLoop.CONTEXT)
         self.assertIs(sub_loop_for_intent(TaskIntent.INFER_ORDER_FLOW), SubLoop.ACQUISITION)
         self.assertIs(loop_for_intent(TaskIntent.VALIDATE_FINAL), NestedLoop.VALIDATION)
         self.assertIs(sub_loop_for_intent(TaskIntent.VALIDATE_FINAL), SubLoop.GATE)
@@ -339,7 +335,7 @@ class TerminalTests(unittest.TestCase):
 
 class LoopObservationTests(unittest.TestCase):
     def test_observation_defaults_to_no_subloop(self):
-        obs = LoopObservation(NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH)
+        obs = LoopObservation(NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH)
         self.assertIsNone(obs.sub_loop)
 
     def test_observation_carries_subloop(self):
@@ -352,14 +348,14 @@ class LoopObservationTests(unittest.TestCase):
 
     def test_observation_is_frozen(self):
         obs = LoopObservation(
-            NestedLoop.EVIDENCE, TaskIntent.INFER_ORDER_FLOW, SubLoop.ACQUISITION
+            NestedLoop.CONTEXT, TaskIntent.INFER_ORDER_FLOW, SubLoop.ACQUISITION
         )
         with self.assertRaises(Exception):
             obs.sub_loop = SubLoop.VERIFICATION  # type: ignore[misc]
 
     def test_observation_equality_and_hash(self):
-        a = LoopObservation(NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH, SubLoop.SOURCING)
-        b = LoopObservation(NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH, SubLoop.SOURCING)
+        a = LoopObservation(NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH, SubLoop.SOURCING)
+        b = LoopObservation(NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH, SubLoop.SOURCING)
         self.assertEqual(a, b)
         self.assertEqual(hash(a), hash(b))
 

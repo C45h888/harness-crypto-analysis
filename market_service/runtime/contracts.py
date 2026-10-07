@@ -24,6 +24,15 @@ WAKE_ENVELOPE_SCHEMA_VERSION = 1
 # requests, briefings — plus 'fact'/'note' for durable analyst notes.
 ValidMemoryKinds: tuple[str, ...] = (
     "observation", "hypothesis", "request", "briefing", "fact", "note",
+    # Loop-internal carry kinds (agentic-surface state redistribution). These
+    # are written by the runtime between loops, not proposed by the LLM:
+    #   "understanding" — the frozen comprehension receipt placed at the
+    #       comprehension->acquisition handoff (runner._place_understanding).
+    #   "plan"          — the disposed task plan the acquisition loop is bound
+    #       to (state redistribution: FRAMING -> memory segment).
+    #   "handoff"       — the gathered context package + reasoning needs
+    #       written at the end of acquisition for the reasoning loop.
+    "understanding", "plan", "handoff",
 )
 # Valid wake trigger sources (who materialized the envelope).
 ValidWakeSources: tuple[str, ...] = ("manual", "watcher", "hook")
@@ -586,6 +595,11 @@ class AgentMemory:
     content: str
     memory_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     run_id: str | None = None
+    # Task-scoped memory segment (state redistribution): a deterministic
+    # task id that partitions this memory from other tasks/sessions so the
+    # plan/handoff carry never bleeds across tasks. ``None`` = unsegmented
+    # (legacy rows and LLM-proposed memories).
+    segment: str | None = None
     title: str | None = None
     importance: float = 5.0
     tags: tuple[str, ...] = field(default_factory=tuple)
@@ -628,6 +642,10 @@ class AgentMemory:
                 str(value["run_id"])
                 if value.get("run_id") is not None else None
             ),
+            segment=(
+                str(value["segment"])
+                if value.get("segment") is not None else None
+            ),
             title=(
                 str(value["title"])
                 if value.get("title") is not None else None
@@ -655,6 +673,7 @@ class AgentMemory:
             "content": self.content,
             "memory_id": self.memory_id,
             "run_id": self.run_id,
+            "segment": self.segment,
             "title": self.title,
             "importance": self.importance,
             "tags": list(self.tags),

@@ -1,8 +1,12 @@
-"""Tool registry — names, phases, homes, normalization (extracted verbatim from dispatch.py monolith)."""
+"""Tool registry — names, phases, homes, normalization (extracted verbatim from dispatch.py monolith).
+
+Segment vocabulary is canonical in ``market_service.interaction_plane.segments``
+(inner + outer models share one table; this module owns phases/homes only)."""
 from __future__ import annotations
 
 from typing import Any
 
+from market_service.interaction_plane.segments import SEGMENTS as INTERACTION_SEGMENTS
 from ..capability import CAPABILITIES, CapabilityDenied, capability_log_entry
 
 TOOL_NAMES: dict[str, str] = {

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    SUMMARY_MIN_CHARS,
     AGENTIC_MAX_LLM_TURNS,
     AGENTIC_MAX_TOOL_ROUNDS,
     LOOP_PASS_BUDGET,
@@ -450,7 +451,7 @@ def build_loop_state_block(
             "YOUR COMPREHENSION (binding — conclusions answer it): "
             f"{json_dumps_short(comprehension)}"
         )
-    if seeds and loop == "evidence":
+    if seeds and loop in ("evidence", "context"):
         parts.append(f"SEEDED PLAN (dispose freely): {', '.join(seeds)}.")
     if gate:
         parts.append(f"GATE — {json_dumps_short(gate)}.")
@@ -529,6 +530,7 @@ __all__ = [
     "seed_evidence_plan",
     "build_system_prompt",
     "build_output_format",
+    "PHASE_GUIDANCE",
     # Tool schema exports
     "wrap_tool_result",
 ]
@@ -902,3 +904,50 @@ def compose_repair_prompt(
         "Return the next turn now: declare \"phase\", include the missing tool_calls, "
         "and finalize (tool_calls=[]) only when every missing item is addressed."
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-phase intent + constraints (P1→P6), appended to follow-up turns.
+# Moved from engine/narration.py (Pass-C redistribution): guidance is
+# prompt-layer content composed next to the prompts that carry it.
+# narration.py re-exports this name until its deletion pass.
+# ---------------------------------------------------------------------------
+
+
+PHASE_GUIDANCE: dict[str, str] = {
+    "P1": ("PHASE P1 — OFI INFERENCE: call calc.ofi.intervals "
+           "(and/or micro.ofi_intervals). Judge tape quality: n vs minimum, "
+           "capture gaps, hetero flag. Verdict: is this OFI tape usable or degraded, and why. "
+           "You may vary interval_seconds (10/15/30) and window_minutes (15/30/60) in tool args."),
+    "P2": ("PHASE P2 — AD INFERENCE: call calc.depth.average + "
+           "calc.observation.build (and/or micro.fit_beta, calc.fit.price_impact). "
+           "Judge AD stability and observation count separately from OFI — never merge. "
+           "You may vary interval_seconds/window_minutes in tool args."),
+    "P3": ("PHASE P3 — CORRELATE: substrate.read is the PRIMARY evidence; market.read is context. "
+           "Available means: substrate.* workers (fire-tick invoke, then read), substrate.read, market.read "
+           "plus derivatives/keystone/wall histories as regime context. Work them in whatever order "
+           "answers the correlation — dispatches run sequentially, so order a read after the invoke "
+           "whose projection it must see. Constraints: an invoke is a REQUEST the calculation plane may "
+           "decline (cooldown gates) — available:false, fired:0, invoked:false, unreachable plane, or empty "
+           "upstream are FINDINGS to report and continue from, never reasons to retry, re-invoke, or stall. "
+           "Judge freshness from each projection's own age_ms against its own cadence (in the projection) — "
+           "never one global threshold. Cross-validate P1/P2 against the warm plane; name agreements AND "
+           "contradictions explicitly."),
+    "P4": ("PHASE P4 — EXPLAIN: no new tools required. Write the synthesis: what the fits show "
+           f"(≥{SUMMARY_MIN_CHARS} chars in summary) AND why it is happening now — regime, capture quality, "
+           "flow/positioning drivers. Then proceed to P5."),
+    "P5": ("PHASE P5 — DERIVE the NUMERIC derived ΔP with 95% band (route A direct + route B when c/λ exist). "
+           "Available means: calc.price.delta for the diagnostic; the forward stack (forecast → scenario for "
+           "P(T)/P(S) when calibrated; feature/join/fit/distribution tools as diagnostics); legacy "
+           "calc.scenario.evaluate as a linear flow-requirement scenario; calc.hypothesis.test; "
+           "calc.decay.report for surviving horizons; calc.discipline.audit for the Phase-12 go/no-go. "
+           "Constraints: a refusal (insufficient fit) is a finding, not a failure — report it; hypothesis "
+           "test only after a fit exists (p<0.05 is evidence, never execution); nulls are results."),
+    "P6": ("PHASE P6 — OUTPUT GENERATION (final): no tools. Synthesize the PRIMARY inference output "
+           "strictly from this run's reasoning: H0/H1 verdict, numeric ΔP with band, regime explanation, "
+           "confidence, limitations. Every numeric claim cites its tool path, including a "
+           "calc.price.delta → … path for the ΔP. Return FINAL JSON: tool_calls=[], full summary/evidence/"
+           "confidence/limitations/model_separation/hypothesis{H0,H1,paper_refs,evidence_refs}."),
+}
+
+

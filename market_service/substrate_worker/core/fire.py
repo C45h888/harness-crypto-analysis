@@ -22,6 +22,9 @@ import logging
 import time
 from typing import Any
 
+from market_service.runtime.horizons import (
+    fold_snapshot, fold_state_summary, fold_trades, horizon_minutes,
+)
 from market_service.runtime.raw_window import (
     build_raw_window,
     build_ws_surface,
@@ -79,10 +82,21 @@ class FireMixin(SubstrateBase):
         ws_rows = ws_rows or []
         arrival = bool(rows) or bool(ws_rows)
 
+        # Phase H1 — fold new raw rows into the per-horizon accumulators
+        # BEFORE any decision. The fold is the cadence-layer horizon
+        # identification: every entry the consumer group delivers updates
+        # the IST-aligned segment rings (monotonic-id dedupe inside), so
+        # probes and fires read always-fresh horizon state with zero
+        # history re-scans.
+        if self.horizons:
+            self._fold_rows(rows)
+
         # L4 — cold start: data arrived but no (usable) prior projection.
         if last_state is None:
             if not arrival:
                 return  # nothing to compute from yet; heartbeat continues
+            if self.horizons and not self._horizons_backfilled:
+                await self._backfill_horizons()
             decision = TriggerDecision(fired=True, source="cold_start",
                                        predicates={"consumed_entries": len(rows) + len(ws_rows)})
             await self._fire(decision, last_state, now_ms, high_water=self._high_water(rows or ws_rows))
@@ -110,6 +124,28 @@ class FireMixin(SubstrateBase):
             )
             await self._fire(decision, last_state, now_ms, high_water=self._high_water(rows or ws_rows))
             return
+
+        # L3 — per-horizon staleness (Phase H1): a declared horizon's fold
+        # that has not seen fresh evidence for its OWN bound fires with a
+        # horizon-tagged predicate. Uses trade-time (fold last_trade_ms),
+        # so a silent tape trips the bound even when stream entries arrive.
+        if self.horizons:
+            profile_hz = type(self).CADENCE
+            for hz in self.horizons:
+                bound_s = profile_hz.staleness_for(hz) if profile_hz is not None else self.staleness_s
+                segs = self._horizon_folds[hz]["segments"]
+                newest_fold_ms = max((s.get("last_trade_ms") or 0) for s in segs) if segs else None
+                if newest_fold_ms:
+                    hz_age_ms = now_ms - newest_fold_ms
+                    if hz_age_ms > bound_s * 1_000:
+                        decision = TriggerDecision(
+                            fired=True, source="staleness",
+                            predicates={"horizon": hz, "age_ms": hz_age_ms,
+                                        "staleness_s": bound_s},
+                        )
+                        await self._fire(decision, last_state, now_ms,
+                                         high_water=self._high_water(rows or ws_rows))
+                        return
 
         # L3 — window rollovers: a period boundary crossed between the
         # previous and current batch's newest entries.
@@ -188,6 +224,63 @@ class FireMixin(SubstrateBase):
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def _backfill_horizons(self) -> None:
+        """Cold-start horizon rebuild (Phase H1 §2.5).
+
+        One bounded read of the widened raw retention (never per fire)
+        rebuilds every declared horizon's fold state. The stream's
+        MINID-trimmed history IS the backfill source — this is exactly what
+        time-based retention buys the cadence layer.
+        """
+        try:
+            max_minutes = max(horizon_minutes(hz) for hz in self.horizons)
+            window = await build_raw_window(self.store, self.symbol, max_minutes)
+            for hz in self.horizons:
+                state = self._horizon_folds[hz]
+                for venue in ("spot", "futures"):
+                    trades = ((window.get(venue) or {}).get("trades_normalized")) or []
+                    fold_trades(state, trades, venue)
+            self._horizons_backfilled = True
+            log.info(
+                "substrate %s horizon backfill complete: horizons=%s segments=%s",
+                self.SUBSTRATE_NAME, list(self.horizons),
+                {hz: len(self._horizon_folds[hz]["segments"]) for hz in self.horizons},
+            )
+        except Exception as exc:
+            # Never fail a cold-start fire on backfill; fold state resumes
+            # incrementally and the next cold_start/staleness boundary
+            # retries the rebuild.
+            log.warning("substrate %s horizon backfill failed: %s", self.SUBSTRATE_NAME, exc)
+            self._last_error = f"horizon_backfill: {exc}"
+
+    def _fold_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Fold newly arrived raw stream rows into the horizon folds.
+
+        Runs on EVERY read tick for horizon workers (cheap: monotonic-id
+        dedupe means each trade is folded exactly once per process). Each
+        row's payload is the slimmed raw snapshot — the fold reads only
+        ``trades_normalized``.
+        """
+        if not rows:
+            return
+        for row in rows:
+            fields = row.get("fields") or {}
+            raw = fields.get("payload")
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                snapshot = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(snapshot, dict):
+                continue
+            for hz in self.horizons:
+                state = self._horizon_folds[hz]
+                for venue in ("spot", "futures"):
+                    fold_snapshot(state, snapshot, venue)
+
     async def _build_evidence(self, now_ms: int, *, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Evidence assembly seam — the raw evidence window (calculation plane).
 
@@ -199,8 +292,32 @@ class FireMixin(SubstrateBase):
         window with the high-frequency microstructure WS surface so compute
         aggregates poller + WS as one combined input. WS is best-effort: an
         absent WS surface leaves the REST window intact (pre-WS behavior).
+
+        Phase H1 — horizon workers: when ``HORIZONS`` is declared, each
+        horizon gets its OWN deduped evidence window (built from the
+        widened, time-trimmed raw retention) attached at
+        ``evidence["horizons"][hz]``. Builds share the process-global
+        evidence cache (keyed by symbol+window), so a 4h rebuild happens
+        at most once per cache slice across all workers of the symbol.
         """
         evidence = await build_raw_window(self.store, self.symbol, self.window_minutes)
+        if self.horizons:
+            horizon_windows: dict[str, dict[str, Any]] = {}
+            for hz in self.horizons:
+                minutes = horizon_minutes(hz)
+                if minutes == int(self.window_minutes):
+                    horizon_windows[hz] = evidence
+                    continue
+                key = (self.symbol, minutes, False)
+                cached = _EVIDENCE_CACHE.get(key)
+                now = time.monotonic()
+                if cached is not None and (now - cached[0]) < _EVIDENCE_CACHE_TTL_S:
+                    horizon_windows[hz] = cached[1]
+                    continue
+                built = await build_raw_window(self.store, self.symbol, minutes)
+                _EVIDENCE_CACHE[key] = (time.monotonic(), built)
+                horizon_windows[hz] = built
+            evidence = {**evidence, "horizons": horizon_windows}
         if self.ws_input and "microstructure" in self.INPUT_STREAMS:
             try:
                 ws = await build_ws_surface(
@@ -256,6 +373,29 @@ class FireMixin(SubstrateBase):
             output = self.compute(evidence, self.depth if self.depth is not None else evidence.get("depth_levels") or 20)
             missing: list[str] = []
             status = "healthy"
+            # Phase H1 — extract per-horizon outputs the worker computed
+            # (output["horizons"]) into the payload's horizons block, next
+            # to the persisted fold summaries. Base ``output`` stays the
+            # base-horizon verdict for every existing reader.
+            horizons_block: dict[str, Any] = {}
+            if self.horizons:
+                per_hz = output.get("horizons")
+                per_hz = dict(per_hz) if isinstance(per_hz, dict) else {}
+                if "horizons" in output:
+                    output = {k: v for k, v in output.items() if k != "horizons"}
+                for hz in self.horizons:
+                    horizons_block[hz] = {
+                        "output": per_hz.get(hz) or {},
+                        "fold": fold_state_summary(self._horizon_folds[hz]),
+                    }
+                    # Retention honesty: a horizon window the stream cannot
+                    # cover is DEGRADED evidence — named, never silent.
+                    hz_cov = ((evidence.get("horizons") or {}).get(hz) or {}).get("coverage") or {}
+                    ret = hz_cov.get("retention") or {}
+                    if ret.get("horizon_degraded"):
+                        missing.append(
+                            f"horizon_degraded: {hz} oldest_entry_ms={ret.get('oldest_entry_ms')}"
+                        )
             # Precise provenance: when the derivative cache was missing/stale
             # at fire time, name THAT (not a generic "output empty") so the
             # projection tells the operator which cache surface degraded.
@@ -277,6 +417,7 @@ class FireMixin(SubstrateBase):
                 observed_at_ms=evidence.get("observed_at_ms"),
                 computed_at_ms=now_ms,
                 missing_inputs=missing,
+                horizons=horizons_block or None,
             )
             payload = (
                 payload if status == "healthy"
@@ -398,6 +539,7 @@ class FireMixin(SubstrateBase):
             output=payload.output,
             missing_inputs=tuple(missing),
             provenance=payload.provenance,
+            horizons=payload.horizons,
         )
 
     def _freshness(self, evidence: dict[str, Any], *, high_water: str | None) -> dict[str, Any]:

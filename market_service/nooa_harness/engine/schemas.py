@@ -2,8 +2,9 @@
 
 Semantic authority: STRUCTURE-of-the-narration-contract. This module owns
 the wire-format of one LLM turn (the shape every other module reads and
-writes). It does NOT know how to extract one from raw text (that lives in
-``narration.py``) or how to call the model (that lives in ``llm.py``).
+writes). It knows how to extract one from raw text (``extract_json_object``) and
+normalize it (``coerce_turn``), and how the contract reads — but never
+how to call the model (that lives in ``llm.py``).
 
 The optional pydantic import is preserved: when the SDK is absent the
 narrator falls back to raw JSON, and the schema names become ``None`` so
@@ -12,7 +13,11 @@ callers can branch on availability without try/except at every call site.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 try:
     from pydantic import BaseModel, Field
@@ -60,7 +65,104 @@ class NarrationParseError(ValueError):
 
 
 __all__ = [
+    "coerce_turn",
+    "extract_json_object",
     "NarrationToolCall",
     "NarrationTurn",
     "NarrationParseError",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Wire-format unpacking — raw LLM text into the contract above.
+# Moved from engine/narration.py (Pass-C redistribution); narration.py
+# re-exports these names until its deletion pass.
+# ---------------------------------------------------------------------------
+
+
+def extract_json_object(raw: str) -> dict[str, Any] | None:
+    """Extract the first JSON object from LLM text (fenced or embedded)."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # fenced block first
+    if "```" in raw:
+        for chunk in raw.split("```"):
+            candidate = chunk.strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if candidate.startswith("{"):
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+    # first brace-balanced object
+    start = raw.find("{")
+    while start != -1:
+        depth = 0
+        for idx in range(start, len(raw)):
+            if raw[idx] == "{":
+                depth += 1
+            elif raw[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(raw[start:idx + 1])
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        break
+                    break
+        start = raw.find("{", start + 1)
+    return None
+
+
+
+def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize one narration turn: drop undispatchable tool_calls entries.
+
+    Entries without a non-empty string ``name`` can never dispatch — drop
+    them here (logged) instead of burning a tool round on tool.unknown.
+    Raw-JSON fallbacks (structured output refused) frequently emit the key
+    ``tool`` instead of ``name`` (proven live: a full 8-turn cycle with
+    every call dropped); accept it as an alias, ``name`` winning on
+    conflict. Missing/invalid ``args`` become {}. A non-dict hypothesis
+    is wrapped.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    calls = parsed.get("tool_calls")
+    if calls is None:
+        return parsed
+    if not isinstance(calls, list):
+        parsed["tool_calls"] = []
+        return parsed
+    kept: list[dict[str, Any]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name")
+        if (not isinstance(name, str) or not name.strip()) and isinstance(
+            call.get("tool"), str
+        ) and call.get("tool").strip():
+            name = call.get("tool")
+            log.warning("coercing tool_call key 'tool' → 'name': %.120r", call)
+        if not isinstance(name, str) or not name.strip():
+            log.warning("dropping tool_call without a registry name: %.120r", call)
+            continue
+        args = call.get("args")
+        kept.append({"name": name.strip(),
+                     "args": dict(args) if isinstance(args, dict) else {}})
+    parsed["tool_calls"] = kept
+    hypothesis = parsed.get("hypothesis")
+    if hypothesis is not None and not isinstance(hypothesis, dict):
+        parsed["hypothesis"] = {"raw": hypothesis}
+    return parsed
+
+

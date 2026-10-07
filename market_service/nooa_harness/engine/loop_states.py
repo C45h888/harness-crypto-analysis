@@ -51,15 +51,14 @@ from enum import Enum
 class AgenticStage(str, Enum):
     """The agentic loop's top-level workflow stages, in traversal order.
 
-        WAKE -> GATHER -> REASON -> CHECK -> FINALIZE
+        CONTEXT -> REASON -> CHECK -> FINALIZE
 
-    Each stage HOSTS exactly one ``NestedLoop`` (see ``STAGE_LOOP``). A stage
-    is the agent's position in the workflow; the nested loop inside it
-    carries the in-depth work.
+    ``CONTEXT`` is the merged wake+gather stage: understand the ask, plan,
+    acquire the plan's data, and verify coverage before reasoning. Each stage
+    HOSTS exactly one ``NestedLoop`` (see ``STAGE_LOOP``).
     """
 
-    WAKE = "wake"          # prompt/wake received; understand the ask
-    GATHER = "gather"      # acquire data: reads + calc/microprice tools
+    CONTEXT = "context"    # wake+gather merged: understand, plan, acquire, verify
     REASON = "reason"      # reason prompt data against tool data
     CHECK = "check"        # validate the final; recover when rejected
     FINALIZE = "finalize"  # place the output; dispose memory
@@ -73,16 +72,17 @@ class AgenticStage(str, Enum):
 class NestedLoop(str, Enum):
     """The in-depth workflow loop each stage hosts.
 
-    Named for the MODE of work; the subject is the ``TaskIntent``. The final
+    Named for the MODE of work; the subject is the ``TaskIntent``. The first
+    loop is ``CONTEXT`` — the merged comprehension+evidence loop: intake,
+    interpretation, framing, sourcing, acquisition, verification. The final
     loop is ``OUTPUT`` — placing the output requires understanding the
     agentic surface it is placed into.
     """
 
-    COMPREHENSION = "comprehension"  # WAKE: understand the prompt
-    EVIDENCE = "evidence"            # GATHER: acquire + verify data
-    REASONING = "reasoning"          # REASON: form + test + synthesize
-    VALIDATION = "validation"        # CHECK: gate the final; recover
-    OUTPUT = "output"                # FINALIZE: compose, understand, place
+    CONTEXT = "context"        # merged: understand, plan, source, acquire, verify
+    REASONING = "reasoning"    # REASON: form + test + synthesize
+    VALIDATION = "validation"  # CHECK: gate the final; recover
+    OUTPUT = "output"          # FINALIZE: compose, understand, place
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,7 @@ class LoopStep(str, Enum):
     RECEIVE = "receive"                  # input arrives
     DECODE = "decode"                    # decode the transport (text/JSON)
     NORMALIZE = "normalize"              # normalize fields, defaults, units
+    GATE_DATA = "gate_data"              # zero-LLM data-sufficiency gate (terminal)
 
     # --- INTERPRETATION ---
     CLASSIFY_INTENT = "classify_intent"          # what is being asked?
@@ -156,6 +157,7 @@ class LoopStep(str, Enum):
     # --- SOURCING ---
     PLAN_READS = "plan_reads"            # choose the reads
     SELECT_TOOLS = "select_tools"        # choose calc/microprice tools
+    GATE_PLAN = "gate_plan"              # deterministic plan-adequacy gate (terminal)
 
     # --- ACQUISITION ---
     READ = "read"                        # dispatch read tools
@@ -165,6 +167,7 @@ class LoopStep(str, Enum):
     # --- VERIFICATION ---
     ASSESS = "assess"                    # coverage vs plan
     REPLAN = "replan"                    # close gaps -> back to sourcing
+    STORE_HANDOFF = "store_handoff"      # write context package to memory segment
 
     # --- HYPOTHESIS ---
     FRAME = "frame"                      # frame H0/H1 from prompt + data
@@ -325,8 +328,7 @@ class LoopObservation:
 
 
 STAGE_ORDER: tuple[AgenticStage, ...] = (
-    AgenticStage.WAKE,
-    AgenticStage.GATHER,
+    AgenticStage.CONTEXT,
     AgenticStage.REASON,
     AgenticStage.CHECK,
     AgenticStage.FINALIZE,
@@ -334,8 +336,7 @@ STAGE_ORDER: tuple[AgenticStage, ...] = (
 
 # Each stage hosts exactly one nested loop.
 STAGE_LOOP: dict[AgenticStage, NestedLoop] = {
-    AgenticStage.WAKE: NestedLoop.COMPREHENSION,
-    AgenticStage.GATHER: NestedLoop.EVIDENCE,
+    AgenticStage.CONTEXT: NestedLoop.CONTEXT,
     AgenticStage.REASON: NestedLoop.REASONING,
     AgenticStage.CHECK: NestedLoop.VALIDATION,
     AgenticStage.FINALIZE: NestedLoop.OUTPUT,
@@ -348,12 +349,10 @@ LOOP_STAGE: dict[NestedLoop, AgenticStage] = {
 
 # Each nested loop is an in-depth workflow of sub-loops, in order.
 LOOP_SUBLOOPS: dict[NestedLoop, tuple[SubLoop, ...]] = {
-    NestedLoop.COMPREHENSION: (
+    NestedLoop.CONTEXT: (
         SubLoop.INTAKE,
         SubLoop.INTERPRETATION,
         SubLoop.FRAMING,
-    ),
-    NestedLoop.EVIDENCE: (
         SubLoop.SOURCING,
         SubLoop.ACQUISITION,
         SubLoop.VERIFICATION,
@@ -379,7 +378,8 @@ LOOP_SUBLOOPS: dict[NestedLoop, tuple[SubLoop, ...]] = {
 SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     # --- COMPREHENSION ---
     SubLoop.INTAKE: SubLoopSpec(
-        steps=(LoopStep.RECEIVE, LoopStep.DECODE, LoopStep.NORMALIZE),
+        steps=(LoopStep.RECEIVE, LoopStep.DECODE, LoopStep.NORMALIZE,
+               LoopStep.GATE_DATA),
         iterates=False,
         purpose="Receive and normalize the raw input into a known shape.",
     ),
@@ -404,7 +404,7 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     ),
     # --- EVIDENCE ---
     SubLoop.SOURCING: SubLoopSpec(
-        steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS),
+        steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS, LoopStep.GATE_PLAN),
         iterates=False,
         purpose="Plan which reads and tools will satisfy the intent.",
     ),
@@ -415,7 +415,7 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
         exit_condition="every planned read/calculation has been observed",
     ),
     SubLoop.VERIFICATION: SubLoopSpec(
-        steps=(LoopStep.ASSESS, LoopStep.REPLAN),
+        steps=(LoopStep.ASSESS, LoopStep.REPLAN, LoopStep.STORE_HANDOFF),
         iterates=True,
         purpose="Assess coverage against the plan and re-plan gaps.",
         exit_condition="evidence coverage satisfies the intent or budget spent",
@@ -495,8 +495,7 @@ LOOP_STEPS: dict[NestedLoop, tuple[LoopStep, ...]] = {
 # actually runs as its reason/act/observe cycle. For OUTPUT the core is
 # PLACEMENT: the final act is placing the output.
 PRIMARY_SUBLOOP: dict[NestedLoop, SubLoop] = {
-    NestedLoop.COMPREHENSION: SubLoop.INTERPRETATION,
-    NestedLoop.EVIDENCE: SubLoop.ACQUISITION,
+    NestedLoop.CONTEXT: SubLoop.ACQUISITION,
     NestedLoop.REASONING: SubLoop.ANALYSIS,
     NestedLoop.VALIDATION: SubLoop.RECOVERY,
     NestedLoop.OUTPUT: SubLoop.PLACEMENT,
@@ -504,9 +503,9 @@ PRIMARY_SUBLOOP: dict[NestedLoop, SubLoop] = {
 
 # The nested loop each task intent is served by.
 INTENT_LOOP: dict[TaskIntent, NestedLoop] = {
-    TaskIntent.UNDERSTAND_TASK: NestedLoop.COMPREHENSION,
-    TaskIntent.INFER_ORDER_FLOW: NestedLoop.EVIDENCE,
-    TaskIntent.INFER_DEPTH: NestedLoop.EVIDENCE,
+    TaskIntent.UNDERSTAND_TASK: NestedLoop.CONTEXT,
+    TaskIntent.INFER_ORDER_FLOW: NestedLoop.CONTEXT,
+    TaskIntent.INFER_DEPTH: NestedLoop.CONTEXT,
     TaskIntent.CORRELATE_EVIDENCE: NestedLoop.REASONING,
     TaskIntent.EXPLAIN_FINDINGS: NestedLoop.REASONING,
     TaskIntent.DERIVE_HYPOTHESIS: NestedLoop.REASONING,

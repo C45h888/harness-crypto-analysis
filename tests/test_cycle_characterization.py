@@ -99,11 +99,6 @@ async def capture(case, stage_trace=None):
             raise AssertionError("LLM called more times than scripted") from None
 
     if stage_trace is not None:
-        wake_stage = engine.run_wake
-        def wake_spy(*args, **kwargs):
-            stage_trace.append("run_wake")
-            return wake_stage(*args, **kwargs)
-        engine.run_wake = wake_spy
         def _wrap_stage(label, original):
             async def _spy(*args, **kwargs):
                 stage_trace.append(label)
@@ -112,10 +107,17 @@ async def capture(case, stage_trace=None):
                     ctx = args[1]
                     assert ctx.controller.terminal.value == result[1]["terminal"]
                 return result
+            def _sync_spy(*args, **kwargs):
+                stage_trace.append(label)
+                return original(*args, **kwargs)
+            if label == "run_wake":
+                return _sync_spy
             return _spy
         _stage_wraps = [
-            (core.gather, "run_gather"),
-            (core.reasoning, "run_comprehension"),
+            (core.wake, "run_wake"),
+            (core.gather, "run_bootstrap"),
+            (core.wake, "run_comprehension"),
+            (core.gather, "run_plan_bound_acquisition"),
             (core.reasoning, "run_evidence"),
             (core.reasoning, "run_reasoning"),
             (core.reasoning, "run_validation"),
@@ -172,19 +174,22 @@ def test_staged_cycle_converges_and_preserves_placement_order():
     # missing discipline citation, the recovery turn dispatches the audit,
     # and validation re-runs to accept the repaired final. That two-phase
     # entry is the repair mechanics the settlement depends on.
-    assert stages == ["run_wake", "run_gather", "run_comprehension", "run_evidence",
+    assert stages == ["run_wake", "run_bootstrap", "run_comprehension",
+                    "run_plan_bound_acquisition", "run_evidence",
                     "run_reasoning", "run_validation", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
     assert result["meta"]["final_validation"]["passed"]
-    # Pending projection, memory disposition, final projection, and the
-    # final-trace refresh are explicit side effects of two-phase settlement.
+    # Understanding + plan placement (two memory writes, at the
+    # comprehension→evidence handoff) precede the two-phase settlement side
+    # effects: pending projection, memory disposition, final projection,
+    # final-trace refresh.
     assert [effect[0] for effect in result["effects"] if effect[0] in ("postgres", "redis", "memory")] == [
-        "postgres", "redis", "memory", "redis", "redis",
+        "memory", "memory", "postgres", "redis", "memory", "redis", "redis",
     ]
 
 
 def test_gate_refusal_stops_stage_execution():
     stages = []
     result = asyncio.run(capture("gate", stages))
-    assert stages == ["run_wake", "run_gather"]
+    assert stages == ["run_wake", "run_bootstrap"]
     assert result["meta"]["llm_calls"] == 0

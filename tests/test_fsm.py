@@ -45,13 +45,14 @@ class BoardViewabilityTests(unittest.TestCase):
         self.assertEqual(
             M.initial(),
             LoopObservation(
-                NestedLoop.COMPREHENSION, TaskIntent.UNDERSTAND_TASK, None
+                NestedLoop.CONTEXT, TaskIntent.UNDERSTAND_TASK, None
             ),
         )
 
-    def test_board_state_count_is_41(self):
-        # 4 + 8 + 16 + 3 + 10 = 41 admissible (loop, intent, sub-loop|None).
-        self.assertEqual(len(M.states()), 41)
+    def test_board_state_count_is_50(self):
+        # CONTEXT: 3 intents * (6 sub-loops + None) = 21
+        # REASONING: 4 * 4 = 16; VALIDATION: 1 * 3 = 3; OUTPUT: 2 * 5 = 10
+        self.assertEqual(len(M.states()), 21 + 16 + 3 + 10)
 
     def test_every_state_is_legal(self):
         for obs in M.states():
@@ -59,21 +60,21 @@ class BoardViewabilityTests(unittest.TestCase):
 
     def test_states_follow_traversal_loop_order(self):
         loops = [obs.nested_loop for obs in M.states()]
-        self.assertIs(loops[0], NestedLoop.COMPREHENSION)
+        self.assertIs(loops[0], NestedLoop.CONTEXT)
         self.assertIs(loops[-1], NestedLoop.OUTPUT)
 
     def test_rejects_illegal_observations(self):
         # intent served by a different loop.
         self.assertFalse(
             M.is_legal_state(
-                LoopObservation(NestedLoop.EVIDENCE, TaskIntent.VALIDATE_FINAL)
+                LoopObservation(NestedLoop.CONTEXT, TaskIntent.VALIDATE_FINAL)
             )
         )
         # sub-loop not a sub-loop of the loop.
         self.assertFalse(
             M.is_legal_state(
                 LoopObservation(
-                    NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH, SubLoop.FRAMING
+                    NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH, SubLoop.ANALYSIS
                 )
             )
         )
@@ -133,7 +134,7 @@ class LegalEventsTests(unittest.TestCase):
 
     def test_enter_loop_requires_closed_subloop_in_legal_events(self):
         obs = LoopObservation(
-            NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH, SubLoop.ACQUISITION
+            NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH, SubLoop.ACQUISITION
         )
         kinds = {e.kind for e in M.legal_events(obs)}
         self.assertNotIn(GovernanceEventKind.ENTER_LOOP, kinds)
@@ -147,26 +148,26 @@ class LegalEventsTests(unittest.TestCase):
 class DecideConstitutionTests(unittest.TestCase):
     def test_enter_loop_only_to_successor(self):
         v = M.decide(
-            M.initial(), GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.EVIDENCE)
+            M.initial(), GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING)
         )
         self.assertTrue(v.allowed)
-        self.assertEqual(v.next, LoopObservation(NestedLoop.EVIDENCE, TaskIntent.INFER_ORDER_FLOW, None))
+        self.assertEqual(v.next, LoopObservation(NestedLoop.REASONING, TaskIntent.CORRELATE_EVIDENCE, None))
 
         # Not the successor -> denied.
         v2 = M.decide(
-            M.initial(), GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING)
+            M.initial(), GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.VALIDATION)
         )
         self.assertFalse(v2.allowed)
 
         # Entering the first loop from initial is not legal (already there).
         v3 = M.decide(
-            M.initial(), GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.COMPREHENSION)
+            M.initial(), GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.CONTEXT)
         )
         self.assertFalse(v3.allowed)
 
     def test_enter_loop_requires_closed_subloop(self):
         obs = LoopObservation(
-            NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH, SubLoop.ACQUISITION
+            NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH, SubLoop.ACQUISITION
         )
         v = M.decide(
             obs, GovernanceEvent(GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING)
@@ -189,7 +190,7 @@ class DecideConstitutionTests(unittest.TestCase):
         )
         # After INTAKE, only INTERPRETATION.
         obs = LoopObservation(
-            NestedLoop.COMPREHENSION, TaskIntent.UNDERSTAND_TASK, SubLoop.INTAKE
+            NestedLoop.CONTEXT, TaskIntent.UNDERSTAND_TASK, SubLoop.INTAKE
         )
         self.assertTrue(
             M.decide(
@@ -205,15 +206,16 @@ class DecideConstitutionTests(unittest.TestCase):
         )
 
     def test_set_task_only_intents_served_by_loop(self):
-        ev_obs = LoopObservation(NestedLoop.EVIDENCE, TaskIntent.INFER_ORDER_FLOW)
+        ev_obs = LoopObservation(NestedLoop.CONTEXT, TaskIntent.INFER_ORDER_FLOW)
         self.assertTrue(
             M.decide(
                 ev_obs, GovernanceEvent(GovernanceEventKind.SET_TASK, TaskIntent.INFER_DEPTH)
             ).allowed
         )
+        # An intent owned by another loop is denied.
         self.assertFalse(
             M.decide(
-                M.initial(), GovernanceEvent(GovernanceEventKind.SET_TASK, TaskIntent.INFER_DEPTH)
+                M.initial(), GovernanceEvent(GovernanceEventKind.SET_TASK, TaskIntent.VALIDATE_FINAL)
             ).allowed
         )
 
@@ -224,7 +226,7 @@ class DecideConstitutionTests(unittest.TestCase):
             ).allowed
         )
         obs = LoopObservation(
-            NestedLoop.EVIDENCE, TaskIntent.INFER_DEPTH, SubLoop.SOURCING
+            NestedLoop.CONTEXT, TaskIntent.INFER_DEPTH, SubLoop.SOURCING
         )
         v = M.decide(obs, GovernanceEvent(GovernanceEventKind.CLOSE_SUBLOOP))
         self.assertTrue(v.allowed)
@@ -234,7 +236,7 @@ class DecideConstitutionTests(unittest.TestCase):
         self.assertFalse(
             M.decide(M.initial(), GovernanceEvent(GovernanceEventKind.SETTLE)).allowed
         )
-        for loop in (NestedLoop.EVIDENCE, NestedLoop.REASONING, NestedLoop.VALIDATION):
+        for loop in (NestedLoop.CONTEXT, NestedLoop.REASONING, NestedLoop.VALIDATION):
             obs = LoopObservation(loop, LOOP_INTENTS[loop][0], None)
             self.assertFalse(
                 M.decide(obs, GovernanceEvent(GovernanceEventKind.SETTLE)).allowed,
@@ -246,13 +248,10 @@ class DecideConstitutionTests(unittest.TestCase):
         self.assertEqual(v.terminal, LoopTerminal.SETTLED)
 
     def test_legal_traversal_reaches_output_settled(self):
-        # A canonical walk: comprehension -> evidence -> reasoning ->
-        # validation -> output -> settle, all adjudicated allowed.
+        # A canonical walk: context -> reasoning -> validation -> output -> settle.
         moves = [
             (GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTAKE),
             (GovernanceEventKind.CLOSE_SUBLOOP, None),
-            (GovernanceEventKind.ENTER_LOOP, NestedLoop.EVIDENCE),
-            (GovernanceEventKind.SET_TASK, TaskIntent.INFER_DEPTH),
             (GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING),
             (GovernanceEventKind.ENTER_LOOP, NestedLoop.VALIDATION),
             (GovernanceEventKind.ENTER_LOOP, NestedLoop.OUTPUT),

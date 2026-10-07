@@ -16,14 +16,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-SUBSTRATE_STATE_SCHEMA_VERSION = 1
+SUBSTRATE_STATE_SCHEMA_VERSION = 2
 OUTPUT_ARRAY_CAP = 128
 
 # Rollover period lengths in milliseconds (stream entry-id time base).
+# Phase H1: ``bar_15m`` / ``bar_4h`` extend the boundary set to the declared
+# worker horizons; their bucket identity is IST-aligned (see
+# runtime/horizons.py — bar_5m/bar_15m align identically to the epoch grid
+# since IST_OFFSET_MS is an exact multiple of them; bar_1h/bar_4h boundaries
+# sit at UTC :30 offsets, anchored to IST-clock hours/days). The legacy
+# ``hour`` period keeps its epoch-hour bucket ids (pinned by existing payloads).
 ROLLOVER_PERIOD_MS: dict[str, int] = {
     "hour": 3_600_000,
     "bar_5m": 300_000,
+    "bar_15m": 900_000,
     "bar_1h": 3_600_000,
+    "bar_4h": 14_400_000,
 }
 
 
@@ -37,6 +45,12 @@ class CadenceProfile:
     (see ``ROLLOVER_PERIOD_MS``). ``min_book_depth`` / ``min_trade_count``
     form the minimum-data gate before a probe may fire. ``ws_input`` marks
     workers that also consume the microstructure event stream.
+
+    Phase H1 horizon cadence: ``horizons`` declares the worker's time-horizon
+    vector (e.g. ``("15m", "1h", "4h")``; ``()`` = legacy single-window
+    behavior). ``horizon_staleness_s`` overrides the staleness bound PER
+    HORIZON — a 4h horizon does not heartbeat at 120s; its staleness is
+    naturally hours. Unlisted horizons use the global ``staleness_s``.
     """
 
     cooldown_s: int
@@ -45,6 +59,17 @@ class CadenceProfile:
     min_book_depth: int = 1
     min_trade_count: int = 0
     ws_input: bool = False
+    horizons: tuple[str, ...] = ()
+    horizon_staleness_s: tuple[tuple[str, int], ...] = ()
+
+    def staleness_for(self, horizon: str | None) -> int:
+        """Effective staleness bound for one horizon (base when None)."""
+        if horizon is None:
+            return self.staleness_s
+        for hz, seconds in self.horizon_staleness_s:
+            if hz == horizon:
+                return seconds
+        return self.staleness_s
 
 # Why a fire happened. L2 semantic probes report "probe"; the core's time /
 # liveness guards report the others.
@@ -113,6 +138,10 @@ class SubstrateStatePayload:
     output: dict[str, Any]
     missing_inputs: tuple[str, ...] = ()
     provenance: dict[str, Any] = field(default_factory=dict)
+    # Phase H1: per-horizon outputs + fold summaries. The base ``output``
+    # stays the base-horizon (15m) verdict so every existing reader keeps
+    # working; ``horizons`` carries {horizon: {output, fold}} extras.
+    horizons: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -126,6 +155,7 @@ class SubstrateStatePayload:
         observed_at_ms: int | None = None,
         computed_at_ms: int | None = None,
         missing_inputs: tuple[str, ...] | list[str] = (),
+        horizons: dict[str, Any] | None = None,
     ) -> SubstrateStatePayload:
         observed = observed_at_ms if observed_at_ms is not None else (freshness or {}).get("observed_at_ms")
         return cls(
@@ -140,6 +170,7 @@ class SubstrateStatePayload:
             output=bound_arrays(dict(output)),
             missing_inputs=tuple(missing_inputs),
             provenance={"substrates": [substrate.lower()]},
+            horizons=bound_arrays(dict(horizons or {})),
         )
 
     def __post_init__(self) -> None:
@@ -177,12 +208,16 @@ class SubstrateStatePayload:
             "missing_inputs": list(self.missing_inputs),
             "output": dict(self.output),
             "provenance": dict(self.provenance),
+            "horizons": dict(self.horizons),
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> SubstrateStatePayload:
+        # v1 back-compat: a stored v1 payload carries no horizons block —
+        # it IS the implicit base-horizon record. Normalize to the current
+        # schema version on read (write paths always emit current).
         return cls(
-            schema_version=int(value.get("schema_version") or SUBSTRATE_STATE_SCHEMA_VERSION),
+            schema_version=SUBSTRATE_STATE_SCHEMA_VERSION,
             substrate=str(value.get("substrate") or ""),
             symbol=str(value.get("symbol") or ""),
             status=str(value.get("status") or "healthy"),
@@ -193,6 +228,7 @@ class SubstrateStatePayload:
             missing_inputs=tuple(value.get("missing_inputs") or ()),
             output=dict(value.get("output") or {}),
             provenance=dict(value.get("provenance") or {}),
+            horizons=dict(value.get("horizons") or {}),
         )
 
 

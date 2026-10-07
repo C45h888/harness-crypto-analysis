@@ -310,8 +310,8 @@ class AgenticLoopMembrane:
             return MembraneVerdict(False, reason="work requested from an illegal observation")
         if bootstrap:
             if (
-                nested_loop is NestedLoop.COMPREHENSION
-                and observation.nested_loop is NestedLoop.COMPREHENSION
+                nested_loop is NestedLoop.CONTEXT
+                and observation.nested_loop is NestedLoop.CONTEXT
                 and observation.task is TaskIntent.UNDERSTAND_TASK
                 and observation.sub_loop is None
             ):
@@ -344,9 +344,9 @@ class AgenticLoopMembrane:
     # ------------------------------------------------------------------
 
     def initial(self) -> LoopObservation:
-        """The post-wake observation: COMPREHENSION / UNDERSTAND_TASK."""
+        """The post-wake observation: CONTEXT / UNDERSTAND_TASK."""
         return LoopObservation(
-            NestedLoop.COMPREHENSION, TaskIntent.UNDERSTAND_TASK, None
+            NestedLoop.CONTEXT, TaskIntent.UNDERSTAND_TASK, None
         )
 
     def states(self) -> tuple[LoopObservation, ...]:

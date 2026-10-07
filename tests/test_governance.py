@@ -281,7 +281,7 @@ class ControllerGovernanceUnitTests(unittest.TestCase):
         c = CycleController().with_membrane(M).with_observation(M.initial())
         c2 = c.advance(
             GovernanceEvent(
-                GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING
+                GovernanceEventKind.ENTER_LOOP, NestedLoop.VALIDATION
             )
         )
         self.assertIs(c2, c)
@@ -291,7 +291,6 @@ class ControllerGovernanceUnitTests(unittest.TestCase):
         moves = [
             (GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTAKE),
             (GovernanceEventKind.CLOSE_SUBLOOP, None),
-            (GovernanceEventKind.ENTER_LOOP, NestedLoop.EVIDENCE),
             (GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING),
             (GovernanceEventKind.ENTER_LOOP, NestedLoop.VALIDATION),
             (GovernanceEventKind.ENTER_LOOP, NestedLoop.OUTPUT),

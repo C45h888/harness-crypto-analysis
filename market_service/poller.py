@@ -261,6 +261,7 @@ async def main() -> int:
     settings = Settings.from_redis_env()
     redis = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
+        raw_retention_ms=settings.redis_raw_retention_ms,
     )
     try:
         if not await redis.ping_with_retry():

@@ -206,7 +206,7 @@ class HarnessPollerControlParserTests(unittest.TestCase):
 
 
 class PollerControlHandlerTests(unittest.TestCase):
-    """_poller_control writes/reads through the RedisRuntimeStore seam."""
+    """_poller_control routes through the interaction-plane control module."""
 
     def _run(self, coro):
         return asyncio.run(coro)
@@ -216,60 +216,56 @@ class PollerControlHandlerTests(unittest.TestCase):
         base.update(overrides)
         return argparse.Namespace(**base)
 
-    @patch("market_service.commands.harness.RedisRuntimeStore")
-    def test_set_symbols(self, MockStore):
-        store = MockStore.return_value
-        store.set_poller_symbols = AsyncMock()
-        store.close = AsyncMock()
-        store.poller_control_key.return_value = "marketflow:poller:active_symbols"
-        with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
-            result = self._run(_poller_control(self._args(poller_symbols="solusdt")))
+    def test_set_symbols(self):
+        with patch("market_service.interaction_plane.control.poller_set",
+                      new_callable=AsyncMock) as m_set:
+            m_set.return_value = {"status": "ok", "action": "set",
+                                  "active_symbols": ["SOLUSDT"]}
+            with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
+                result = self._run(_poller_control(self._args(poller_symbols="solusdt")))
+        self.assertEqual(result["tool"], "poller.control")
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["action"], "set")
-        self.assertEqual(result["active_symbols"], ["SOLUSDT"])
-        store.set_poller_symbols.assert_awaited_once_with(["SOLUSDT"])
+        self.assertEqual(result["data"]["action"], "set")
+        self.assertEqual(result["data"]["active_symbols"], ["SOLUSDT"])
+        m_set.assert_awaited_once_with(["solusdt"])
 
-    @patch("market_service.commands.harness.RedisRuntimeStore")
-    def test_set_symbols_rejects_empty_string(self, MockStore):
-        store = MockStore.return_value
-        store.set_poller_symbols = AsyncMock()
-        store.close = AsyncMock()
-        with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
-            result = self._run(_poller_control(self._args(poller_symbols=" , ")))
+    def test_set_symbols_rejects_empty_string(self):
+        with patch("market_service.interaction_plane.control.poller_set",
+                      new_callable=AsyncMock) as m_set:
+            m_set.return_value = {"status": "error",
+                                  "error": "no valid symbols provided"}
+            with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
+                result = self._run(_poller_control(self._args(poller_symbols=" , ")))
         self.assertEqual(result["status"], "error")
-        store.set_poller_symbols.assert_not_awaited()
 
-    @patch("market_service.commands.harness.RedisRuntimeStore")
-    def test_reset_clears_control_key(self, MockStore):
-        store = MockStore.return_value
-        store.clear_poller_symbols = AsyncMock()
-        store.close = AsyncMock()
-        store.poller_control_key.return_value = "marketflow:poller:active_symbols"
-        with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
-            result = self._run(_poller_control(self._args(poller_symbols_reset=True)))
+    def test_reset_clears_control_key(self):
+        with patch("market_service.interaction_plane.control.poller_reset",
+                      new_callable=AsyncMock) as m_reset:
+            m_reset.return_value = {"status": "ok", "action": "reset"}
+            with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
+                result = self._run(_poller_control(self._args(poller_symbols_reset=True)))
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["action"], "reset")
-        store.clear_poller_symbols.assert_awaited_once()
+        self.assertEqual(result["data"]["action"], "reset")
+        m_reset.assert_awaited_once()
 
-    @patch("market_service.commands.harness.RedisRuntimeStore")
-    def test_status_returns_payload(self, MockStore):
-        store = MockStore.return_value
-        store.read_poller_status = AsyncMock(
-            return_value={"symbols": ["SOLUSDT"], "source": "redis_control"})
-        store.close = AsyncMock()
-        with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
-            result = self._run(_poller_control(self._args(poller_status=True)))
+    def test_status_returns_payload(self):
+        with patch("market_service.interaction_plane.control.poller_status",
+                      new_callable=AsyncMock) as m_status:
+            m_status.return_value = {"status": "ok", "action": "status",
+                                     "symbols": ["SOLUSDT"]}
+            with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
+                result = self._run(_poller_control(self._args(poller_status=True)))
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["action"], "status")
-        self.assertEqual(result["symbols"], ["SOLUSDT"])
+        self.assertEqual(result["data"]["action"], "status")
+        self.assertEqual(result["data"]["symbols"], ["SOLUSDT"])
 
-    @patch("market_service.commands.harness.RedisRuntimeStore")
-    def test_status_missing_reports_error(self, MockStore):
-        store = MockStore.return_value
-        store.read_poller_status = AsyncMock(return_value=None)
-        store.close = AsyncMock()
-        with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
-            result = self._run(_poller_control(self._args(poller_status=True)))
+    def test_status_missing_reports_error(self):
+        with patch("market_service.interaction_plane.control.poller_status",
+                      new_callable=AsyncMock) as m_status:
+            m_status.return_value = {"status": "error", "action": "status",
+                                     "error": "no poller status found"}
+            with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379/0"}):
+                result = self._run(_poller_control(self._args(poller_status=True)))
         self.assertEqual(result["status"], "error")
 
 

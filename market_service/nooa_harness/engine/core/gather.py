@@ -1,11 +1,18 @@
-"""GATHER stage (EVIDENCE loop, fixed part) — pre-gate reads + hard gate."""
+"""GATHER stage — split across the comprehension boundary (Pass B).
+
+run_bootstrap: pre-gate reads + hard gate (needs no understanding).
+run_plan_bound_acquisition: forecast + scenario pre-acquisition driven by
+the FROZEN understanding receipt (post-comprehension). The split cures the
+ordering inversion: plan-bound work executes under the receipt that
+authorizes it, never before it exists.
+"""
 
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from market_service.nooa_harness.inference import resolve_inference_status
+from ..gates import evaluate_data_gate
 from market_service.runtime.contracts import InferenceArtifact
 from . import context
 from .context import _CycleContext, _GatheredEvidence
@@ -18,8 +25,25 @@ log = logging.getLogger(__name__)
 async def run_gather(
     engine: Any, ctx: "_CycleContext",
 ) -> tuple[InferenceArtifact, dict[str, Any]] | None:
-    """EVIDENCE loop, fixed part — pre-gate reads + hard gate."""
-    wake, task, scenario = ctx.wake, ctx.task, ctx.scenario
+    """Compat entry — runs bootstrap only. The runner calls the split
+    phases explicitly (bootstrap → comprehension → plan-bound
+    acquisition); direct callers get bootstrap semantics."""
+    return await run_bootstrap(engine, ctx)
+
+
+async def run_bootstrap(
+    engine: Any, ctx: "_CycleContext",
+) -> tuple[InferenceArtifact, dict[str, Any]] | None:
+    """Bootstrap phase — pre-gate reads + hard gate (no understanding needed)."""
+    # Canonical read: task/scenario flow from the injected PromptVariable
+    # (normalized once in wake.run_wake); raw ctx.task/scenario are the
+    # compat fallback for callers that bypass run_wake.
+    _prompt = getattr(ctx, "prompt", None)
+    wake = ctx.wake
+    if _prompt is not None:
+        task, scenario = _prompt.raw, _prompt.scenario
+    else:
+        task, scenario = ctx.task, ctx.scenario
     generated_at = ctx.generated_at
     controller, capability_log = ctx.controller, ctx.capability_log
 
@@ -40,7 +64,7 @@ async def run_gather(
     # COMPREHENSION observation rather than pretending that EVIDENCE was
     # already traversed.
     context._must_authorize_work(
-        controller, nested_loop=NestedLoop.COMPREHENSION, bootstrap=True,
+        controller, nested_loop=NestedLoop.CONTEXT, bootstrap=True,
     )
     status, status_log = await context.execute_tool(
         engine.store, "micro.capture_status",
@@ -56,7 +80,7 @@ async def run_gather(
     tool_results["micro.capture_status"] = status
 
     context._must_authorize_work(
-        controller, nested_loop=NestedLoop.COMPREHENSION, bootstrap=True,
+        controller, nested_loop=NestedLoop.CONTEXT, bootstrap=True,
     )
     evidence, fit_log = await context.execute_tool(
         engine.store, "micro.fit_beta",
@@ -94,7 +118,11 @@ async def run_gather(
         )
     except Exception:
         _degraded = 0
-    gate_status, gate_reasons = resolve_inference_status(
+    # Gate 1 (DATA) runs through the deterministic gate base layer: the
+    # verdict is a frozen data contract, not inline ad-hoc logic. The
+    # resolved trichotomy is preserved verbatim (behavior-identical); the
+    # full verdict rides deterministic_state so a refusal cites its facts.
+    data_gate = evaluate_data_gate(
         n_observations=n_observations,
         min_observations=30,
         fit_status=fit_status,
@@ -102,84 +130,29 @@ async def run_gather(
         events_in_window=events_in_window,
         degraded_spans_in_window=_degraded,
     )
+    gate_status = str(data_gate.facts_dict()["resolved_status"])
+    gate_reasons = list(data_gate.reasons)
 
-    # --- TASK DIRECTIVE (Phase A — deterministic parse, no LLM) ---
-    # The prompt becomes a plan variable BEFORE any pre-acquisition: the
-    # directive selects the forecast horizon (native vocabulary only) and
-    # triggers the canonical scenario pre-acquisition. Pure parse; refusal
-    # is a finding recorded on the directive, never a cycle abort.
-    from ..task_directive import build_plan, parse_task_directive
-    task_directive = parse_task_directive(ctx.task, ctx.scenario)
-    task_plan = build_plan(task_directive)
+    # --- TASK DIRECTIVE (record-only provisional — acquisition moved out)
+    # The bootstrap runs the canonical understand() entry so the gate
+    # record (including gate-refusal artifacts) carries the directive
+    # context. These keys are PROVISIONAL and record-only: the plan-bound
+    # acquisition below runs post-receipt off the FINAL disposed plan, and
+    # run_comprehension overwrites these keys as final authority. One
+    # methodology, declared author; no acquisition executes pre-receipt.
+    from ..task_directive import understand as _understand
+    from .wake import PromptVariable as _PromptVariable
+    _pv = _prompt if _prompt is not None else _PromptVariable.from_cli(task, scenario)
+    task_directive, task_plan, _ = _understand(_pv)
 
-    # Build the canonical forward ForecastResult before any interpretation.
-    # This is deterministic evidence, not an agent-selected sequence of raw
-    # statistical tools. A legacy-insufficient cycle still exits before this
-    # call; provisional forward evidence remains readable and explicitly gated.
+    # Plan-bound acquisition lives in run_plan_bound_acquisition (below) —
+    # it executes AFTER the comprehension receipt freezes, driven by the
+    # final disposed plan. Placeholders below preserve the deterministic
+    # key order; acquisition overwrites values in place (never re-inserts).
     forecast_result = None
     forecast_log: dict[str, Any] | None = None
     forward_scenario_result: Any = None
     forward_scenario_log: dict[str, Any] | None = None
-    if gate_status != "insufficient":
-        # Directive-driven horizon: the plan binds the horizon the task asked
-        # about. Native horizons fit directly; long horizons (15m/1h/4h) are
-        # answered through the deterministic long-horizon bridge (native fit
-        # projected to H — sigma scaled, skill decayed). Anything outside the
-        # vocabulary is refused by the tool with the supported set attached.
-        _planned_horizon = task_plan.get("forecast_horizon_ms")
-        _forecast_horizon_ms = int(_planned_horizon) if _planned_horizon else 5_000
-        _forecast_args = {"symbol": engine.symbol, "venue": engine.venue,
-                          "horizon_ms": _forecast_horizon_ms, "window_minutes": 30}
-        context._must_authorize_work(
-            controller, nested_loop=NestedLoop.COMPREHENSION, bootstrap=True,
-        )
-        forecast_result, forecast_log = await context.execute_tool(
-            engine.store, "calc.forward.forecast",
-            _forecast_args,
-            postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
-        )
-        capability_log.append(forecast_log)
-        controller = controller.record_outcome(
-            "calc.forward.forecast", forecast_log, forecast_result,
-            args=_forecast_args,
-        )
-        accumulated_tool_results["calc.forward.forecast"] = forecast_result
-        tool_results["calc.forward.forecast"] = forecast_result
-        forward_status = (
-            forecast_result.get("validation_state")
-            if isinstance(forecast_result, dict) else None
-        )
-        if gate_status == "validated" and forward_status != "validated":
-            gate_status = "provisional"
-            gate_reasons = list(gate_reasons) + [
-                "forward ForecastResult is not OOS-validated"
-                if forward_status is not None
-                else "forward ForecastResult unavailable"
-            ]
-
-        # Directive-driven scenario pre-acquisition: a target-bearing native
-        # task gets its P(T)/P(S) curves computed deterministically BEFORE
-        # interpretation (same authority pattern as the canonical forecast).
-        if (task_plan["horizon_regime"] == "native"
-                and (task_plan["targets"] or task_plan["invalidations"])):
-            _scenario_args = {"symbol": engine.symbol, "venue": engine.venue,
-                              "horizon_ms": _forecast_horizon_ms,
-                              "targets": [t["value"] for t in task_plan["targets"]],
-                              "invalidations": [s["value"] for s in task_plan["invalidations"]],
-                              "window_minutes": 30}
-            forward_scenario_result, forward_scenario_log = await context.execute_tool(
-                engine.store, "calc.forward.scenario",
-                _scenario_args,
-                postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
-            )
-            capability_log.append(forward_scenario_log)
-            controller = controller.record_outcome(
-                "calc.forward.scenario", forward_scenario_log, forward_scenario_result,
-                args=_scenario_args,
-            )
-            accumulated_tool_results["calc.forward.scenario"] = forward_scenario_result
-            tool_results["calc.forward.scenario"] = forward_scenario_result
-    task_directive = task_directive  # Phase A result; Phase B refines later
 
     # --- READ-PLANE SHAPE (envelope-driven) ---
     # The controller receives the envelope and hands it to the agent;
@@ -203,6 +176,7 @@ async def run_gather(
         "forward_scenario_note": ((forward_scenario_log or {}).get("detail")
                                   if isinstance(forward_scenario_log, dict) else "not_run"),
         "gate": {"status": gate_status, "reasons": list(gate_reasons)},
+        "data_gate": data_gate.to_dict(),
         "forward_gate": {
             "status": ((forecast_result or {}).get("validation_state")
                        if isinstance(forecast_result, dict) else "unavailable"),
@@ -270,7 +244,10 @@ async def run_gather(
                 )
             except Exception:
                 log.exception("gate-cycle memory write failed")
-        return artifact, {"task": task[:200] if task else None,
+        _pv = _prompt if _prompt is not None else None
+        _preview = (_pv.preview_200 if _pv is not None
+                    else (task[:200] if task else None))
+        return artifact, {"task": _preview,
                           "scenario": scenario,
                           "llm_calls": 0, "gate": gate_status,
                           "reasons": list(gate_reasons),
@@ -285,3 +262,107 @@ async def run_gather(
     )
     return None
 
+
+
+async def run_plan_bound_acquisition(
+    engine: Any, ctx: "_CycleContext", st: Any,
+) -> None:
+    """Plan-bound acquisition — forecast + scenario AFTER the receipt.
+
+    Driven by the FINAL disposed plan (``st.task_plan``), never the
+    provisional one: Phase-B bound horizons/targets steer acquisition for
+    the first time. Executes under the COMPREHENSION observation (the
+    receipt authorizes its own acquisition) and merges in place into the
+    carrier (``st`` shares its state dicts with ``ctx.gathered`` by
+    reference, so the denial-handler path sees the merged view).
+    """
+    task_plan = st.task_plan or {}
+    deterministic_state = st.deterministic_state
+    accumulated_tool_results = st.accumulated_tool_results
+    tool_results = st.tool_results
+    capability_log = st.capability_log
+    controller = st.controller
+
+    # Directive-driven horizon: the plan binds the horizon the task asked
+    # about. Native horizons fit directly; long horizons (15m/1h/4h) are
+    # answered through the deterministic long-horizon bridge (native fit
+    # projected to H — sigma scaled, skill decayed). Anything outside the
+    # vocabulary is refused by the tool with the supported set attached.
+    _planned_horizon = task_plan.get("forecast_horizon_ms")
+    _forecast_horizon_ms = int(_planned_horizon) if _planned_horizon else 5_000
+    _forecast_args = {"symbol": engine.symbol, "venue": engine.venue,
+                      "horizon_ms": _forecast_horizon_ms, "window_minutes": 30}
+    context._must_authorize_work(
+        controller, nested_loop=NestedLoop.CONTEXT,
+    )
+    forecast_result, forecast_log = await context.execute_tool(
+        engine.store, "calc.forward.forecast",
+        _forecast_args,
+        postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
+    )
+    capability_log.append(forecast_log)
+    controller = controller.record_outcome(
+        "calc.forward.forecast", forecast_log, forecast_result,
+        args=_forecast_args,
+    )
+    accumulated_tool_results["calc.forward.forecast"] = forecast_result
+    tool_results["calc.forward.forecast"] = forecast_result
+    forward_status = (
+        forecast_result.get("validation_state")
+        if isinstance(forecast_result, dict) else None
+    )
+    gate_status = ctx.gathered.gate_status if ctx.gathered is not None else "provisional"
+    gate_reasons = list(ctx.gathered.gate_reasons) if ctx.gathered is not None else []
+    if gate_status == "validated" and forward_status != "validated":
+        gate_status = "provisional"
+        gate_reasons = list(gate_reasons) + [
+            "forward ForecastResult is not OOS-validated"
+            if forward_status is not None
+            else "forward ForecastResult unavailable"
+        ]
+
+    # Directive-driven scenario pre-acquisition: a target-bearing native
+    # task gets its P(T)/P(S) curves computed deterministically under the
+    # receipt (same authority pattern as the canonical forecast).
+    forward_scenario_result: Any = None
+    forward_scenario_log: dict[str, Any] | None = None
+    if (task_plan.get("horizon_regime") == "native"
+            and (task_plan.get("targets") or task_plan.get("invalidations"))):
+        _scenario_args = {"symbol": engine.symbol, "venue": engine.venue,
+                          "horizon_ms": _forecast_horizon_ms,
+                          "targets": [t["value"] for t in task_plan.get("targets")],
+                          "invalidations": [s["value"] for s in task_plan.get("invalidations")],
+                          "window_minutes": 30}
+        context._must_authorize_work(
+            controller, nested_loop=NestedLoop.CONTEXT,
+        )
+        forward_scenario_result, forward_scenario_log = await context.execute_tool(
+            engine.store, "calc.forward.scenario",
+            _scenario_args,
+            postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
+        )
+        capability_log.append(forward_scenario_log)
+        controller = controller.record_outcome(
+            "calc.forward.scenario", forward_scenario_log, forward_scenario_result,
+            args=_scenario_args,
+        )
+        accumulated_tool_results["calc.forward.scenario"] = forward_scenario_result
+        tool_results["calc.forward.scenario"] = forward_scenario_result
+
+    # In-place merge (key order preserved — placeholders set by bootstrap).
+    deterministic_state["forecast_result"] = forecast_result
+    deterministic_state["forward_scenario"] = forward_scenario_result
+    deterministic_state["forward_scenario_note"] = (
+        (forward_scenario_log or {}).get("detail")
+        if isinstance(forward_scenario_log, dict) else "not_run")
+    deterministic_state["gate"] = {"status": gate_status, "reasons": list(gate_reasons)}
+    deterministic_state["forward_gate"] = {
+        "status": ((forecast_result or {}).get("validation_state")
+                   if isinstance(forecast_result, dict) else "unavailable"),
+        "probability_status": (((forecast_result or {}).get("multivariate") or {}).get("probability_status")
+                               if isinstance(forecast_result, dict) else "unavailable"),
+        "reason": ((forecast_log or {}).get("detail")
+                   if isinstance(forecast_log, dict) else "not_run"),
+    }
+    st.controller = controller
+    ctx.controller = controller

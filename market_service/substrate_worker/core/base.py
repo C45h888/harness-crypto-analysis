@@ -21,6 +21,9 @@ import os
 import time
 from typing import Any
 
+from market_service.runtime.horizons import (
+    HORIZON_PERIOD_MS, new_fold_state,
+)
 from market_service.runtime.redis_store import RedisRuntimeStore
 from market_service.substrate_worker.contracts import (
     CadenceProfile,
@@ -74,6 +77,12 @@ class SubstrateBase:
     # Consumer-group prefix (groups are namespaced per stream; this keeps
     # analysis groups identifiable on the substrate state streams).
     GROUP_PREFIX: str = "substrate"
+    # Phase H1 — declared time horizons (docs/HORIZON_RETENTION_SPEC.md).
+    # () = legacy single-window behavior (byte-for-byte unchanged). A
+    # worker declaring e.g. ("15m", "1h", "4h") gets per-horizon fold
+    # state maintained by the cadence layer, per-horizon evidence windows
+    # attached to compute input, and horizon-tagged rollover fires.
+    HORIZONS: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -159,6 +168,19 @@ class SubstrateBase:
 
         self._redis = store.redis
         self._dedupe_lua_sha: str | None = None
+        # Phase H1 — per-horizon fold state (in-memory; summaries persist in
+        # the payload and rebuild via backfill/PG on cold start).
+        for hz in type(self).HORIZONS:
+            if hz not in HORIZON_PERIOD_MS:
+                raise ValueError(
+                    f"{type(self).__name__}: unknown horizon {hz!r}; "
+                    f"expected one of {sorted(HORIZON_PERIOD_MS)}"
+                )
+        self.horizons: tuple[str, ...] = tuple(type(self).HORIZONS)
+        self._horizon_folds: dict[str, dict[str, Any]] = {
+            hz: new_fold_state(hz) for hz in self.horizons
+        }
+        self._horizons_backfilled = False
         self._last_fire_ms: int | None = None
         self._last_error: str | None = None
         self._last_dormant_reason: str | None = None

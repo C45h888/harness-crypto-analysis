@@ -168,7 +168,7 @@ class MergeJudgementTests(unittest.TestCase):
     """Final validation judges the MERGED interpretation, not the last turn."""
 
     def test_bare_declaration_turn_does_not_erase_content(self):
-        from market_service.nooa_harness.engine.narration import (
+        from market_service.nooa_harness.engine.core.reasoning import (
             merge_interpretation,
         )
         turns = [
@@ -185,7 +185,7 @@ class MergeJudgementTests(unittest.TestCase):
         self.assertEqual(len(merged["evidence"]), 1)
 
     def test_evidence_union_dedupes_and_scenario_last_wins(self):
-        from market_service.nooa_harness.engine.narration import (
+        from market_service.nooa_harness.engine.core.reasoning import (
             merge_interpretation,
         )
         entry = {"path": "calc.ofi.intervals → data[0].ofi",
@@ -203,7 +203,7 @@ class RootsIdentityTests(unittest.TestCase):
     """Two different calc.* tools are TWO roots (not one root 'calc')."""
 
     def test_tool_heads_count_distinct(self):
-        from market_service.nooa_harness.engine.narration import (
+        from market_service.nooa_harness.engine.core.reasoning import (
             validate_final_turn,
         )
         parsed = {
@@ -225,7 +225,7 @@ class RootsIdentityTests(unittest.TestCase):
             not any("roots" in m for m in missing), missing)
 
     def test_deterministic_state_only_is_still_rejected(self):
-        from market_service.nooa_harness.engine.narration import (
+        from market_service.nooa_harness.engine.core.reasoning import (
             validate_final_turn,
         )
         parsed = {

@@ -987,7 +987,10 @@ class P3PromptContractTests(unittest.TestCase):
         from market_service.nooa_harness.engine import _PHASE_GUIDANCE
         p3 = _PHASE_GUIDANCE["P3"]
         self.assertIn("substrate.read", p3)
-        self.assertIn("BEFORE", p3)  # invoke listed before read
+        # Intent + constraints, not a program: order a read after the
+        # invoke whose projection it must see; no scripted array layout.
+        self.assertNotIn("BEFORE", p3)
+        self.assertIn("sequentially", p3)
         self.assertIn("age_ms", p3)
         self.assertIn("FINDINGS", p3)
         self.assertIn("PRIMARY", p3)
@@ -997,7 +1000,11 @@ class P3PromptContractTests(unittest.TestCase):
         from market_service.nooa_harness.engine import _PHASE_GUIDANCE
         p3 = _PHASE_GUIDANCE["P3"]
         self.assertIn("cadence", p3.lower())
-        self.assertIn("migration", p3)  # the ~900s outlier is named
+        # Constraint without the rotting per-worker table: cadence is read
+        # off each projection, never one global threshold.
+        self.assertIn("global threshold", p3)
+        self.assertNotIn("migration", p3)
+        self.assertNotIn("900s", p3)
 
     def test_p3_guidance_makes_an_unreachable_plane_a_finding(self):
         from market_service.nooa_harness.engine import _PHASE_GUIDANCE

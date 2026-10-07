@@ -89,17 +89,27 @@ def command() -> None:
     help="output shape (same as the agent's market.read tool)",
 )
 def read_cmd(symbol: str, run_id: str | None, mode: str) -> None:
-    """Read a collated market run — raw payload through the shared projections."""
-    payload = asyncio.run(_read_collated_run(_settings(), symbol, run_id))
-    if payload is None:
-        _emit({"run": None})
-        return
-    if mode == "full":
-        _emit(payload)
-    elif mode == "inventory":
-        _emit(read_paths.market_inventory(payload))
-    else:
-        _emit(read_paths.market_snapshot(payload))
+    """Read a collated market run — via the canonical interaction plane."""
+    from market_service.interaction_plane import parsing as _parsing
+    from market_service.interaction_plane import prompts as _prompts
+    from market_service.interaction_plane import reads as _reads
+
+    async def _op() -> dict:
+        payload, source, _ = await _reads.read_ledger(
+            symbol.upper(), run_id=run_id, mode=mode)
+        if payload is None:
+            surfaces = await _reads.read_surfaces(symbol.upper())
+            return _prompts.attach_header(
+                _parsing.empty_read(
+                    tool="market.read", segment="ledger", mode=mode,
+                    symbol=symbol.upper(), surfaces=surfaces), 
+                segment="ledger", mode=mode, source=None)
+        return _prompts.attach_header(
+            _parsing.wrap_result(
+                "market.read", payload, segment="ledger", mode=mode),
+            segment="ledger", mode=mode, source=source)
+
+    _emit(asyncio.run(_op()))
 
 
 @command.command("substrate-read")
@@ -110,21 +120,19 @@ def read_cmd(symbol: str, run_id: str | None, mode: str) -> None:
               type=click.Choice(["compact", "full"]),
               help="output shape (same discipline as the agent's substrate.read tool)")
 def substrate_read_cmd(symbol: str, substrate: str | None, mode: str) -> None:
-    """Read worker state — the warm-plane companion of ``market read``."""
-    from market_service.substrate_worker import tools as substrate_tools
+    """Read worker state — via the canonical interaction plane."""
+    from market_service.interaction_plane import parsing as _parsing
+    from market_service.interaction_plane import prompts as _prompts
+    from market_service.interaction_plane import reads as _reads
 
     async def _op() -> dict:
-        settings = _settings()
-        redis = RedisRuntimeStore(
-            settings.redis_url, settings.redis_key_prefix,
-            settings.redis_stream_maxlen,
-        )
-        try:
-            return await substrate_tools.read_state(
-                redis, symbol.upper(),
-                substrates=[substrate] if substrate else None, mode=mode)
-        finally:
-            await redis.close()
+        payload, source = await _reads.read_warm(
+            symbol.upper(),
+            substrates=[substrate] if substrate else None, mode=mode)
+        return _prompts.attach_header(
+            _parsing.wrap_result(
+                "substrate.read", payload, segment="warm", mode=mode),
+            segment="warm", mode=mode, source=source)
 
     _emit(asyncio.run(_op()))
 
