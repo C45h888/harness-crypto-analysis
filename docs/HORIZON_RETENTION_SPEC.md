@@ -1,7 +1,8 @@
 # Horizon Retention & Worker Cadence Spec — Time-Horizon Segmentation (Phase H1)
 
-Status: **implemented and green** (1060 tests incl. 32 new horizon/retention
-contract tests). Companion to
+Status: **implemented and green — H1 AND the A/B/C rollout landed**
+(1104 tests incl. 48 new horizon/retention/rollout contract tests).
+Companion to
 `SUBSTRATE_WORKER_SPEC.md` (worker doctrine) and `CANONICAL_RUNTIME_DOCTRINE.md`
 (null discipline, evidence-first). Governs two change vectors decided in the
 H1 assessment:
@@ -285,16 +286,38 @@ substrate purity violation.
    horizon-tagged predicates; probe purity preserved (thresholds imported
    from substrate module only).
 
-## 5. Implementation order
+## 5. Implementation order (all steps COMPLETE)
 
 1. Part 1: slimming + MINID trim + `read_raw_oldest_ms` + coverage honesty
    (independently shippable, prerequisite for everything else).
 2. `runtime/horizons.py` + contracts v2 (pure additions, no behavior change).
 3. Core fold + backfill machinery (default no-op — zero effect until a
    worker opts in).
-4. Pilot: `migration_worker` on `("15m", "1h", "4h")`.
-5. Rollout to remaining opted-in workers one at a time (`tape`, `density`,
-   `technicals` next; `large_print` stays base-horizon only).
+4. Pilot: `migration_worker` on `("1h", "4h")`.
+5. **Phase A — rollout COMPLETE**: `tape` (fold-native per-horizon CVD/
+   buy-share + horizon-tagged band-cross predicates), `technicals`
+   (fold-candle EMA/trend/ATR — the horizon leg is **ema9**, the only EMA
+   resolving on the ≤14/18-segment rings; base ema21 stays on klines),
+   `density` (window-native 4h keystone intensity over the core-attached
+   deduped horizon window); `large_print` stays base-horizon only.
+6. **Phase B — PG fold rebuild COMPLETE**: `_backfill_horizons` is
+   PG-first via the existing `read_substrate_history` reader — restore
+   seeds hwm + segments, then the raw backfill folds on top; the monotonic
+   trade-id dedupe folds every already-counted trade as zero, so the
+   merge is free. v1/absent/failed ledger rows → raw-only fallback.
+   `freshness.horizons_rebuilt_from` records the source ("pg"|"raw").
+7. **Phase C — budget guard COMPLETE**: poller boot check estimates the
+   raw budget (symbols × RAW_STREAM_MAXLEN × ~60KB) against
+   `CONFIG GET maxmemory` and warns loudly >70% (never blocks); docker-redis
+   maxmemory raised 1500mb → 3000mb per §1.3.
+
+### 5a. Implementation correction — guardrail separation
+
+The raw stream's count guardrail is a SEPARATE cap (`RAW_STREAM_MAXLEN`,
+default 20 000 ≈ 28h at 5s cadence) — the state-stream
+`REDIS_STREAM_MAXLEN` (default 1200 ≈ 100 min) would silently defeat the
+12h MINID contract if reused as the raw burst cap. A count cap below the
+time retention MUST NOT be allowed.
 
 ## 6. Explicit non-goals (H1)
 
@@ -304,3 +327,6 @@ substrate purity violation.
   stream's retention model is a separate concern.
 * No typed horizon contracts (dataclass horizon views) — dict-based in H1;
   the substrate purity rule is the guard until a follow-up spec types them.
+* Fold horizon semantics: trailing-horizon rings (pruned by segment time
+  behind the newest folded trade), NOT IST-bucket-aligned spans — bucket
+  identity governs rollovers; the fold ring covers the trailing window.

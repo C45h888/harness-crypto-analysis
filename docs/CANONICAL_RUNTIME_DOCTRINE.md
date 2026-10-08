@@ -131,3 +131,16 @@ coherent state
 + explicit uncertainty
 + human-controlled decision
 ```
+
+## State charter
+
+The runtime's state model is chartered: one canonical owner per state axis
+(horizon identity → `runtime/horizons.py`; loop identity →
+`nooa_harness/loop_states.py` incl. the `LoopTag` crosswalk; the
+deterministic_state keyspace → `engine/core/context.py` roots registry;
+schema versions → `runtime/contracts.py` registry; status families → their
+per-plane owners, pairwise disjoint). Planes consume owners by IMPORT, never
+by mirrored constants; silent defaults that map unknown state identities to
+authorized behavior are governance errors. Enforcement lives in
+`tests/test_state_charter.py` + `tests/test_outer_cycle_charter.py`; the
+full doctrine is `docs/STATE_CHARTER_SPEC.md`.

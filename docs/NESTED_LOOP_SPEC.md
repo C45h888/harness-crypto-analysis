@@ -79,8 +79,9 @@ the loop + intent + sub-loop, never the internal step.
 - **SOURCING** — `PLAN_READS → SELECT_TOOLS`.
 - **ACQUISITION** *(iterates)* — `READ → CALCULATE → OBSERVE`. Exit: every
   planned read/calculation has been observed.
-- **VERIFICATION** *(iterates)* — `ASSESS → REPLAN`. Exit: coverage
-  satisfies the intent or budget spent.
+- **VERIFICATION** *(iterates)* — `ASSESS → STORE_HANDOFF`. Exit: coverage
+  assessed and handoff stored, or budget spent. Gaps ride forward as
+  findings — no re-plan edge (gate 2 is forward-only).
 
 ### REASONING (REASON) — reason prompt data against tool data
 - **HYPOTHESIS** — `FRAME → STATE_PRIOR`.
@@ -243,7 +244,7 @@ contract unchanged. Extract four private methods:
 | Method | Exact existing-code seam | Vocabulary it hosts |
 |---|---|---|
 | `_stage_wake` | timestamp, wake log, governed controller initialization; stop before pre-gate reads | WAKE / COMPREHENSION |
-| `_stage_gather` | two pre-gate reads, ledger, deterministic state and hard-gate early return; stop before memory recall | GATHER / EVIDENCE |
+| `_stage_gather` | agent-first fetch turn + floor fill, ledger, deterministic state and hard-gate early return; stop before memory recall | GATHER / CONTEXT |
 | `_stage_reason_and_check` | memory recall, prompts, initial narration, tool rounds, validation/repair and final-turn bookkeeping; stop before interpretation assembly | REASON / REASONING and CHECK / VALIDATION |
 | `_stage_output` | interpretation/fallback, hypothesis, calculations, terminal, artifact persistence and memory disposition | FINALIZE / OUTPUT |
 
@@ -251,7 +252,8 @@ The combined reason/check method is a feedback coordinator, not a new stage.
 During P3b-A these associations identify implementation seams; they do not
 claim that all nested sub-loops are already operational.
 
-The orchestrator creates a context, calls gather, propagates any completed
+The orchestrator creates a context, runs the agent fetch, verdicts the
+data gate, propagates any completed
 result, calls reason/check, propagates any completed result, then calls output.
 Gather and reason/check return `None` to continue or the existing artifact/meta
 tuple to finish. Failure-path persistence stays in its existing branch.
