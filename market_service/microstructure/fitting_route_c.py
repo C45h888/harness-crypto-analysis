@@ -44,12 +44,17 @@ from .contracts import (
     ForwardObservation,
 )
 from .fitting_common import PRECISION, MIN_OBSERVATIONS, _fit_id
+from market_service.runtime.horizons import NATIVE_HORIZON_ORDER
 
 # ---------------------------------------------------------------------------
 # Route C frozen constants
 # ---------------------------------------------------------------------------
 
-FORWARD_HORIZONS_MS: tuple[int, ...] = (1_000, 5_000, 30_000, 60_000)
+# Phase S-2 (docs/STATE_CHARTER_SPEC.md): the native forward horizons are
+# owned by the tree-wide charter module — this is an IDENTITY to
+# runtime/horizons.NATIVE_HORIZON_ORDER, not a local copy. Route C remains
+# the plane that FITS at these horizons; the vocabulary is chartered.
+FORWARD_HORIZONS_MS: tuple[int, ...] = NATIVE_HORIZON_ORDER
 MIN_OOS_OBSERVATIONS = 30
 OOS_SPLIT_METHOD = "time-ordered-70/30"
 FORWARD_SCENARIO_VERSION = "fwd-scenario-v1"

@@ -31,7 +31,10 @@ PRECISION = 50
 # The fitted model supplies the REQUIREMENT (required horizon flow); the
 # tape supplies the PROBABILITY (empirical exceedance over horizon-length
 # OFI sums). Horizons live where the question lives (15m/1h/4h).
-SCENARIO_HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400}
+# Phase S-2 (docs/STATE_CHARTER_SPEC.md): this resolves to the tree-wide
+# charter owner by IDENTITY — runtime/horizons.LONG_HORIZONS_SECONDS.
+from market_service.runtime.horizons import LONG_HORIZONS_SECONDS
+SCENARIO_HORIZONS = LONG_HORIZONS_SECONDS
 MIN_SCENARIO_WINDOWS = 30
 MAX_SCENARIO_INTERVALS = 50_000
 _BETA_ZERO_EPS = Decimal("1e-18")

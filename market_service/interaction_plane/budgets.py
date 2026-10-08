@@ -6,7 +6,11 @@ enforces them; the CLI never invents its own cutoffs.
 
 from __future__ import annotations
 
-INTERACTION_SCHEMA_VERSION = 1
+from market_service.runtime.contracts import SCHEMA_VERSION_REGISTRY
+
+# Phase S-4: the interaction-plane contract version resolves to the tree
+# registry (identity, not a local copy).
+INTERACTION_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["interaction_budget"]
 INTERACTION_PROMPT_VERSION = "interaction-prompt-v1"
 
 MODE_CHAR_ROOF: dict[str, int] = {

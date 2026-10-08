@@ -66,7 +66,10 @@ HUMAN_ONLY_MODES: frozenset[str] = frozenset({"full"})
 
 # Horizon-span slice vocabulary (per-horizon keys — sibling projections of
 # the collated ledger, read via `--read --span <h>`; see runtime/horizon_spans).
-SPAN_HORIZONS: tuple[str, ...] = ("1s", "5s", "30s", "60s", "15m", "1h", "4h")
+# Phase S-2 (docs/STATE_CHARTER_SPEC.md): resolves to the charter owner by
+# IDENTITY — the same names runtime/horizon_spans (and runtime/horizons)
+# declare, so the interaction plane can never fork the span set.
+from market_service.runtime.horizon_spans import SPAN_HORIZONS
 
 # Outer CLI flag → segment. The CLI adapter (cli.py) routes purely on this.
 FLAG_SEGMENTS: dict[str, str] = {

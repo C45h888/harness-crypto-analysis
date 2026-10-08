@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-MICROSTRUCTURE_SCHEMA_VERSION = 1
+from market_service.runtime.contracts import SCHEMA_VERSION_REGISTRY
+
+# Phase S-4: the microstructure payload contracts' version resolves to the
+# tree registry (identity, not a local copy).
+MICROSTRUCTURE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["microstructure"]
 
 # FROZEN label of the L2 ladder projection carried on tape events. The
 # ladder is ADDITIVE evidence: it never enters the best-quote hash domains

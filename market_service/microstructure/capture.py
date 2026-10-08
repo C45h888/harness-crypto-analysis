@@ -21,6 +21,15 @@ import aiohttp
 
 from market_service.clients import BinanceWebSocket, DepthSnapshot
 from market_service.microstructure.contracts import DepthDelta
+from market_service.microstructure.contracts import MICROSTRUCTURE_SCHEMA_VERSION
+
+# Phase S-4 (docs/STATE_CHARTER_SPEC.md) — the transport-liveness status
+# family: every state ``_status()`` may report, frozen. The charter test
+# asserts each ``_status("...")`` call site resolves to a member of this
+# set, so a new transport state is added HERE first.
+STATUS_TRANSITIONS: tuple[str, ...] = (
+    "starting", "reconnecting", "stopped", "connected", "running", "gap",
+)
 from market_service.microstructure.ofi import OFIAggregator
 from market_service.microstructure.orderbook import BookGapError, OrderBookReconstructor
 from market_service.runtime.postgres_store import PostgresRuntimeStore
@@ -462,7 +471,7 @@ class BinanceSpotDepthCapture:
 
     async def _status(self, state: str, *, error: str | None = None) -> None:
         payload: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": MICROSTRUCTURE_SCHEMA_VERSION,
             "symbol": self.settings.symbol,
             "venue": self.settings.venue,
             "state": state,

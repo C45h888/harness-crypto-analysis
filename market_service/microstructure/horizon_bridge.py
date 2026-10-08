@@ -36,11 +36,16 @@ from typing import Any
 
 from .contracts import ForwardFit
 
-# Mirrors fitting_route_c.FORWARD_HORIZONS_MS / task_directive.NATIVE_HORIZONS_MS
-# (kept equal by test — see tests/test_horizon_bridge.py).
-NATIVE_HORIZONS_MS: tuple[int, ...] = (1_000, 5_000, 30_000, 60_000)
-# Mirrors task_directive.LONG_HORIZONS_MS ({15m, 1h, 4h} in ms).
-LONG_HORIZONS_MS: tuple[int, ...] = (900_000, 3_600_000, 14_400_000)
+# Phase S-2 (docs/STATE_CHARTER_SPEC.md): the native + long horizon numbers
+# resolve to the tree-wide charter owner (runtime/horizons) by IDENTITY —
+# this module no longer mirrors them locally, and the charter test
+# (test_state_charter.TestHorizonNamespace) pins the resolution. Route C
+# remains the plane that fits at the native horizons; task_directive parses
+# the directive vocabulary against the same owner's dict form.
+from market_service.runtime.horizons import LONG_HORIZON_ORDER, NATIVE_HORIZON_ORDER
+
+NATIVE_HORIZONS_MS: tuple[int, ...] = NATIVE_HORIZON_ORDER
+LONG_HORIZONS_MS: tuple[int, ...] = LONG_HORIZON_ORDER
 
 BRIDGE_MODEL_VERSION = "forward-ols-v2+long-bridge-v1"
 BRIDGE_METHOD = "native-bridge-v1"
