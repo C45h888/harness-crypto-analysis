@@ -9,15 +9,17 @@
 
 set -e
 
-# 1.5 GB hard cap with allkeys-lru eviction (Option C contract).
-# 64 MB / 100% rewrite threshold + RDB-preamble AOF = small,
-# frequent, crash-safe rewrites instead of one giant fragmented
-# rewrite every few hours.
+# Phase H1 (docs/HORIZON_RETENTION_SPEC.md §1.3): the widened raw
+# retention (12h, time-trimmed) needs the larger cap — 3 GB hard cap with
+# allkeys-lru eviction. The poller's boot-time budget guard makes this
+# contract observable at every start. 64 MB / 100% rewrite threshold +
+# RDB-preamble AOF = small, frequent, crash-safe rewrites instead of one
+# giant fragmented rewrite every few hours.
 
 redis-server \
   --appendonly yes \
   --appendfsync everysec \
-  --maxmemory 1500mb \
+  --maxmemory 3000mb \
   --maxmemory-policy allkeys-lru \
   --auto-aof-rewrite-min-size 64mb \
   --auto-aof-rewrite-percentage 100 \
