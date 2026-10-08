@@ -376,9 +376,15 @@ class TestCycleFailureEndToEnd:
         if case == "narr_fail":
             turns = []
         elif case == "parse_fail":
-            turns = ["not valid json at all whatsoever"]
+            # Fetch degrades to floor on the first unparseable turn;
+            # narrate#1 then fails to parse on the second.
+            turns = ["not valid json at all whatsoever",
+                     "not valid json at all whatsoever"]
         elif case == "budget_exhausted":
-            turns = [_staged_narration("P6", final=True)] * 12
+            turns = ([_staged_narration("P1", tools=[
+                {"name": "micro.capture_status"},
+                {"name": "micro.fit_beta"}])]
+                + [_staged_narration("P6", final=True)] * 12)
 
         engine, store, postgres, memory = _engine(llm_responses=turns)
 

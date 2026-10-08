@@ -28,7 +28,15 @@ async def capture(case, stage_trace=None):
     # on the missing discipline citation — the repair turn dispatches
     # calc.discipline.audit in the validation home, then the final passes.
     # The spare trailing P6 is the output-composition pass's scripted turn.
+    # The agent-first fetch turn opens every scripted cycle: the agent pulls
+    # the gate reads itself (floor fills whatever is absent). All cases below
+    # prepend it; the gate case refuses on the fetched thin tape (llm_calls
+    # paid once — approved Option-2 cut, zero-LLM doctrine retired).
+    fetch_turn = _staged_narration("P1", tools=[{"name": "micro.capture_status"},
+                                           {"name": "micro.fit_beta"},
+                                           {"name": "market.read"}])
     success_turns = [
+        fetch_turn,
         _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"},
                                        {"name": "micro.ofi_intervals"}]),
         _staged_narration("P2", tools=[{"name": "calc.depth.average"},
@@ -51,6 +59,7 @@ async def capture(case, stage_trace=None):
         # early P6-final cannot be scripted first (final-ness only binds at
         # validation, and an unwalked track is not repairable mid-recovery).
         turns = [
+            fetch_turn,
             _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"},
                                            {"name": "micro.ofi_intervals"}]),
             _staged_narration("P2", tools=[{"name": "calc.depth.average"},
@@ -68,11 +77,17 @@ async def capture(case, stage_trace=None):
             _staged_narration("P6", final=True),
         ]
     elif case == "parse":
-        turns = ["not json"]
-    elif case in ("transport", "gate"):
+        # Fetch degrades to full floor on the unparseable turn; narrate#1
+        # then fails to parse on the second unparseable turn.
+        turns = ["not json", "not json"]
+    elif case == "transport":
         turns = []
+    elif case == "gate":
+        # The agent pulls the reads; the fake store reports thin tape for
+        # the gate case and the DATA gate refuses (llm_calls == 1).
+        turns = [fetch_turn]
     elif case == "budget":
-        turns = [_staged_narration("P6", final=True)] * 12
+        turns = [fetch_turn] + [_staged_narration("P6", final=True)] * 12
     else:
         turns = success_turns
     engine, store, postgres, memory = _engine(llm_responses=turns)
@@ -115,7 +130,8 @@ async def capture(case, stage_trace=None):
             return _spy
         _stage_wraps = [
             (core.wake, "run_wake"),
-            (core.gather, "run_bootstrap"),
+            (core.gather, "run_agent_fetch"),
+            (core.gather, "run_data_gate"),
             (core.wake, "run_comprehension"),
             (core.gather, "run_plan_bound_acquisition"),
             (core.reasoning, "run_evidence"),
@@ -174,22 +190,22 @@ def test_staged_cycle_converges_and_preserves_placement_order():
     # missing discipline citation, the recovery turn dispatches the audit,
     # and validation re-runs to accept the repaired final. That two-phase
     # entry is the repair mechanics the settlement depends on.
-    assert stages == ["run_wake", "run_bootstrap", "run_comprehension",
+    assert stages == ["run_wake", "run_agent_fetch", "run_data_gate", "run_comprehension",
                     "run_plan_bound_acquisition", "run_evidence",
                     "run_reasoning", "run_validation", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
     assert result["meta"]["final_validation"]["passed"]
     # Understanding + plan placement (two memory writes, at the
-    # comprehension→evidence handoff) precede the two-phase settlement side
-    # effects: pending projection, memory disposition, final projection,
-    # final-trace refresh.
+    # comprehension→evidence handoff) plus the end-of-CONTEXT handoff
+    # package precede the two-phase settlement side effects: pending
+    # projection, memory disposition, final projection, final-trace refresh.
     assert [effect[0] for effect in result["effects"] if effect[0] in ("postgres", "redis", "memory")] == [
-        "memory", "memory", "postgres", "redis", "memory", "redis", "redis",
+        "memory", "memory", "memory", "postgres", "redis", "memory", "redis", "redis",
     ]
 
 
 def test_gate_refusal_stops_stage_execution():
     stages = []
     result = asyncio.run(capture("gate", stages))
-    assert stages == ["run_wake", "run_bootstrap"]
-    assert result["meta"]["llm_calls"] == 0
+    assert stages == ["run_wake", "run_agent_fetch", "run_data_gate"]
+    assert result["meta"]["llm_calls"] == 1

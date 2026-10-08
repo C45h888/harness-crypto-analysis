@@ -373,6 +373,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
         import json as _json
 
         from tests.test_engine import (
+            _FETCH_TURN,
             _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
             _TRACK_INTERPRET, _engine, _good_narration, _track_tools, _wake,
         )
@@ -393,6 +394,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
                            "evidence_refs": ["calc.ofi.intervals"]},
         })
         engine, _s, _p, _m = _engine(llm_responses=[
+            _FETCH_TURN,
             _good_narration(),                 # thin, no tools
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
@@ -439,6 +441,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
         import json as _json
 
         from tests.test_engine import (
+            _FETCH_TURN,
             _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
             _TRACK_INTERPRET, _engine, _good_narration, _track_tools, _wake,
         )
@@ -458,6 +461,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             "hypothesis": {"H0": "no continuation", "H1": "continuation"},
         })
         engine, _s, _p, _m = _engine(llm_responses=[
+            _FETCH_TURN,
             _good_narration(),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),

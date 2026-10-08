@@ -20,6 +20,7 @@ import unittest
 from typing import Any
 
 from tests.test_engine import (
+    _FETCH_TURN,
     _TRACK_ASSEMBLE,
     _TRACK_DISCIPLINE,
     _TRACK_HYPOTHESIZE,
@@ -34,6 +35,7 @@ from tests.test_engine import (
 def _evidence_prefix() -> list[str]:
     """Standard evidence reads (unchanged across walks)."""
     return [
+        _FETCH_TURN,
         _staged_narration("P1", tools=[
             {"name": "calc.ofi.intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
             {"name": "micro.ofi_intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
@@ -315,11 +317,11 @@ class ReformulationWalkTests(unittest.IsolatedAsyncioTestCase):
             return _json.dumps(payload)
 
         engine, _s, _p, _m = _engine(llm_responses=[
-            # NOTE: evidence consumes exactly three turns, and the halt
+            # NOTE: fetch + evidence consume four turns, and the halt
             # fires on the first reasoning dispatch already (the refusal is
-            # cycle-scoped) — so the reformulation offer is 4th, with no
+            # cycle-scoped) — so the reformulation offer is 5th, with no
             # empty close in between (that slot belongs to healthy flows).
-            *_evidence_prefix()[:3],
+            *_evidence_prefix()[:4],
             _reform(),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),

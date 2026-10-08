@@ -7,7 +7,7 @@ Covers the full engine cycle with fakes (no Redis, no Postgres, no litellm):
   or repair-then-final → artifact persisted (PG-first, Redis after) →
   memory proposals resolved. Thin finals are rejected for repair while
   LLM budget (8 turns, 5 tool rounds) remains.
-- Hard gate: insufficient inputs → NULL interpretation, ZERO LLM calls,
+- Hard gate: insufficient inputs → NULL interpretation, ONE fetch turn,
   gate observation remembered deterministically.
 - Final validation: P1/P2/P3/P5 tool coverage + H0 + ≥200-char P4
   explanation + dual-root evidence required; failures recorded honestly.
@@ -273,9 +273,18 @@ def _wake():
     )
 
 
+# Agent-first fetch turn shared by cycle-driving tests: the agent pulls
+# the two gate reads itself; the floor has nothing left to fill.
+_FETCH_TURN = _staged_narration("P1", tools=[
+    {"name": "micro.capture_status", "args": {}},
+    {"name": "micro.fit_beta", "args": {}},
+])
+
+
 class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_staged_cycle_covers_phases_and_finalizes(self):
         engine, store, postgres, memory = _engine(llm_responses=[
+            _FETCH_TURN,
             _staged_narration("P1", tools=[
                 {"name": "calc.ofi.intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
                 {"name": "micro.ofi_intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
@@ -300,7 +309,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 10)
+        self.assertEqual(meta["llm_calls"], 11)
         self.assertTrue(meta["tool_round"])
         self.assertEqual(meta["repairs"], 1)
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
@@ -322,15 +331,18 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # Memory proposal accepted and written
         self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
 
-    async def test_insufficient_gate_zero_llm_calls(self):
+    async def test_insufficient_gate_single_fetch_call(self):
+        # Agent-first bootstrap: the agent spends one fetch turn pulling the
+        # reads, then the DATA gate refuses thin tape. Dead tape costs one
+        # turn now (approved Option-2 cut — zero-LLM doctrine retired).
         engine, store, postgres, memory = _engine(
-            llm_responses=[], capture_state="starting",
+            llm_responses=[_FETCH_TURN], capture_state="starting",
         )
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 0)
+        self.assertEqual(meta["llm_calls"], 1)
         self.assertEqual(artifact.status, "insufficient")
         self.assertIsNone(artifact.interpretation)
-        self.assertEqual(len(engine.llm.calls), 0)
+        self.assertEqual(len(engine.llm.calls), 1)
         # Deterministic quality observation remembered (engine disposes)
         self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
 
@@ -339,12 +351,12 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # gate refuses narration: deterministic_state.task, cycle_meta.task,
         # and the wake capability detail all carry it (zero LLM calls).
         engine, _s, _p, _m = _engine(
-            llm_responses=[], capture_state="starting",
+            llm_responses=[_FETCH_TURN], capture_state="starting",
         )
         task = "is short-term sell pressure exhausting on BTCUSDT?"
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task=task)
-        self.assertEqual(meta["llm_calls"], 0)
+        self.assertEqual(meta["llm_calls"], 1)
         self.assertEqual(meta["task"], task[:200])
         self.assertEqual(artifact.deterministic_state.get("task"), task)
         wake_detail = artifact.capability_log[0]["detail"]
@@ -358,13 +370,13 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # Phase 2 plumbing: scenario echoes into state/meta/detail with zero
         # LLM calls; absent scenario leaves no keys behind (parity).
         engine, _s, _p, _m = _engine(
-            llm_responses=[], capture_state="starting",
+            llm_responses=[_FETCH_TURN], capture_state="starting",
         )
         scenario = {"target_price": "245.30", "horizon": "1h"}
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="can price hit 245.30?",
             scenario=scenario)
-        self.assertEqual(meta["llm_calls"], 0)
+        self.assertEqual(meta["llm_calls"], 1)
         self.assertEqual(meta["scenario"], scenario)
         self.assertEqual(artifact.deterministic_state.get("scenario"), scenario)
         self.assertEqual(
@@ -378,6 +390,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # (VALIDATION_RETRY_PASSES = 2): the thin final (no H0) cannot pass
         # either gate and every repair budget turn is spent before terminal.
         engine, _s, _p, _m = _engine(llm_responses=[
+            _FETCH_TURN,
             _good_narration(),  # thin, no tools → evidence breaks at once
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
@@ -388,7 +401,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _good_narration(),  # repair #2 close (budget 2 since 2026-09-27)
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 8)
+        self.assertEqual(meta["llm_calls"], 9)
         self.assertEqual(meta["repairs"], 2)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
@@ -476,7 +489,8 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(postgres.inserted), 1)
 
     async def test_unparseable_narration_is_degraded_not_fatal(self):
-        engine, _s, postgres, _m = _engine(llm_responses=["no json here at all"])
+        engine, _s, postgres, _m = _engine(llm_responses=["no json here at all",
+                                                          "no json here at all"])
         artifact, _meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertIsNone(artifact.interpretation)
         self.assertTrue(any(
@@ -501,6 +515,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             "memory_proposals": [],
         })
         engine, _s, _p, _m = _engine(llm_responses=[
+            _FETCH_TURN,
             narration,
             _staged_narration("P3", tools=[
                 {"name": "market.derivatives", "args": {}},
@@ -533,11 +548,12 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # runtime preserves the failure terminal and intentionally does not
         # claim a composed interpretation.
         engine, _s, _p, _m = _engine(llm_responses=[
+            _FETCH_TURN,
             _good_narration(with_tools=True),
             "unparseable",
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 2)
+        self.assertEqual(meta["llm_calls"], 3)
         self.assertIsNone(artifact.interpretation)
         self.assertEqual(meta["terminal"], "parse_failed")
         self.assertFalse(meta["final_validation"]["passed"])
@@ -857,6 +873,7 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
         # tape world instead of erroring, so the outage is injected on the
         # derivatives read to preserve this test's error-path premise.)
         engine, store, _p, _m = _engine(llm_responses=[
+            _FETCH_TURN,
             _staged_narration("P1", tools=[
                 {"name": "market.read", "args": {}},
                 {"name": "calc.ofi.intervals", "args": {}},

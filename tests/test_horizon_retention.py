@@ -27,9 +27,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from market_service.runtime.horizons import (
-    HORIZON_PERIOD_MS, IST_OFFSET_MS, bucket_start_ms, fold_snapshot,
-    fold_state_summary, fold_trades, horizon_bucket, horizon_minutes,
-    new_fold_state, restore_fold_state,
+    HORIZON_PERIOD_MS, IST_OFFSET_MS, bucket_start_ms, fold_candles,
+    fold_snapshot, fold_state_summary, fold_trades, horizon_bucket,
+    horizon_minutes, new_fold_state, restore_fold_state,
 )
 from market_service.runtime.raw_window import build_raw_window
 from market_service.runtime.redis_store import RedisRuntimeStore, _slim_stream_body
@@ -157,21 +157,39 @@ class FoldTests(unittest.TestCase):
     def test_summary_round_trip_bounded(self):
         state = new_fold_state("15m")
         t = _utc_epoch_ms("2026-09-08T12:00:00+00:00")
-        for i in range(10):  # 10 segments (50 minutes)
+        for i in range(10):  # 10 segments spanning 50 minutes
             fold_trades(state, [_trade(i + 1, t + i * 6 * 60_000, 100.0, 1.0)],
                         "futures")
+        # Phase A trailing prune: the ring keeps only segments inside the
+        # trailing 15m horizon (newest at t+54m → cutoff t+39m). Segment
+        # starts are 5m-GRID aligned, not trade-relative.
+        self.assertEqual(len(state["segments"]), 3)
+        self.assertEqual(
+            [s["segment_start_ms"] for s in state["segments"]],
+            [((t + i * 360_000) // 300_000) * 300_000 for i in (7, 8, 9)],
+        )
         summary = fold_state_summary(state, segment_cap=4)
-        self.assertEqual(summary["segments_total"], 10)
-        self.assertTrue(summary["__segments_truncated__"])
-        self.assertEqual(len(summary["segments"]), 4)
+        self.assertEqual(summary["segments_total"], 3)
+        self.assertFalse(summary["__segments_truncated__"])
         restored = restore_fold_state(summary)
         self.assertEqual(restored["hwm"], state["hwm"])
-        self.assertEqual(len(restored["segments"]), 4)
+        self.assertEqual(len(restored["segments"]), 3)
         # Restored state resumes dedupe at the high-water.
         self.assertEqual(
             fold_trades(restored, [_trade(5, t + 4 * 6 * 60_000)], "futures"), 0)
         self.assertEqual(
             fold_trades(restored, [_trade(99, t + 60 * 60_000)], "futures"), 1)
+
+    def test_fold_prune_counts_bounded_fallback(self):
+        """Even a burst of many segments within the horizon stays capped."""
+        state = new_fold_state("15m")
+        t = _utc_epoch_ms("2026-09-08T12:00:00+00:00")
+        # 5m segments over 15 minutes → 4 segments, all within the horizon.
+        for i in range(4):
+            fold_trades(state, [_trade(i + 1, t + i * 5 * 60_000, 100.0, 1.0)],
+                        "futures")
+        self.assertEqual(len(state["segments"]), 4)  # ring cap 5 not hit
+        self.assertEqual(len(fold_candles(state)), 4)
 
     def test_fold_per_venue_highwater_independent(self):
         state = new_fold_state("1h")
@@ -244,6 +262,7 @@ class SlimmingTests(unittest.TestCase):
         store.prefix = "mkt"
         store.stream_maxlen = 5000
         store.raw_retention_ms = 43_200_000
+        store.raw_guardrail_maxlen = 20_000
         sid = asyncio.run(store.publish_raw_evidence("SOLUSDT", _full_payload(1_000)))
         self.assertEqual(sid, "1527-0")
         script, args = calls[0]
@@ -254,7 +273,10 @@ class SlimmingTests(unittest.TestCase):
         *keys, full_body, ts, _ttl, stream_body, maxlen, minid = args
         self.assertEqual(len(keys), 3)
         self.assertEqual(ts, "1000")
-        self.assertEqual(maxlen, "5000")
+        # The MAXLEN guardrail is the RAW guardrail (20 000), NOT the
+        # state-stream maxlen — a count cap below the time retention
+        # would silently defeat the MINID contract.
+        self.assertEqual(maxlen, "20000")
         # minid = publish instant - 12h → within a second of that math
         now_ms = int(time.time() * 1000)
         self.assertAlmostEqual(int(minid), now_ms - 43_200_000, delta=2_000)
