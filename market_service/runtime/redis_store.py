@@ -62,7 +62,8 @@ class RedisRuntimeStore:
     def __init__(self, url: str, prefix: str = "marketflow", stream_maxlen: int = 10_000,
                  postgres_store: Any | None = None,
                  collated_stream_maxlen: int = 5_000,
-                 raw_retention_ms: int = 43_200_000):
+                 raw_retention_ms: int = 43_200_000,
+                 raw_guardrail_maxlen: int = 20_000):
         self.redis: Redis = Redis.from_url(url, decode_responses=True)
         self.prefix = prefix.strip(":")
         self.stream_maxlen = stream_maxlen
@@ -73,6 +74,14 @@ class RedisRuntimeStore:
         # only as a pathological-burst memory guardrail. Default 12h
         # serves the widest declared worker horizon (4h) with margin.
         self.raw_retention_ms = int(raw_retention_ms)
+        # Phase H1 — the raw stream's count guardrail is SEPARATE from
+        # ``stream_maxlen`` (which caps the substrate/analysis state
+        # streams and defaults to ~100min at the 5s cadence — far below
+        # the 12h retention). A count cap SMALLER than the time retention
+        # would silently defeat the MINID contract, so the raw guardrail
+        # defaults to the spec §1.3 burst ceiling (20 000 entries ≈ 28h
+        # at 5s cadence).
+        self.raw_guardrail_maxlen = int(raw_guardrail_maxlen)
         # Doctrine §4 leaves the collated stream "intentionally
         # unbounded by default so downstream replay and auditing have
         # the full history". In practice this lets the AOF rewrite
@@ -580,7 +589,7 @@ class RedisRuntimeStore:
         stream_body = json.dumps(
             _slim_stream_body(payload), default=str, separators=(",", ":"))
         ts = str(payload.get("observed_at_ms", ""))
-        maxlen = str(int(self.stream_maxlen))
+        maxlen = str(int(self.raw_guardrail_maxlen))
         # Trim floor: entries older than this are evicted in the same
         # atomic step that publishes the new one (approximate trim —
         # exact-mode XTRIM is O(n) and would tax the 5s publish path).
@@ -605,6 +614,20 @@ class RedisRuntimeStore:
         if result == "duplicate":
             return None
         return str(result)
+
+    async def redis_maxmemory_bytes(self) -> int | None:
+        """Server ``maxmemory`` in bytes (Phase H1 budget guard seam).
+
+        ``None`` when unlimited (0) or the read fails — the guard treats
+        both as "cannot check", never as "budget available".
+        """
+        try:
+            cfg = await self.redis.config_get("maxmemory")
+            raw = (cfg or {}).get("maxmemory") if isinstance(cfg, dict) else None
+            value = int(raw) if raw is not None else 0
+            return value if value > 0 else None
+        except Exception:
+            return None
 
     async def read_raw_oldest_ms(self, symbol: str) -> int | None:
         """Event-time of the OLDEST entry still in the raw stream.

@@ -253,6 +253,55 @@ async def resolve_active_symbols(
     return settings.symbols, "symbols_env"
 
 
+# Phase H1 boot-time memory guard (docs/HORIZON_RETENTION_SPEC.md §1.3).
+# The raw stream retention is a CLOCK contract now; this check turns the
+# deployment budget into an observable, deterministic condition at every
+# boot instead of an operator's memory note.
+_SLIM_ENTRY_EST_BYTES = 60_000  # conservative slimmed-entry estimate (§1.3)
+_BUDGET_WARN_FRACTION = 0.7
+
+
+async def _raw_retention_budget_check(
+    redis: RedisRuntimeStore, settings: Settings, symbols: tuple[str, ...],
+) -> None:
+    """Estimate the widened raw-stream budget vs the server maxmemory cap.
+
+    budget ≈ symbols × guardrail maxlen × slimmed-entry estimate. When the
+    estimate exceeds the warn fraction of maxmemory, log a LOUD degraded
+    warning naming the two env levers (RAW_RETENTION_MS / REDIS_STREAM_MAXLEN)
+    so an operator can shorten retention or raise maxmemory — the guard
+    never blocks the poller, it makes the trade-off visible.
+    """
+    maxmemory = await redis.redis_maxmemory_bytes()
+    if maxmemory is None:
+        log.info(
+            "raw-retention budget guard skipped: redis maxmemory unlimited "
+            "or unreadable — no cap to check against"
+        )
+        return
+    est_bytes = (
+        len(symbols) * int(settings.redis_raw_guardrail_maxlen) * _SLIM_ENTRY_EST_BYTES
+    )
+    est_mb = est_bytes // 1_000_000
+    cap_mb = maxmemory // 1_000_000
+    log.info(
+        "raw-retention budget: ~%dMB est (symbols=%s guardrail=%s × ~%dKB) "
+        "vs maxmemory=%dMB",
+        est_mb, len(symbols), settings.redis_raw_guardrail_maxlen,
+        _SLIM_ENTRY_EST_BYTES // 1_000, cap_mb,
+    )
+    if est_bytes > _BUDGET_WARN_FRACTION * maxmemory:
+        log.warning(
+            "RAW-RETENTION BUDGET DEGRADED: estimated raw stream footprint "
+            "~%dMB exceeds %.0f%% of maxmemory (%dMB). Widen maxmemory OR "
+            "shorten retention (RAW_RETENTION_MS, now %dms) OR lower the "
+            "burst guardrail (RAW_STREAM_MAXLEN, now %s). Under-bugeted "
+            "maxmemory makes allkeys-lru evict NON-raw keys first-risk.",
+            est_mb, _BUDGET_WARN_FRACTION * 100, cap_mb,
+            settings.redis_raw_retention_ms, settings.redis_raw_guardrail_maxlen,
+        )
+
+
 async def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -262,6 +311,7 @@ async def main() -> int:
     redis = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
         raw_retention_ms=settings.redis_raw_retention_ms,
+        raw_guardrail_maxlen=settings.redis_raw_guardrail_maxlen,
     )
     try:
         if not await redis.ping_with_retry():
@@ -271,6 +321,7 @@ async def main() -> int:
             active_symbols, source = await resolve_active_symbols(redis, settings)
             log.info("poller starting (symbols=%s poll=%ss source=%s)",
                      active_symbols, settings.poll_seconds, source)
+            await _raw_retention_budget_check(redis, settings, active_symbols)
             # Derivative cache warm-up task: refreshes the derivative
             # evidence cache (taker_buy_sell, oi_history, top_ls,
             # global_ls, klines, funding) on a slower cadence than the

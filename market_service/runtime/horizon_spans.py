@@ -15,11 +15,19 @@ from __future__ import annotations
 import time
 from typing import Any
 
-HORIZON_SPAN_SCHEMA_VERSION = 1
+from market_service.runtime.contracts import SCHEMA_VERSION_REGISTRY
+from market_service.runtime.horizons import (
+    HORIZON_NAMES, NATIVE_HORIZON_NAMES, SPAN_HORIZON_NAMES,
+)
 
-NATIVE_HORIZONS: tuple[str, ...] = ("1s", "5s", "30s", "60s")
-LONG_HORIZONS: tuple[str, ...] = ("15m", "1h", "4h")
-SPAN_HORIZONS: tuple[str, ...] = NATIVE_HORIZONS + LONG_HORIZONS
+# Phase S-2/S-4: the span horizons resolve to the charter owner's name
+# vocabulary (identity, not a local copy); the version resolves to the tree
+# registry.
+HORIZON_SPAN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["horizon_span"]
+
+NATIVE_HORIZONS: tuple[str, ...] = NATIVE_HORIZON_NAMES
+LONG_HORIZONS: tuple[str, ...] = HORIZON_NAMES
+SPAN_HORIZONS: tuple[str, ...] = SPAN_HORIZON_NAMES
 
 STATUSES: frozenset[str] = frozenset({"validated", "provisional", "insufficient"})
 

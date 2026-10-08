@@ -13,12 +13,30 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-MARKET_STATE_SCHEMA_VERSION = 1
-MARKET_RUN_SCHEMA_VERSION = 1
-SPECIALIST_REPORT_SCHEMA_VERSION = 2
-AGENT_MEMORY_SCHEMA_VERSION = 1
-INFERENCE_ARTIFACT_SCHEMA_VERSION = 1
-WAKE_ENVELOPE_SCHEMA_VERSION = 1
+# Phase S-4 (docs/STATE_CHARTER_SPEC.md) — the schema-version registry.
+# ONE numeric authority for every payload contract in the tree: each plane's
+# public constant resolves to its registry entry (identity, not a copy), so
+# a version bump is ONE edit here + the charter test pins every consumer.
+SCHEMA_VERSION_REGISTRY: dict[str, int] = {
+    "market_state": 1,
+    "market_run": 1,
+    "specialist_report": 2,
+    "agent_memory": 1,
+    "inference_artifact": 1,
+    "wake_envelope": 1,
+    "substrate_state": 2,
+    "microstructure": 1,
+    "interaction_budget": 1,
+    "horizon_span": 1,
+    "group_envelope": 1,
+    "directive": 1,
+}
+MARKET_STATE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_state"]
+MARKET_RUN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_run"]
+SPECIALIST_REPORT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["specialist_report"]
+AGENT_MEMORY_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["agent_memory"]
+INFERENCE_ARTIFACT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["inference_artifact"]
+WAKE_ENVELOPE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["wake_envelope"]
 # Agent-artifact kinds the memory node can persist. Mirrors the agent-owned
 # write surfaces from NOOA_HARNESS_ARCHITECTURE.md: observations, hypotheses,
 # requests, briefings — plus 'fact'/'note' for durable analyst notes.

@@ -131,6 +131,11 @@ class Settings:
     # 12h serves the widest declared worker horizon (4h) with 3x margin for
     # poller gaps / cold-start backfill.
     redis_raw_retention_ms: int = 43_200_000
+    # Phase H1 — raw stream BURST guardrail (count cap), separate from
+    # ``redis_stream_maxlen`` (state streams). Must exceed the retention
+    # capacity at the poll cadence or the count cap silently shortens the
+    # time retention. Spec §1.3: 20 000 entries ≈ 28h at 5s cadence.
+    redis_raw_guardrail_maxlen: int = 20_000
     wall_scorecard_weights: dict[str, float] = field(default_factory=lambda: {
         # Each weight scales the corresponding factor's raw contribution
         # (0 / 1 / 2 from the legacy ladder). Default weight 1.0
@@ -199,6 +204,7 @@ class Settings:
             redis_key_prefix=os.getenv("REDIS_KEY_PREFIX", "marketflow"),
             redis_stream_maxlen=_positive_int("REDIS_STREAM_MAXLEN", 1200),
             redis_raw_retention_ms=_positive_int("RAW_RETENTION_MS", 43_200_000),
+            redis_raw_guardrail_maxlen=_positive_int("RAW_STREAM_MAXLEN", 20_000),
             wall_history_maxlen=_positive_int("WALL_HISTORY_MAXLEN", 200),
             symbols=symbols,
             poll_symbols=poll_env or symbols,
