@@ -96,7 +96,17 @@ def _enrich_fut_keystone(keystone: dict[str, Any], asks: list[list[float]]) -> d
 class DensityWorker(SubstrateWorkerCore):
     SUBSTRATE_NAME = "density"
     INPUT_STREAMS = ("raw",)
-    CADENCE = CadenceProfile(cooldown_s=30, staleness_s=120)
+    # Phase A rollout — WINDOW-NATIVE horizon: the 4h-relevant density
+    # quantity is keystone trade intensity over the session tape. The
+    # book stays point-in-time (keystone position from ``latest``); the
+    # 4h verdict comes from the core-attached deduped horizon window —
+    # the same pattern the migration pilot established.
+    HORIZONS = ("4h",)
+    CADENCE = CadenceProfile(
+        cooldown_s=30, staleness_s=120,
+        horizons=("4h",),
+        horizon_staleness_s=(("4h", 4 * 3600),),
+    )
 
     # ------------------------------------------------------------------
     # L2 — significance probe (substrate constants only)
@@ -206,7 +216,7 @@ class DensityWorker(SubstrateWorkerCore):
         kz_wide = fut_keystone.get("wide") or {}
         trades = (evidence.get("futures") or {}).get("trades_normalized") or []
 
-        return {
+        out = {
             "fut_keystone": fut_keystone,
             "spot_keystone": spot_keystone,
             "fut_top_density_bids": top_density_windows(
@@ -228,3 +238,21 @@ class DensityWorker(SubstrateWorkerCore):
                 else None
             ),
         }
+        # Phase A — window-native 4h horizon: the SAME keystone bands
+        # (from the point-in-time book) applied to the 4h deduped tape.
+        hz_window = (evidence.get("horizons") or {}).get("4h")
+        if isinstance(hz_window, dict) and kz_price is not None \
+                and kz_tight.get("lo") is not None and kz_wide.get("hi") is not None:
+            hz_trades = (hz_window.get("futures") or {}).get("trades_normalized") or []
+            if hz_trades:
+                out["horizons"] = {
+                    "4h": {
+                        "keystone_trade_intensity": keystone_trade_intensity(
+                            hz_trades,
+                            kz_tight.get("lo"), kz_tight.get("hi"),
+                            kz_wide.get("lo"), kz_wide.get("hi"),
+                        ),
+                        "trade_count": len(hz_trades),
+                    },
+                }
+        return out

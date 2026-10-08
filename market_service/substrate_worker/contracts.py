@@ -16,7 +16,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-SUBSTRATE_STATE_SCHEMA_VERSION = 2
+from market_service.runtime.contracts import SCHEMA_VERSION_REGISTRY
+
+# Phase S-4: the substrate state contract's version resolves to the tree
+# registry (identity, not a local copy) — a bump is one edit in
+# runtime/contracts.py + this re-resolution.
+SUBSTRATE_STATE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["substrate_state"]
 OUTPUT_ARRAY_CAP = 128
 
 # Rollover period lengths in milliseconds (stream entry-id time base).

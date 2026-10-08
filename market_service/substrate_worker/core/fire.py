@@ -36,6 +36,7 @@ from market_service.substrate_worker.contracts import (
     TriggerDecision,
     SubstrateStatePayload,
 )
+from market_service.runtime.horizons import restore_fold_state
 
 log = logging.getLogger(__name__)
 
@@ -227,11 +228,24 @@ class FireMixin(SubstrateBase):
     async def _backfill_horizons(self) -> None:
         """Cold-start horizon rebuild (Phase H1 §2.5).
 
-        One bounded read of the widened raw retention (never per fire)
-        rebuilds every declared horizon's fold state. The stream's
-        MINID-trimmed history IS the backfill source — this is exactly what
-        time-based retention buys the cadence layer.
+        PG-FIRST, raw-merge: the durable ledger's newest v2 payload carries
+        the last persisted fold summaries; restoring them seeds segment
+        state AND the trade-id high-waters. The raw retention fold then
+        runs on TOP unchanged — the monotonic-id dedupe folds every
+        already-counted trade as zero, so the merge is free and the only
+        work done is folding the ledger-to-now delta. PG absent, stale,
+        schema-mismatched, or fold-less → raw-only rebuild (pre-B shape).
+        One bounded read of the widened raw retention either way; never
+        per fire.
         """
+        source = "raw"
+        try:
+            if await self._restore_horizons_from_pg():
+                source = "pg"
+        except Exception as exc:
+            log.warning("substrate %s horizon PG restore failed: %s",
+                        self.SUBSTRATE_NAME, exc)
+            self._last_error = f"horizon_pg_restore: {exc}"
         try:
             max_minutes = max(horizon_minutes(hz) for hz in self.horizons)
             window = await build_raw_window(self.store, self.symbol, max_minutes)
@@ -241,9 +255,10 @@ class FireMixin(SubstrateBase):
                     trades = ((window.get(venue) or {}).get("trades_normalized")) or []
                     fold_trades(state, trades, venue)
             self._horizons_backfilled = True
+            self._horizons_rebuilt_from = source
             log.info(
-                "substrate %s horizon backfill complete: horizons=%s segments=%s",
-                self.SUBSTRATE_NAME, list(self.horizons),
+                "substrate %s horizon backfill complete (source=%s): horizons=%s segments=%s",
+                self.SUBSTRATE_NAME, source, list(self.horizons),
                 {hz: len(self._horizon_folds[hz]["segments"]) for hz in self.horizons},
             )
         except Exception as exc:
@@ -252,6 +267,57 @@ class FireMixin(SubstrateBase):
             # retries the rebuild.
             log.warning("substrate %s horizon backfill failed: %s", self.SUBSTRATE_NAME, exc)
             self._last_error = f"horizon_backfill: {exc}"
+
+    async def _restore_horizons_from_pg(self) -> bool:
+        """Seed fold state from the durable ledger's last v2 payload.
+
+        Uses the EXISTING ``read_substrate_history`` reader (limit=1). A
+        payload qualifies when it is the current schema version AND its
+        horizons block carries restorable fold summaries. Returns True
+        only when at least one horizon actually restored — a partial
+        restore falls back to raw-only for the missing horizons.
+        """
+        if self.pg_store is None:
+            return False
+        reader = getattr(self.pg_store, "read_substrate_history", None)
+        if not callable(reader):
+            return False
+        ledger_name = (
+            f"analysis:{self.SUBSTRATE_NAME}"
+            if self._plane == "analysis" else self.SUBSTRATE_NAME
+        )
+        try:
+            rows = await reader(self.symbol, ledger_name, 1)
+        except Exception as exc:
+            log.warning("substrate %s ledger read failed: %s",
+                        self.SUBSTRATE_NAME, exc)
+            return False
+        if not rows or not isinstance(rows[0], dict):
+            return False
+        payload = rows[0].get("payload")
+        if not isinstance(payload, dict):
+            return False
+        try:
+            if int(payload.get("schema_version") or 0) != SUBSTRATE_STATE_SCHEMA_VERSION:
+                return False
+        except (TypeError, ValueError):
+            return False
+        block = payload.get("horizons") or {}
+        if not isinstance(block, dict):
+            return False
+        restored_any = False
+        for hz in self.horizons:
+            summary = (block.get(hz) or {}).get("fold") \
+                if isinstance(block.get(hz), dict) else None
+            if not isinstance(summary, dict):
+                continue
+            try:
+                self._horizon_folds[hz] = restore_fold_state(summary)
+                restored_any = True
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("substrate %s fold restore %s failed: %s",
+                            self.SUBSTRATE_NAME, hz, exc)
+        return restored_any
 
     def _fold_rows(self, rows: list[dict[str, Any]]) -> None:
         """Fold newly arrived raw stream rows into the horizon folds.
@@ -544,7 +610,7 @@ class FireMixin(SubstrateBase):
 
     def _freshness(self, evidence: dict[str, Any], *, high_water: str | None) -> dict[str, Any]:
         coverage = evidence.get("coverage") or {}
-        return {
+        out = {
             "window_minutes": self.window_minutes,
             "input_fingerprint": {
                 "observed_at_ms": evidence.get("observed_at_ms"),
@@ -554,6 +620,12 @@ class FireMixin(SubstrateBase):
                 "high_water": high_water,
             },
         }
+        if self.horizons:
+            out["horizons_rebuilt_from"] = self._horizons_rebuilt_from
+            out["horizon_segments"] = {
+                hz: len(self._horizon_folds[hz]["segments"]) for hz in self.horizons
+            }
+        return out
 
     async def _dedupe(self, decision: TriggerDecision, high_water: str, now_ms: int) -> bool:
         """Collapse identical fire conditions via the supervisor Lua script."""

@@ -31,6 +31,7 @@ from market_service.calculations.substrates.tape import (
     spot_turnover_share,
     summarize,
 )
+from market_service.runtime.horizons import fold_venue_totals
 from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
@@ -89,7 +90,15 @@ def _window_s(evidence: dict[str, Any]) -> int:
 class TapeWorker(SubstrateWorkerCore):
     SUBSTRATE_NAME = "tape"
     INPUT_STREAMS = ("raw", "microstructure")
-    CADENCE = CadenceProfile(cooldown_s=60, staleness_s=180, ws_input=True)
+    # Phase A rollout — fold-NATIVE horizons: per-horizon CVD/buy-share
+    # are computed from the cadence layer's fold aggregates (no extra
+    # evidence windows). Probe predicates are horizon-tagged.
+    HORIZONS = ("1h", "4h")
+    CADENCE = CadenceProfile(
+        cooldown_s=60, staleness_s=180, ws_input=True,
+        horizons=("1h", "4h"),
+        horizon_staleness_s=(("1h", 600), ("4h", 4 * 3600)),
+    )
 
     # ------------------------------------------------------------------
     # L2 — significance probe (demand bands + CVD surge)
@@ -126,6 +135,36 @@ class TapeWorker(SubstrateWorkerCore):
                     "venue": venue, "from": prev_f, "to": share,
                     "bands": [hi, lo],
                 }
+
+        # Phase A — fold-native horizon predicates: per-horizon, per-venue
+        # buy-share band crossings between THIS fold's trailing-horizon
+        # totals and the PREVIOUS fire's persisted fold totals. The same
+        # 0.55/0.45 bands, on the horizon frame — no second threshold table.
+        prev_horizons = (last_state or {}).get("horizons") or {}
+        for hz in self.horizons:
+            cur_totals = fold_venue_totals(self._horizon_folds[hz])
+            prev_fold = (prev_horizons.get(hz) or {}).get("fold") or {}
+            prev_totals = fold_venue_totals({"segments": prev_fold.get("segments") or []})
+            for venue in ("spot", "futures"):
+                cur = cur_totals.get(venue) or {}
+                prev = prev_totals.get(venue) or {}
+                cur_notional = float(cur.get("notional") or 0.0)
+                prev_notional = float(prev.get("notional") or 0.0)
+                if cur_notional <= 0 or prev_notional <= 0:
+                    continue
+                share = float(cur.get("buy_notional") or 0.0) / cur_notional
+                prev_share = float(prev.get("buy_notional") or 0.0) / prev_notional
+                hi, lo = BUY_SHARE_BANDS
+                crossed = (
+                    (prev_share < hi <= share) or (prev_share >= hi > share)
+                    or (prev_share > lo >= share) or (prev_share <= lo < share)
+                )
+                if crossed:
+                    predicates[f"{hz}:buy_share_cross:{venue}"] = {
+                        "horizon": hz, "venue": venue,
+                        "from": round(prev_share, 6), "to": round(share, 6),
+                        "bands": [hi, lo],
+                    }
 
         # CVD surge on the futures tape vs the prior buckets' scale.
         window_s = _window_s(window)
@@ -173,7 +212,7 @@ class TapeWorker(SubstrateWorkerCore):
         # the skew field is named fut_* but computed over the SPOT book.
         spot_bids = _pairs(spot_book.get("bids"), depth)
         spot_asks = _pairs(spot_book.get("asks"), depth)
-        return {
+        out = {
             "spot_flow": spot_flow,
             "futures_flow": futures_flow,
             "spot_bucketed_cvd": spot_buckets,
@@ -183,3 +222,32 @@ class TapeWorker(SubstrateWorkerCore):
             "spot_turnover_share": spot_turnover_share(spot_notional, fut_notional),
             "fut_microprice_skew_bps": microprice_skew_bps(spot_bids, spot_asks),
         }
+        # Phase A — fold-native horizon outputs: per-horizon per-venue
+        # CVD proxy (buy_notional − sell_notional over the trailing
+        # horizon) + buy_share, straight from the fold aggregates. The
+        # core lifts "horizons" into the payload's horizons block.
+        hz_outputs: dict[str, Any] = {}
+        for hz in self.horizons:
+            totals = fold_venue_totals(self._horizon_folds[hz])
+            if not totals:
+                continue
+            hz_outputs[hz] = {
+                "cvd_by_venue": {
+                    venue: round(float(v.get("buy_notional") or 0.0)
+                                 - float(v.get("sell_notional") or 0.0), 6)
+                    for venue, v in sorted(totals.items())
+                },
+                "buy_share": {
+                    venue: round(float(v.get("buy_notional") or 0.0)
+                                 / float(v["notional"]), 6)
+                    for venue, v in sorted(totals.items())
+                    if float(v.get("notional") or 0.0) > 0
+                },
+                "notional_by_venue": {
+                    venue: round(float(v.get("notional") or 0.0), 6)
+                    for venue, v in sorted(totals.items())
+                },
+            }
+        if hz_outputs:
+            out["horizons"] = hz_outputs
+        return out

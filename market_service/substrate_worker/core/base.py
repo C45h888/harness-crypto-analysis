@@ -181,6 +181,7 @@ class SubstrateBase:
             hz: new_fold_state(hz) for hz in self.horizons
         }
         self._horizons_backfilled = False
+        self._horizons_rebuilt_from: str | None = None
         self._last_fire_ms: int | None = None
         self._last_error: str | None = None
         self._last_dormant_reason: str | None = None

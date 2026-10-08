@@ -25,10 +25,15 @@ from market_service.calculations.substrates.technicals import (
     trend_drift,
     trend_slope,
 )
+from market_service.runtime.horizons import fold_candles
 from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 EMA_SHORT_KEY = "ema21"  # the watched EMA leg (price vs ema21)
+# Phase A — the horizon-fold leg. The fold rings cap at 14 (1h) / 18 (4h)
+# segments, so only the SHORT EMA leg can resolve there; the horizon
+# predicates watch ema9 while the base path keeps ema21 on klines.
+EMA_HORIZON_LEG = "ema9"
 
 
 def _closes(klines: Any) -> list[float]:
@@ -45,8 +50,20 @@ def _closes(klines: Any) -> list[float]:
 class TechnicalsWorker(SubstrateWorkerCore):
     SUBSTRATE_NAME = "technicals"
     INPUT_STREAMS = ("raw",)
-    CADENCE = CadenceProfile(cooldown_s=60, staleness_s=300, rollovers=("bar_5m",))
+    # Phase A rollout — fold-CANDLE horizons: per-horizon EMA/trend/ATR
+    # are computed from fold segments (each segment becomes a kline-shaped
+    # row) — no extra derivative fetch. Base 5m EMA stays on klines.
+    HORIZONS = ("1h", "4h")
+    CADENCE = CadenceProfile(
+        cooldown_s=60, staleness_s=300, rollovers=("bar_5m",),
+        horizons=("1h", "4h"),
+        horizon_staleness_s=(("1h", 600), ("4h", 4 * 3600)),
+    )
     DERIVATIVE_INPUTS = ("klines",)
+    # Short ATR window for fold candles: the 1h ring holds ≤14 segments,
+    # so the kline default (14) would rarely resolve; period 3 resolves
+    # from 4 candles and stays honest on partial rings.
+    FOLD_ATR_PERIOD = 3
 
     # ------------------------------------------------------------------
     # L2 — significance probe (new bar / EMA-position flip)
@@ -74,6 +91,23 @@ class TechnicalsWorker(SubstrateWorkerCore):
                 "leg": EMA_SHORT_KEY, "from": prev_pos, "to": current_pos,
             }
 
+        # Phase A — fold-candle horizon predicates: EMA-position flips on
+        # the horizon frames, vs the last fired horizon output.
+        prev_horizons = (last_state or {}).get("horizons") or {}
+        for hz in self.horizons:
+            candles = fold_candles(self._horizon_folds[hz], include_partial=True)
+            hz_closes = _closes(candles)
+            if not hz_closes:
+                continue
+            hz_pos = ema_position(hz_closes).get(EMA_HORIZON_LEG)
+            prev_hz_out = (prev_horizons.get(hz) or {}).get("output") or {}
+            prev_hz_pos = (prev_hz_out.get("ema_position") or {}).get(EMA_HORIZON_LEG)
+            if hz_pos is not None and prev_hz_pos is not None and hz_pos != prev_hz_pos:
+                predicates[f"{hz}:ema_position_flip"] = {
+                    "horizon": hz, "leg": EMA_HORIZON_LEG,
+                    "from": prev_hz_pos, "to": hz_pos,
+                }
+
         return TriggerDecision(fired=bool(predicates), source="probe",
                                predicates=predicates)
 
@@ -88,7 +122,7 @@ class TechnicalsWorker(SubstrateWorkerCore):
             # Null discipline: no klines means no time-series math.
             return {}
         # Mirrors composition._technical_builder (emas + source marker).
-        return {
+        out = {
             "emas": ema_series(closes),
             "emas_source": "derivatives.klines_5m",
             "atr_pct": atr_pct_from_klines(klines, period=14),
@@ -97,3 +131,23 @@ class TechnicalsWorker(SubstrateWorkerCore):
             "ema_position": ema_position(closes),
             "kline_count": len(klines),
         }
+        # Phase A — fold-candle horizon outputs: per-horizon EMA/trend
+        # over the fold ring (segments as candles). Same substrate
+        # functions, kline-shaped input — the math stays horizon-agnostic.
+        hz_outputs: dict[str, Any] = {}
+        for hz in self.horizons:
+            candles = fold_candles(self._horizon_folds[hz], include_partial=True)
+            if not candles:
+                continue
+            hz_closes = _closes(candles)
+            hz_outputs[hz] = {
+                "ema_position": ema_position(hz_closes),
+                "trend_slope": trend_slope(hz_closes),
+                "trend_drift": trend_drift(hz_closes),
+                "atr_pct": atr_pct_from_klines(candles, period=self.FOLD_ATR_PERIOD),
+                "candle_count": len(candles),
+                "source": "fold_candles",
+            }
+        if hz_outputs:
+            out["horizons"] = hz_outputs
+        return out
