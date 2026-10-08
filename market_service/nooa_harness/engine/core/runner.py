@@ -3,8 +3,11 @@
 The runner is the OUTER loop; the nested loops are derived within it via
 ``OUTER_SEQUENCE``. It owns the stage order and nothing else:
 
-  - stage order (WAKE → GATHER → COMPREHENSION → EVIDENCE → REASONING →
-    VALIDATION → OUTPUT) over the nested-loop modules it imports;
+  - stage order — DERIVED from ``OUTER_SEQUENCE`` (Phase S-1,
+    docs/STATE_CHARTER_SPEC.md): the receipts enumerate the real chain
+    (wake → agent_fetch → data_gate → comprehension → plan-bound
+    acquisition → evidence → reasoning → validation → output) and
+    narrate_cycle iterates the table through _STAGE_RUNNERS;
   - the orchestration membrane: ``GovernanceDenied`` → canonical FSM
     failure route (sits between the governance membrane and the stages);
   - durable writes (persist / finalize / degraded artifact) over the
@@ -22,7 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 from market_service.runtime.contracts import InferenceArtifact
 
@@ -36,20 +40,130 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Outer-loop derivation: the nested loop states walked, in order, by
-# narrate_cycle. Pass-B work makes each entry an explicit receipt-gated
-# handoff (including the gather split: bootstrap reads → comprehension →
-# plan-bound acquisition); Pass-A preserves the verbatim stage order.
+# Phase S-1 (docs/STATE_CHARTER_SPEC.md) — the outer cycle is DERIVED from
+# the table. OUTER_SEQUENCE is no longer dead documentation: narrate_cycle
+# iterates it, and each entry's runner resolves through _STAGE_RUNNERS.
+# Stage spies still patch core.wake / core.gather / the reasoning+output
+# owners — every stage wrapper calls through the module attribute at call
+# time, so the seams survive.
+#
+# Stage receipts are the honest grain: the FSM's CONTEXT loop covers the
+# four pre-reasoning stages (wake is pre-FSM; the merged CONTEXT loop hosts
+# gate reads → comprehension → plan-bound acquisition → evidence).
 # ---------------------------------------------------------------------------
-OUTER_SEQUENCE: tuple[NestedLoop, ...] = (
-    NestedLoop.CONTEXT,    # merged: bootstrap(gate) → comprehension → plan-bound acquisition → evidence
-    NestedLoop.REASONING,  # run_reasoning (assemble → interpret → hypothesize)
-    NestedLoop.VALIDATION, # run_validation (gate + one bounded retry)
-    NestedLoop.OUTPUT,     # run_output (finalize + settle + place)
+@dataclass(frozen=True)
+class StageReceipt:
+    """One stage of the outer cycle: its name (the _STAGE_RUNNERS key),
+    the NestedLoop it narrates (None for the pre-FSM wake), and its role."""
+    name: str
+    loop: NestedLoop | None
+    note: str = ""
+
+
+OUTER_SEQUENCE: tuple[StageReceipt, ...] = (
+    StageReceipt("wake", None, "bind the cycle context (pre-FSM)"),
+    StageReceipt("agent_fetch", NestedLoop.CONTEXT,
+                 "agent-commanded tape-quality reads"),
+    StageReceipt("data_gate", NestedLoop.CONTEXT,
+                 "DATA verdict on the agent's pull"),
+    StageReceipt("comprehension", NestedLoop.CONTEXT,
+                 "understanding pass + receipt gate + placement"),
+    StageReceipt("plan_bound_acquisition", NestedLoop.CONTEXT,
+                 "acquisition under the frozen receipt"),
+    StageReceipt("evidence", NestedLoop.CONTEXT,
+                 "evidence narration"),
+    StageReceipt("reasoning", NestedLoop.REASONING,
+                 "assemble → interpret → hypothesize"),
+    StageReceipt("validation", NestedLoop.VALIDATION,
+                 "gate + one bounded retry"),
+    StageReceipt("output", NestedLoop.OUTPUT,
+                 "finalize + settle + place"),
 )
+
+
+# Stage runners — uniform signature (engine, ctx, st, wake, wake_meta,
+# task, scenario) → (st, ctx, completed). Each wrapper calls through its
+# module attribute AT CALL TIME so test spies on core.wake / core.gather /
+# the reasoning+output owners keep working.
+async def _stage_wake(engine, ctx, st, wake, wake_meta, task, scenario):
+    return st, wake_mod.run_wake(engine, wake, wake_meta, task, scenario), None
+
+
+async def _stage_agent_fetch(engine, ctx, st, wake, wake_meta, task, scenario):
+    completed = await gather.run_agent_fetch(engine, ctx)
+    if completed is not None:
+        return st, ctx, completed
+    if ctx.fetched is None:
+        raise context.GovernanceDenied(
+            "fetch closed without fetched reads")
+    return st, ctx, None
+
+
+async def _stage_data_gate(engine, ctx, st, wake, wake_meta, task, scenario):
+    completed = await gather.run_data_gate(engine, ctx)
+    if completed is not None:
+        return st, ctx, completed
+    if ctx.gathered is None:
+        raise context.GovernanceDenied(
+            "gate closed without gathered evidence")
+    return st, ctx, None
+
+async def _stage_comprehension(engine, ctx, st, wake, wake_meta, task, scenario):
+    st, completed = await wake_mod.run_comprehension(engine, ctx)
+    if completed is not None:
+        return st, ctx, completed
+    if st is None:
+        raise context.GovernanceDenied(
+            "comprehension closed without a runtime state")
+    # Receipt gate: the runner refuses to advance on a missing
+    # understanding — a loop never starts on an un-understood prompt.
+    if not wake_mod.is_framing_complete(st):
+        raise context.GovernanceDenied(
+            "comprehension closed without understanding receipt")
+    await _place_understanding(engine, ctx, st)
+    return st, ctx, None
+
+
+async def _stage_plan_bound_acquisition(engine, ctx, st, wake, wake_meta, task, scenario):
+    await gather.run_plan_bound_acquisition(engine, ctx, st)
+    return st, ctx, None
+
+
+async def _stage_evidence(engine, ctx, st, wake, wake_meta, task, scenario):
+    completed = await reasoning.run_evidence(engine, ctx, st)
+    return st, ctx, completed
+
+
+async def _stage_reasoning(engine, ctx, st, wake, wake_meta, task, scenario):
+    completed = await reasoning.run_reasoning(engine, ctx, st)
+    return st, ctx, completed
+
+
+async def _stage_validation(engine, ctx, st, wake, wake_meta, task, scenario):
+    completed = await reasoning.run_validation(engine, ctx, st)
+    return st, ctx, completed
+
+
+async def _stage_output(engine, ctx, st, wake, wake_meta, task, scenario):
+    artifact = await output.run_output(engine, ctx)
+    return st, ctx, artifact
+
+
+_STAGE_RUNNERS: dict[str, Callable[..., Awaitable[tuple[Any, Any, Any]]]] = {
+    "wake": _stage_wake,
+    "agent_fetch": _stage_agent_fetch,
+    "data_gate": _stage_data_gate,
+    "comprehension": _stage_comprehension,
+    "plan_bound_acquisition": _stage_plan_bound_acquisition,
+    "evidence": _stage_evidence,
+    "reasoning": _stage_reasoning,
+    "validation": _stage_validation,
+    "output": _stage_output,
+}
 
 __all__ = [
     "OUTER_SEQUENCE",
+    "StageReceipt",
     "narrate_cycle",
     "persist_artifact",
     "finalize_persisted",
@@ -85,43 +199,22 @@ async def narrate_cycle(
     on ``deterministic_state["scenario"]`` and echoed in the prompt so
     Phase 3 semantics can evaluate it via ``calc.scenario.evaluate``.
     """
-    # Canonical calls: the runner (outer loop) invokes the nested-loop
-    # owners directly. Stage spies patch core.wake / core.gather — the
-    # engine owns no forward for these (driver boundary).
-    ctx = wake_mod.run_wake(engine, wake, wake_meta, task, scenario)
+    # Phase S-1: the stage order IS OUTER_SEQUENCE — the loop below is the
+    # only traversal (previously a hardcoded await chain that could silently
+    # drift from the table). Stage wrappers call through the module
+    # attributes so the core.wake/core.gather spy seams survive. The
+    # GovernanceDenied membrane below is unchanged.
+    ctx: Any = None
+    st: Any = None
+    completed: Any = None
     try:
-        # WAKE → GATHER(bootstrap): gate reads + hard gate. No
-        # understanding is needed, none is consumed.
-        completed = await gather.run_bootstrap(engine, ctx)
-        if completed is not None:
-            return completed
-        if ctx.gathered is None:
-            raise context.GovernanceDenied(
-                "bootstrap closed without gathered evidence")
-        # GATHER(bootstrap) → COMPREHENSION: the understanding pass.
-        st, completed = await wake_mod.run_comprehension(engine, ctx)
-        if completed is not None:
-            return completed
-        assert st is not None
-        # Receipt gate: the runner refuses to advance on a missing
-        # understanding — a loop never starts on an un-understood prompt.
-        if not wake_mod.is_framing_complete(st):
-            raise context.GovernanceDenied(
-                "comprehension closed without understanding receipt")
-        await _place_understanding(engine, ctx, st)
-        # COMPREHENSION → GATHER(plan-bound): acquisition under the
-        # receipt, driven by the final disposed plan.
-        await gather.run_plan_bound_acquisition(engine, ctx, st)
-        completed = await reasoning.run_evidence(engine, ctx, st)
-        if completed is not None:
-            return completed
-        completed = await reasoning.run_reasoning(engine, ctx, st)
-        if completed is not None:
-            return completed
-        completed = await reasoning.run_validation(engine, ctx, st)
-        if completed is not None:
-            return completed
-        return await output.run_output(engine, ctx)
+        for receipt in OUTER_SEQUENCE:
+            st, ctx, completed = await _STAGE_RUNNERS[receipt.name](
+                engine, ctx, st, wake, wake_meta, task, scenario,
+            )
+            if completed is not None:
+                return completed
+        return completed
     except context.GovernanceDenied as exc:
         # --- ORCHESTRATION MEMBRANE (governance → runner) ---
         # A governance denial is an infrastructure/contract failure, not

@@ -11,6 +11,7 @@ from typing import Any
 from market_service.nooa_harness.inference import execute_tool  # noqa: F401  (re-export: mock point)
 from ..controller import CycleController
 from ..fsm import GovernanceEvent, GovernanceEventKind, MembraneVerdict
+from ..llm import last_tier as _last_tier
 from ..loop_states import NestedLoop, SubLoop, TaskIntent
 from .chain import (
     POSITION_ORDER,
@@ -154,6 +155,10 @@ class _ReasonedCycle:
     tool_results: dict[str, Any]
     comprehension: dict[str, Any] | None = None
     passes_per_loop: dict[str, int] | None = None
+    # Per-turn extraction-tier history (llm.py ladder observability): one
+    # entry per narration call, in order. The process-global LAST_TIER only
+    # keeps the latest — this preserves the whole cycle for the artifact.
+    llm_tiers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -167,6 +172,10 @@ class _CycleContext:
     controller: CycleController
     capability_log: list[dict[str, Any]]
     gathered: _GatheredEvidence | None = None
+    # Agent fetch receipt (Option-2 bootstrap): the agent's own gate-read
+    # pull plus the deterministic floor fill, produced by run_agent_fetch
+    # before the DATA gate runs. Comprehension seeds its carrier from this.
+    fetched: Any | None = None
     reasoned: _ReasonedCycle | None = None
     # Canonical prompt variable (owner: core.wake.PromptVariable). Normalized
     # once in run_wake; loops read fields off it instead of re-slicing raw
@@ -188,6 +197,33 @@ class _CycleContext:
 # per-loop module) because every loop reads and writes the same fields
 # through the same helpers — colocating it with the FSM helpers keeps the
 # runtime-plumbing layer in one place.
+
+
+# ---------------------------------------------------------------------------
+# Phase S-3 (docs/STATE_CHARTER_SPEC.md) — the deterministic_state keyspace
+# namespace: every TOP-LEVEL root the engine plane writes or reads. The
+# charter test (test_state_charter.TestDeterministicRoots) AST-scans every
+# ``deterministic_state[...]`` write site + the gather init dict across
+# nooa_harness/engine and pins THIS set — a new root is added by editing
+# the writer AND this registry ("context and gather move together"), and an
+# undeclared write fails the charter at commit time.
+# ---------------------------------------------------------------------------
+DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
+    # task-directive roots (gather init + inference_runner persist)
+    "task", "scenario", "task_directive", "task_plan", "task_workflow",
+    # wake + gather surface roots
+    "wake", "capture_status", "microstructure_evidence",
+    "forecast_result", "forward_scenario", "forward_scenario_note",
+    "forward_gate", "gate", "data_gate", "bootstrap_basis", "fetch_note",
+    # pass/loop-carried verdict roots
+    "assessment_note", "chain_gaps", "chain_halt", "comprehension",
+    "congruence", "failure", "failure_report", "terminal",
+    "loop_traversal", "validation_issue", "understanding_receipt",
+    "statistical_chain", "governance_trace",
+    # re-ordered cycle roots (agent_fetch/data_gate plane)
+    "data_quality", "seeded_plan", "plan_gate", "persistence",
+    "narration_tiers",
+})
 
 
 @dataclass
@@ -212,7 +248,7 @@ class CycleRuntimeState:
     validation_entered: bool = False
     opened_subs: set[str] = field(default_factory=set)
     passes_per_loop: dict[str, int] = field(default_factory=lambda: {
-        "comprehension": 0, "evidence": 0, "reasoning": 0,
+        "fetch": 0, "comprehension": 0, "evidence": 0, "reasoning": 0,
         "validation": 0, "output": 0,
     })
     dispatched_in_pass: int = 0
@@ -246,6 +282,8 @@ class CycleRuntimeState:
     # once per cycle: after the repair budget is exhausted and before the
     # validation-failed terminal.
     forced_final_sent: bool = False
+    # Per-turn extraction-tier history, frozen into _ReasonedCycle at exit.
+    llm_tiers: list[str] = field(default_factory=list)
 
     def to_reasoned(self) -> _ReasonedCycle:
         """Freeze the handoff the OUTPUT loop consumes."""
@@ -261,7 +299,22 @@ class CycleRuntimeState:
             tool_results=self.tool_results,
             comprehension=self.comprehension,
             passes_per_loop=dict(self.passes_per_loop),
+            llm_tiers=list(self.llm_tiers),
         )
+
+
+def record_tier(st: CycleRuntimeState) -> None:
+    """Append the last narration extraction tier to the cycle history.
+
+    Call immediately after every ``_call_llm`` so the artifact carries the
+    full tier sequence (structured_model vs content_str vs reasoning vs
+    fallbacks) instead of only the process-global latest. Never raises.
+    """
+    try:
+        tier = _last_tier()
+    except Exception:
+        tier = None
+    st.llm_tiers.append(tier or "unknown")
 
 
 def _mark_declared(

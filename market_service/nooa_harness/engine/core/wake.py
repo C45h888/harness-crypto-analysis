@@ -18,10 +18,10 @@ Per-pass mechanics live next to their owning modules:
 
 FSM alignment (strict order, no close-reset between siblings):
 
-  initial(COMPREHENSION / UNDERSTAND_TASK / None)
-    → OPEN INTAKE → OPEN INTERPRETATION → OPEN FRAMING → COMPLETE
-    → record_loop_visit(comprehension, 1, (...), True)
-    → ENTER EVIDENCE (gather takes over)
+  initial(CONTEXT / UNDERSTAND_TASK / None)
+    → [fetch owns OPEN INTAKE in run_agent_fetch] → OPEN INTERPRETATION
+    → OPEN FRAMING (cursor stays open for SOURCING)
+    → single CONTEXT visit at VERIFICATION close (all six sub-loops).
 
 Budgets: LOOP_PASS_BUDGET["comprehension"] == 1, 0 dispatches, ≤1 bounded
 LLM call (Task-Directive Phase-B assessment only when _assessment_due).
@@ -280,6 +280,14 @@ async def run_comprehension(
         tool_results=gathered.tool_results,
         parsed_current={},
     )
+    # Seed the carrier from the fetch receipt: the fetch turn's LLM cost,
+    # tier history, and unexecuted names belong to this cycle's budgets.
+    fetched = getattr(ctx, "fetched", None)
+    if fetched is not None:
+        st.llm_calls = fetched.llm_calls
+        st.llm_tiers = list(fetched.llm_tiers)
+        st.unexecuted = list(fetched.unexecuted)
+        st.passes_per_loop["fetch"] = 1
 
     # --- CONTEXT: memory node pruned from the track (transport retained on
     # the driver for later use) — no recall read feeds the prompts; H0/H1
@@ -309,7 +317,7 @@ async def run_comprehension(
     _memories, st.memory_block = await engine._recall_memory(
         segment=ctx.task_id,
     )
-    st.prior_note = ""  # type: ignore[attr-defined]
+    st.prior_note = fetched.fetch_note if fetched is not None else ""  # type: ignore[attr-defined]
     st.scenario_reminder = (
         f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
         f"given horizon; frame H0/H1 as not-reachable/reachable): "
@@ -358,6 +366,7 @@ async def run_comprehension(
             raw_assessment = await engine._call_llm(
                 assessment_prompt(task, directive))
             st.llm_calls += 1
+            context.record_tier(st)
             parsed_assessment = coerce_turn(
                 extract_json_object(raw_assessment))
             if parsed_assessment is None:
@@ -397,9 +406,8 @@ async def run_comprehension(
     # envelope normalization, task classification and evidence framing do
     # not spend an additional model turn before the agent's first proposal.
     # This keeps the hard-gate and narration budgets unambiguous.
-    st.controller, _ = context._must_govern(
-        st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTAKE
-    )
+    # INTAKE opened in run_agent_fetch (the fetch turn runs there); the
+    # cursor advances to INTERPRETATION here, FRAMING after that.
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTERPRETATION
     )

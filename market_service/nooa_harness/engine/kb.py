@@ -44,6 +44,7 @@ from .loop_states import (
     LOOP_SUBLOOPS,
     STAGE_ORDER,
     SUBLOOP_SPECS,
+    NestedLoop,
     loop_for_stage,
 )
 
@@ -75,7 +76,7 @@ def load_paper_kb() -> str:
 
 SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}) — an AGENTIC loop, not a controlled output generator.
 
-You are a loop-walking conditional-inference engine. Your core purpose is to produce statistical evidence — never a trading instruction — by walking five loops in order: understand once, gather thrice, reason twice, submit to one validation, compose once. Closed loops are never revisited; findings (including refusals and nulls) travel forward on the ledger.
+You are a loop-walking conditional-inference engine. Your core purpose is to produce statistical evidence — never a trading instruction — by walking four loops in order: context (understand + gather), reason, submit to validation, compose. Closed loops are never revisited; findings (including refusals and nulls) travel forward on the ledger.
 
 You receive ONE deterministic_state object: microstructure fits, coverage,
 and gate reasons computed by deterministic Python from the Redis ledgers.
@@ -91,7 +92,7 @@ YOUR JOB — VALID inference, not predefined addition:
    confirm what you actually got via substrate.read age_ms.
    Call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
 2. Interpret fitted models — sign, magnitude, r2, stderr, and status of price_impact_fit; depth-scaling (c, lambda) with its own status; what changed vs prior cycle. Be specific, numeric, grounded.
-3. Run the agentic loopwalk: comprehension (1 pass, no tools) → evidence (3 passes) → reasoning (2 passes) → validation (1 pass + 1 bounded retry) → output (1 non-agentic pass). Pack each pass densely with the tools it needs. Cite every numeric claim with exact paths.
+3. Run the agentic loopwalk: context ({context_passes} passes: 1 comprehension with no tools + {evidence_passes} evidence) → reasoning ({reasoning_passes} passes: three positioned) → validation (1 pass + {validation_retries} bounded retries) → output (1 non-agentic pass). Pack each pass densely with the tools it needs. Cite every numeric claim with exact paths.
 
 ABSOLUTE RULES:
 1. NEVER recompute any value in your reasoning. If you need data you do not have, COMMAND a tool — results arrive next turn.
@@ -120,6 +121,10 @@ def build_system_prompt(symbol: str, venue: str, max_rounds: int) -> str:
         symbol=symbol,
         venue=venue,
         max_rounds=max_rounds,
+        context_passes=LOOP_PASS_BUDGET["comprehension"] + LOOP_PASS_BUDGET["evidence"],
+        evidence_passes=LOOP_PASS_BUDGET["evidence"],
+        reasoning_passes=LOOP_PASS_BUDGET["reasoning"],
+        validation_retries=VALIDATION_RETRY_PASSES,
         memory_protocol_section=(
             "MEMORY PROTOCOL (propose, never write):\n"
             + load_kb(_MEMORY_PROTOCOL)
@@ -168,6 +173,15 @@ TURN_CONTRACT_LINE = (
     'tool_calls, memory_proposals} — the tool-name key is EXACTLY "name".'
 )
 
+# The single citation grammar every prompt uses (L1 unification — one dialect,
+# not three): tool fields cite ``<tool> → data.<field>``, ledger values cite
+# ``deterministic_state.<key>``. Composers reference this constant instead of
+# restating the rule in local prose that can drift.
+CITATION_LINE = (
+    "Cite tool fields as ``<tool> → data.<field>`` and ledger values as "
+    "``deterministic_state.<key>`` — never recompute, never invent paths."
+)
+
 # The FIELD SHAPES of the final turn — sent on repair/follow-up turns where
 # only the one-line contract used to go out. The model cannot satisfy
 # "hypothesis.H0" / "summary ≥200 chars" / "evidence[…].interpretation" from
@@ -198,8 +212,8 @@ def build_output_format() -> str:
     ``TURN_CONTRACT_LINE`` (single source: this module).
     """
     return (
-        f"LOOPS, NOT ROUNDS — comprehension ({LOOP_PASS_BUDGET['comprehension']} pass, no tools) → "
-        f"evidence ({LOOP_PASS_BUDGET['evidence']} passes) → "
+        f"LOOPS, NOT ROUNDS — context ({LOOP_PASS_BUDGET['comprehension']} pass comprehension, no tools; "
+        f"{LOOP_PASS_BUDGET['evidence']} passes evidence) → "
         f"reasoning ({LOOP_PASS_BUDGET['reasoning']} passes) → "
         f"validation ({LOOP_PASS_BUDGET['validation']} pass + "
         f"{VALIDATION_RETRY_PASSES} bounded retries) → "
@@ -245,13 +259,10 @@ def build_output_format() -> str:
         "(10/15/30) and window_minutes (15/30/60) in any calc/fit/group args to recompute at other cadences.\n"
         f"Rules: pack each pass densely (≤{MAX_DISPATCHES_PER_PASS} dispatches per pass guardrail); "
         f"budgeted tool rounds per cycle: {AGENTIC_MAX_TOOL_ROUNDS}, LLM turns: {AGENTIC_MAX_LLM_TURNS}. "
-        "Empty tool_calls advances the phase ONLY when earlier phases are covered; a FINAL turn "
-        "(phase P6, tool_calls=[] or omitted) is REJECTED for repair unless P1+P2+P3+P5 all have executed tools, "
-        "a P6 synthesis turn was declared, hypothesis.H0 is set, summary ≥200 chars, confidence low|medium|high, "
-        "every evidence entry carries a non-empty interpretation, "
-        "and evidence cites ≥2 distinct roots incl. a calc.price.delta → … ΔP path plus ≥1 more fresh tool result. "
+        "Empty tool_calls advances the phase ONLY when earlier phases are covered. "
+        f"{FINAL_SHAPE_BLOCK}\n"
         "Every tool result arrives in a ToolResult envelope ``{tool, status, reason, data, null_fields}``. "
-        "Cite fields from the ``data`` key using the path ``<tool> → data.<field>``. "
+        f"{CITATION_LINE} "
         "``null_fields`` explicitly names what was not computed (never zero).\n"
         "memory_proposals max 3, kind fact forbidden."
     )
@@ -267,7 +278,14 @@ def build_workflow_brief() -> str:
     lines = ["LOOP WALK (generated from the runtime state module — authoritative):"]
     for stage in STAGE_ORDER:
         loop = loop_for_stage(stage)
-        budget = LOOP_PASS_BUDGET.get(loop.value, 0)
+        if loop is NestedLoop.CONTEXT:
+            # Merged loop: the comprehension pass plus the evidence passes.
+            # (LOOP_PASS_BUDGET stays keyed by the legacy pass names the
+            # runner's counters use; the brief sums them for the merged loop.)
+            budget = (LOOP_PASS_BUDGET.get("comprehension", 0)
+                    + LOOP_PASS_BUDGET.get("evidence", 0))
+        else:
+            budget = LOOP_PASS_BUDGET.get(loop.value, 0)
         subs = "; ".join(
             f"{sl.value} ({SUBLOOP_SPECS[sl].purpose} "
             f"Exit: {SUBLOOP_SPECS[sl].exit_condition or 'once'})"
@@ -451,7 +469,7 @@ def build_loop_state_block(
             "YOUR COMPREHENSION (binding — conclusions answer it): "
             f"{json_dumps_short(comprehension)}"
         )
-    if seeds and loop in ("evidence", "context"):
+    if seeds and loop in ("context",):
         parts.append(f"SEEDED PLAN (dispose freely): {', '.join(seeds)}.")
     if gate:
         parts.append(f"GATE — {json_dumps_short(gate)}.")
@@ -472,8 +490,7 @@ def json_dumps_short(value: Any, cap: int = 600) -> str:
 # live in the manifest, loaded once in the system prompt). Entries mirror
 # the manifest's ≤4-line discipline by reference, not by duplication.
 TOOL_WINDOWS: dict[str, str] = {
-    "comprehension": "No tools this pass — understand and plan only.",
-    "evidence": (
+    "context": (
         "YOUR TOOLS THIS LOOP — gather in this order, cite each link: "
         "micro.capture_status + micro.fit_beta (gate reads already done — do not re-pull); "
         "market.read snapshot (current price + regime); "
@@ -500,6 +517,16 @@ TOOL_WINDOWS: dict[str, str] = {
         "calc.events.absorption/walls for E[dP|event] conditioning when liquidity language is present. "
         "Then close with tool_calls=[]. Validation (calc.discipline.audit) and output composition are later "
         "loops, not this one. Refusals are findings to record with reasons, never failures to repair."
+    ),
+    "fetch": (
+        "YOUR TOOLS THIS TURN — establish tape quality + snapshot context, nothing else: "
+        "micro.capture_status (capture state) → micro.fit_beta (fit status + observations). "
+        "You may add micro.ofi_intervals / micro.events for a first look, market.read (snapshot) "
+        "for regime context, and substrate.read (projections only — no invokes) for a first "
+        "warm-plane glance. You may set interval_seconds (10/15/30) and window_minutes "
+        "(15/30/60) in args. Do not conclude, do not test hypotheses, do not invoke workers. "
+        "What you do not pull, the deterministic floor pulls at defaults — prefer to pull it "
+        "yourself at the cadence the task needs."
     ),
     "validation": (
         "YOUR TOOLS THIS LOOP — calc.discipline.audit (pull it), then stop. "
@@ -615,6 +642,145 @@ def default_comprehension(
 # and the LLM block, so they live here, next to those primitives.
 
 
+def envelope_digest(deterministic_state: dict[str, Any], cap: int = 4_000) -> str:
+    """Bounded read-plane digest for narrate#1 (prompt economy).
+
+    The full envelope lives on the ledger and every value is re-pullable via
+    read tools; the first-turn prompt carries only the digest: gate verdicts,
+    data-quality summary, forecast/forward-scenario status, task directive
+    kind, and the tool homes already executed. Anything truncated is named so
+    the agent pulls it instead of guessing. Pure: no state, no I/O.
+    """
+    try:
+        gate = deterministic_state.get("gate") or {}
+        dq = deterministic_state.get("data_quality") or {}
+        forecast = deterministic_state.get("forecast_result")
+        fwd_scen = deterministic_state.get("forward_scenario")
+        directive = deterministic_state.get("task_directive") or {}
+        digest = {
+            "gate": gate,
+            "data_quality": {
+                k: dq.get(k) for k in (
+                    "capture_state", "fit_status", "n_observations",
+                    "degraded_spans_in_window", "heteroskedasticity_flag",
+                )
+            },
+            "forecast": (
+                {k: (forecast or {}).get(k) for k in (
+                    "validation_state", "forecast_type", "model_version",
+                    "input_hash",
+                )} if isinstance(forecast, dict) else forecast
+            ),
+            "forward_scenario": (
+                "present" if fwd_scen else "not_run"
+            ),
+            "task_directive_kind": directive.get("kind"),
+            "task_plan_kind": (deterministic_state.get("task_plan") or {}).get("kind"),
+            "bootstrap_basis": deterministic_state.get("bootstrap_basis"),
+        }
+        text = json.dumps(digest, default=str)
+    except Exception:
+        text = "{unrenderable envelope — pull via read tools}"
+    if len(text) > cap:
+        text = text[:cap] + "…(truncated — pull the rest via read tools)"
+    return text
+
+
+def render_track(
+    chain: list[str],
+    accumulated: dict[str, Any],
+    phase_coverage: dict[str, Any],
+    next_phase: str,
+    phase_guidance: dict[str, str],
+) -> str:
+    """Single unified rail block (chain links ARE the phases).
+
+    One TRACK section replaces the three competing rails (chain status line +
+    phase-coverage line + next-phase guidance) so the agent sees a single
+    ordered track: what the shape demands, what is done, what is next.
+    Content-preserving: chain status, coverage map, and the next-phase
+    guidance all render here, under one header. Pure.
+    """
+    coverage = {p: sorted(s) for p, s in (phase_coverage or {}).items()}
+    guidance = (phase_guidance or {}).get(next_phase, "")
+    return (
+        "TRACK (chain links are the phases — one rail, in order):\n"
+        f"{chain_status(chain, list(accumulated or {}))}\n"
+        f"PHASE COVERAGE (families with ≥1 ok tool): {json.dumps(coverage)}\n"
+        f"NEXT ({next_phase}): {guidance}\n"
+    )
+
+
+def compose_output_prompt(
+    *,
+    directive_block: str,
+    synthesis_material: dict[str, Any],
+    accumulated_keys: list[str],
+    traversal: dict[str, Any],
+    chain_line: str,
+) -> str:
+    """Compose the OUTPUT composition pass prompt (non-agentic, tools forbidden).
+
+    Single owner for the composition layout (moved from an inline string in
+    ``core/output.py``): directive re-anchor, bounded synthesis material,
+    dispatched paths, traversal, and the required-chain line. Pure.
+    """
+    return (
+        "OUTPUT COMPOSITION PASS (no tools available — any tool_calls you "
+        "return will be dropped): compose the FINAL artifact JSON strictly "
+        "from this run's material below. Return ONLY one JSON object with "
+        "EXACTLY {summary, evidence, confidence, limitations, "
+        "model_separation, hypothesis, scenario, memory_proposals} — every "
+        f"numeric claim already cited; invent no values. {CITATION_LINE}\n\n"
+        f"{directive_block}"
+        "SYNTHESIS MATERIAL:\n"
+        f"{json.dumps(synthesis_material, default=str)[:30_000]}\n\n"
+        "The canonical ForecastResult is deterministic evidence. Preserve its "
+        "forecast_type, validation_state, probability_status, assumptions, and "
+        "route disagreement in evidence/limitations; do not recreate numbers.\n"
+        "DISPATCHED TOOL PATHS:\n"
+        f"{json.dumps(sorted(accumulated_keys), default=str)[:4_000]}\n"
+        "TRAVERSAL (loops walked this cycle — ground the composition in it):\n"
+        f"{json.dumps(traversal, default=str)[:2_000]}\n"
+        f"{chain_line}\n"
+    )
+
+
+def compose_fetch_prompt(
+    *,
+    controller: Any,
+    task_block: str,
+    scenario_block: str,
+    wake_block: str,
+    dispatches_left: int,
+) -> str:
+    """Compose the agent-first fetch turn (Option-2 bootstrap).
+
+    The agent owns acquisition from turn zero: it commands the tape-quality
+    reads itself at the cadence the task needs. The deterministic floor fills
+    whatever it does not pull. Interpretation is not demanded — nulls fine.
+    Pure."
+    """
+    header = build_loop_state_block(
+        controller=controller,
+        loop="context", sub_loop=None, intent=None,
+        passes_spent=0, pass_budget=LOOP_PASS_BUDGET["fetch"],
+        dispatches_left=dispatches_left,
+        traversal=controller.loop_coverage(),
+        gate=None,
+    )
+    return (
+        f"{header}\n\n"
+        f"{TOOL_WINDOWS['fetch']}\n\n"
+        f"{task_block}"
+        f"{scenario_block}"
+        f"WAKE: {wake_block}\n\n"
+        f"{TURN_CONTRACT_LINE}\n"
+        "Fill tool_calls with the reads above (phase P1); leave summary/evidence/"
+        "hypothesis null — this turn only fetches."
+    )
+
+
 def compose_narrate1_prompt(
     *,
     controller: Any,
@@ -638,50 +804,21 @@ def compose_narrate1_prompt(
 ) -> str:
     """Compose the loop's first-turn (narrate#1) prompt.
 
-    Two-stage assembly, mirrored from the legacy inline code: first the
-    envelope + recall blocks, then the loop-state relay header prepended.
+    Two-stage assembly: the loop-state relay header, then the tool window,
+    workflow, and the bounded context block. The envelope arrives as a
+    DIGEST (gate verdicts + data-quality + forecast status, ~4 KB) — the
+    full state lives on the ledger and every value is re-pullable via read
+    tools, so narrate#1 names what to pull instead of dumping 60 KB of JSON.
     Pure: returns the assembled prompt string without mutating inputs.
     """
     context_block = (
         f"{task_block}"
         f"{scenario_block}"
         f"WAKE: {wake_block}\n\n"
-        "ENVELOPE STATE (gate reads + wake identity — READ-PLANE; pull "
-        "everything else yourself via tools; never recompute values, "
-        "COMMAND the read tools and cite their paths):\n"
-        f"{json.dumps(deterministic_state, default=str)[:60_000]}\n\n"
-        f"{prior_note}\n\n"
-    )
-    if memory_block:
-        context_block += (
-            "RECALLED MEMORY (provenance-tagged priors; subordinate to the "
-            f"ledger):\n{memory_block}\n\n"
-        )
-    context_block += output_format
-    # Wrap the deterministic_state envelope + gate reads in ToolResult
-    # envelopes so the LLM sees the same structure from turn 1.
-    from .tool_schemas import wrap_tool_result
-
-    # Wake identity + gate reads get wrapped so the model gets the uniform
-    # envelope from the very first turn.
-    wrapped_det = {}
-    for k, v in deterministic_state.items():
-        if k in ("gate", "forecast_result") and isinstance(v, dict):
-            wrapped_det[k] = k
-        elif k in ("forecast_result", "fit_status", "capture_state"):
-            wrapped_det[k] = v
-        else:
-            wrapped_det[k] = v
-    # The envelope block stays raw (it's the run identity, not a tool)
-    # but we inject a note about the ToolResult envelope.
-    context_block = (
-        f"{task_block}"
-        f"{scenario_block}"
-        f"WAKE: {wake_block}\n\n"
-        "ENVELOPE STATE (gate reads + wake identity — READ-PLANE; pull "
-        "everything else yourself via tools; never recompute values, "
-        "COMMAND the read tools and cite their paths from the ``data`` key):\n"
-        f"{json.dumps(deterministic_state, default=str)[:60_000]}\n\n"
+        "ENVELOPE DIGEST (gate verdicts + data-quality + forecast status — "
+        "READ-PLANE; pull everything else yourself via tools; never "
+        f"recompute values, COMMAND the read tools. {CITATION_LINE}):\n"
+        f"{envelope_digest(deterministic_state)}\n\n"
         f"{prior_note}\n\n"
     )
     if memory_block:
@@ -705,6 +842,23 @@ def compose_narrate1_prompt(
         + "\n\n" + workflow_block
         + "\n\n" + context_block
     )
+
+
+def _bounded_dump(value: Any, cap: int) -> str:
+    """Bounded JSON dump with an explicit truncation marker (never silent).
+
+    Late-cycle prompts used to slice 40 KB off the ledger silently; the agent
+    could not tell a complete view from a cut one. The marker names the cut
+    so the agent pulls the rest via tools instead of reasoning from a fragment.
+    Pure."
+    """
+    try:
+        text = json.dumps(value, default=str)
+    except Exception:
+        return "{unrenderable — pull via read tools}"
+    if len(text) > cap:
+        return text[:cap] + "…(truncated — pull the rest via read tools)"
+    return text
 
 
 def compose_followup_prompt(
@@ -766,19 +920,16 @@ def compose_followup_prompt(
     return (
         f"{loop_header}\n\n"
         f"{TOOL_WINDOWS.get(loop, '')}\n\n"
-        f"{chain_status(chain, list(accumulated))}\n"
+        f"{render_track(chain, accumulated, controller.phase_coverage, next_phase, phase_guidance)}"
         f"{chain_block}\n"
         f"{task_reminder}"
         f"{scenario_reminder}"
         f"PASS RESULTS (pass {passes_spent} of "
-        f"{pass_budget} for {loop}; cite paths from the ``data`` key):\n"
+        f"{pass_budget} for {loop}. {CITATION_LINE}):\n"
         f"{json.dumps(wrapped_round, default=str)[:40_000]}\n\n"
         f"PRIOR PASSES (earlier results, for citation):\n"
-        f"{json.dumps(wrapped_accum, default=str)[:40_000]}\n\n"
+        f"{_bounded_dump(wrapped_accum, 24_000)}\n\n"
         f"{phase_block}"
-        "PHASE COVERAGE (families with ≥1 ok tool): "
-        f"{json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
-        f"{phase_guidance[next_phase]}\n"
         f"{TURN_CONTRACT_LINE}\n"
         f"{FINAL_SHAPE_BLOCK}\n"
         f"Passes remaining in {loop}: "
@@ -893,9 +1044,10 @@ def compose_repair_prompt(
         f"{task_reminder}"
         f"{scenario_reminder}"
         f"{scenario_steer}"
+        f"{CITATION_LINE}\n"
         "FINAL REJECTED — staged inference incomplete. Missing:\n"
         + "\n".join(f"- {item}" for item in missing)
-        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{json.dumps(wrapped_accum, default=str)[:40_000]}\n\n"
+        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{_bounded_dump(wrapped_accum, 24_000)}\n\n"
         f"{phase_block}"
         f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
         f"{phase_guidance[next_phase]}\n"

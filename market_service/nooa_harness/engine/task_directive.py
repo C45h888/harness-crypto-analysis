@@ -22,17 +22,18 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-DIRECTIVE_SCHEMA_VERSION = 1
 
-# Frozen horizon vocabularies (mirror the deterministic plane; kept in sync
-# by test, by value — the plane remains the source of truth at runtime).
-NATIVE_HORIZONS_MS: dict[str, int] = {
-    "1s": 1_000, "5s": 5_000, "30s": 30_000, "60s": 60_000,
-}
-LONG_HORIZONS_SECONDS: dict[str, int] = {"15m": 900, "1h": 3_600, "4h": 14_400}
-LONG_HORIZONS_MS: dict[str, int] = {
-    key: seconds * 1_000 for key, seconds in LONG_HORIZONS_SECONDS.items()
-}
+# Phase S-2 (docs/STATE_CHARTER_SPEC.md): the horizon vocabularies resolve
+# to the tree-wide charter owner (runtime/horizons) by IDENTITY — this
+# module no longer mirrors them locally ("kept in sync by test, by value"
+# is now enforced by import + the charter test).
+from market_service.runtime.horizons import (
+    LONG_HORIZONS_MS, LONG_HORIZONS_SECONDS, NATIVE_HORIZONS_MS,
+)
+from market_service.runtime.contracts import SCHEMA_VERSION_REGISTRY
+
+# Phase S-4: the directive contract's version resolves to the tree registry.
+DIRECTIVE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["directive"]
 
 KINDS = ("price_target", "hypothesis", "general")
 

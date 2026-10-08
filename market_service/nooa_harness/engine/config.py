@@ -52,20 +52,23 @@ DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
 AGENTIC_MAX_TOOL_ROUNDS = 10
 # narrate#1 + tool follow-ups + repairs + forced-final, with headroom for
 # redundant rounds.
-AGENTIC_MAX_LLM_TURNS = 14
+AGENTIC_MAX_LLM_TURNS = 16
 # Max dispatches per tool round.
 AGENTIC_PER_ROUND_CALL_CAP = 3
 # Per-loop-state pass allotment (Track A congruence shape, loop-surface spec v1).
 # The budget counts LLM passes per nested loop, never tools: within a pass
 # the agent packs whatever calls the work needs, bounded only by the
-# anti-runaway dispatch ceiling below. Pre-gate fixed reads sit outside the
-# budget (zero-LLM gate doctrine). Planned LLM max is 12 = 1+3+6+1(+1 retry)+1,
-# inside the AGENTIC_MAX_LLM_TURNS backstop. Reasoning needs 6: three forced
+# anti-runaway dispatch ceiling below. The fetch turn is agent-driven (it
+# commands the gate reads itself) so it spends budget: 1 fetch + 1 + 3 + 6 +
+# 1(+2 retries) + 1 = 13 planned, inside the AGENTIC_MAX_LLM_TURNS backstop.
+# Headroom (16): +1 fetch follow-up recourse, +1 reflection turn reserve.
+# Reasoning needs 6: three forced
 # track positions (assemble → interpret → hypothesize, one pass minimum each)
 # plus the empty-leftover steer, the close, and one slack pass — the
 # hard-track floor is what the steady statistical track spends, not a
 # suggestion.
 LOOP_PASS_BUDGET: dict[str, int] = {
+    "fetch": 1,
     "comprehension": 1,
     "evidence": 3,
     "reasoning": 6,

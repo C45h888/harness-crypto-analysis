@@ -39,7 +39,9 @@ from ..kb import (
 )
 from ..schemas import coerce_turn, extract_json_object
 from ..controller import next_uncovered_phase
-from ..loop_states import NestedLoop, SubLoop, TaskIntent
+from ..loop_states import (
+    LOOP_TAG_CROSSWALK, NestedLoop, REGISTRY_HOME_LOOPS, SubLoop, TaskIntent,
+)
 from .chain import (
     FORWARD_SCENARIO_TOOL,
     POSITION_ORDER,
@@ -51,6 +53,7 @@ from .chain import (
     position_status,
     position_steer,
 )
+from ..principles import evaluate_principles, render_findings
 
 
 def _derived_hypothesis_id(
@@ -361,30 +364,28 @@ class InferenceEngine:
                         st.unexecuted.append(raw_name)
                     round_results[canonical] = None
                     continue
-            expected_loop = {
-                "evidence": NestedLoop.CONTEXT,
-                "context": NestedLoop.CONTEXT,
-                "reasoning": NestedLoop.REASONING,
-                "validation": NestedLoop.VALIDATION,
-            }.get(st.loop_tag, NestedLoop.REASONING)
-            expected_sub_loop = {
-                "evidence": SubLoop.ACQUISITION,
-                "context": SubLoop.ACQUISITION,
-                "reasoning": SubLoop.ANALYSIS,
-                "validation": SubLoop.RECOVERY,
-            }.get(st.loop_tag)
+            # Phase S-1 (docs/STATE_CHARTER_SPEC.md): ONE crosswalk in the
+            # loop-identity owner (loop_states.LOOP_TAG_CROSSWALK) resolves
+            # the runtime loop tag to its FSM (NestedLoop, SubLoop)
+            # observation. The per-map silent default that authorized an
+            # UNKNOWN tag as REASONING is REMOVED — an unknown loop tag is a
+            # governance error (the orchestration membrane routes it), never
+            # an invented authorization.
+            try:
+                expected_loop, expected_sub_loop = LOOP_TAG_CROSSWALK[st.loop_tag]
+            except KeyError:
+                raise context.GovernanceDenied(
+                    f"unknown loop_tag {st.loop_tag!r}: no FSM crosswalk — "
+                    "refusing to authorize work under an invented observation"
+                ) from None
             # The dispatch registry owns the allowed work homes; the FSM owns
             # whether the current observation is one of them.  A model cannot
             # move a tool into a convenient phase by naming it differently.
-            # Legacy home names (comprehension/evidence) resolve to the merged
-            # CONTEXT loop so no registry string rewrite is required.
-            _legacy_loop_names = {
-                "comprehension": NestedLoop.CONTEXT,
-                "evidence": NestedLoop.CONTEXT,
-            }
+            # Registry home names (comprehension/evidence) resolve to the
+            # merged CONTEXT loop via the charter's REGISTRY_HOME_LOOPS table.
             authorization = None
             for home_loop, home_sub_loop in tool_homes(canonical):
-                home_nested_loop = _legacy_loop_names.get(home_loop)
+                home_nested_loop = REGISTRY_HOME_LOOPS.get(home_loop)
                 if home_nested_loop is None:
                     try:
                         home_nested_loop = NestedLoop(home_loop)
@@ -544,6 +545,14 @@ class InferenceEngine:
                     f"\nREASONING POSITION {st.reason_position + 1}/3: "
                     f"{active_position}\n{position_steer(pstat)}\n"
                 )
+        # Principles (advisory guard, never denials): the frozen plan + the
+        # just-dispatched turn render as steer findings on every follow-up.
+        _pfindings = evaluate_principles(
+            controller=st.controller, plan=st.task_plan,
+            turn=st.parsed_current, reason_position=st.reason_position,
+        )
+        if _pfindings:
+            chain_block = f"{chain_block}\n{render_findings(_pfindings)}"
         # Compose the follow-up prompt via the prompt-ecosystem composer so
         # follow-up layout stays in lock-step with the narrate-1 and repair
         # composers.
@@ -567,6 +576,7 @@ class InferenceEngine:
         )
         try:
             raw_next = await self._call_llm(user_prompt_next)
+            context.record_tier(st)
         except Exception as exc:
             log.exception("pass narration round failed; ending loop early")
             st.failure_kind = "narration_failed"

@@ -17,7 +17,8 @@ Authority split (unchanged, now with a named base):
   - ``engine/controller.py`` owns classification/credit/exit: it consumes the
     verdict, records it, and asks the membrane for the terminal.
   - ``core/`` owns WHEN a gate runs in the loop body (the ``GATE_DATA`` step
-    at the end of ingestion; the ``GATE_PLAN`` step at the end of sourcing).
+    verdicts the agent-first fetch in ``run_data_gate``; the ``GATE_PLAN``
+    step executes post-framing in ``run_comprehension``).
 
 The gate vocabulary is deliberately pure data so it may be replayed,
 unit-tested with no stores, and cited as the deterministic fact the loop
@@ -59,8 +60,8 @@ _HORIZON_BEARING_REGIMES = frozenset({"native", "long"})
 class GateKind(str, Enum):
     """Which guard a verdict belongs to."""
 
-    DATA = "data"   # post-ingestion sufficiency (zero-LLM)
-    PLAN = "plan"   # post-sourcing plan adequacy (forward-only)
+    DATA = "data"   # bootstrap data sufficiency (zero-LLM)
+    PLAN = "plan"   # post-framing plan adequacy (forward-only)
 
 
 class GateStatus(str, Enum):
@@ -176,7 +177,7 @@ def evaluate_data_gate(
 
 
 # ---------------------------------------------------------------------------
-# PLAN gate — post-sourcing adequacy (forward-only)
+# PLAN gate — post-framing adequacy (forward-only)
 # ---------------------------------------------------------------------------
 
 

@@ -63,6 +63,7 @@ from .chain import (
     position_steer,
 )
 from ..loop_states import NestedLoop, SubLoop, TaskIntent
+from ..principles import evaluate_principles as _evaluate_principles
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ async def run_evidence(
     )
     try:
         raw_1 = await engine._call_llm(user_prompt_1)
+        context.record_tier(st)
     except Exception as exc:
         log.exception("narration#1 failed")
         st.controller = st.controller.advance(
@@ -183,6 +185,45 @@ async def run_evidence(
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )
+    # STORE_HANDOFF (state redistribution): the end-of-CONTEXT package for
+    # the reasoning loop — what was gathered, what the prompt asked, and what
+    # reasoning still needs. Written to the task segment so the next turn
+    # reasons over data, never from scratch. Best-effort: memory-less runs
+    # skip silently (transport pattern).
+    try:
+        if engine.memory is not None:
+            from .chain import chain_completion as _chain_completion
+            _snap = _chain_completion(
+                st.controller, task=ctx.task, scenario=ctx.scenario,
+            )
+            _coverage = st.controller.phase_coverage
+            _handoff = {
+                "prompt_preview": (ctx.task[:200] if ctx.task else None),
+                "plan_kind": (st.task_plan or {}).get("kind"),
+                "gathered": sorted(st.accumulated_tool_results.keys()),
+                "chain_missing": list(_snap.get("missing") or []),
+                "chain_refused": list(_snap.get("refused") or []),
+                "phase_coverage": {
+                    p: sorted(s) for p, s in _coverage.items()
+                },
+                "reasoning_needs": sorted(
+                    list(_snap.get("missing") or [])
+                    + [f"phase {p} uncovered"
+                       for p in ("P1", "P2", "P3", "P5")
+                       if not _coverage.get(p)]
+                ),
+            }
+            import json as _json
+            await engine.memory.remember(
+                engine.session_id, "handoff",
+                _json.dumps(_handoff, default=str),
+                segment=getattr(ctx, "task_id", None),
+                importance=2.0,
+                tags=("wake", "handoff", engine.symbol.lower()),
+                evidence_refs=(ctx.wake.wake_id,),
+            )
+    except Exception:
+        log.exception("handoff placement failed")
     # The CONTEXT loop visit is recorded once, at the loop's true close,
     # covering all six sub-loops (its deterministic passes + the evidence pass).
     st.controller = st.controller.record_loop_visit(
@@ -347,6 +388,7 @@ async def run_validation(
     st_chain = chain_completion(st.controller, task=ctx.task, scenario=ctx.scenario)
     freeze_chain(st, ctx.task, ctx.scenario)
     missing = list(missing)
+    chain_gaps: list[str] = []
     for tool in st_chain["missing"]:
         if tool == "calc.discipline.audit":
             # The audit is validation-homed: the repair turn can pull it.
@@ -356,13 +398,26 @@ async def run_validation(
             )
         else:
             # Every other chain link lives in an earlier loop and cannot be
-            # pulled from validation: record the unwalked link honestly so
-            # the repair budget terminates instead of demanding uncallable
-            # tools from the agent.
-            missing.append(
-                f"statistical chain: {tool} never attempted in its loop — "
-                "recorded unwalked; the track cannot pass this cycle"
+            # pulled from validation: record it as a GAP (findings preserved,
+            # artifact carries it) instead of a blocking miss. Demanding an
+            # uncallable tool from the repair turn guaranteed a
+            # validation_failed terminal for cycles that were otherwise
+            # complete — the track gap rides the artifact, it does not kill
+            # the cycle.
+            chain_gaps.append(
+                f"statistical chain gap: {tool} never attempted in its loop — "
+                "recorded unwalked; cited as a limitation, not a failure"
             )
+    if chain_gaps:
+        st.deterministic_state["chain_gaps"] = list(chain_gaps)
+    # Principles at the gate: advisory findings land beside the verdict —
+    # they inform the artifact, they never join missing[] (guards, not gates).
+    for _finding in _evaluate_principles(
+        controller=st.controller, plan=st.task_plan, turn=judged,
+        reason_position=st.reason_position,
+    ):
+        st.deterministic_state.setdefault("principle_findings", []).append(
+            {"principle": _finding.principle, "detail": _finding.detail})
     # Task-conformance (core-owned): a target-bearing directive must surface
     # its verdict — the band membership / scenario citation or its refusal —
     # before the gate passes. This closes the prompt→answer loop: the final
@@ -452,6 +507,7 @@ async def run_validation(
     )
     try:
         raw_repair = await engine._call_llm(repair_prompt)
+        context.record_tier(st)
     except Exception as exc:
         log.exception("repair turn failed; ending validation")
         st.failure_kind = "narration_failed"
@@ -506,6 +562,7 @@ async def _forced_final_turn(
         )
         try:
             raw_final = await engine._call_llm(prompt)
+            context.record_tier(st)
         except Exception as exc:
             log.warning("forced final turn (attempt %d) failed: %s", attempt, exc)
             return last_parsed

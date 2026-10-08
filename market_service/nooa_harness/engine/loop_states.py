@@ -6,13 +6,16 @@ transition legality and it does NOT own semantics (classification / credit /
 exit). Those belong to the governance membrane (Layer 2, deferred) and the
 ``CycleController``, respectively.
 
-The hierarchy is four levels deep, so each loop state carries an IN-DEPTH
+The hierarchy is six levels deep, so each loop state carries an IN-DEPTH
 workflow nested loop:
 
-  AgenticStage          the workflow position (WAKE .. OUTPUT)
-    └── NestedLoop      the mode of work (COMPREHENSION .. OUTPUT)
+  AgenticStage          the workflow position (CONTEXT .. FINALIZE)
+    └── NestedLoop      the mode of work (CONTEXT .. OUTPUT)
           └── SubLoop   an in-depth workflow stage inside the loop
                 └── LoopStep   a fine state inside the sub-loop
+
+plus intent-based tasks (``TaskIntent``) naming what the agent establishes
+and ``LoopTerminal`` endpoints where a cycle stops.
 
 The SUB-LOOP is the primary agentic loop the agent follows: each
 ``NestedLoop`` is a multi-stage workflow (2-4 ``SubLoop`` stages), and each
@@ -25,6 +28,12 @@ what the agent is trying to establish, so the agentic surface carries
 authority rather than obeying a phase ordinal. ``INTENT_SUBLOOP`` binds each
 intent to the sub-loop that serves it, giving the future membrane
 in-depth visibility.
+
+Positions vs sub-loops (REASONING): the statistical hard track
+(``chain.py`` ``POSITION_ORDER``: assemble → interpret → hypothesize)
+executes INSIDE the ANALYSIS sub-loop — HYPOTHESIS is the entry frame and
+SYNTHESIS the freeze + close. Steers speak position language; governance
+speaks sub-loop language; this module is where the two meet.
 
 The FINAL nested loop is ``OUTPUT``: it composes the output, grounds it in
 an UNDERSTANDING OF THE AGENTIC SURFACE ARCHITECTURE (the ``ARCHITECTURE``
@@ -93,20 +102,18 @@ class NestedLoop(str, Enum):
 class SubLoop(str, Enum):
     """In-depth workflow stages inside a ``NestedLoop``.
 
-    Each nested loop is a sequence of 2-4 sub-loops; each sub-loop is an
+    Each nested loop is a sequence of 2-6 sub-loops; each sub-loop is an
     ordered ``LoopStep`` sequence and may iterate to its exit condition.
     This is the primary agentic loop the agent follows.
     """
 
-    # --- COMPREHENSION (WAKE) ---
+    # --- CONTEXT (merged comprehension + evidence) ---
     INTAKE = "intake"                     # receive + normalize the input
     INTERPRETATION = "interpretation"     # classify intent, extract constraints
     FRAMING = "framing"                   # decompose task, set acceptance
-
-    # --- EVIDENCE (GATHER) ---
     SOURCING = "sourcing"                 # plan reads, select tools
     ACQUISITION = "acquisition"           # read + calculate + observe
-    VERIFICATION = "verification"         # assess coverage, re-plan
+    VERIFICATION = "verification"         # assess coverage, store handoff
 
     # --- REASONING (REASON) ---
     HYPOTHESIS = "hypothesis"             # frame H0/H1, state prior
@@ -166,7 +173,6 @@ class LoopStep(str, Enum):
 
     # --- VERIFICATION ---
     ASSESS = "assess"                    # coverage vs plan
-    REPLAN = "replan"                    # close gaps -> back to sourcing
     STORE_HANDOFF = "store_handoff"      # write context package to memory segment
 
     # --- HYPOTHESIS ---
@@ -347,6 +353,56 @@ LOOP_STAGE: dict[NestedLoop, AgenticStage] = {
     loop: stage for stage, loop in STAGE_LOOP.items()
 }
 
+# ---------------------------------------------------------------------------
+# Phase S-1 (docs/STATE_CHARTER_SPEC.md) — the runtime loop-tag vocabulary
+# and its ONE crosswalk to the FSM loops.
+#
+# The runtime's ``loop_tag`` is a plain string carried on
+# ``CycleRuntimeState`` (context.py); LoopTag declares its LEGAL members,
+# and LOOP_TAG_CROSSWALK is the ONLY place a loop tag resolves to an FSM
+# (NestedLoop, SubLoop) observation. driver.py consumes this crosswalk — the
+# per-map silent defaults that used to authorize unknown tags as REASONING
+# are gone: an unknown tag is a governance error, never an invented
+# authorization. The charter test pins that every producer literal, budget
+# key, and passes_per_loop key resolves to this namespace.
+# ---------------------------------------------------------------------------
+class LoopTag:
+    """Frozen runtime loop-tag vocabulary. Members are plain strings (the
+    runtime's loop_tag grain); every producer (reasoning.py) and consumer
+    (config budgets, context.passes_per_loop, driver crosswalk) resolves
+    to this namespace."""
+
+    FETCH = "fetch"
+    COMPREHENSION = "comprehension"
+    EVIDENCE = "evidence"
+    REASONING = "reasoning"
+    VALIDATION = "validation"
+    OUTPUT = "output"
+
+
+LOOP_TAG_CROSSWALK: dict[str, tuple[NestedLoop, "SubLoop | None"]] = {
+    # Declarative homes for tags the engine does not currently assign
+    # (fetch = the pre-gate gate-read turn; output = the finalize stage).
+    # They document the intended FSM home so a future producer resolves
+    # without re-inventing a mapping.
+    LoopTag.FETCH: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
+    LoopTag.COMPREHENSION: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
+    # Live tags (assigned by reasoning.py) — byte-identical to the previous
+    # driver map.
+    LoopTag.EVIDENCE: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
+    LoopTag.REASONING: (NestedLoop.REASONING, SubLoop.ANALYSIS),
+    LoopTag.VALIDATION: (NestedLoop.VALIDATION, SubLoop.RECOVERY),
+    LoopTag.OUTPUT: (NestedLoop.OUTPUT, SubLoop.PLACEMENT),
+}
+
+# The dispatch registry's LEGACY home names (comprehension/evidence) resolve
+# to the merged CONTEXT loop — declared here so the reconciliation is data
+# in the charter owner, not an inline driver map.
+REGISTRY_HOME_LOOPS: dict[str, NestedLoop] = {
+    "comprehension": NestedLoop.CONTEXT,
+    "evidence": NestedLoop.CONTEXT,
+}
+
 # Each nested loop is an in-depth workflow of sub-loops, in order.
 LOOP_SUBLOOPS: dict[NestedLoop, tuple[SubLoop, ...]] = {
     NestedLoop.CONTEXT: (
@@ -376,12 +432,17 @@ LOOP_SUBLOOPS: dict[NestedLoop, tuple[SubLoop, ...]] = {
 
 # The in-depth workflow shape of every sub-loop.
 SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
-    # --- COMPREHENSION ---
+    # --- CONTEXT (merged comprehension + evidence) ---
     SubLoop.INTAKE: SubLoopSpec(
         steps=(LoopStep.RECEIVE, LoopStep.DECODE, LoopStep.NORMALIZE,
                LoopStep.GATE_DATA),
         iterates=False,
-        purpose="Receive and normalize the raw input into a known shape.",
+        purpose=(
+            "Receive and normalize the raw input into a known shape. "
+            "Executed by run_wake (normalization) and run_agent_fetch "
+            "(agent fetch turn + floor fill, authorized as wake-bootstrap "
+            "before INTAKE opens — acquisition precedes all later spend)."
+        ),
     ),
     SubLoop.INTERPRETATION: SubLoopSpec(
         steps=(
@@ -402,34 +463,53 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
         iterates=False,
         purpose="Decompose the task and set the acceptance bar.",
     ),
-    # --- EVIDENCE ---
+    # --- CONTEXT (merged comprehension + evidence), continued ---
     SubLoop.SOURCING: SubLoopSpec(
         steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS, LoopStep.GATE_PLAN),
         iterates=False,
-        purpose="Plan which reads and tools will satisfy the intent.",
+        purpose=(
+            "Plan which reads and tools will satisfy the intent. "
+            "GATE_PLAN executes post-framing in run_comprehension "
+            "(forward-only — a refused plan ends the cycle); the planned "
+            "acquisition itself runs in run_plan_bound_acquisition."
+        ),
     ),
     SubLoop.ACQUISITION: SubLoopSpec(
         steps=(LoopStep.READ, LoopStep.CALCULATE, LoopStep.OBSERVE),
         iterates=True,
-        purpose="Execute the reads/calculations and capture their results.",
-        exit_condition="every planned read/calculation has been observed",
+        purpose=(
+            "Execute the reads/calculations and capture their results. "
+            "Runs in run_evidence (narrate#1 + budgeted follow-ups)."
+        ),
+        exit_condition="tool_calls empty (candidate stands) or budget spent",
     ),
     SubLoop.VERIFICATION: SubLoopSpec(
-        steps=(LoopStep.ASSESS, LoopStep.REPLAN, LoopStep.STORE_HANDOFF),
+        steps=(LoopStep.ASSESS, LoopStep.STORE_HANDOFF),
         iterates=True,
-        purpose="Assess coverage against the plan and re-plan gaps.",
-        exit_condition="evidence coverage satisfies the intent or budget spent",
+        purpose=(
+            "Assess coverage against the plan and store the handoff package. "
+            "Gaps ride forward as findings — there is no re-plan edge "
+            "(gate 2 is forward-only)."
+        ),
+        exit_condition="coverage assessed and handoff stored, or budget spent",
     ),
     # --- REASONING ---
     SubLoop.HYPOTHESIS: SubLoopSpec(
         steps=(LoopStep.FRAME, LoopStep.STATE_PRIOR),
         iterates=False,
-        purpose="Frame the hypothesis (H0/H1) and state the prior.",
+        purpose=(
+            "Reasoning entry: open the hypothesis frame. H0/H1 itself is "
+            "formed at the hypothesize position inside ANALYSIS."
+        ),
     ),
     SubLoop.ANALYSIS: SubLoopSpec(
         steps=(LoopStep.TEST, LoopStep.COMPARE),
         iterates=True,
-        purpose="Test the hypothesis against the evidence and compare sources.",
+        purpose=(
+            "The positioned execution core: hosts the hard track "
+            "assemble → interpret → hypothesize (chain.py POSITION_ORDER), "
+            "one position per pass, out-of-position tools denied."
+        ),
         exit_condition="the hypothesis is settled or refinement stops adding signal",
     ),
     SubLoop.SYNTHESIS: SubLoopSpec(
@@ -520,7 +600,7 @@ INTENT_SUBLOOP: dict[TaskIntent, SubLoop] = {
     TaskIntent.UNDERSTAND_TASK: SubLoop.INTERPRETATION,
     TaskIntent.INFER_ORDER_FLOW: SubLoop.ACQUISITION,
     TaskIntent.INFER_DEPTH: SubLoop.ACQUISITION,
-    TaskIntent.CORRELATE_EVIDENCE: SubLoop.SYNTHESIS,
+    TaskIntent.CORRELATE_EVIDENCE: SubLoop.ANALYSIS,
     TaskIntent.EXPLAIN_FINDINGS: SubLoop.SYNTHESIS,
     TaskIntent.DERIVE_HYPOTHESIS: SubLoop.ANALYSIS,
     TaskIntent.SYNTHESIZE_OUTPUT: SubLoop.SYNTHESIS,

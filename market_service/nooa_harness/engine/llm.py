@@ -56,6 +56,11 @@ log = logging.getLogger(__name__)
 LAST_EXTRACTION_TIER: str | None = None
 
 
+def last_tier() -> str | None:
+    """The extraction tier of the most recent narration call (observability)."""
+    return LAST_EXTRACTION_TIER
+
+
 def _note_tier(tier: str, text: str) -> str:
     global LAST_EXTRACTION_TIER
     LAST_EXTRACTION_TIER = tier

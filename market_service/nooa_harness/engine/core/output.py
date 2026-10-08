@@ -12,7 +12,7 @@ from . import context
 from ..schemas import extract_json_object
 from ..controller import scenario_verdict as _scenario_verdict
 from ..fsm import GovernanceEvent, GovernanceEventKind
-from ..kb import build_task_workflow, chain_status
+from ..kb import build_task_workflow, chain_status, compose_output_prompt
 from ..loop_states import NestedLoop, SubLoop
 
 log = logging.getLogger(__name__)
@@ -65,28 +65,35 @@ async def run_output(
             "paths; preserve refusals as findings, never paraphrased numbers):\n"
             f"{json.dumps(deterministic_state.get('task_directive'), default=str)[:6_000]}\n\n"
         )
-    compose_prompt = (
-        "OUTPUT COMPOSITION PASS (no tools available — any tool_calls you "
-        "return will be dropped): compose the FINAL artifact JSON strictly "
-        "from this run's material below. Return ONLY one JSON object with "
-        "EXACTLY {summary, evidence, confidence, limitations, "
-        "model_separation, hypothesis, scenario, memory_proposals} — every "
-        "numeric claim already cited; invent no values.\n\n"
-        f"{directive_block}"
-        "SYNTHESIS MATERIAL:\n"
-        f"{json.dumps({'summary': staged_final.get('summary'), 'evidence': staged_final.get('evidence'), 'confidence': staged_final.get('confidence'), 'limitations': staged_final.get('limitations'), 'model_separation': staged_final.get('model_separation'), 'hypothesis': staged_final.get('hypothesis'), 'scenario': staged_final.get('scenario'), 'forecast_result': deterministic_state.get('forecast_result'), 'forward_scenario': deterministic_state.get('forward_scenario'), 'task_directive': deterministic_state.get('task_directive')}, default=str)[:30_000]}\n\n"
-        "The canonical ForecastResult is deterministic evidence. Preserve its "
-        "forecast_type, validation_state, probability_status, assumptions, and "
-        "route disagreement in evidence/limitations; do not recreate numbers.\n"
-        "DISPATCHED TOOL PATHS:\n"
-        f"{json.dumps(sorted(accumulated_tool_results), default=str)[:4_000]}\n"
-        "TRAVERSAL (loops walked this cycle — ground the composition in it):\n"
-        f"{json.dumps(controller.loop_coverage(), default=str)[:2_000]}\n"
-        f"{chain_status(task_workflow['chain'], list(accumulated_tool_results))}\n"
+    compose_prompt = compose_output_prompt(
+        directive_block=directive_block,
+        synthesis_material={
+            'summary': staged_final.get('summary'),
+            'evidence': staged_final.get('evidence'),
+            'confidence': staged_final.get('confidence'),
+            'limitations': staged_final.get('limitations'),
+            'model_separation': staged_final.get('model_separation'),
+            'hypothesis': staged_final.get('hypothesis'),
+            'scenario': staged_final.get('scenario'),
+            'forecast_result': deterministic_state.get('forecast_result'),
+            'forward_scenario': deterministic_state.get('forward_scenario'),
+            'task_directive': deterministic_state.get('task_directive'),
+        },
+        accumulated_keys=list(accumulated_tool_results),
+        traversal=controller.loop_coverage(),
+        chain_line=chain_status(
+            task_workflow['chain'], list(accumulated_tool_results)),
     )
     try:
         raw_compose = await engine._call_llm(compose_prompt)
         llm_calls += 1
+        try:
+            from ..llm import last_tier as _last_tier
+            _compose_tier = _last_tier() or "unknown"
+        except Exception:
+            _compose_tier = "unknown"
+        deterministic_state["narration_tiers"] = list(
+            reasoned.llm_tiers) + [_compose_tier]
         passes_per_loop["output"] = passes_per_loop.get("output", 0) + 1
         maybe_composed = extract_json_object(raw_compose)
         if isinstance(maybe_composed, dict):
