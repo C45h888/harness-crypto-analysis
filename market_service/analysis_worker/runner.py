@@ -49,6 +49,7 @@ def build_workers(
     names: list[str] | None = None,
     pg_store: Any | None = None,
     pg_strict: bool = True,
+    governor: Any | None = None,
 ) -> list[Any]:
     """Instantiate the enabled analysis workers (registry-driven)."""
     selected = names or _split_env("ANALYSIS_WORKERS", "all")
@@ -75,8 +76,24 @@ def build_workers(
                 staleness_s=staleness_s,
                 pg_store=pg_store,
                 pg_strict=pg_strict,
+                governor=governor,
             ))
     return workers
+
+
+def governance_from_env(store: RedisRuntimeStore, pg_store: Any | None = None) -> Any | None:
+    """The analysis plane's governance governor (default ON).
+
+    ``ANALYSIS_GOVERNANCE=0`` disables the gate. The analysis FSM is the
+    plane's sole legality authority: it enforces the substrate-root rule
+    (every analysis worker must reduce substrate state), checks the outputs
+    in the analysis keyspace, and gates the PG write.
+    """
+    if (os.getenv("ANALYSIS_GOVERNANCE") or "1").strip() == "0":
+        return None
+    from market_service.governance import build_analysis_governor
+
+    return build_analysis_governor(store, pg_store)
 
 
 async def run_forever() -> int:
@@ -86,7 +103,17 @@ async def run_forever() -> int:
         os.getenv("REDIS_KEY_PREFIX") or "marketflow",
         int(os.getenv("REDIS_STREAM_MAXLEN") or 10_000),
     )
-    workers = build_workers(store, symbols=_symbols())
+    from market_service.substrate_worker.runner import (
+        pg_store_from_env,
+        pg_strict_from_env,
+    )
+
+    pg = pg_store_from_env()
+    workers = build_workers(
+        store, symbols=_symbols(),
+        pg_store=pg, pg_strict=pg_strict_from_env(),
+        governor=governance_from_env(store, pg),
+    )
     if not workers:
         log.error("no analysis workers selected — nothing to run")
         return 1
@@ -110,6 +137,11 @@ async def run_forever() -> int:
             except Exception:
                 log.exception("worker %s stop failed", worker.SUBSTRATE_NAME)
         await store.close()
+        if pg is not None:
+            try:
+                await pg.close()
+            except Exception:
+                log.exception("pg store close failed")
 
 
 def main(argv: list[str] | None = None) -> int:

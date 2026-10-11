@@ -56,6 +56,7 @@ def build_workers(
     names: list[str] | None = None,
     pg_store: Any | None = None,
     pg_strict: bool = True,
+    governor: Any | None = None,
 ) -> list[SubstrateWorkerCore]:
     """Instantiate the enabled workers (registry-driven, env-tunable)."""
     selected = names or _split_env("SUBSTRATE_WORKERS", "all")
@@ -93,6 +94,7 @@ def build_workers(
                 supervisor_ms=supervisor_ms,
                 pg_store=pg_store,
                 pg_strict=pg_strict,
+                governor=governor,
             ))
     return workers
 
@@ -125,6 +127,20 @@ def pg_strict_from_env() -> bool:
     return (os.getenv("SUBSTRATE_PG_STRICT") or "1").strip() != "0"
 
 
+def governance_from_env(store: RedisRuntimeStore, pg_store: Any | None = None) -> Any | None:
+    """The calculation plane's governance governor (default ON).
+
+    ``SUBSTRATE_GOVERNANCE=0`` disables the gate (ungoverned legacy path).
+    The governor is the plane's sole legality authority — it checks the
+    outputs in Redis and gates the PG write before it happens.
+    """
+    if (os.getenv("SUBSTRATE_GOVERNANCE") or "1").strip() == "0":
+        return None
+    from market_service.governance import build_calculation_governor
+
+    return build_calculation_governor(store, pg_store)
+
+
 async def run_forever() -> int:
     """Run all enabled workers until cancelled."""
     settings_url = os.getenv("REDIS_URL") or "redis://localhost:6379/0"
@@ -134,7 +150,8 @@ async def run_forever() -> int:
         int(os.getenv("REDIS_STREAM_MAXLEN") or 10_000),
     )
     workers = build_workers(store, symbols=_symbols(),
-                            pg_store=(pg := _pg_store()), pg_strict=_pg_strict())
+                            pg_store=(pg := _pg_store()), pg_strict=_pg_strict(),
+                            governor=governance_from_env(store, pg))
     if not workers:
         log.error("no substrate workers selected — nothing to run")
         return 1

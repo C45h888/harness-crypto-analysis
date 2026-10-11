@@ -133,7 +133,7 @@ async def run_evidence(
     except Exception as exc:
         log.exception("narration#1 failed")
         st.controller = st.controller.advance(
-            GovernanceEvent(GovernanceEventKind.NARRATION_FAILED)
+            context.failure_event("narration_failed")
         )
         terminal = (
             st.controller.terminal.value if st.controller.terminal
@@ -144,14 +144,16 @@ async def run_evidence(
         return await engine._degraded_artifact(
             st.deterministic_state, st.capability_log,
             f"narration_failed: {type(exc).__name__}: {exc}",
-        ), {"llm_calls": st.llm_calls, "terminal": terminal}
+        ), {"task": (ctx.task or "")[:200] or None,
+            "scenario": ctx.scenario,
+            "llm_calls": st.llm_calls, "terminal": terminal}
     st.llm_calls += 1
     st.passes_per_loop["evidence"] += 1
     st.dispatched_in_pass = 0
     parsed_1 = coerce_turn(extract_json_object(raw_1))
     if parsed_1 is None:
         st.controller = st.controller.advance(
-            GovernanceEvent(GovernanceEventKind.PARSE_FAILED)
+            context.failure_event("parse_failed")
         )
         terminal = (
             st.controller.terminal.value if st.controller.terminal
@@ -162,7 +164,9 @@ async def run_evidence(
         return await engine._degraded_artifact(
             st.deterministic_state, st.capability_log,
             "narration_parse_failed: no JSON object in output",
-        ), {"llm_calls": st.llm_calls, "terminal": terminal}
+        ), {"task": (ctx.task or "")[:200] or None,
+            "scenario": ctx.scenario,
+            "llm_calls": st.llm_calls, "terminal": terminal}
     st.parsed_1 = parsed_1
     st.parsed_current = parsed_1
     st.turn_log.append(parsed_1)

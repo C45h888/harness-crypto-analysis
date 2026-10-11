@@ -19,6 +19,9 @@ Endpoints (port ``CALC_CONTROL_PORT``, default 8041):
                    Postgres ledger threaded through. Bad symbol or unknown
                    substrate → 400, so a caller can tell a bad request from a
                    worker that simply declined to fire (200, ``fired: 0``).
+  GET  /governance?symbol=&substrate=  the calculation governance FSM's own
+                   decision ledger (latest + denials + count) — the plane's
+                   legality audit trail (docs/PLANE_GOVERNANCE_SPEC.md).
 
 **This endpoint is the only sanctioned way for a process outside
 ``market_service/substrate_worker/`` to request a fire-tick.** Worker identity
@@ -63,9 +66,20 @@ def _settings() -> dict[str, Any]:
 
 
 async def build_workers(store: RedisRuntimeStore) -> list[Any]:
-    from market_service.substrate_worker.runner import _symbols, build_workers
+    from market_service.substrate_worker.runner import (
+        _symbols,
+        build_workers,
+        governance_from_env,
+        pg_store_from_env,
+        pg_strict_from_env,
+    )
 
-    return build_workers(store, symbols=_symbols())
+    pg = pg_store_from_env()
+    return build_workers(
+        store, symbols=_symbols(),
+        pg_store=pg, pg_strict=pg_strict_from_env(),
+        governor=governance_from_env(store, pg),
+    )
 
 
 async def health(store: RedisRuntimeStore, workers: list[Any]) -> bool:
@@ -90,13 +104,44 @@ class CalcHttpApp:
         self.app = web.Application()
         self.app.router.add_get("/health", self._health)
         self.app.router.add_get("/status", self._status)
+        self.app.router.add_get("/governance", self._governance)
         self.app.router.add_post("/invoke", self._invoke)
 
-    async def _health(self, _request: web.Request) -> web.Response:
+    async def _governance(self, request: web.Request) -> web.Response:
+        """The calculation plane's governance observability surface.
+
+        Reads the FSM's own decision ledger from Redis (latest + recent
+        decisions + denials + liveness). The FSM is the sole legality
+        authority, so its decisions — allowed AND denied — are the plane's
+        audit trail.
+        """
+        plane = "calculation"
+        symbol = request.query.get("symbol", "SOLUSDT").upper()
+        substrate = request.query.get("substrate", "").lower()
+        latest = await self.store.read_governance_latest(plane, symbol, substrate=substrate)
+        history = await self.store.read_governance_history(plane, symbol, count=50)
+        denials = await self.store.read_governance_denials(plane, symbol, count=20)
+        alive = await self.store.governance_alive(plane, symbol)
+        return web.json_response({
+            "plane": plane,
+            "symbol": symbol,
+            "alive": alive,
+            "available": latest is not None,
+            "latest": latest,
+            "denials": denials,
+            "decisions": len(history),
+        })
+
+    async def _health(self, request: web.Request) -> web.Response:
         ok = await health(self.store, self.workers)
+        symbol = request.query.get("symbol", "SOLUSDT").upper()
         return web.json_response(
             {"status": "ok" if ok else "degraded",
-             "workers": [f"{w.SUBSTRATE_NAME}:{w.symbol}" for w in self.workers]},
+             "workers": [f"{w.SUBSTRATE_NAME}:{w.symbol}" for w in self.workers],
+             "governance": {
+                 "plane": "calculation",
+                 "alive": await self.store.governance_alive("calculation", symbol),
+             }},
             status=200 if ok else 503,
         )
 

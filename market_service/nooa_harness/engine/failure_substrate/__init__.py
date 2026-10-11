@@ -1,63 +1,81 @@
-"""Failure substrate — bounded remediation layer for governance-reported failures.
+"""Failure substrate — the deterministic MECHANICAL plane of failure handling.
 
-The FSM (``engine/fsm.py``) is the **authority** — it designates that a
-cycle is in a failure state by routing a ``GovernanceEventKind`` to a
-``LoopTerminal``. This substrate is the **executor** — it receives a failure
-signal from the runtime, classifies it, applies bounded remediation (retry /
-fallback / degrade), and either returns the loop to work or lets the failure
-pass through to ``run_runtime_failure()``.
+The failure chain is three layers, each with ONE owner:
 
-ARCHITECTURE:
+    engine/fsm.py            [router]      one intake edge: CYCLE_FAILED
+    engine/failure_fsm.py    [GOVERNANCE]  classifies kinds -> verdicts
+                                           (class, severity, policy, terminal)
+    failure_substrate/       [MECHANICS]   worker selection, retry budgets,
+                                           per-cycle ledger, coordination
+    failure_substrate/workers.py [EXECUTION] bounded remediation units
 
-    runtime loop  ──→  FSM (fsm.py)  ──designates─→  failure substrate
-                                                          │
-                                                    ┌─────┴──────┐
-                                                    │  retry?    │
-                                                    │  fallback? │
-                                                    │  degrade?  │
-                                                    └─────┬──────┘
-                                                          │
-                                               ┌──────────┴─────────┐
-                                               │                    │
-                                          resolved            exhausted
-                                               │                    │
-                                         back to loop     run_runtime_failure()
-                                                              (existing path)
+This package is the MECHANICAL plane. It receives a decided
+``FailureVerdict`` from the Failure FSM and coordinates a bounded worker. It
+does NOT classify (that is governance) and it does NOT know terminals (except
+to carry the verdict's terminal onto the report).
 
-The substrate is a pure addition: the existing ``run_runtime_failure()`` and
-``run_validation_terminal()`` paths are untouched. When the substrate is
-present it intercepts the failure; when absent or when it declares exhaustion,
-the existing terminal path runs as before.
+Boundary rule enforced by the charter test:
+  - the substrate imports the Failure FSM's VALUE TYPES only;
+  - the failure FSM never imports the substrate;
+  - the main FSM imports the failure FSM (to delegate) but neither the
+    substrate nor the workers.
 """
 
 from __future__ import annotations
 
-from .membrane import (
+# --- governance vocabulary, re-exported for consumers -----------------------
+from ..failure_fsm import (
     FAILURE_CLASSIFICATION,
-    MAX_RETRIES,
+    FAILURE_FSM,
+    FAILURE_TERMINAL,
     FailureClass,
+    FailureFSM,
+    FailureKind,
     FailureSeverity,
-    FailureSubstrateMembrane,
     FailureVerdict,
     RemediationKind,
 )
+
+# --- the mechanical plane ---------------------------------------------------
 from .report import FailureReport
 from .signal import FailureOutcome, signal_failure
-from .workers import FAILURE_WORKER_REGISTRY, FailureWorker, RemediationOutcome
+from .substrate import (
+    FAILURE_SUBSTRATE,
+    MAX_RETRIES,
+    WORKER_FOR_KIND,
+    FailureSubstrate,
+    worker_for_verdict,
+)
+from .workers import (
+    FAILURE_WORKER_REGISTRY,
+    FailureWorker,
+    RemediationOutcome,
+    default_workers,
+)
 
-# Re-export the public API surface
+
 __all__ = [
+    # governance vocabulary
     "FAILURE_CLASSIFICATION",
-    "FAILURE_WORKER_REGISTRY",
+    "FAILURE_FSM",
+    "FAILURE_TERMINAL",
     "FailureClass",
+    "FailureFSM",
+    "FailureKind",
+    "FailureSeverity",
+    "FailureVerdict",
+    "RemediationKind",
+    # mechanical plane
+    "FAILURE_SUBSTRATE",
+    "MAX_RETRIES",
+    "WORKER_FOR_KIND",
+    "FailureSubstrate",
     "FailureOutcome",
     "FailureReport",
-    "FailureSeverity",
-    "FailureSubstrateMembrane",
-    "FailureVerdict",
     "FailureWorker",
-    "MAX_RETRIES",
-    "RemediationKind",
     "RemediationOutcome",
+    "FAILURE_WORKER_REGISTRY",
+    "default_workers",
     "signal_failure",
+    "worker_for_verdict",
 ]

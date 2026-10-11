@@ -50,14 +50,18 @@ def test_denied_transition_is_side_effect_free_and_traced() -> None:
     assert successor.transitions[-1].after_sub_loop is None
 
 
-def test_fsm_authorizes_bootstrap_only_at_initial_comprehension() -> None:
+def test_fsm_authorizes_work_against_the_live_observation() -> None:
+    """Phase R4: the bootstrap exception is GONE — no pre-INTAKE work.
+
+    Every dispatch authorizes against the live (loop, sub-loop) observation.
+    At the initial observation (INTAKE not yet open) NO work home is legal;
+    once INTAKE opens, only its own sub-loop authorizes.
+    """
     controller = _controller()
 
-    assert controller.authorize_work(
-        nested_loop=NestedLoop.CONTEXT, bootstrap=True,
-    ).allowed
     assert not controller.authorize_work(
-        nested_loop=NestedLoop.REASONING, bootstrap=True,
+        nested_loop=NestedLoop.CONTEXT,
+        sub_loop=SubLoop.ACQUISITION,
     ).allowed
 
     opened, verdict = controller.transition(

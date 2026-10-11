@@ -83,6 +83,22 @@ TRIGGER_SOURCES = ("probe", "staleness", "cold_start", "recovery", "rollover")
 PAYLOAD_STATUSES = ("healthy", "degraded", "insufficient_data")
 
 
+def ledger_substrate_name(plane: str, substrate: str) -> str:
+    """The durable-ledger substrate identity for a worker plane.
+
+    OWNER of the durable-ledger naming. ``substrate_calculation`` has no
+    ``plane`` column, so the analysis plane's rows are namespaced
+    ``analysis:<name>`` to keep the two planes' substrate names disjoint.
+
+    The GOVERNANCE ledger is keyed ``(plane, substrate)`` explicitly and keeps
+    the bare substrate; ``docs/PLANE_GOVERNANCE_SPEC.md`` §7 documents the
+    join key. This function is the ONE derivation, so the two ledgers cannot
+    drift.
+    """
+    name = str(substrate).lower()
+    return f"analysis:{name}" if str(plane).lower() == "analysis" else name
+
+
 @dataclass(frozen=True)
 class TriggerDecision:
     """The deterministic fire decision (L2 probe result + provenance).

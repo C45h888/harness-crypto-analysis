@@ -162,6 +162,16 @@ class CycleController:
     observation: LoopObservation | None = field(
         default=None, repr=False, compare=False,
     )
+    # Phase R3 (cadence-into-plan): the controller ADOPTS the plan-bound
+    # cadence at comprehension close (with_cadence). Selection is computed
+    # by the pure ``engine.cadence.resolve_cadence`` and bound by the plan
+    # factor; the controller is the sole semantic authority over it and
+    # acquisition/dispatch read it from here. compare=False keeps value
+    # semantics unchanged for legacy constructors (same treatment as
+    # membrane/observation).
+    cadence: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False,
+    )
     terminal: LoopTerminal | None = field(
         default=None, repr=False, compare=False,
     )
@@ -177,6 +187,25 @@ class CycleController:
     def with_observation(self, observation: LoopObservation) -> "CycleController":
         """A new controller carrying ``observation`` (immutable setter)."""
         return replace(self, observation=observation)
+
+    def with_cadence(self, cadence: Mapping[str, Any] | None) -> "CycleController":
+        """Adopt the plan-bound cadence (immutable setter).
+
+        The mapping is frozen defensively (MappingProxyType) so an adopted
+        cadence cannot be mutated in place by any consumer. ``None`` keeps
+        the legacy no-cadence shape (legacy controllers/tests).
+        """
+        if cadence is None:
+            return replace(self, cadence=None)
+        return replace(self, cadence=MappingProxyType(dict(cadence)))
+
+    def cadence_value(self, key: str) -> Any | None:
+        """One resolved cadence value (interval_seconds/window_minutes/
+        horizon_ms/regime/provenance); ``None`` when unadopted."""
+        cad = self.cadence
+        if not isinstance(cad, Mapping):
+            return None
+        return cad.get(key)
 
     def govern(self, event: GovernanceEvent) -> MembraneVerdict:
         """Consult the membrane: may this move happen? NEVER raises.
@@ -274,9 +303,12 @@ class CycleController:
         *,
         nested_loop: Any,
         sub_loop: Any | None = None,
-        bootstrap: bool = False,
     ) -> MembraneVerdict:
-        """Ask the FSM whether work may execute at the current observation."""
+        """Ask the FSM whether work may execute at the current observation.
+
+        Phase R4: the bootstrap flag is gone with the fetch semantic —
+        there is no work that predates the FSM observation anymore.
+        """
         if self.terminal is not None:
             return MembraneVerdict(False, reason=f"cycle already terminated at {self.terminal.value}")
         if self.membrane is None:
@@ -287,7 +319,6 @@ class CycleController:
             self.observation,
             nested_loop=nested_loop,
             sub_loop=sub_loop,
-            bootstrap=bootstrap,
         )
 
     # ------------------------------------------------------------------

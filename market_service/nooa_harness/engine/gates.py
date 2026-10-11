@@ -9,22 +9,24 @@ inline code "doing as it pleases".
 
 Authority split (unchanged, now with a named base):
 
-  - THIS module owns the gate VOCABULARY and the pure verdict functions —
-    what "the data is sufficient" and "the plan is adequate" mean,
-    deterministically.
+  - THIS module owns the gate VOCABULARY and the pure verdict functions.
   - ``engine/fsm.py`` owns where a refused gate TERMINATES (``GATE_REFUSED``
     and any future gate-specific terminals).
   - ``engine/controller.py`` owns classification/credit/exit: it consumes the
     verdict, records it, and asks the membrane for the terminal.
-  - ``core/`` owns WHEN a gate runs in the loop body (the ``GATE_DATA`` step
-    verdicts the agent-first fetch in ``run_data_gate``; the ``GATE_PLAN``
+  - ``core/`` owns WHEN a gate runs in the loop body (the ``GATE_PLAN``
     step executes post-framing in ``run_comprehension``).
 
-The gate vocabulary is deliberately pure data so it may be replayed,
-unit-tested with no stores, and cited as the deterministic fact the loop
-refused on. The DATA gate wraps the canonical trichotomy
-(``resolve_inference_status``); the PLAN gate is forward-only — a refused
-plan routes to a terminal, never to a re-plan edge.
+Phase R7 (fetch semantic removed): the DATA gate is RETIRED. It was the
+judgement layer for the agent-fetch semantic — it verdicted model-chosen
+cadence data against the tape-quality trichotomy, and its zero-LLM
+insufficient-tape refusal was the fetch turn's only reason to exist.
+With comprehension as the first agentic step and plan-bound acquisition,
+per-tool deterministic refusals plus the validation gate carry the same
+guarantees without a pre-receipt judgement layer. The PLAN gate is
+forward-only — a refused plan routes to a terminal, never to a re-plan
+edge. The gate vocabulary is deliberately pure data so it may be replayed
+and unit-tested with no stores.
 """
 
 from __future__ import annotations
@@ -33,15 +35,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
-from market_service.nooa_harness.inference.gate import resolve_inference_status
-
 __all__ = [
     "GateKind",
     "GateStatus",
     "GateVerdict",
     "GateRefused",
-    "evaluate_data_gate",
     "evaluate_plan_gate",
+    "evaluate_budget_gate",
     "require_gate",
 ]
 
@@ -60,8 +60,8 @@ _HORIZON_BEARING_REGIMES = frozenset({"native", "long"})
 class GateKind(str, Enum):
     """Which guard a verdict belongs to."""
 
-    DATA = "data"   # bootstrap data sufficiency (zero-LLM)
-    PLAN = "plan"   # post-framing plan adequacy (forward-only)
+    PLAN = "plan"     # post-framing plan adequacy (forward-only)
+    BUDGET = "budget"  # LLM-call/tool ceiling adjudication (G4)
 
 
 class GateStatus(str, Enum):
@@ -131,52 +131,6 @@ def require_gate(verdict: GateVerdict) -> GateVerdict:
 
 
 # ---------------------------------------------------------------------------
-# DATA gate — post-ingestion sufficiency (zero-LLM)
-# ---------------------------------------------------------------------------
-
-
-def evaluate_data_gate(
-    *,
-    n_observations: int,
-    min_observations: int,
-    fit_status: str | None,
-    capture_state: str | None,
-    events_in_window: int,
-    degraded_spans_in_window: int = 0,
-) -> GateVerdict:
-    """Deterministically resolve data sufficiency before any LLM call.
-
-    The canonical trichotomy (validated / provisional / insufficient) is
-    resolved by ``resolve_inference_status``; this gate maps ``insufficient``
-    to REFUSED and everything else to PASSED (provisional is a pass WITH
-    reasons, not a refusal). Zero tokens are spent on a refused gate.
-    """
-    status, reasons = resolve_inference_status(
-        n_observations=n_observations,
-        min_observations=min_observations,
-        fit_status=fit_status,
-        capture_state=capture_state,
-        events_in_window=events_in_window,
-        degraded_spans_in_window=degraded_spans_in_window,
-    )
-    gate_status = GateStatus.REFUSED if status == "insufficient" else GateStatus.PASSED
-    return GateVerdict(
-        gate=GateKind.DATA,
-        status=gate_status,
-        reasons=tuple(reasons),
-        facts=(
-            ("resolved_status", status),
-            ("n_observations", n_observations),
-            ("min_observations", min_observations),
-            ("fit_status", fit_status),
-            ("capture_state", capture_state),
-            ("events_in_window", events_in_window),
-            ("degraded_spans_in_window", degraded_spans_in_window),
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
 # PLAN gate — post-framing adequacy (forward-only)
 # ---------------------------------------------------------------------------
 
@@ -234,6 +188,60 @@ def evaluate_plan_gate(
 
     return GateVerdict(
         gate=GateKind.PLAN,
+        status=GateStatus.REFUSED if reasons else GateStatus.PASSED,
+        reasons=tuple(reasons),
+        facts=tuple(facts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# BUDGET gate — ceiling adjudication before each dispatch round (G4)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_budget_gate(
+    *,
+    tool_rounds_used: int,
+    dispatched_in_pass: int,
+    max_tool_rounds: int,
+    max_dispatches_per_pass: int,
+) -> GateVerdict:
+    """Deterministically adjudicate the LLM-call/tool budgets before a round.
+
+    The NUMBERS are config-owned (engine.config ceilings); the VERDICT is
+    governance-owned (this module, same shape as the plan gate). The driver
+    consults this verdict before every round — it never decides budget
+    inline. Overflow is a finding that names what will not run (the caller
+    moves the names to ``unexecuted``); it is a refusal of the WORK, not a
+    terminal — the loop continues its closing semantics.
+
+    Rules (evaluated in order):
+    - rounds exhausted (``tool_rounds_used >= max_tool_rounds``): nothing
+      further executes this cycle;
+    - pass ceiling reached (``dispatched_in_pass >= max_dispatches_per_pass``):
+      nothing further executes in THIS pass (a later pass may still run).
+
+    Identical inputs always yield identical verdicts (pure).
+    """
+    reasons: list[str] = []
+    facts: list[tuple[str, Any]] = [
+        ("tool_rounds_used", tool_rounds_used),
+        ("dispatched_in_pass", dispatched_in_pass),
+        ("max_tool_rounds", max_tool_rounds),
+        ("max_dispatches_per_pass", max_dispatches_per_pass),
+    ]
+    if tool_rounds_used >= max_tool_rounds:
+        reasons.append(
+            f"cycle tool-round budget exhausted "
+            f"({tool_rounds_used}/{max_tool_rounds})"
+        )
+    if dispatched_in_pass >= max_dispatches_per_pass:
+        reasons.append(
+            f"pass dispatch ceiling reached "
+            f"({dispatched_in_pass}/{max_dispatches_per_pass})"
+        )
+    return GateVerdict(
+        gate=GateKind.BUDGET,
         status=GateStatus.REFUSED if reasons else GateStatus.PASSED,
         reasons=tuple(reasons),
         facts=tuple(facts),

@@ -206,6 +206,14 @@ def run_wake(
         .with_membrane(GOVERNANCE_MEMBRANE)
         .with_observation(GOVERNANCE_MEMBRANE.initial())
     )
+    # Phase R7 (fetch semantic removed): run_wake OWNS INTAKE — the
+    # deterministic normalization above IS the RECEIVE → DECODE → NORMALIZE
+    # work. With no fetch turn to open it, the wake opens its sub-loop here
+    # so comprehension's next OPEN advances to INTERPRETATION (the FSM
+    # grants the next sub-loop in order).
+    controller, _ = context._must_govern(
+        controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTAKE
+    )
 
     return _CycleContext(
         wake=wake, task=task, scenario=scenario, generated_at=generated_at,
@@ -259,35 +267,68 @@ async def run_comprehension(
     engine: Any, ctx: Any,
 ) -> tuple[CycleRuntimeState | None, tuple | None]:
     """COMPREHENSION loop (1 pass, no tools). Returns (st, None) or (None, finished)."""
-    gathered = ctx.gathered
-    if gathered is None:
-        # WAKE ordering: comprehension runs after gather's deterministic
-        # evidence so the agent's first proposal sees gate reads. The FSM
-        # observation is still COMPREHENSION — gather's bootstrap reads are
-        # authorized as wake-bootstrap, not as EVIDENCE traversal.
-        raise RuntimeError("reason/check requires gathered evidence")
+    # Phase R7 (fetch semantic removed): there is no gathered receipt to
+    # consume — comprehension IS the first agentic step. The carrier is
+    # constructed here from the normalized prompt and the wake identity;
+    # the gathered receipt is formed at comprehension CLOSE (shared by
+    # reference with the carrier, exactly the old ownership shape) so
+    # plan-bound acquisition and output consume the same dicts.
     wake, task, scenario = ctx.wake, ctx.task, ctx.scenario
     # Canonical read: bounded prompt fields come off the injected variable;
     # getattr fallback preserves direct-ctx construction in older tests.
     prompt = getattr(ctx, "prompt", None)
     if prompt is None:
         prompt = PromptVariable.from_cli(task, scenario)
+    # Named init dict (charter-visible): the comprehension plane OWNS
+    # the deterministic keyspace now. capture_status /
+    # microstructure_evidence / data_quality are None placeholders
+    # until the agent pulls the reads (null = not-provided, never
+    # zero); plan-bound acquisition merges forecast/scenario in place.
+    deterministic_state: dict[str, Any] = {
+        "task": prompt.raw,
+        "scenario": scenario,
+        "wake": {
+            "trigger_source": wake.trigger_source,
+            "predicates_fired": wake.predicates_fired,
+        },
+        "capture_status": None,
+        "microstructure_evidence": None,
+        "data_quality": None,
+        # Plan-bound acquisition merges these in place after the
+        # receipt (placeholders preserve the charter key order).
+        "forecast_result": None,
+        "forward_scenario": None,
+        "forward_scenario_note": "not_run",
+        "gate": {"status": "provisional", "reasons": []},
+        "forward_gate": {"status": "unavailable",
+                         "probability_status": "unavailable",
+                         "reason": "not_run"},
+    }
     st = CycleRuntimeState(
         controller=ctx.controller,
         capability_log=ctx.capability_log,
-        deterministic_state=gathered.deterministic_state,
-        accumulated_tool_results=gathered.accumulated_tool_results,
-        tool_results=gathered.tool_results,
+        deterministic_state=deterministic_state,
+        accumulated_tool_results={},
+        tool_results={},
         parsed_current={},
+    )
+    # The gathered receipt rides the carrier's own dicts by reference:
+    # acquisition's in-place merge is visible to output without a copy.
+    from .context import _GatheredEvidence as _Gathered
+    ctx.gathered = _Gathered(
+        evidence=None,
+        gate_status="provisional",
+        gate_reasons=[],
+        deterministic_state=st.deterministic_state,
+        accumulated_tool_results=st.accumulated_tool_results,
+        tool_results=st.tool_results,
     )
     # Seed the carrier from the fetch receipt: the fetch turn's LLM cost,
     # tier history, and unexecuted names belong to this cycle's budgets.
-    fetched = getattr(ctx, "fetched", None)
-    if fetched is not None:
-        st.llm_calls = fetched.llm_calls
-        st.llm_tiers = list(fetched.llm_tiers)
-        st.unexecuted = list(fetched.unexecuted)
-        st.passes_per_loop["fetch"] = 1
+    # Phase R7 (fetch semantic removed): there is no fetch turn anymore —
+    # the carrier starts at zero and every read is agent-pulled downstream.
+    # The plan-bound cadence is adopted HERE (controller = sole semantic
+    # authority) and logged inside the wake-semantic boundary.
 
     # --- CONTEXT: memory node pruned from the track (transport retained on
     # the driver for later use) — no recall read feeds the prompts; H0/H1
@@ -317,7 +358,7 @@ async def run_comprehension(
     _memories, st.memory_block = await engine._recall_memory(
         segment=ctx.task_id,
     )
-    st.prior_note = fetched.fetch_note if fetched is not None else ""  # type: ignore[attr-defined]
+    st.prior_note = ""  # type: ignore[attr-defined]  # fetch_note removed (R7)
     st.scenario_reminder = (
         f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
         f"given horizon; frame H0/H1 as not-reachable/reachable): "
@@ -408,6 +449,50 @@ async def run_comprehension(
     # This keeps the hard-gate and narration budgets unambiguous.
     # INTAKE opened in run_agent_fetch (the fetch turn runs there); the
     # cursor advances to INTERPRETATION here, FRAMING after that.
+    # Phase R3+R5 + G2 (cadence governance): the plan's cadence verdict is
+    # offered to the membrane BEFORE the controller adopts it — the FSM is
+    # the sole legality authority over cadence binding. A bound verdict
+    # adopts onto the controller; any refusal is a recorded finding (the
+    # cycle continues at the deterministic floor — never a terminal). The
+    # adoption/refusal is LOGGED inside the wake-semantic boundary — one
+    # engine.cadence capability entry riding the same log run_wake opened.
+    # The values (or the refusal) ride the frozen receipt either way.
+    _cadence_verdict = (st.task_plan or {}).get("cadence")
+    _cadence_governed = False
+    if isinstance(_cadence_verdict, dict):
+        _, _verdict = context._must_govern(
+            st.controller, GovernanceEventKind.ADOPT_CADENCE, None,
+            cadence_verdict=_cadence_verdict,
+        )
+        _cadence_bound = (
+            _verdict.allowed
+            and isinstance(_cadence_verdict, dict)
+            and _cadence_verdict.get("bound") is True
+            and str(_verdict.reason).startswith("cadence bound")
+        )
+        if _cadence_bound:
+            ctx.controller = ctx.controller.with_cadence(
+                _cadence_verdict.get("cadence"))
+            st.controller = ctx.controller
+            _cadence_governed = True
+            ctx.capability_log.append({
+                "capability": "engine.cadence",
+                "scope": {"symbol": engine.symbol, "venue": engine.venue},
+                "result": "ok",
+                "detail": dict(_cadence_verdict.get("cadence") or {}),
+                "governance": _verdict.reason,
+            })
+        else:
+            ctx.capability_log.append({
+                "capability": "engine.cadence.refused",
+                "scope": {"symbol": engine.symbol, "venue": engine.venue},
+                "result": "denied",
+                "detail": {
+                    "reasons": list(_cadence_verdict.get("reasons") or ()),
+                    "provenance": _cadence_verdict.get("provenance"),
+                },
+                "governance": _verdict.reason,
+            })
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.INTERPRETATION
     )
@@ -437,6 +522,9 @@ async def run_comprehension(
         "raw_proposal": raw_proposal,
         "seed_plan": st.seed_plan,
         "comprehension": st.comprehension,
+        # Phase R5: the adopted plan-bound cadence rides the frozen receipt
+        # (agent-visible, logged, provenance-stamped by the resolver).
+        "cadence": (st.task_plan or {}).get("cadence"),
         "loop_visit": ("intake", "interpretation", "framing"),
     }
     # GATE_PLAN (post-framing): the deterministic plan-adequacy guard.
@@ -446,7 +534,7 @@ async def run_comprehension(
     st.deterministic_state["plan_gate"] = plan_gate.to_dict()
     if plan_gate.refused:
         st.controller = st.controller.advance(
-            GovernanceEvent(GovernanceEventKind.GATE_REFUSED)
+            context.failure_event("gate_refused")
         )
         terminal = (
             st.controller.terminal.value if st.controller.terminal

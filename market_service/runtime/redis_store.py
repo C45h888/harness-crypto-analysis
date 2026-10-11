@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import Any
 
@@ -1154,6 +1155,162 @@ class RedisRuntimeStore:
         """Read recorded analysis states, newest first."""
         rows = await self.redis.xrevrange(
             self.analysis_stream(analysis, symbol), count=count,
+        )
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    # ------------------------------------------------------------------
+    # Governance plane keyspace (docs/PLANE_GOVERNANCE_SPEC.md)
+    #
+    #   latest     STRING — the plane's most recent governance decision
+    #   stream         — bounded decision history (audit; denied + allowed)
+    #   denials        — bounded denials-only stream (violations surface)
+    #   supervisor     — the governor's liveness heartbeat (observability)
+    #
+    # WRITTEN BY THE GOVERNANCE FSMs ONLY. Worker planes never touch these
+    # keys: the FSM is the sole writer of its own audit trail.
+    # ------------------------------------------------------------------
+
+    def governance_latest_key(self, plane: str, substrate: str, symbol: str) -> str:
+        return (f"{self.prefix}:latest:governance:{plane.lower()}:"
+                f"{substrate.lower()}:{symbol.upper()}")
+
+    def governance_stream(self, plane: str, symbol: str) -> str:
+        return f"{self.prefix}:stream:governance:{plane.lower()}:{symbol.upper()}"
+
+    def governance_denial_stream(self, plane: str, symbol: str) -> str:
+        return (f"{self.prefix}:stream:governance:denials:"
+                f"{plane.lower()}:{symbol.upper()}")
+
+    def governance_supervisor_key(self, plane: str, symbol: str) -> str:
+        return f"{self.prefix}:governance:{plane.lower()}:{symbol.upper()}:supervisor"
+
+    async def publish_governance_decision(
+        self, plane: str, substrate: str, symbol: str, payload: dict[str, Any],
+        *, supervisor_ms: int | None = None,
+    ) -> str:
+        """Atomic SET(latest) + XADD(decision stream) + supervisor heartbeat.
+
+        Denials are additionally appended to the denials-only stream. The
+        supervisor key is refreshed by the DECISION itself (never by a timer):
+        a plane that keeps deciding is alive; one that stops is not.
+
+        Same Lua ordering-hole closure as ``publish_substrate_state``: no
+        reader can observe a latest decision whose stream entry is missing.
+        """
+        body = json.dumps(payload, default=str, separators=(",", ":"))
+        ts = str(payload.get("decided_at_ms") or "")
+        allowed = "1" if payload.get("allowed") else "0"
+        maxlen = str(int(self.stream_maxlen))
+        ttl_ms = str(int(
+            supervisor_ms if supervisor_ms is not None
+            else os.getenv("GOVERNANCE_SUPERVISOR_MS") or 900_000
+        ))
+        script = """
+        redis.call('SET', KEYS[1], ARGV[1])
+        local id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'plane', ARGV[2], 'substrate', ARGV[3], 'symbol', ARGV[4],
+            'ts', ARGV[6], 'allowed', ARGV[7], 'payload', ARGV[1])
+        if ARGV[7] == '0' then
+            redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
+                'plane', ARGV[2], 'substrate', ARGV[3], 'symbol', ARGV[4],
+                'ts', ARGV[6], 'allowed', ARGV[7], 'payload', ARGV[1])
+        end
+        redis.call('SET', KEYS[4], ARGV[6], 'PX', ARGV[8])
+        return id
+        """
+        return str(await self.redis.eval(
+            script, 4,
+            self.governance_latest_key(plane, substrate, symbol),
+            self.governance_stream(plane, symbol),
+            self.governance_denial_stream(plane, symbol),
+            self.governance_supervisor_key(plane, symbol),
+            body, plane.lower(), substrate.lower(), symbol.upper(),
+            maxlen, ts, allowed, ttl_ms,
+        ))
+
+    async def read_governance_latest(
+        self, plane: str, symbol: str, substrate: str = "",
+    ) -> dict[str, Any] | None:
+        """Read the plane's latest governance decision (None = none yet).
+
+        With a ``substrate`` the per-substrate latest projection is read. With
+        none, the HEAD of the plane's decision stream is read — so
+        ``GET /governance?symbol=X`` reports the plane's most recent decision
+        regardless of substrate (never a literal ``*`` key, which nothing
+        writes).
+        """
+        if substrate:
+            raw = await self.redis.get(
+                self.governance_latest_key(plane, substrate, symbol)
+            )
+            if not raw:
+                return None
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                return None
+            return value if isinstance(value, dict) else None
+
+        rows = await self.redis.xrevrange(
+            self.governance_stream(plane, symbol), count=1,
+        )
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                return value
+        return None
+
+    async def governance_alive(self, plane: str, symbol: str) -> bool:
+        """Liveness: has the plane's FSM decided recently? (decision-driven)"""
+        try:
+            return bool(await self.redis.get(
+                self.governance_supervisor_key(plane, symbol)))
+        except Exception:
+            return False
+
+    async def read_governance_denials(
+        self, plane: str, symbol: str, count: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Read the plane's denials-only stream, newest first."""
+        rows = await self.redis.xrevrange(
+            self.governance_denial_stream(plane, symbol), count=count,
+        )
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows:
+            raw = fields.get("payload")
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    async def read_governance_history(
+        self, plane: str, symbol: str, count: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read recorded governance decisions, newest first."""
+        rows = await self.redis.xrevrange(
+            self.governance_stream(plane, symbol), count=count,
         )
         out: list[dict[str, Any]] = []
         for _entry_id, fields in rows:

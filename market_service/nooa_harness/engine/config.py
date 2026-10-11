@@ -58,20 +58,20 @@ AGENTIC_PER_ROUND_CALL_CAP = 3
 # Per-loop-state pass allotment (Track A congruence shape, loop-surface spec v1).
 # The budget counts LLM passes per nested loop, never tools: within a pass
 # the agent packs whatever calls the work needs, bounded only by the
-# anti-runaway dispatch ceiling below. The fetch turn is agent-driven (it
-# commands the gate reads itself) so it spends budget: 1 fetch + 1 + 3 + 6 +
-# 1(+2 retries) + 1 = 13 planned, inside the AGENTIC_MAX_LLM_TURNS backstop.
-# Headroom (16): +1 fetch follow-up recourse, +1 reflection turn reserve.
-# Reasoning needs 6: three forced
-# track positions (assemble → interpret → hypothesize, one pass minimum each)
-# plus the empty-leftover steer, the close, and one slack pass — the
-# hard-track floor is what the steady statistical track spends, not a
-# suggestion.
+# anti-runaway dispatch ceiling below.
+# Phase R7 (fetch semantic removed): the fetch pass budget is gone with
+# the fetch turn. Comprehension is the first agentic pass (its bounded
+# assessment turn rides its budget); acquisition is plan-bound (0 LLM);
+# evidence/reasoning/validation/output unchanged.
+# 1 + 3 + 6 + 1(+2 retries) + 1 = 12 planned, inside the backstop.
+# Headroom (16): +1 comprehension assessment + reflection/refusal reserves.
 LOOP_PASS_BUDGET: dict[str, int] = {
-    "fetch": 1,
     "comprehension": 1,
     "evidence": 3,
-    "reasoning": 6,
+    # R7 + floor-steer: three forced positions + the empty-close floor
+    # steer + one slack pass — the hard-track floor is what the steady
+    # statistical track spends, not a suggestion.
+    "reasoning": 7,
     "validation": 1,
     "output": 1,
 }

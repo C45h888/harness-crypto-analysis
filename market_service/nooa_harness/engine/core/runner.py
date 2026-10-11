@@ -5,13 +5,18 @@ The runner is the OUTER loop; the nested loops are derived within it via
 
   - stage order — DERIVED from ``OUTER_SEQUENCE`` (Phase S-1,
     docs/STATE_CHARTER_SPEC.md): the receipts enumerate the real chain
-    (wake → agent_fetch → data_gate → comprehension → plan-bound
-    acquisition → evidence → reasoning → validation → output) and
-    narrate_cycle iterates the table through _STAGE_RUNNERS;
+    (wake → comprehension → plan-bound acquisition → evidence → reasoning
+    → validation → output) and narrate_cycle iterates the table through
+    _STAGE_RUNNERS;
   - the orchestration membrane: ``GovernanceDenied`` → canonical FSM
     failure route (sits between the governance membrane and the stages);
   - durable writes (persist / finalize / degraded artifact) over the
     engine's stores.
+
+Phase R7 (fetch semantic removed): there are no fetch/data-gate stages —
+``run_wake`` is deterministic INTAKE (no tools), ``run_comprehension`` is
+the canonical first agentic step (cadence adopted + logged there), and
+plan-bound acquisition runs under the frozen receipt.
 
 It owns no transport (``_call_llm`` / dispatch rounds live on the engine
 handle), no loop bodies (those live in ``wake`` / ``gather`` /
@@ -41,15 +46,14 @@ log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Phase S-1 (docs/STATE_CHARTER_SPEC.md) — the outer cycle is DERIVED from
-# the table. OUTER_SEQUENCE is no longer dead documentation: narrate_cycle
-# iterates it, and each entry's runner resolves through _STAGE_RUNNERS.
-# Stage spies still patch core.wake / core.gather / the reasoning+output
-# owners — every stage wrapper calls through the module attribute at call
-# time, so the seams survive.
+# the table. narrate_cycle iterates it, and each entry's runner resolves
+# through _STAGE_RUNNERS. Stage spies still patch core.wake / core.gather /
+# the reasoning+output owners — every stage wrapper calls through the module
+# attribute at call time, so the seams survive.
 #
 # Stage receipts are the honest grain: the FSM's CONTEXT loop covers the
-# four pre-reasoning stages (wake is pre-FSM; the merged CONTEXT loop hosts
-# gate reads → comprehension → plan-bound acquisition → evidence).
+# pre-reasoning stages (wake is pre-FSM; the merged CONTEXT loop hosts
+# comprehension → plan-bound acquisition → evidence).
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class StageReceipt:
@@ -62,14 +66,10 @@ class StageReceipt:
 
 OUTER_SEQUENCE: tuple[StageReceipt, ...] = (
     StageReceipt("wake", None, "bind the cycle context (pre-FSM)"),
-    StageReceipt("agent_fetch", NestedLoop.CONTEXT,
-                 "agent-commanded tape-quality reads"),
-    StageReceipt("data_gate", NestedLoop.CONTEXT,
-                 "DATA verdict on the agent's pull"),
     StageReceipt("comprehension", NestedLoop.CONTEXT,
-                 "understanding pass + receipt gate + placement"),
+                 "understanding pass + cadence adoption + receipt gate"),
     StageReceipt("plan_bound_acquisition", NestedLoop.CONTEXT,
-                 "acquisition under the frozen receipt"),
+                 "acquisition under the frozen receipt at the plan cadence"),
     StageReceipt("evidence", NestedLoop.CONTEXT,
                  "evidence narration"),
     StageReceipt("reasoning", NestedLoop.REASONING,
@@ -88,25 +88,6 @@ OUTER_SEQUENCE: tuple[StageReceipt, ...] = (
 async def _stage_wake(engine, ctx, st, wake, wake_meta, task, scenario):
     return st, wake_mod.run_wake(engine, wake, wake_meta, task, scenario), None
 
-
-async def _stage_agent_fetch(engine, ctx, st, wake, wake_meta, task, scenario):
-    completed = await gather.run_agent_fetch(engine, ctx)
-    if completed is not None:
-        return st, ctx, completed
-    if ctx.fetched is None:
-        raise context.GovernanceDenied(
-            "fetch closed without fetched reads")
-    return st, ctx, None
-
-
-async def _stage_data_gate(engine, ctx, st, wake, wake_meta, task, scenario):
-    completed = await gather.run_data_gate(engine, ctx)
-    if completed is not None:
-        return st, ctx, completed
-    if ctx.gathered is None:
-        raise context.GovernanceDenied(
-            "gate closed without gathered evidence")
-    return st, ctx, None
 
 async def _stage_comprehension(engine, ctx, st, wake, wake_meta, task, scenario):
     st, completed = await wake_mod.run_comprehension(engine, ctx)
@@ -151,8 +132,6 @@ async def _stage_output(engine, ctx, st, wake, wake_meta, task, scenario):
 
 _STAGE_RUNNERS: dict[str, Callable[..., Awaitable[tuple[Any, Any, Any]]]] = {
     "wake": _stage_wake,
-    "agent_fetch": _stage_agent_fetch,
-    "data_gate": _stage_data_gate,
     "comprehension": _stage_comprehension,
     "plan_bound_acquisition": _stage_plan_bound_acquisition,
     "evidence": _stage_evidence,
@@ -179,19 +158,22 @@ async def narrate_cycle(
     """One narration cycle — READ-PLANE, envelope-driven.
 
     The controller receives the envelope (task, scenario, wake identity)
-    and hands it to the agent via the comprehension pass. The agent then reads as it
-    pleases through the tool base — calc.*/substrate.*/market.*/memory.*
+    and comprehension disposes the prompt into the frozen receipt; the
+    agent then reads as it pleases through the tool base — calc.*/substrate.*/market.*/memory.*
     read tools — to complete its task; the controller classifies every
-    outcome and the loop persists the artifact. NO deterministic spine is
-    pre-computed here; only the two pre-gate reads serving the zero-token
-    gate contract precede narration.
+    outcome and the loop persists the artifact.
+
+    Phase R7: there is no agent fetch turn and no DATA gate. The first
+    agentic work is comprehension (deterministic parse + bounded
+    assessment); acquisition is plan-bound at the adopted cadence; every
+    other read is agent-pulled inside the evidence loop.
 
     ``task`` is the interactive-plane directive: a free-text trade
     hypothesis / question from the harness caller (``harness.py --task``
     or ``nooa market inference run --task``). It steers narration — the
     TASK block opens user_prompt_1 and is repeated on follow-up/repair
     turns so every phase answers it — and is persisted on
-    ``deterministic_state["task"]`` plus the wake capability detail.
+    ``deterministic_state["task"]``.
     ``None`` preserves the legacy autonomous behaviour (agent frames its
     own generic H0/H1, as seen in pre-task artifacts).
     ``scenario`` is ``{"target_price": str, "horizon": "15m|1h|4h"}``
@@ -200,10 +182,9 @@ async def narrate_cycle(
     Phase 3 semantics can evaluate it via ``calc.scenario.evaluate``.
     """
     # Phase S-1: the stage order IS OUTER_SEQUENCE — the loop below is the
-    # only traversal (previously a hardcoded await chain that could silently
-    # drift from the table). Stage wrappers call through the module
-    # attributes so the core.wake/core.gather spy seams survive. The
-    # GovernanceDenied membrane below is unchanged.
+    # only traversal. Stage wrappers call through the module attributes so
+    # the core.wake/core.gather spy seams survive. The GovernanceDenied
+    # membrane below is unchanged.
     ctx: Any = None
     st: Any = None
     completed: Any = None
@@ -225,7 +206,7 @@ async def narrate_cycle(
         if exc.controller is not None:
             ctx.controller = exc.controller
         ctx.controller = ctx.controller.advance(
-            GovernanceEvent(GovernanceEventKind.INFRA_FAILED)
+            context.failure_event("infra_failed")
         )
         state = (
             ctx.gathered.deterministic_state

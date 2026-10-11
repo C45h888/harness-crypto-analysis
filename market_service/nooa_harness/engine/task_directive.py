@@ -454,6 +454,12 @@ def build_plan(directive: TaskDirective) -> dict[str, Any]:
     if directive.has_targets and directive.horizon_regime in ("native", "long"):
         if "calc.forward.scenario" not in pre_acquire and directive.horizon_regime == "native":
             pre_acquire.append("calc.forward.scenario")
+    # Phase R2 + G1: the plan binds its cadence as a VERDICT (single-owner
+    # resolve, pure). Only a CLI-sourced directive may bind cadence (the
+    # CLI is the sole approval channel); prompt-parsed/LLM-proposed
+    # horizons resolve as unapproved-source refusals. The verdict rides
+    # the frozen plan contract; the FSM adjudicates it at adoption.
+    from .cadence import resolve_cadence as _resolve_cadence
     return {
         "schema_version": DIRECTIVE_SCHEMA_VERSION,
         "kind": kind,
@@ -471,6 +477,13 @@ def build_plan(directive: TaskDirective) -> dict[str, Any]:
         "forecast_horizon_ms": horizon_for_forecast,
         "directive_refusals": [dict(r) for r in directive.refusals],
         "notes": [n for n in (horizon_note,) if n],
+        "cadence": _resolve_cadence(
+            {
+                "horizon_regime": directive.horizon_regime,
+                "forecast_horizon_ms": horizon_for_forecast,
+            },
+            directive_source=directive.source,
+        ).to_dict(),
     }
 
 

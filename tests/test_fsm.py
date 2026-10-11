@@ -7,7 +7,8 @@ Pins the laws of ``engine/fsm.py``, the primary governance membrane:
 - legality is derived ONLY from loop_states (no state names defined here);
 - ENTER_LOOP / SET_TASK / OPEN_SUBLOOP / CLOSE_SUBLOOP / SETTLE follow the
   constitution exactly;
-- failure kinds route to their terminals from EVERY state (graceful);
+- the CYCLE_FAILED failure INTAKE edge is legal from EVERY state and
+  delegates its terminal to the primary failure node (FailureFSM);
 - every (state x event-kind) pair yields a verdict — never a raise.
 
 The old FSM vocabulary (LoopState / LoopEvent / AgentLoopFSM) is dead.
@@ -18,12 +19,15 @@ from __future__ import annotations
 import unittest
 
 from market_service.nooa_harness.engine.fsm import (
-    FAILURE_EVENT_KINDS,
     GOVERNANCE_MEMBRANE,
     AgenticLoopMembrane,
     GovernanceEvent,
     GovernanceEventKind,
     MembraneVerdict,
+)
+from market_service.nooa_harness.engine.failure_fsm import (
+    FAILURE_FSM,
+    FailureKind,
 )
 from market_service.nooa_harness.engine.loop_states import (
     INTENT_LOOP,
@@ -120,9 +124,8 @@ class LegalEventsTests(unittest.TestCase):
         # No close (nothing open), no settle (not OUTPUT).
         self.assertNotIn(GovernanceEventKind.CLOSE_SUBLOOP, kinds)
         self.assertNotIn(GovernanceEventKind.SETTLE, kinds)
-        # Failures are legal everywhere (graceful).
-        for kind in FAILURE_EVENT_KINDS:
-            self.assertIn(kind, kinds)
+        # The failure INTAKE edge is legal everywhere (it delegates).
+        self.assertIn(GovernanceEventKind.CYCLE_FAILED, kinds)
 
     def test_output_offers_settle(self):
         obs = LoopObservation(
@@ -271,30 +274,44 @@ class DecideConstitutionTests(unittest.TestCase):
 
 
 class GracefulFailureTests(unittest.TestCase):
-    def test_every_state_routes_every_failure_kind_to_its_terminal(self):
+    """The main FSM's ONE failure edge: CYCLE_FAILED intake + delegation."""
+
+    def test_every_state_delegates_cycle_failed_to_failure_node_terminal(self):
         for state in M.states():
-            for kind in FAILURE_EVENT_KINDS:
-                event = GovernanceEvent(kind)
+            for member in FailureKind:
+                event = GovernanceEvent(
+                    GovernanceEventKind.CYCLE_FAILED,
+                    failure_kind=member.value,
+                )
                 verdict = M.decide(state, event)
-                self.assertTrue(verdict.allowed, (state, kind))
+                self.assertTrue(verdict.allowed, (state, member))
                 self.assertEqual(
-                    verdict.terminal, M.terminal_for(kind), (state, kind)
+                    verdict.terminal,
+                    FAILURE_FSM.terminal_for(member.value),
+                    (state, member),
                 )
 
-    def test_terminal_for_maps_publicly(self):
+    def test_cycle_failed_without_kind_defaults_to_infra(self):
+        verdict = M.decide(
+            M.initial(), GovernanceEvent(GovernanceEventKind.CYCLE_FAILED)
+        )
+        self.assertTrue(verdict.allowed)
+        self.assertEqual(verdict.terminal, LoopTerminal.INFRA_FAILED)
+
+    def test_terminal_for_delegates_to_failure_node(self):
         self.assertEqual(
-            M.terminal_for(GovernanceEventKind.GATE_REFUSED),
-            LoopTerminal.GATE_REFUSED,
+            M.terminal_for("gate_refused"), LoopTerminal.GATE_REFUSED,
         )
         self.assertEqual(
-            M.terminal_for(GovernanceEventKind.BUDGET_EXHAUSTED),
-            LoopTerminal.BUDGET_EXHAUSTED,
+            M.terminal_for("budget_exhausted"), LoopTerminal.BUDGET_EXHAUSTED,
         )
         self.assertEqual(
-            M.terminal_for(GovernanceEventKind.VALIDATION_FAILED),
-            LoopTerminal.VALIDATION_FAILED,
+            M.terminal_for("validation_failed"), LoopTerminal.VALIDATION_FAILED,
         )
-        self.assertIsNone(M.terminal_for(GovernanceEventKind.SETTLE))
+        # Unknown kinds route to the honest INFRA_FAILED terminal.
+        self.assertEqual(
+            M.terminal_for("not_a_kind"), LoopTerminal.INFRA_FAILED,
+        )
 
     def test_no_raise_over_all_state_kind_pairs(self):
         for state in M.states():
@@ -317,6 +334,7 @@ class SelfCheckTests(unittest.TestCase):
             GovernanceEventKind.OPEN_SUBLOOP,
             GovernanceEventKind.CLOSE_SUBLOOP,
             GovernanceEventKind.SETTLE,
+            GovernanceEventKind.CYCLE_FAILED,
         ):
             self.assertIn(kind, exercised, kind)
 

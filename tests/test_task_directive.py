@@ -162,17 +162,11 @@ class GatherWiringTests(unittest.TestCase):
                 result = {"value": "fixture"}
             return result, {"capability": name, "scope": {}, "result": "ok"}
 
-        engine, _store, _postgres, _memory = _engine(llm_responses=[
-            json.dumps({"phase": "P1", "summary": None, "evidence": [],
-                        "confidence": None, "limitations": [],
-                        "model_separation": None, "hypothesis": None,
-                        "tool_calls": [{"name": "micro.capture_status", "args": {}},
-                                       {"name": "micro.fit_beta", "args": {}}],
-                        "memory_proposals": []}),
-        ])
+        engine, _store, _postgres, _memory = _engine(llm_responses=[])
         with patch.object(core.context, "execute_tool", side_effect=spy_execute):
+            # Phase R7 wiring: wake (INTAKE) → comprehension (receipt +
+            # cadence adoption) → plan-bound acquisition. No fetch/gate.
             ctx = core.wake.run_wake(engine, _wake(), {"decision": "fire"}, task, None)
-            await core.gather.run_gather(engine, ctx)
             st, _ = await core.wake.run_comprehension(engine, ctx)
             await core.gather.run_plan_bound_acquisition(engine, ctx, st)
         return dispatched

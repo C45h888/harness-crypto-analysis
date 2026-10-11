@@ -220,7 +220,7 @@ async def run_output(
     # never opened.
     if not finalize_now:
         controller = controller.advance(
-            GovernanceEvent(GovernanceEventKind.BUDGET_EXHAUSTED)
+            context.failure_event("budget_exhausted")
         )
         terminal = controller.terminal.value if controller.terminal else "budget_exhausted"
         deterministic_state["terminal"] = terminal
@@ -324,7 +324,7 @@ async def run_output(
             )
     if final_terminal != "settled" and controller.terminal is None:
         controller = controller.advance(
-            GovernanceEvent(GovernanceEventKind.INFRA_FAILED)
+            context.failure_event("infra_failed")
         )
     terminal = controller.terminal.value if controller.terminal else final_terminal
     # Placement is complete only after the write/receipt path ran.  MEMORY

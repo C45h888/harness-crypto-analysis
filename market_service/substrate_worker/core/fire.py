@@ -35,6 +35,7 @@ from market_service.substrate_worker.contracts import (
     SUBSTRATE_STATE_SCHEMA_VERSION,
     TriggerDecision,
     SubstrateStatePayload,
+    ledger_substrate_name,
 )
 from market_service.runtime.horizons import restore_fold_state
 
@@ -210,7 +211,16 @@ class FireMixin(SubstrateBase):
         high_water: str,
         rows: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Dedupe, then dispatch the compute+persist cycle as a task."""
+        """Gate, dedupe, then dispatch the compute+persist cycle as a task.
+
+        ORDER IS THE CONTRACT: the governance FIRE gate runs FIRST, before
+        the dedupe high-water, the cooldown stamp and the fired counter. A
+        denial must not burn the dedupe slot (which would permanently
+        suppress the retry of the very condition it denied), must not burn
+        the cooldown window, and must not be counted as a fire.
+        """
+        if not await self._govern("fire"):
+            return
         allowed = await self._dedupe(decision, high_water, now_ms)
         if not allowed:
             log.info("substrate %s fire deduped (source=%s)", self.SUBSTRATE_NAME, decision.source)
@@ -491,16 +501,28 @@ class FireMixin(SubstrateBase):
             )
             if self.dispatcher is not None:
                 await self.dispatcher(payload)
+            # Governance gates (PUBLISH then PG_WRITE), ONE ledger row per fire:
+            # a denial records at the gate that denied; an allowance records at
+            # the LAST gate the cycle reaches (PG_WRITE when a durable ledger is
+            # attached, otherwise PUBLISH). This keeps the audit one-row-per-fire
+            # so real denials are never buried in allow-noise.
+            if not await self._govern("publish", payload.to_dict(),
+                                      record_allow=(self.pg_store is None)):
+                return
             # Phase 3 PG-first: durable insert precedes the Redis publish.
             if self.pg_store is not None:
+                # Governance gate (PG_WRITE): the sanity gate before the write.
+                if not await self._govern("pg_write", payload.to_dict(),
+                                          record_allow=True):
+                    return
                 try:
-                    # Shared durable ledger, plane-namespaced: analysis
-                    # workers record under "analysis:<name>" so calc-plane
-                    # and analysis-plane names can never collide.
-                    ledger_name = (
-                        f"analysis:{self.SUBSTRATE_NAME}"
-                        if self._plane == "analysis" else self.SUBSTRATE_NAME
-                    )
+                    # Durable ledger identity: the payload ledger has no plane
+                    # column, so the analysis plane's rows are namespaced
+                    # 'analysis:<name>'. The GOVERNANCE ledger keeps the bare
+                    # substrate and its own ``plane`` column — see
+                    # PLANE_GOVERNANCE_SPEC §7 for the documented join key.
+                    ledger_name = ledger_substrate_name(
+                        self._plane, self.SUBSTRATE_NAME)
                     # Bounded insert: a hung PG (dead daemon, network drop)
                     # must fail FAST — an unbounded await here stalls every
                     # dispatched fire task, freezes all projections, and
@@ -525,6 +547,70 @@ class FireMixin(SubstrateBase):
         except Exception as exc:
             log.exception("substrate %s fire failed", self.SUBSTRATE_NAME)
             self._last_error = f"fire: {exc}"
+
+    async def _govern(
+        self, gate: str, payload: dict[str, Any] | None = None,
+        *, record_allow: bool = False,
+    ) -> bool:
+        """Ask the plane governor whether one gate is legal (duck-typed).
+
+        Returns True when ungoverned (``governor is None``) — the legacy path
+        is byte-identical to before this seam existed. A governor error fails
+        CLOSED (an unaskable FSM must not authorize) and is logged loudly; a
+        denial records ``_last_dormant_reason`` so the dormancy is observable.
+
+        **Ledger discipline:** a DENIAL is always recorded (it is evidence);
+        an ALLOWANCE is recorded only when ``record_allow`` — so a fire cycle
+        that evaluates several gates writes exactly one ledger row.
+        """
+        if self.governor is None:
+            return True
+        evaluate = getattr(self.governor, "evaluate", None)
+        record = getattr(self.governor, "record", None)
+        try:
+            if callable(evaluate) and callable(record):
+                from market_service.governance.contracts import GovernanceGate
+
+                observation, verdict = await evaluate(
+                    GovernanceGate(gate),
+                    substrate=self.SUBSTRATE_NAME,
+                    symbol=self.symbol,
+                    payload=payload,
+                    inputs=tuple(self.INPUT_STREAMS),
+                )
+                if not verdict.allowed or record_allow:
+                    await record(
+                        GovernanceGate(gate),
+                        substrate=self.SUBSTRATE_NAME,
+                        symbol=self.symbol,
+                        observation=observation,
+                        verdict=verdict,
+                    )
+            else:
+                method = getattr(self.governor, f"authorize_{gate}", None)
+                if not callable(method):
+                    log.error("governor has no evaluate/record or authorize_%s; "
+                              "refusing gate", gate)
+                    self._last_error = f"governance: no authorize_{gate}"
+                    return False
+                verdict = await method(
+                    substrate=self.SUBSTRATE_NAME,
+                    symbol=self.symbol,
+                    payload=payload,
+                    inputs=tuple(self.INPUT_STREAMS),
+                )
+        except Exception as exc:
+            log.error("governance %s gate raised (failing closed): %s", gate, exc)
+            self._last_error = f"governance: {gate}: {exc!r}"
+            return False
+        if not verdict.allowed:
+            self._last_dormant_reason = f"governance:{verdict.rule}:{verdict.reason}"
+            log.warning(
+                "substrate %s denied at %s: [%s] %s",
+                self.SUBSTRATE_NAME, gate, verdict.rule, verdict.reason,
+            )
+            return False
+        return True
 
     async def _attach_derivatives(
         self, window: dict[str, Any], now_ms: int,

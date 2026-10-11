@@ -15,6 +15,9 @@ iterates the table through _STAGE_RUNNERS — and tripwire the regression:
    (the per-map silent defaults are gone — charter rule: no silent defaults
    map unknown identities to authorized behavior);
 5. P1–P6 phase coverage stays a formally separate axis from LoopTag.
+
+Phase R7 revision: the fetch/data-gate stages are retired with the fetch
+semantic — the table is wake + 3 CONTEXT stages + 3 terminator stages.
 """
 
 from __future__ import annotations
@@ -58,15 +61,27 @@ class OuterSequenceDerivationTests(unittest.TestCase):
         )
 
     def test_fsm_loop_coverage_is_the_documented_order(self):
-        # Pre-FSM wake, then the five merged CONTEXT stages of the re-ordered
-        # chain (agent_fetch → data_gate → comprehension → plan-bound
-        # acquisition → evidence), then the three terminator stages —
-        # exactly the narrate_cycle chain.
+        # Pre-FSM wake, then the three merged CONTEXT stages of the
+        # re-ordered chain (comprehension → plan-bound acquisition →
+        # evidence), then the three terminator stages — exactly the
+        # narrate_cycle chain. Phase R7: no fetch/data-gate stages.
         self.assertEqual(
             [r.loop for r in runner.OUTER_SEQUENCE],
-            [None] + [NestedLoop.CONTEXT] * 5 + [
+            [None] + [NestedLoop.CONTEXT] * 3 + [
                 NestedLoop.REASONING, NestedLoop.VALIDATION, NestedLoop.OUTPUT],
         )
+
+    def test_fetch_semantic_is_retired(self):
+        """The fetch/data-gate stages and their vocabulary are gone —
+        the dual wake semantic dissolved into run_wake (deterministic
+        INTAKE) + comprehension (first agentic step)."""
+        runner_src = pathlib.Path(runner.__file__).read_text()
+        self.assertNotIn("agent_fetch", runner_src)
+        self.assertNotIn("run_data_gate", runner_src)
+        self.assertNotIn("bootstrap", inspect.getsource(
+            engine_driver.__dict__["__loader__"] and runner or runner))
+        self.assertFalse(hasattr(runner, "run_agent_fetch"))
+        self.assertNotIn("FETCH", loop_states.__dict__["LoopTag"].__dict__)
 
     def test_narrate_cycle_consumes_the_table(self):
         """The dead-table tripwire: the traversal MUST iterate
@@ -82,8 +97,6 @@ class OuterSequenceDerivationTests(unittest.TestCase):
         sources = {name: inspect.getsource(fn)
                    for name, fn in runner._STAGE_RUNNERS.items()}
         self.assertIn("wake_mod.run_wake(", sources["wake"])
-        self.assertIn("gather.run_agent_fetch(", sources["agent_fetch"])
-        self.assertIn("gather.run_data_gate(", sources["data_gate"])
         self.assertIn("wake_mod.run_comprehension(", sources["comprehension"])
         self.assertIn("gather.run_plan_bound_acquisition(",
                       sources["plan_bound_acquisition"])
@@ -124,8 +137,8 @@ class LoopTagCrosswalkTests(unittest.TestCase):
     """ONE loop-identity reconciliation — and no silent authorized defaults."""
 
     def test_crosswalk_covers_every_assigned_loop_tag_literal(self):
-        """AST scan: every ``loop_tag = "..."`` assignment and every
-        ``st.loop_tag == "..."`` comparison literal in the engine plane
+        """AST scan: every ``loop_tag = \"...\"`` assignment and every
+        ``st.loop_tag == \"...\"`` comparison literal in the engine plane
         must be a LoopTag member with a crosswalk entry."""
         literals: set[str] = set()
         for _p, src in _engine_sources():

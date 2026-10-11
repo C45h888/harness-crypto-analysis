@@ -7,18 +7,19 @@ outcomes, the frozen task plan, and the parsed turn, they steer the agent
 and land on the artifact's finding records — they never deny a dispatch
 and never route a terminal. That is what keeps them a guard, not a gate.
 
-Seed set (Option-2 + planning-layer pass):
+Seed set (Option-2 + planning-layer pass; Phase R7 revision):
 
-  - ``fetch_window``      — the fetch turn establishes tape quality and
-    snapshot context only; window membership is evaluated HERE (single
-    vocabulary shared with the fetch dispatcher), never as an inline
-    prefix check that can drift.
   - ``hypothesis_timing`` — H0 content before the hypothesize position
     is drift (the hard track already denies the tool; the principle
     names the finding so the agent stops forming early).
   - ``scenario_coverage`` — a target-bearing plan with no scenario-tool
     attempt yet is a finding from mid-loop onward (blocking stays at
     the validation gate, where it always was).
+
+Phase R7 (fetch semantic removed): the ``fetch_window`` principle and its
+vocabulary (``FETCH_PREFIXES`` / ``FETCH_TOOLS`` / ``in_fetch_window``)
+are RETIRED with the fetch turn — comprehension is the first agentic step
+and later loops command the full registry by design.
 
 Pure: no state, no I/O, no imports from the runtime (the controller is
 read through duck-typed ``tool_state`` guarded by try/except).
@@ -28,28 +29,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-
-
-# ---------------------------------------------------------------------------
-# The fetch window (single vocabulary — the dispatcher reads this too)
-# ---------------------------------------------------------------------------
-
-#: Tool-name prefixes the fetch turn may command (tape-quality surface).
-FETCH_PREFIXES: tuple[str, ...] = ("micro.",)
-
-#: Exact tool names admitted besides the prefixes (read-only snapshot
-#: context — invokes stay in evidence/reasoning where intent exists).
-FETCH_TOOLS: tuple[str, ...] = ("market.read", "substrate.read")
-
-
-def in_fetch_window(canonical: str) -> bool:
-    """Whether a canonical tool name may be commanded on the fetch turn."""
-    name = (canonical or "").strip()
-    if not name:
-        return False
-    if name in FETCH_TOOLS:
-        return True
-    return any(name.startswith(prefix) for prefix in FETCH_PREFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -68,25 +47,6 @@ class PrincipleFinding:
     principle: str
     detail: str
     severity: str = "advisory"
-
-
-def _window_violations(turn: Any) -> list[PrincipleFinding]:
-    calls = (turn or {}).get("tool_calls") if isinstance(turn, dict) else None
-    if not isinstance(calls, list):
-        return []
-    findings: list[PrincipleFinding] = []
-    for call in calls:
-        if not isinstance(call, dict):
-            continue
-        name = str(call.get("name") or call.get("tool") or "").strip()
-        if name and not in_fetch_window(name):
-            findings.append(PrincipleFinding(
-                principle="fetch_window",
-                detail=f"{name} is outside the fetch window "
-                       f"(prefixes {list(FETCH_PREFIXES)}, tools {list(FETCH_TOOLS)}) — "
-                       "fetch establishes tape quality + snapshot context only",
-            ))
-    return findings
 
 
 def _hypothesis_timing(
@@ -138,19 +98,14 @@ def _scenario_coverage(
 
 def evaluate_principles(
     *, controller: Any, plan: Any, turn: Any, reason_position: int = 0,
-    fetch_turn: bool = False,
 ) -> list[PrincipleFinding]:
     """Evaluate the seed principles over one turn (pure).
 
     ``plan`` is the frozen task plan (or None pre-receipt — plan-derived
     principles skip). ``reason_position`` is the hard-track index (0-2).
-    ``fetch_turn`` scopes the window principle to the fetch turn only —
-    later loops command the full registry by design. Returns advisory
-    findings only; an empty list means conformant.
+    Returns advisory findings only; an empty list means conformant.
     """
     findings: list[PrincipleFinding] = []
-    if fetch_turn:
-        findings.extend(_window_violations(turn))
     findings.extend(_hypothesis_timing(turn, reason_position))
     findings.extend(_scenario_coverage(controller, plan))
     return findings
@@ -169,10 +124,7 @@ def render_findings(findings: list[PrincipleFinding]) -> str:
 
 
 __all__ = [
-    "FETCH_PREFIXES",
-    "FETCH_TOOLS",
     "PrincipleFinding",
     "evaluate_principles",
-    "in_fetch_window",
     "render_findings",
 ]

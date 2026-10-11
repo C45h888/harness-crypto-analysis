@@ -97,6 +97,7 @@ class SubstrateBase:
         read_block_ms: int = READ_BLOCK_MS,
         supervisor_ms: int = SUPERVISOR_MS,
         dispatcher: Any | None = None,
+        governor: Any | None = None,
         pg_store: Any | None = None,
         pg_strict: bool = True,
     ) -> None:
@@ -134,6 +135,12 @@ class SubstrateBase:
         self.read_block_ms = read_block_ms
         self.supervisor_ms = supervisor_ms
         self.dispatcher = dispatcher
+        # Plane governance gate (docs/PLANE_GOVERNANCE_SPEC.md). Duck-typed:
+        # an object exposing async ``authorize_fire`` / ``authorize_publish`` /
+        # ``authorize_pg_write``. ``None`` = ungoverned legacy behaviour
+        # (byte-identical to before this seam existed). The core never imports
+        # governance — the plane's governor is injected at construction.
+        self.governor = governor
         self.pg_store = pg_store
         self.pg_strict = pg_strict
 

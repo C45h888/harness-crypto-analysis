@@ -14,47 +14,10 @@ from market_service.nooa_harness.engine.gates import (
     GateRefused,
     GateStatus,
     GateVerdict,
-    evaluate_data_gate,
     evaluate_plan_gate,
     require_gate,
 )
 from market_service.runtime.contracts import AgentMemory, ValidMemoryKinds
-
-
-class DataGateTests(unittest.TestCase):
-    def test_sufficient_data_passes(self):
-        verdict = evaluate_data_gate(
-            n_observations=80, min_observations=30, fit_status="validated",
-            capture_state="running", events_in_window=5000,
-        )
-        self.assertIs(verdict.gate, GateKind.DATA)
-        self.assertTrue(verdict.passed)
-        self.assertEqual(verdict.facts_dict()["resolved_status"], "validated")
-
-    def test_provisional_is_a_pass_with_reasons(self):
-        verdict = evaluate_data_gate(
-            n_observations=40, min_observations=30, fit_status="provisional",
-            capture_state="running", events_in_window=5000,
-        )
-        self.assertTrue(verdict.passed)
-        self.assertEqual(verdict.facts_dict()["resolved_status"], "provisional")
-        self.assertTrue(verdict.reasons)
-
-    def test_insufficient_refuses_with_reasons(self):
-        verdict = evaluate_data_gate(
-            n_observations=2, min_observations=30, fit_status="insufficient",
-            capture_state="starting", events_in_window=1,
-        )
-        self.assertTrue(verdict.refused)
-        self.assertTrue(verdict.reasons)
-        self.assertEqual(verdict.facts_dict()["resolved_status"], "insufficient")
-
-    def test_deterministic_identical_outputs(self):
-        kwargs = dict(
-            n_observations=10, min_observations=30, fit_status="insufficient",
-            capture_state="starting", events_in_window=3,
-        )
-        self.assertEqual(evaluate_data_gate(**kwargs), evaluate_data_gate(**kwargs))
 
 
 class PlanGateTests(unittest.TestCase):

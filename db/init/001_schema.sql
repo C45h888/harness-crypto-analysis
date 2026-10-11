@@ -307,3 +307,30 @@ CREATE TABLE IF NOT EXISTS microstructure_event_tape (
 
 CREATE INDEX IF NOT EXISTS microstructure_event_tape_window_idx
     ON microstructure_event_tape (symbol, venue, exchange_ts_ms);
+
+-- Durable governance ledger for the plane governance FSMs
+-- (docs/PLANE_GOVERNANCE_SPEC.md). The two plane FSMs are the sole legality
+-- authority for the calculation and analysis worker planes; every decision
+-- (allowed or denied) lands here. A denial is evidence about the system and
+-- must survive the process that produced it. Append-only; no backfill.
+CREATE TABLE IF NOT EXISTS governance_ledger (
+    id BIGSERIAL PRIMARY KEY,
+    plane TEXT NOT NULL,
+    substrate TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    gate TEXT NOT NULL,
+    allowed BOOLEAN NOT NULL,
+    rule TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+    observation JSONB NOT NULL DEFAULT '{}'::jsonb,
+    decided_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    schema_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS ix_governance_ledger_lookup
+    ON governance_ledger (plane, substrate, symbol, decided_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_governance_ledger_denials
+    ON governance_ledger (plane, symbol, decided_at DESC)
+    WHERE allowed = FALSE;

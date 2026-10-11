@@ -1,16 +1,24 @@
-"""End-to-end tests: failure substrate classification, remediation, integration.
+"""Three-layer failure chain tests — governance, mechanics, execution.
 
-Covers the complete flow:
-  1. FailureSubstrateMembrane classifies every failure kind into the right
-     verdict (retry/fallback/degrade/terminate).
-  2. FailureWorker retry budgets are enforced.
-  3. signal_failure() returns the correct FailureOutcome for each case.
-  4. signal_and_route_failure() integrates with the existing runtime.
-  5. A full engine cycle terminates through the substrate for each failure kind.
+Pins the canonical failure architecture:
 
-The test is nooa-free (no Redis, no Postgres, no LLM). Uses the same fakes
-(``_FakeStore``, ``_FakePostgres``, ``_FakeMemory``, ``_FakeLLM``) as the
-existing governance tests.
+    engine/fsm.py            [router]     CYCLE_FAILED intake -> delegate
+    engine/failure_fsm.py    [GOVERNANCE] classify(kind) -> FailureVerdict
+                                          (class, severity, policy, terminal)
+    failure_substrate/       [MECHANICS]  worker selection, retry budget,
+                                          per-cycle ledger, coordination
+    failure_substrate/workers.py [EXECUTION] bounded remediation units
+
+Sections:
+  1. FailureFSM (governance classification + policy + terminal routing).
+  2. The boundary: governance holds no workers; the substrate holds no
+     classification table; the main FSM holds no failure semantics.
+  3. FailureSubstrate mechanics (worker selection, escalation, outcomes).
+  4. signal_failure / signal_and_route_failure integration.
+  5. Full-cycle E2E terminals through the failure node.
+  6. FailureReport serialization.
+
+Nooa-free (no Redis, no Postgres, no LLM).
 """
 
 from __future__ import annotations
@@ -18,300 +26,284 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from market_service.nooa_harness.engine.failure_substrate import (
+from market_service.nooa_harness.engine.failure_fsm import (
     FAILURE_CLASSIFICATION,
-    FAILURE_WORKER_REGISTRY,
+    FAILURE_FSM,
+    FAILURE_TERMINAL,
     FailureClass,
-    FailureOutcome,
-    FailureReport,
+    FailureFSM,
+    FailureKind,
     FailureSeverity,
-    FailureSubstrateMembrane,
     FailureVerdict,
-    FailureWorker,
-    MAX_RETRIES,
     RemediationKind,
-    RemediationOutcome,
-    signal_failure,
 )
+from market_service.nooa_harness.engine.failure_substrate import (
+    FAILURE_WORKER_REGISTRY,
+    MAX_RETRIES,
+    WORKER_FOR_KIND,
+    FailureReport,
+    FailureSubstrate,
+    FailureWorker,
+    RemediationOutcome,
+    default_workers,
+    signal_failure,
+    worker_for_verdict,
+)
+from market_service.nooa_harness.engine.loop_states import LoopTerminal
 
 
 @pytest.fixture(autouse=True)
 def _reset_workers():
-    """Reset all failure workers before each test to avoid pollution."""
+    """Reset the module-global template registry between tests."""
     for w in FAILURE_WORKER_REGISTRY.values():
         w.reset()
     yield
 
 
 # ========================================================================
-# Part 1 — Membrane unit tests
+# 1 — Governance: FailureFSM classification, policy, terminal routing
 # ========================================================================
 
 
-class TestFailureSubstrateMembrane:
-    """Classification membrane: every failure kind gets the right verdict."""
+class TestFailureFSMClassification:
+    """Every kind is classified; the policy and terminal are decided here."""
 
-    def test_every_kind_classified(self):
-        """Every key in _FAILURE_TO_EVENT (runtime context) maps to a entry."""
-        runtime_kinds = [
-            "narration_failed", "parse_failed", "budget_exhausted",
-        ]
-        for kind in runtime_kinds:
-            assert kind in FAILURE_CLASSIFICATION, f"{kind} missing from FAILURE_CLASSIFICATION"
+    def test_classification_covers_every_kind(self):
+        assert set(FAILURE_CLASSIFICATION) == {m.value for m in FailureKind}
 
-    def test_all_workers_have_max_retries(self):
-        """Every worker name in the classification map has a MAX_RETRIES entry."""
-        for _, worker_name, _ in FAILURE_CLASSIFICATION.values():
-            assert worker_name in MAX_RETRIES, f"{worker_name} missing from MAX_RETRIES"
-            assert worker_name in FAILURE_WORKER_REGISTRY, f"{worker_name} missing from registry"
-
-    @pytest.mark.parametrize("kind,expected_class,expected_worker,expected_severity", [
-        ("narration_failed", FailureClass.NARRATION, "narration", FailureSeverity.TRANSIENT),
-        ("parse_failed", FailureClass.NARRATION, "narration", FailureSeverity.PERMANENT),
-        ("tool_denied", FailureClass.TOOL, "tool", FailureSeverity.PERMANENT),
-        ("tool_error", FailureClass.TOOL, "tool", FailureSeverity.TRANSIENT),
-        ("tool_suppressed", FailureClass.TOOL, "tool", FailureSeverity.DEGRADED),
-        ("validation_failed", FailureClass.VALIDATION, "validation", FailureSeverity.PERMANENT),
-        ("budget_exhausted", FailureClass.DISPATCH, "dispatch", FailureSeverity.PERMANENT),
-        ("dispatch_failed", FailureClass.DISPATCH, "dispatch", FailureSeverity.TRANSIENT),
-        ("memory_failed", FailureClass.MEMORY, "memory", FailureSeverity.DEGRADED),
-        ("gate_refused", FailureClass.GATE, "gate", FailureSeverity.PERMANENT),
-        ("gate_timeout", FailureClass.GATE, "gate", FailureSeverity.TRANSIENT),
-        ("infra_failed", FailureClass.INFRA, "infra", FailureSeverity.TRANSIENT),
-        ("unknown_kind", FailureClass.INFRA, "infra", FailureSeverity.TRANSIENT),
+    @pytest.mark.parametrize("kind,expected_class,expected_severity", [
+        ("narration_failed", FailureClass.NARRATION, FailureSeverity.TRANSIENT),
+        ("parse_failed", FailureClass.NARRATION, FailureSeverity.PERMANENT),
+        ("tool_denied", FailureClass.TOOL, FailureSeverity.PERMANENT),
+        ("tool_error", FailureClass.TOOL, FailureSeverity.TRANSIENT),
+        ("tool_suppressed", FailureClass.TOOL, FailureSeverity.DEGRADED),
+        ("validation_failed", FailureClass.VALIDATION, FailureSeverity.PERMANENT),
+        ("budget_exhausted", FailureClass.DISPATCH, FailureSeverity.PERMANENT),
+        ("memory_failed", FailureClass.MEMORY, FailureSeverity.DEGRADED),
+        ("gate_refused", FailureClass.GATE, FailureSeverity.PERMANENT),
+        ("infra_failed", FailureClass.INFRA, FailureSeverity.TRANSIENT),
     ])
-    def test_classify_returns_correct_metadata(
-        self, kind, expected_class, expected_worker, expected_severity,
-    ):
-        cls_lookup = FAILURE_CLASSIFICATION.get(
-            kind, (FailureClass.INFRA, "infra", FailureSeverity.TRANSIENT)
-        )
-        assert cls_lookup[0] == expected_class
-        assert cls_lookup[1] == expected_worker
+    def test_classify_metadata(self, kind, expected_class, expected_severity):
+        verdict = FAILURE_FSM.classify(kind)
+        assert verdict.failure_class is expected_class
+        assert verdict.severity is expected_severity
 
-    @pytest.mark.parametrize("kind,severity,max_retries,expected_remediation", [
-        # TRANSIENT + retry budget remaining → RETRY
-        ("narration_failed", FailureSeverity.TRANSIENT, 1, RemediationKind.RETRY),
-        ("tool_error", FailureSeverity.TRANSIENT, 2, RemediationKind.RETRY),
-        ("infra_failed", FailureSeverity.TRANSIENT, 1, RemediationKind.RETRY),
-        # TRANSIENT but retry_count >= max_retries → TERMINATE
-        ("narration_failed", None, 1, RemediationKind.TERMINATE),
-        ("tool_error", None, 2, RemediationKind.TERMINATE),
-        # PERMANENT → TERMINATE
-        ("parse_failed", FailureSeverity.PERMANENT, 0, RemediationKind.TERMINATE),
-        ("validation_failed", FailureSeverity.PERMANENT, 0, RemediationKind.TERMINATE),
-        ("gate_refused", FailureSeverity.PERMANENT, 0, RemediationKind.TERMINATE),
-        # DEGRADED → DEGRADE
-        ("tool_suppressed", FailureSeverity.DEGRADED, 0, RemediationKind.DEGRADE),
-        ("memory_failed", FailureSeverity.DEGRADED, 0, RemediationKind.DEGRADE),
+    @pytest.mark.parametrize("kind,expected_terminal", [
+        ("gate_refused", LoopTerminal.GATE_REFUSED),
+        ("narration_failed", LoopTerminal.NARRATION_FAILED),
+        ("parse_failed", LoopTerminal.PARSE_FAILED),
+        ("validation_failed", LoopTerminal.VALIDATION_FAILED),
+        ("budget_exhausted", LoopTerminal.BUDGET_EXHAUSTED),
+        ("infra_failed", LoopTerminal.INFRA_FAILED),
+        # substrate-routed kinds default to INFRA_FAILED
+        ("tool_suppressed", LoopTerminal.INFRA_FAILED),
+        ("chain_halt", LoopTerminal.INFRA_FAILED),
+        ("unknown_kind", LoopTerminal.INFRA_FAILED),
     ])
-    def test_classify_verdict(
-        self, kind, severity, max_retries, expected_remediation,
-    ):
-        if severity is None:
-            verdict = FailureSubstrateMembrane.classify(
-                kind, retry_count=max_retries,
-                is_transient_override=True,
-            )
-        elif severity is FailureSeverity.PERMANENT:
-            verdict = FailureSubstrateMembrane.classify(
-                kind, is_transient_override=False,
-            )
-        elif severity is FailureSeverity.DEGRADED:
-            verdict = FailureSubstrateMembrane.classify(kind)
-        else:
-            verdict = FailureSubstrateMembrane.classify(kind)
+    def test_terminal_routing(self, kind, expected_terminal):
+        assert FAILURE_FSM.classify(kind).terminal is expected_terminal
+        assert FAILURE_FSM.terminal_for(kind) is expected_terminal
 
-        assert verdict.remediation is expected_remediation, \
-            f"{kind}: expected {expected_remediation.value}, got {verdict.remediation.value}"
+    @pytest.mark.parametrize("kind,expected_policy", [
+        ("narration_failed", RemediationKind.RETRY),      # transient
+        ("tool_suppressed", RemediationKind.DEGRADE),     # degraded
+        ("memory_failed", RemediationKind.DEGRADE),       # degraded
+        ("parse_failed", RemediationKind.TERMINATE),      # permanent
+        ("gate_refused", RemediationKind.TERMINATE),      # permanent
+    ])
+    def test_policy_from_severity(self, kind, expected_policy):
+        assert FAILURE_FSM.classify(kind).remediation is expected_policy
 
     def test_classify_never_raises(self):
         for bad in [None, "", "no_such_failure", " "]:
-            verdict = FailureSubstrateMembrane.classify(bad)
-            assert verdict is not None
-            assert verdict.remediation in RemediationKind
+            verdict = FAILURE_FSM.classify(bad)
+            assert isinstance(verdict, FailureVerdict)
+            assert verdict.terminal is LoopTerminal.INFRA_FAILED
 
-    def test_remediation_for_kind_matches_classify(self):
-        for kind in FAILURE_CLASSIFICATION:
-            r1 = FailureSubstrateMembrane.remediation_for_kind(kind)
-            r2 = FailureSubstrateMembrane.classify(kind).remediation
-            if r1 is RemediationKind.TERMINATE:
-                assert r2 is RemediationKind.TERMINATE, f"{kind}: expected terminate"
+    def test_transient_override(self):
+        assert FAILURE_FSM.classify(
+            "parse_failed", is_transient_override=True,
+        ).severity is FailureSeverity.TRANSIENT
+        assert FAILURE_FSM.classify(
+            "narration_failed", is_transient_override=False,
+        ).severity is FailureSeverity.PERMANENT
+
+    def test_self_check_passes(self):
+        FailureFSM().self_check()
 
 
 # ========================================================================
-# Part 2 — Worker unit tests
+# 2 — The boundary (the semantic boundary that was missing)
 # ========================================================================
 
 
-class TestFailureWorkers:
-    """Bounded workers: retry budgets, fallback, reports."""
+class TestFailureBoundary:
+    """The three layers must not leak into each other."""
+
+    def test_governance_verdict_carries_no_worker(self):
+        verdict = FAILURE_FSM.classify("narration_failed")
+        assert not hasattr(verdict, "worker_name")
+        assert not hasattr(verdict, "max_retries")
+
+    def test_classification_table_has_no_worker_column(self):
+        # Each entry is exactly (class, severity) — worker assignment is
+        # the substrate's mechanical affair.
+        for kind, entry in FAILURE_CLASSIFICATION.items():
+            assert len(entry) == 2, kind
+            assert isinstance(entry[0], FailureClass)
+            assert isinstance(entry[1], FailureSeverity)
+
+    def test_main_fsm_holds_no_failure_semantics(self):
+        from market_service.nooa_harness.engine import fsm as main_fsm
+
+        for dead in (
+            "FAILURE_EVENT_KINDS", "FAILURE_EVENT_WORKERS",
+            "_FAILURE_KIND_TERMINAL", "_FAILURE_KIND_WORKER", "_resolve_worker",
+        ):
+            assert not hasattr(main_fsm, dead), dead
+
+    def test_main_fsm_knows_no_workers(self):
+        from market_service.nooa_harness.engine import fsm as main_fsm
+
+        verdict = main_fsm.GOVERNANCE_MEMBRANE.decide(
+            main_fsm.GOVERNANCE_MEMBRANE.initial(),
+            main_fsm.GovernanceEvent(
+                main_fsm.GovernanceEventKind.CYCLE_FAILED,
+                failure_kind="narration_failed",
+            ),
+        )
+        assert verdict.terminal is LoopTerminal.NARRATION_FAILED
+        assert not hasattr(verdict, "assigned_worker")
+
+    def test_substrate_owns_the_worker_map(self):
+        assert "narration_failed" in WORKER_FOR_KIND
+        assert worker_for_verdict(FAILURE_FSM.classify("narration_failed")) == "narration"
+
+    def test_worker_budgets_match_declared_max_retries(self):
+        for name, worker in FAILURE_WORKER_REGISTRY.items():
+            assert worker.max_retries == MAX_RETRIES.get(name, 0), name
+
+
+# ========================================================================
+# 3 — Mechanics: FailureSubstrate coordination
+# ========================================================================
+
+
+class TestFailureSubstrateMechanics:
+    """Worker selection, escalation, and per-cycle isolation."""
 
     def test_registry_has_all_workers(self):
-        expected_workers = {"narration", "tool", "validation", "dispatch",
-                            "memory", "gate", "infra", "inference"}
-        assert set(FAILURE_WORKER_REGISTRY) == expected_workers
+        expected = {"narration", "tool", "validation", "dispatch",
+                    "memory", "gate", "infra", "inference"}
+        assert set(FAILURE_WORKER_REGISTRY) == expected
+
+    def test_default_workers_are_fresh_instances(self):
+        a = default_workers()
+        b = default_workers()
+        assert a is not b
+        for name in a:
+            assert a[name] is not b[name]
 
     def test_worker_retry_budget(self):
-        w = FAILURE_WORKER_REGISTRY["narration"]
-        assert w.max_retries == 1
+        w = FailureWorker(name="t", max_retries=1)
         assert w.can_retry() is True
         w.consume_retry()
         assert w.can_retry() is False
-        w.reset()
-        assert w.can_retry() is True
+        assert w.retry_count == 1
 
-    def test_worker_retry_count_matches_max(self):
-        for name, worker in FAILURE_WORKER_REGISTRY.items():
-            assert worker.max_retries == MAX_RETRIES.get(name, 0), \
-                f"{name}: worker max_retries ({worker.max_retries}) != membrane MAX_RETRIES ({MAX_RETRIES.get(name)})"
+    def test_transient_retries_then_escalates_to_terminate(self):
+        sub = FailureSubstrate()
+        verdict = FAILURE_FSM.classify("narration_failed")  # transient, budget 1
+        first = asyncio.run(sub.mediate(verdict, detail="blip"))
+        assert first.resolved is False and first.terminate_now is False
+        assert first.remediation is RemediationKind.RETRY
+        # Budget (1) now spent -> escalation to terminate.
+        second = asyncio.run(sub.mediate(verdict, detail="blip again"))
+        assert second.terminate_now is True
+        assert second.remediation is RemediationKind.TERMINATE
 
-    def test_invoke_consumes_retry_when_budget_remains(self):
-        w = FailureWorker(name="test", max_retries=3, fallback="degrade")
-        outcome = asyncio.run(w.invoke("test failure"))
-        assert outcome.resolved is False
+    def test_permanent_terminates_immediately(self):
+        sub = FailureSubstrate()
+        out = asyncio.run(sub.mediate(FAILURE_FSM.classify("parse_failed")))
+        assert out.terminate_now is True
+        assert out.remediation is RemediationKind.TERMINATE
+
+    def test_degraded_resolves_and_continues(self):
+        sub = FailureSubstrate()
+        out = asyncio.run(sub.mediate(FAILURE_FSM.classify("tool_suppressed")))
+        assert out.resolved is True and out.terminate_now is False
+        assert out.remediation is RemediationKind.DEGRADE
+
+    def test_unknown_worker_terminates_honestly(self):
+        sub = FailureSubstrate(workers={})  # no workers wired
+        out = asyncio.run(sub.mediate(FAILURE_FSM.classify("narration_failed")))
+        assert out.terminate_now is True
+        assert "unknown worker" in (out.failure_report.remediation_detail or "")
+
+    def test_retry_ledger_is_per_instance(self):
+        a, b = FailureSubstrate(), FailureSubstrate()
+        verdict = FAILURE_FSM.classify("narration_failed")
+        asyncio.run(a.mediate(verdict))
+        # b's ledger is untouched — no shared global retry state.
+        assert b.worker("narration").retry_count == 0
+
+    def test_worker_invoke_reports_outcome(self):
+        w = FailureWorker(name="t", max_retries=2, fallback="degrade")
+        outcome = asyncio.run(w.invoke("x"))
+        assert isinstance(outcome, RemediationOutcome)
         assert outcome.retry_count == 1
-        assert w._retry_count == 1
-
-    def test_invoke_fallback_when_budget_exhausted(self):
-        w = FailureWorker(name="test", max_retries=2, fallback="degrade")
-        w.consume_retry()
-        w.consume_retry()
-        assert w.can_retry() is False
-        outcome = asyncio.run(w.invoke("test exhausted"))
-        assert outcome.resolved is True
-        assert outcome.fallback_applied is True
-        assert outcome.degraded is True
-
-    def test_invoke_terminates_when_budget_exhausted_and_no_fallback(self):
-        w = FailureWorker(name="test", max_retries=2, fallback="terminate")
-        w.consume_retry()
-        w.consume_retry()
-        outcome = asyncio.run(w.invoke("test terminate"))
-        assert outcome.resolved is False
-        assert outcome.fallback_applied is True
-        assert outcome.degraded is False
-
-    @pytest.mark.parametrize("worker_name", FAILURE_WORKER_REGISTRY)
-    def test_every_worker_produces_report(self, worker_name):
-        w = FAILURE_WORKER_REGISTRY[worker_name]
-        report = w.report(None, f"test {worker_name} failure")
-        assert report["worker"] == worker_name
-        assert "retries_used" in report
-        assert "max_retries" in report
-        assert "fallback" in report
 
 
 # ========================================================================
-# Part 3 — signal_failure end-to-end
+# 4 — signal_failure / signal_and_route_failure integration
 # ========================================================================
+
 
 class TestSignalFailure:
-    """signal_failure() → FailureOutcome for every classification path.
-
-    IMPORTANT: signal_failure always calls worker.invoke() which consumes one
-    retry attempt. For TRANSIENT kinds with budget remaining, the worker's
-    invoke() returns resolved=False (caller must retry) with retry_count=1.
-    The membrane's verdict may say RETRY while the worker report says
-    retry_count=1 — the caller is expected to check both.
-    """
-
     @pytest.mark.parametrize("kind,expected_resolved,expected_terminate", [
-        # TRANSIENT with budget → resolved=False, terminate_now=False
-        # (caller must retry; worker consumed 1 retry attempt)
         ("narration_failed", False, False),
-        # PERMANENT → resolved=False, terminate_now=True
         ("parse_failed", False, True),
         ("validation_failed", False, True),
         ("gate_refused", False, True),
-        # DEGRADED → resolved=True (continue with degraded)
         ("tool_suppressed", True, False),
         ("memory_failed", True, False),
-        # UNKNOWN → maps to infra/TRANSIENT with max_retries=1
-        # First call: worker consumes 1 retry attempt, returns resolved=False
         ("unknown_kind", False, False),
     ])
     def test_signal_outcome(self, kind, expected_resolved, expected_terminate):
         outcome = asyncio.run(signal_failure(kind, f"test {kind}"))
-        assert outcome.resolved is expected_resolved, \
-            f"{kind}: expected resolved={expected_resolved}, got {outcome.resolved}"
-        assert outcome.terminate_now is expected_terminate, \
-            f"{kind}: expected terminate_now={expected_terminate}, got {outcome.terminate_now}"
-        assert isinstance(outcome.failure_report, FailureReport)
+        assert outcome.resolved is expected_resolved, kind
+        assert outcome.terminate_now is expected_terminate, kind
         assert outcome.failure_report.failure_kind == kind
 
-    def test_signal_with_retry_count_exhausted(self):
-        """When retry_count >= max_retries, the membrane says TERMINATE."""
-        outcome = asyncio.run(signal_failure(
-            "narration_failed", "retry exhausted",
-            retry_count=2,  # > max_retries=1
-        ))
-        # Membrane says terminate; worker still consumed one retry attempt
-        # (signal_failure calls invoke before checking membrane)
-        assert outcome.resolved is False
-        assert outcome.terminate_now is True
-        # The report shows what happened
-        assert "exhausted" in (outcome.failure_report.remediation_detail or "").lower() or \
-               outcome.failure_report.terminal == "narration_failed"
-
-    def test_signal_produces_report_with_detail(self):
-        outcome = asyncio.run(signal_failure(
-            "tool_error", "Orderbook subticks raised ValueError",
-        ))
-        report = outcome.failure_report
-        assert report.failure_kind == "tool_error"
-
-    def test_signal_retry_worker_tracks_count(self):
-        """Calling signal_failure twice consumes two retry attempts on distinct workers."""
-        # First call — fresh tool worker has max_retries=2
-        FAILURE_WORKER_REGISTRY["tool"].reset()
-        outcome1 = asyncio.run(signal_failure("tool_error", "first"))
-        assert outcome1.resolved is False
-        assert outcome1.verdict.remediation is RemediationKind.RETRY
-        # The worker's invoke() increments to 1
-        assert outcome1.failure_report.retries_used == 1
-
-        # Second call — same retry_count=0 but worker tracks state.
-        # Since the worker was consumed, we test with retry_count param.
-        FAILURE_WORKER_REGISTRY["tool"].reset()
-        outcome2 = asyncio.run(signal_failure("tool_error", "second",
-                                               retry_count=1))
-        # With retry_count=1 < max_retries=2, membrane still says RETRY.
-        # Worker's invoke() increments to 1 (fresh worker).
-        assert outcome2.resolved is False
-        assert outcome2.failure_report.retries_used == 1
-
-    def test_report_serializable(self):
+    def test_signal_report_serializable(self):
         outcome = asyncio.run(signal_failure("narration_failed", "test"))
         d = outcome.failure_report.to_dict()
-        assert isinstance(d, dict)
         json.dumps(d)
         assert d["failure_kind"] == "narration_failed"
         assert "worker_name" in d
-        assert "severity" in d
 
 
 # ========================================================================
-# Part 4 — Integration with the runtime: signal_and_route_failure
+# 5 — Runtime integration: signal_and_route_failure
 # ========================================================================
+
 
 class TestSignalAndRouteFailure(unittest.IsolatedAsyncioTestCase):
-    """signal_and_route_failure() — the seam between runtime and substrate."""
-
     async def test_transient_resolved_returns_none(self):
         engine, store, _, memory, ctx, st = _build_failure_context()
         st.failure_kind = "narration_failed"
         st.failure_detail = "LLM transport timeout"
 
-        from market_service.nooa_harness.engine.core.context import signal_and_route_failure
+        from market_service.nooa_harness.engine.core.context import (
+            signal_and_route_failure,
+        )
         result = await signal_and_route_failure(engine, ctx, st)
-
         assert result is None, "transient with budget should continue loop"
-        assert st.failure_kind is None, "failure_kind should be reset"
+        assert st.failure_kind is None
         assert "failure_report" in st.deterministic_state
 
     async def test_permanent_returns_terminal(self):
@@ -319,85 +311,72 @@ class TestSignalAndRouteFailure(unittest.IsolatedAsyncioTestCase):
         st.failure_kind = "validation_failed"
         st.failure_detail = "final rejected 3 times"
 
-        from market_service.nooa_harness.engine.core.context import signal_and_route_failure
+        from market_service.nooa_harness.engine.core.context import (
+            signal_and_route_failure,
+        )
         result = await signal_and_route_failure(engine, ctx, st)
-
-        assert result is not None, "permanent failure should terminate"
+        assert result is not None
         artifact, meta = result
-        assert "failure_report" in st.deterministic_state
+        assert meta["terminal"] == "validation_failed"
 
     async def test_degraded_returns_none(self):
         engine, store, _, memory, ctx, st = _build_failure_context()
         st.failure_kind = "tool_suppressed"
         st.failure_detail = "tool refused this cycle"
 
-        from market_service.nooa_harness.engine.core.context import signal_and_route_failure
+        from market_service.nooa_harness.engine.core.context import (
+            signal_and_route_failure,
+        )
         result = await signal_and_route_failure(engine, ctx, st)
-
-        assert result is None, "degraded failure should continue"
-        assert st.failure_kind is None, "failure_kind should be reset"
+        assert result is None
+        assert st.failure_kind is None
         assert st.deterministic_state["failure"]["resolved"] is True
 
-    async def test_report_attached_in_all_cases(self):
-        for kind, detail in [
-            ("narration_failed", "transient"),
-            ("validation_failed", "permanent"),
-            ("tool_suppressed", "degraded"),
-        ]:
-            engine, store, _, memory, ctx, st = _build_failure_context()
-            st.failure_kind = kind
-            st.failure_detail = detail
+    async def test_report_and_governance_carry_through(self):
+        engine, store, _, memory, ctx, st = _build_failure_context()
+        st.failure_kind = "narration_failed"
+        st.failure_detail = "blip"
 
-            from market_service.nooa_harness.engine.core.context import signal_and_route_failure
-            result = await signal_and_route_failure(engine, ctx, st)
-
-            assert "failure_report" in st.deterministic_state, \
-                f"{kind}: no failure_report in deterministic_state"
-            report = st.deterministic_state["failure_report"]
-            assert report["failure_kind"] == kind
+        from market_service.nooa_harness.engine.core.context import (
+            signal_and_route_failure,
+        )
+        await signal_and_route_failure(engine, ctx, st)
+        failure = st.deterministic_state["failure"]
+        # governance fields present
+        assert failure["class"] == "narration"
+        assert failure["severity"] == "transient"
+        assert failure["worker"] == "narration"
+        assert "failure_report" in st.deterministic_state
 
 
 # ========================================================================
-# Part 5 — Full cycle with failure substrate
+# 6 — Full cycle E2E terminals
 # ========================================================================
+
 
 class TestCycleFailureEndToEnd:
-    """Full engine cycles that exercise the failure substrate integration."""
-
     @pytest.mark.parametrize("case,expected_terminal", [
         ("narr_fail", "narration_failed"),
         ("parse_fail", "parse_failed"),
-        ("budget_exhausted", "budget_exhausted"),
     ])
-    def test_cycle_terminates_through_substrate(self, case, expected_terminal):
+    def test_cycle_terminates_through_failure_node(self, case, expected_terminal):
         from tests.test_governance import _engine, _wake, _staged_narration
         from market_service.nooa_harness.engine import core
 
         if case == "narr_fail":
-            turns = []
-        elif case == "parse_fail":
-            # Fetch degrades to floor on the first unparseable turn;
-            # narrate#1 then fails to parse on the second.
+            turns: list[str] = []
+        else:
             turns = ["not valid json at all whatsoever",
                      "not valid json at all whatsoever"]
-        elif case == "budget_exhausted":
-            turns = ([_staged_narration("P1", tools=[
-                {"name": "micro.capture_status"},
-                {"name": "micro.fit_beta"}])]
-                + [_staged_narration("P6", final=True)] * 12)
 
         engine, store, postgres, memory = _engine(llm_responses=turns)
 
         async def execute(store, name, args, **kwargs):
-            if name == "micro.capture_status":
-                return {"state": "running", "sequence_gaps": 0}, {"capability": name, "result": "ok"}
-            elif name == "micro.fit_beta":
-                return {"price_impact_fit": {"status": "validated", "n_observations": 40},
-                        "coverage": {"events_in_window": 5000}}, {"capability": name, "result": "ok"}
             return {"value": "fixture"}, {"capability": name, "result": "ok"}
 
         with patch.object(core.context, "execute_tool", side_effect=execute), \
-             patch.object(core.context, "_utc_now_iso", return_value="2026-01-01T00:00:00+00:00"), \
+             patch.object(core.context, "_utc_now_iso",
+                          return_value="2026-01-01T00:00:00+00:00"), \
              patch("market_service.runtime.contracts.uuid.uuid4", return_value="1"), \
              patch.object(postgres, "insert_inference_artifact", return_value=True), \
              patch.object(store, "publish_inference_artifact", return_value="1"), \
@@ -407,52 +386,33 @@ class TestCycleFailureEndToEnd:
                     _wake(), {"decision": "fire"}, task="test"
                 ))
             except AssertionError:
-                # FakeLLM raises when responses run out — expected for narr_fail
-                return
+                return  # FakeLLM exhausted — expected for narr_fail
 
-        # For parse_fail and budget_exhausted: verify terminal matches the
-        # runtime's actual terminal. Note: budget_exhausted routes to
-        # validation_failed via the runtime's repair flow, not directly to
-        # budget_exhausted (the FakeLLM with 12 P6 turns hits the
-        # validation loop first).
-        assert meta["terminal"] == expected_terminal or \
-            (case == "budget_exhausted" and meta["terminal"] == "validation_failed"), \
-            f"{case}: expected terminal {expected_terminal}, got {meta['terminal']}"
+        assert meta["terminal"] == expected_terminal, \
+            f"{case}: got {meta['terminal']}"
         det_state = artifact.to_dict().get("deterministic_state", {})
-        # parse_fail reaches run_runtime_failure which sets "terminal" and
-        # "failure" on deterministic_state
-        if case == "parse_fail":
-            assert "terminal" in det_state, \
-                f"{case}: no terminal in deterministic_state"
+        assert det_state.get("terminal") == expected_terminal
 
-    def test_successful_cycle_still_works(self):
-        """A cycle with sufficient responses doesn't crash — the failure
-        substrate and runtime are wired correctly. The actual terminal
-        depends on the runtime's full cycle dynamics (11+ LLM calls across
-        gather/comprehension/evidence/reasoning/validation/output)."""
+    def test_successful_cycle_still_reachable(self):
         from tests.test_governance import _engine, _wake, _staged_narration
         from market_service.nooa_harness.engine import core
 
-        # Provide many P6 responses to avoid FakeLLM exhaustion
         turns = [
             _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"}]),
             _staged_narration("P2", tools=[{"name": "calc.depth.average"}]),
             _staged_narration("P3", tools=[{"name": "market.derivatives"}]),
-            _staged_narration("P5", tools=[{"name": "memory.recall_paper"}, {"name": "calc.price.delta"}]),
+            _staged_narration("P5", tools=[
+                {"name": "memory.recall_paper"}, {"name": "calc.price.delta"}]),
             _staged_narration("P6", final=True),
         ] * 10
         engine, store, postgres, memory = _engine(llm_responses=turns)
 
         async def execute(st, name, args, **kwargs):
-            if name == "micro.capture_status":
-                return {"state": "running", "sequence_gaps": 0}, {"capability": name, "result": "ok"}
-            elif name == "micro.fit_beta":
-                return {"price_impact_fit": {"status": "validated", "n_observations": 40},
-                        "coverage": {"events_in_window": 5000}}, {"capability": name, "result": "ok"}
             return {"value": "fixture"}, {"capability": name, "result": "ok"}
 
         with patch.object(core.context, "execute_tool", side_effect=execute), \
-             patch.object(core.context, "_utc_now_iso", return_value="2026-01-01T00:00:00+00:00"), \
+             patch.object(core.context, "_utc_now_iso",
+                          return_value="2026-01-01T00:00:00+00:00"), \
              patch("market_service.runtime.contracts.uuid.uuid4", return_value="1"), \
              patch.object(postgres, "insert_inference_artifact", return_value=True), \
              patch.object(store, "publish_inference_artifact", return_value="1"), \
@@ -461,16 +421,14 @@ class TestCycleFailureEndToEnd:
                 _wake(), {"decision": "fire"}, task="test"
             ))
 
-        # The cycle completes without raising. The terminal depends on
-        # runtime dynamics; what matters is that the failure substrate
-        # was reachable and the report is present.
         assert "terminal" in meta
         assert meta["llm_calls"] > 0
 
 
 # ========================================================================
-# Part 6 — FailureReport serialization
+# 7 — FailureReport
 # ========================================================================
+
 
 class TestFailureReport:
     def test_default_construction(self):
@@ -483,63 +441,51 @@ class TestFailureReport:
 
     def test_full_construction(self):
         r = FailureReport(
-            failure_kind="narration_failed",
-            worker_name="narration",
-            severity="transient",
-            resolved=True,
-            retries_used=1,
-            max_retries=2,
-            fallback_applied=True,
-            fallback_name="json",
-            degraded=False,
-            terminal=None,
-            detail="LLM returned 503",
+            failure_kind="narration_failed", worker_name="narration",
+            severity="transient", resolved=True, retries_used=1, max_retries=2,
+            fallback_applied=True, fallback_name="json", degraded=False,
+            terminal=None, detail="LLM returned 503",
             remediation_detail="retried and succeeded",
         )
         d = r.to_dict()
         assert d["retries_used"] == 1
-        assert d["fallback_name"] == "json"
-        assert d["detail"] == "LLM returned 503"
-
-    def test_json_serializable(self):
-        r = FailureReport(failure_kind="test", worker_name="infra")
-        json.dumps(r.to_dict())
+        json.dumps(d)
 
 
-# ========================================================================
-# Fixture helpers
-# ========================================================================
+# ------------------------------------------------------------------------
+# Shared fakes (mirror tests/test_governance.py)
+# ------------------------------------------------------------------------
+
 
 def _build_failure_context():
-    """Build minimal engine + CycleRuntimeState for signal_and_route_failure tests."""
-    from market_service.nooa_harness.engine.core.context import CycleRuntimeState
-    from market_service.nooa_harness.engine.core.driver import InferenceEngine
-    from market_service.nooa_harness.engine.controller import CycleController
-    from market_service.nooa_harness.engine.loop_states import (
-        LoopObservation, NestedLoop, TaskIntent,
+    from tests.test_governance import _engine, _wake
+    from market_service.nooa_harness.engine.core import context as ctx_mod
+
+    engine, store, postgres, memory = _engine(llm_responses=["{}"])
+    wake = _wake()
+    ctx = ctx_mod._CycleContext(
+        wake=wake, task=None, scenario=None,
+        generated_at="2026-01-01T00:00:00+00:00",
+        controller=engine_state_controller(),
+        capability_log=[],
     )
-
-    controller = CycleController().with_observation(
-        LoopObservation(NestedLoop.CONTEXT, TaskIntent.UNDERSTAND_TASK, None)
-    )
-
-    from tests.test_governance import _FakeStore, _FakePostgres, _FakeMemory, _FakeLLM
-    store = _FakeStore()
-    postgres = _FakePostgres()
-    memory = _FakeMemory()
-    engine = InferenceEngine(store, postgres, memory, _FakeLLM([]),
-                              symbol="BTCUSDT", venue="spot")
-
-    ctx = MagicMock()
-    ctx.controller = controller
-
-    st = CycleRuntimeState(
-        controller=controller,
+    st = ctx_mod.CycleRuntimeState(
+        controller=engine_state_controller(),
         capability_log=[],
         deterministic_state={},
         accumulated_tool_results={},
         tool_results={},
         parsed_current={},
     )
-
     return engine, store, postgres, memory, ctx, st
+
+
+def engine_state_controller():
+    from market_service.nooa_harness.engine.controller import CycleController
+    from market_service.nooa_harness.engine.fsm import GOVERNANCE_MEMBRANE
+
+    return (
+        CycleController()
+        .with_membrane(GOVERNANCE_MEMBRANE)
+        .with_observation(GOVERNANCE_MEMBRANE.initial())
+    )

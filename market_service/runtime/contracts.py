@@ -30,6 +30,10 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     "horizon_span": 1,
     "group_envelope": 1,
     "directive": 1,
+    # Plane-governance ledger (market_service/governance/contracts.py) —
+    # the worker-plane FSMs' durable verdict surface. One registry entry,
+    # identity-resolved by the declaring module per the charter.
+    "governance_ledger": 1,
 }
 MARKET_STATE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_state"]
 MARKET_RUN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_run"]

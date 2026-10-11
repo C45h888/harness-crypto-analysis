@@ -67,11 +67,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Mapping
 
 from market_service.nooa_harness.engine.loop_states import (
     INTENT_LOOP,
     LOOP_INTENTS,
     LOOP_SUBLOOPS,
+    REGISTRY_HOME_LOOPS,
     STAGE_LOOP,
     STAGE_ORDER,
     FAILURE_TERMINALS,
@@ -83,39 +85,17 @@ from market_service.nooa_harness.engine.loop_states import (
     SubLoop,
     TaskIntent,
 )
+from market_service.nooa_harness.engine.cadence import INTERVAL_SECONDS, WINDOW_MINUTES
+from market_service.nooa_harness.engine.failure_fsm import FAILURE_FSM
 
 
 # ---------------------------------------------------------------------------
-# Failure worker assignment — maps each GovernanceEventKind to the worker
-# that should remediate it.  This is the FSM's constitution for failure
-# handling: the membrane designates BOTH the terminal AND the worker.
+# The main FSM holds NO failure semantics. Failure classification, severity,
+# policy and terminal routing all live in the primary failure node
+# (``engine/failure_fsm.py``). The main membrane keeps exactly ONE
+# failure-related edge — the ``CYCLE_FAILED`` intake below, which RECEIVES
+# the bare "the cycle failed" signal and forwards it to the Failure FSM.
 # ---------------------------------------------------------------------------
-
-# Reuse the classification from the failure substrate.  The mapping from
-# GovernanceEventKind -> terminal is already in _FAILURE_KIND_TERMINAL;
-# this companion dict maps the same kinds to worker names and severities.
-# The canonical source of worker metadata is the failure substrate;
-# the FSM imports it to stay the sole authority.
-
-def _resolve_worker(
-    kind: GovernanceEventKind, detail: str | None = None,
-) -> tuple[str, str, str]:
-    """Resolve (worker_name, severity, reason) for a failure kind.
-
-    This is a PURE function.  It uses the FAILURE_CLASSIFICATION mapping
-    from the failure substrate to deterministically assign a worker.
-    Unknown kinds get the 'infra' worker as fallback.
-    """
-    from .failure_substrate.membrane import FAILURE_CLASSIFICATION, FailureSeverity
-
-    entry = FAILURE_CLASSIFICATION.get(
-        kind.value, (None, "infra", FailureSeverity.TRANSIENT)
-    )
-    _, worker_name, severity = entry
-    reason = f"failure {kind.value} assigned to worker {worker_name} ({severity.value})"
-    if detail:
-        reason += f": {detail}"
-    return worker_name, severity.value, reason
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +111,11 @@ class GovernanceEventKind(str, Enum):
       - SET_TASK      -> target is the ``TaskIntent`` to adopt.
       - OPEN_SUBLOOP  -> target is the ``SubLoop`` to open.
 
-    Failure events carry no target; they route to a ``LoopTerminal``
-    (see ``_FAILURE_KIND_TERMINAL``), legal from every non-terminal state.
+    ``CYCLE_FAILED`` is the ONE failure-related edge the main FSM keeps: it
+    carries no failure semantics of its own — the failure KIND travels on
+    ``GovernanceEvent.failure_kind`` and the terminal is DELEGATED to the
+    primary failure node (``FAILURE_FSM``). Legal from every non-terminal
+    state.
     """
 
     ENTER_LOOP = "enter_loop"
@@ -141,53 +124,35 @@ class GovernanceEventKind(str, Enum):
     COMPLETE_SUBLOOP = "complete_subloop"
     CLOSE_SUBLOOP = "close_subloop"
     SETTLE = "settle"
-    GATE_REFUSED = "gate_refused"
-    NARRATION_FAILED = "narration_failed"
-    PARSE_FAILED = "parse_failed"
-    VALIDATION_FAILED = "validation_failed"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    INFRA_FAILED = "infra_failed"
+    # Phase G2 (cadence governance): the comprehension plane offers the
+    # plan's CadenceVerdict to the membrane before the controller adopts
+    # it. The FSM adjudicates the deterministic conditions (CLI-only
+    # approval channel, horizon-charter membership); a refused verdict is
+    # a gate-refusal finding — the cycle continues at the floor, never a
+    # terminal, and the LLM can never approve cadence.
+    ADOPT_CADENCE = "adopt_cadence"
+    # The failure INTAKE edge — a router, not a governor.
+    CYCLE_FAILED = "cycle_failed"
 
 
 @dataclass(frozen=True)
 class GovernanceEvent:
     """A typed event offered to the membrane.
 
-    ``kind``   — the event kind.
-    ``target`` — the payload for progress events (NestedLoop / TaskIntent /
-                 SubLoop); ``None`` for close/settle/failure events.
+    ``kind``         — the event kind.
+    ``target``       — the payload for progress events (NestedLoop /
+                       TaskIntent / SubLoop); ``None`` for close/settle.
+    ``failure_kind`` — the failure-kind string carried by ``CYCLE_FAILED``
+                       (forwarded to the Failure FSM for terminal routing);
+                       ``None`` for every progress event.
     """
 
     kind: GovernanceEventKind
     target: NestedLoop | TaskIntent | SubLoop | None = None
-
-
-_FAILURE_KIND_TERMINAL: dict[GovernanceEventKind, LoopTerminal] = {
-    GovernanceEventKind.GATE_REFUSED: LoopTerminal.GATE_REFUSED,
-    GovernanceEventKind.NARRATION_FAILED: LoopTerminal.NARRATION_FAILED,
-    GovernanceEventKind.PARSE_FAILED: LoopTerminal.PARSE_FAILED,
-    GovernanceEventKind.VALIDATION_FAILED: LoopTerminal.VALIDATION_FAILED,
-    GovernanceEventKind.BUDGET_EXHAUSTED: LoopTerminal.BUDGET_EXHAUSTED,
-    GovernanceEventKind.INFRA_FAILED: LoopTerminal.INFRA_FAILED,
-}
-
-# The same kinds, with their assigned worker names.  The FSM always assigns
-# a worker when it routes a failure — the runtime reads it from the verdict.
-_FAILURE_KIND_WORKER: dict[GovernanceEventKind, str] = {
-    GovernanceEventKind.GATE_REFUSED: "gate",
-    GovernanceEventKind.NARRATION_FAILED: "narration",
-    GovernanceEventKind.PARSE_FAILED: "narration",
-    GovernanceEventKind.VALIDATION_FAILED: "validation",
-    GovernanceEventKind.BUDGET_EXHAUSTED: "dispatch",
-    GovernanceEventKind.INFRA_FAILED: "infra",
-}
-
-FAILURE_EVENT_KINDS: tuple[GovernanceEventKind, ...] = tuple(
-    _FAILURE_KIND_TERMINAL
-)
-
-# Export the worker assignment dict so the runtime can read it directly.
-FAILURE_EVENT_WORKERS: dict[GovernanceEventKind, str] = dict(_FAILURE_KIND_WORKER)
+    failure_kind: str | None = None
+    # Phase G2: the CadenceVerdict payload for ADOPT_CADENCE (dict shape
+    # from cadence.CadenceVerdict.to_dict); None for every other kind.
+    cadence_verdict: Mapping[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +169,18 @@ class MembraneVerdict:
                    stays on the board (``None`` when the move is a terminal
                    or was denied).
     ``terminal`` — the ``LoopTerminal`` reached when the move ends the
-                   cycle (success or graceful failure); else ``None``.
+                   cycle (success or a delegated failure); else ``None``.
     ``reason``   — a human-readable justification (also the denial reason).
-    ``assigned_worker`` — the failure worker assigned by the FSM; ``None``
-                          for progress events and non-failure terminals.
+
+    The verdict carries NO ``assigned_worker``: the main membrane holds no
+    failure semantics and no worker knowledge. Worker assignment is the
+    failure substrate's mechanical affair.
     """
 
     allowed: bool
     next: LoopObservation | None = None
     terminal: LoopTerminal | None = None
     reason: str = ""
-    assigned_worker: str | None = None  # worker name for failure remediation
 
 
 # ---------------------------------------------------------------------------
@@ -295,28 +261,21 @@ class AgenticLoopMembrane:
         *,
         nested_loop: NestedLoop,
         sub_loop: SubLoop | None = None,
-        bootstrap: bool = False,
     ) -> MembraneVerdict:
         """Authorize work at the current membrane-visible position.
 
         Work authorization is deliberately narrower than transition legality:
         the FSM does not know tool semantics, but it does know whether the
-        runtime is currently in the loop/sub-loop that owns the work.  The
-        only exception is the two deterministic gate reads, which are an
-        explicit wake bootstrap and are allowed before COMPREHENSION opens
-        its first sub-loop.
+        runtime is currently in the loop/sub-loop that owns the work.
+
+        Phase R4 (fetch semantic removed): the wake-bootstrap exception is
+        GONE. There is no pre-INTAKE acquisition anywhere in the cycle —
+        run_wake is deterministic normalization (no tools), comprehension
+        is the first agentic step, and every dispatch authorizes against
+        the live (loop, sub-loop) observation like any other work.
         """
         if not self.is_legal_state(observation):
             return MembraneVerdict(False, reason="work requested from an illegal observation")
-        if bootstrap:
-            if (
-                nested_loop is NestedLoop.CONTEXT
-                and observation.nested_loop is NestedLoop.CONTEXT
-                and observation.task is TaskIntent.UNDERSTAND_TASK
-                and observation.sub_loop is None
-            ):
-                return MembraneVerdict(True, next=observation, reason="authorized wake bootstrap work")
-            return MembraneVerdict(False, reason="bootstrap work is only legal at initial comprehension")
         if observation.nested_loop is not nested_loop:
             return MembraneVerdict(
                 False,
@@ -331,13 +290,13 @@ class AgenticLoopMembrane:
             )
         return MembraneVerdict(True, next=observation, reason="work authorized at current observation")
 
-    def terminal_for(self, kind: GovernanceEventKind) -> LoopTerminal | None:
-        """The terminal a failure kind routes to; ``None`` for progress kinds.
+    def terminal_for(self, kind: object) -> LoopTerminal:
+        """The terminal a failure KIND routes to — DELEGATED to the Failure FSM.
 
-        This is the graceful-failure seam: the loop reports a KIND, the
-        membrane returns the terminal. The loop never guesses a terminal.
+        The main membrane holds no failure table. It forwards to the primary
+        failure node, which owns kind -> terminal.
         """
-        return _FAILURE_KIND_TERMINAL.get(kind)
+        return FAILURE_FSM.terminal_for(kind)
 
     # ------------------------------------------------------------------
     # The board (viewability — every state is viewable)
@@ -392,9 +351,9 @@ class AgenticLoopMembrane:
             events.append(GovernanceEvent(GovernanceEventKind.CLOSE_SUBLOOP))
         if loop is NestedLoop.OUTPUT:
             events.append(GovernanceEvent(GovernanceEventKind.SETTLE))
-        # Graceful failure: every failure kind is legal from every state.
-        for kind in FAILURE_EVENT_KINDS:
-            events.append(GovernanceEvent(kind))
+        # The failure INTAKE edge is legal from every state. It carries the
+        # failure KIND but no failure semantics — the terminal is delegated.
+        events.append(GovernanceEvent(GovernanceEventKind.CYCLE_FAILED))
         return tuple(events)
 
     def decide(
@@ -413,27 +372,78 @@ class AgenticLoopMembrane:
             )
         kind = event.kind
 
-        # Graceful failure — first-class, legal from every state.
-        if kind in _FAILURE_KIND_TERMINAL:
-            # Failure routing is total over admissible observations, but a
-            # terminal/absent observation is not a live cycle state.  Keeping
-            # this check here prevents a second failure from overwriting an
+        # The failure INTAKE edge — a ROUTER, not a governor. The main FSM
+        # receives the bare "the cycle failed" signal (the kind travels on
+        # event.failure_kind) and DELEGATES the terminal to the primary
+        # failure node. It holds no failure semantics of its own.
+        if kind is GovernanceEventKind.CYCLE_FAILED:
+            # Failure intake is total over admissible observations, but a
+            # terminal/absent observation is not a live cycle state. Keeping
+            # this check prevents a second failure from overwriting an
             # already-settled controller.
             if not isinstance(observation, LoopObservation):
                 return MembraneVerdict(
                     allowed=False,
                     reason="failure event requires a live loop observation",
                 )
-            terminal = _FAILURE_KIND_TERMINAL[kind]
-            # The FSM assigns the worker deterministically from the
-            # _FAILURE_KIND_WORKER mapping.  The runtime reads this from
-            # the verdict to dispatch the correct failure worker.
-            worker_name = _FAILURE_KIND_WORKER.get(kind, "infra")
+            terminal = FAILURE_FSM.terminal_for(event.failure_kind)
             return MembraneVerdict(
                 allowed=True,
                 terminal=terminal,
-                assigned_worker=worker_name,
-                reason=f"graceful failure routed to terminal {terminal.value}, worker={worker_name}",
+                reason=(
+                    f"cycle failed ({event.failure_kind or 'unspecified'}) -> "
+                    f"delegated to FailureFSM (terminal {terminal.value})"
+                ),
+            )
+
+        # Phase G2 (cadence governance): deterministic conditions on the
+        # CadenceVerdict. The verdict shape was computed by the pure
+        # resolver; the FSM re-checks the conditions IT owns: the CLI-only
+        # approval channel and vocabulary membership of the resolved
+        # triple. A refusal is a FINDING (allowed=True, refusal payload on
+        # the verdict) — the loop continues at the deterministic floor,
+        # never a terminal. The LLM cannot approve cadence here: a
+        # non-cli provenance or out-of-vocabulary values can only deny.
+        if kind is GovernanceEventKind.ADOPT_CADENCE:
+            payload = event.cadence_verdict
+            if not isinstance(payload, Mapping):
+                return MembraneVerdict(
+                    allowed=False,
+                    reason="adopt_cadence requires a cadence verdict mapping",
+                )
+            if payload.get("bound") is True:
+                cad = payload.get("cadence") or {}
+                provenance_ok = payload.get("provenance") == "cli_approved"
+                vocab_ok = (
+                    cad.get("interval_seconds") in INTERVAL_SECONDS
+                    and cad.get("window_minutes") in WINDOW_MINUTES
+                )
+                if provenance_ok and vocab_ok:
+                    return MembraneVerdict(
+                        allowed=True,
+                        reason=(
+                            "cadence bound: cli-approved, in-vocabulary "
+                            f"(interval={cad.get('interval_seconds')}, "
+                            f"window={cad.get('window_minutes')})"
+                        ),
+                    )
+                reason = (
+                    "cadence refused: not cli-approved"
+                    if not provenance_ok
+                    else "cadence refused: values outside the frozen vocabulary"
+                )
+            else:
+                refusal_reasons = "; ".join(
+                    str(r) for r in payload.get("reasons") or ()
+                )
+                reason = (
+                    "cadence refused: " + refusal_reasons
+                    if refusal_reasons
+                    else "cadence refused: unbound verdict"
+                )
+            return MembraneVerdict(
+                allowed=True,
+                reason=reason + " (finding — cycle continues at the floor)",
             )
 
         if not self.is_legal_state(observation):
@@ -605,7 +615,8 @@ class AgenticLoopMembrane:
             observation shape is present;
           - every 'legal event' adjudicates as ALLOWED to a legal outcome;
           - every (state, event-kind) pair yields a verdict (never raises);
-          - failure kinds route to failure terminals; success/failure
+          - the failure INTAKE edge (CYCLE_FAILED) is legal from every
+            non-terminal state and delegates a terminal; success/failure
             partition ``LoopTerminal``.
         """
         order = self._loop_order()
@@ -648,14 +659,20 @@ class AgenticLoopMembrane:
                         f"allowed event {event.kind.value} from {state} has "
                         "neither a next state nor a terminal"
                     )
-            # Graceful failure: every failure kind yields a verdict.
-            for kind in FAILURE_EVENT_KINDS:
+            # The failure INTAKE edge yields a delegated terminal.
+            for kind, terminal in (
+                (None, LoopTerminal.INFRA_FAILED),
+                ("narration_failed", LoopTerminal.NARRATION_FAILED),
+                ("validation_failed", LoopTerminal.VALIDATION_FAILED),
+            ):
                 verdict = self.decide(
-                    state, GovernanceEvent(kind)
+                    state, GovernanceEvent(
+                        GovernanceEventKind.CYCLE_FAILED, failure_kind=kind,
+                    )
                 )
-                if not verdict.allowed or verdict.terminal is None:
+                if not verdict.allowed or verdict.terminal is not terminal:
                     raise ValueError(
-                        f"failure kind {kind.value} not routed to a terminal "
+                        f"cycle_failed({kind}) not delegated to {terminal.value} "
                         f"from {state}"
                     )
 
@@ -669,14 +686,93 @@ class AgenticLoopMembrane:
             GovernanceEventKind.COMPLETE_SUBLOOP,
             GovernanceEventKind.CLOSE_SUBLOOP,
             GovernanceEventKind.SETTLE,
+            GovernanceEventKind.CYCLE_FAILED,
         ):
             if kind not in exercised:
-                raise ValueError(f"progress event kind {kind.value} is dead (never legal)")
+                raise ValueError(f"event kind {kind.value} is dead (never legal)")
 
         if SUCCESS_TERMINALS | FAILURE_TERMINALS != frozenset(LoopTerminal):
             raise ValueError("terminals must partition LoopTerminal")
         if SUCCESS_TERMINALS & FAILURE_TERMINALS:
             raise ValueError("success and failure terminals must be disjoint")
+
+        # Phase G5 (tool-home audit): the registry declares which homes a
+        # tool may run at; the FSM is the sole legality authority, so EVERY
+        # declared home must resolve to a legal FSM observation. A home the
+        # board cannot express is a governance error caught at import —
+        # the registry cannot invent an authorization the FSM does not own.
+        for tool, homes in _registry_home_surface().items():
+            for home_loop, home_sub_loop in homes:
+                nested = REGISTRY_HOME_LOOPS.get(home_loop)
+                if nested is None:
+                    try:
+                        nested = NestedLoop(home_loop)
+                    except ValueError:
+                        raise ValueError(
+                            f"tool {tool!r} declares home loop "
+                            f"{home_loop!r} — not a NestedLoop"
+                        ) from None
+                try:
+                    sub = SubLoop(home_sub_loop)
+                except ValueError:
+                    raise ValueError(
+                        f"tool {tool!r} declares home sub-loop "
+                        f"{home_sub_loop!r} — not a SubLoop"
+                    ) from None
+                probe = LoopObservation(nested, self.default_intent_for(nested), sub)
+                if not self.is_legal_state(probe):
+                    raise ValueError(
+                        f"tool {tool!r} declares illegal home "
+                        f"({nested.value}, {sub.value})"
+                    )
+
+    def audit_tool_homes(
+        self,
+        homes_by_tool: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> dict[str, list[str]]:
+        """A viewable report of every tool home's FSM legality (pure).
+
+        Returns {tool: [problems]} — empty lists mean every declared home
+        resolves to a legal FSM observation. Called by ``self_check`` with
+        the registry surface (import-time enforcement); callable with any
+        candidate surface for charter tests.
+        """
+        problems: dict[str, list[str]] = {}
+        for tool, homes in (homes_by_tool or _registry_home_surface()).items():
+            rows: list[str] = []
+            for home_loop, home_sub_loop in homes:
+                nested = REGISTRY_HOME_LOOPS.get(home_loop)
+                if nested is None:
+                    try:
+                        nested = NestedLoop(home_loop)
+                    except ValueError:
+                        rows.append(f"unknown loop {home_loop!r}")
+                        continue
+                try:
+                    sub = SubLoop(home_sub_loop)
+                except ValueError:
+                    rows.append(f"unknown sub-loop {home_sub_loop!r}")
+                    continue
+                probe = LoopObservation(nested, self.default_intent_for(nested), sub)
+                if not self.is_legal_state(probe):
+                    rows.append(f"illegal home ({nested.value}, {sub.value})")
+            if rows:
+                problems[tool] = rows
+        return problems
+
+
+def _registry_home_surface() -> dict[str, tuple[tuple[str, str], ...]]:
+    """Every tool home the registry declares (lazy — no load-time cycle).
+
+    The engine membrane audits the tool registry's home declarations, but
+    the registry lives on the inference plane; the import is deferred so
+    engine/fsm.py keeps loading without the inference package.
+    """
+    from market_service.nooa_harness.inference.tooling.registry import (
+        TOOL_NAMES,
+        tool_homes,
+    )
+    return {tool: tool_homes(tool) for tool in TOOL_NAMES}
 
 
 GOVERNANCE_MEMBRANE: AgenticLoopMembrane = AgenticLoopMembrane.canonical()
@@ -689,6 +785,4 @@ __all__ = [
     "GovernanceEventKind",
     "MembraneVerdict",
     "GOVERNANCE_MEMBRANE",
-    "FAILURE_EVENT_KINDS",
-    "FAILURE_EVENT_WORKERS",
 ]

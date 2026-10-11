@@ -331,33 +331,37 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # Memory proposal accepted and written
         self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
 
-    async def test_insufficient_gate_single_fetch_call(self):
-        # Agent-first bootstrap: the agent spends one fetch turn pulling the
-        # reads, then the DATA gate refuses thin tape. Dead tape costs one
-        # turn now (approved Option-2 cut — zero-LLM doctrine retired).
+    async def test_thin_tape_no_early_exit(self):
+        # Phase R7 (DATA gate removed): thin tape no longer refuses the
+        # cycle pre-receipt. The cycle runs its full staged path —
+        # comprehension (1 assessment-less pass), plan-bound acquisition
+        # (forecast at the plan cadence), then evidence narration. The
+        # single LLM response is consumed by narrate#1; the artifact is
+        # provisional, not a gate terminal.
         engine, store, postgres, memory = _engine(
             llm_responses=[_FETCH_TURN], capture_state="starting",
         )
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["llm_calls"], 1)
-        self.assertEqual(artifact.status, "insufficient")
+        self.assertEqual(meta["terminal"], "narration_failed")
+        self.assertEqual(artifact.status, "provisional")
         self.assertIsNone(artifact.interpretation)
-        self.assertEqual(len(engine.llm.calls), 1)
-        # Deterministic quality observation remembered (engine disposes)
-        self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
+        # The gate key stays but carries no refusal — the deterministic
+        # plane owns tape quality via per-tool refusals now.
+        self.assertEqual((artifact.deterministic_state.get("gate") or {}).get("status"),
+                         "provisional")
 
-    async def test_task_directive_persists_on_gate_refused_cycle(self):
-        # The interaction-plane directive steers + persists even when the
-        # gate refuses narration: deterministic_state.task, cycle_meta.task,
-        # and the wake capability detail all carry it (zero LLM calls).
-        engine, _s, _p, _m = _engine(
-            llm_responses=[_FETCH_TURN], capture_state="starting",
-        )
+    async def test_task_directive_persists_on_narration_failed_cycle(self):
+        # Phase R7 (gate removed): there is no gate-refused early exit — the
+        # directive persists on EVERY cycle shape. On a transport-failed
+        # narration the degraded artifact still carries the task, and the
+        # wake capability detail names it (zero LLM successes).
+        engine, _s, _p, _m = _engine(llm_responses=[])
         task = "is short-term sell pressure exhausting on BTCUSDT?"
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task=task)
-        self.assertEqual(meta["llm_calls"], 1)
-        self.assertEqual(meta["task"], task[:200])
+        self.assertEqual(meta["llm_calls"], 0)
+        self.assertEqual(meta["terminal"], "narration_failed")
         self.assertEqual(artifact.deterministic_state.get("task"), task)
         wake_detail = artifact.capability_log[0]["detail"]
         self.assertEqual(wake_detail["task"], task[:200])
@@ -366,22 +370,21 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             wake.predicates_fired["manual"], {"task_preview": task[:200]})
 
-    async def test_scenario_directive_persists_on_gate_refused_cycle(self):
-        # Phase 2 plumbing: scenario echoes into state/meta/detail with zero
-        # LLM calls; absent scenario leaves no keys behind (parity).
-        engine, _s, _p, _m = _engine(
-            llm_responses=[_FETCH_TURN], capture_state="starting",
-        )
+    async def test_scenario_directive_persists_on_narration_failed_cycle(self):
+        # Phase R7: scenario echoes into state/detail with zero LLM
+        # successes; absent scenario leaves no keys behind (parity).
+        engine, _s, _p, _m = _engine(llm_responses=[])
         scenario = {"target_price": "245.30", "horizon": "1h"}
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="can price hit 245.30?",
             scenario=scenario)
-        self.assertEqual(meta["llm_calls"], 1)
+        self.assertEqual(meta["llm_calls"], 0)
         self.assertEqual(meta["scenario"], scenario)
         self.assertEqual(artifact.deterministic_state.get("scenario"), scenario)
         self.assertEqual(
             artifact.capability_log[0]["detail"]["scenario"], scenario)
-        plain, _ = await engine.narrate_cycle(_wake(), {"decision": "fire"})
+        plain_engine, _s2, _p2, _m2 = _engine(llm_responses=[])
+        plain, _ = await plain_engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertIsNone(plain.deterministic_state.get("scenario"))
 
     async def test_thin_final_triggers_repair_then_finalizes(self):
@@ -472,7 +475,8 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_narration_failure_produces_degraded_artifact(self):
         # LLM raises on the first call → degraded artifact, NULL interpretation,
-        # deterministic state preserved, PG+Redis persisted.
+        # deterministic state preserved (comprehension plane: directive,
+        # plan, receipt), PG+Redis persisted.
         engine, store, postgres, _m = _engine(llm_responses=[])
 
         async def _boom(messages, max_tokens=None):
@@ -485,7 +489,10 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(
             e.get("source") == "narration" for e in artifact.errors
         ))
-        self.assertIsNotNone(artifact.deterministic_state.get("microstructure_evidence"))
+        # Phase R7: the comprehension plane owns the deterministic state —
+        # the receipt survives the narration failure.
+        self.assertIsNotNone(artifact.deterministic_state.get("understanding_receipt"))
+        self.assertIsNotNone(artifact.deterministic_state.get("task_directive"))
         self.assertEqual(len(postgres.inserted), 1)
 
     async def test_unparseable_narration_is_degraded_not_fatal(self):

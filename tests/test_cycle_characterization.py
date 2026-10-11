@@ -17,33 +17,26 @@ FIXTURE = Path(__file__).with_name("fixtures") / "cycle_characterization.json"
 
 
 async def capture(case, stage_trace=None):
-    # The engine now runs an output composition pass (core/output.py) which
-    # makes one more LLM call. The success case needs 6 turns: 5 stage +
-    # 1 output composition. Other cases terminate before output or fail.
-    # Mirrors tests/test_engine's proven staged walk: evidence turns gather
-    # the read-plane substrates, then the three hard-track reasoning
-    # positions walk in order, discipline closes, and the last P6 is the
-    # non-agentic output composition pass.
-    # Repair-path note: the FIRST final (P6 after the track walk) is rejected
-    # on the missing discipline citation — the repair turn dispatches
-    # calc.discipline.audit in the validation home, then the final passes.
-    # The spare trailing P6 is the output-composition pass's scripted turn.
-    # The agent-first fetch turn opens every scripted cycle: the agent pulls
-    # the gate reads itself (floor fills whatever is absent). All cases below
-    # prepend it; the gate case refuses on the fetched thin tape (llm_calls
-    # paid once — approved Option-2 cut, zero-LLM doctrine retired).
-    fetch_turn = _staged_narration("P1", tools=[{"name": "micro.capture_status"},
-                                           {"name": "micro.fit_beta"},
-                                           {"name": "market.read"}])
+    # Phase R7 (fetch semantic removed): narrate#1 IS the P1 evidence read
+    # (the agent pulls the read-plane substrates directly). The staged walk
+    # mirrors tests/test_engine's proven turns: P1 read + P2 + P5 follow-ups
+    # at the evidence budget, the three hard-track reasoning positions,
+    # discipline close, and the output-composition pass. The success case
+    # needs 11 turns (3 evidence incl. narrate#1 + 3 track + 3 finals +
+    # 1 discipline + 1 composition); other cases terminate early or fail.
+    # Repair-path note: the FIRST final (P6 after the track walk) is
+    # rejected on the missing discipline citation — the repair turn
+    # dispatches calc.discipline.audit in the validation home, then the
+    # final passes; the spare trailing P6 is the composition pass.
+    p1_read = _staged_narration("P1", tools=[{"name": "micro.capture_status"},
+                                            {"name": "micro.fit_beta"},
+                                            {"name": "market.read"}])
     success_turns = [
-        fetch_turn,
-        _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"},
-                                       {"name": "micro.ofi_intervals"}]),
+        p1_read,
         _staged_narration("P2", tools=[{"name": "calc.depth.average"},
                                        {"name": "market.derivatives"}]),
         _staged_narration("P5", tools=[{"name": "memory.recall_paper"},
                                        {"name": "calc.price.delta"}]),
-        _staged_narration("P6", final=True),
         _track_tools(*_TRACK_ASSEMBLE),
         _track_tools(*_TRACK_INTERPRET),
         _track_tools(*_TRACK_HYPOTHESIZE),
@@ -55,39 +48,19 @@ async def capture(case, stage_trace=None):
     if case == "repair":
         # Repair flow: the first final is rejected on the missing discipline
         # citation; the repair turn dispatches the audit in the validation
-        # home; the next final passes. Mirrors the proven staged walk — an
-        # early P6-final cannot be scripted first (final-ness only binds at
-        # validation, and an unwalked track is not repairable mid-recovery).
-        turns = [
-            fetch_turn,
-            _staged_narration("P1", tools=[{"name": "calc.ofi.intervals"},
-                                           {"name": "micro.ofi_intervals"}]),
-            _staged_narration("P2", tools=[{"name": "calc.depth.average"},
-                                           {"name": "market.derivatives"}]),
-            _staged_narration("P5", tools=[{"name": "memory.recall_paper"},
-                                           {"name": "calc.price.delta"}]),
-            _staged_narration("P6", final=True),
-            _track_tools(*_TRACK_ASSEMBLE),
-            _track_tools(*_TRACK_INTERPRET),
-            _track_tools(*_TRACK_HYPOTHESIZE),
-            _staged_narration("P6", final=True),
-            _track_tools(*_TRACK_DISCIPLINE),
-            _staged_narration("P6", final=True),
-            _staged_narration("P6", final=True),
-            _staged_narration("P6", final=True),
-        ]
+        # home; the next final passes.
+        turns = success_turns + [_staged_narration("P6", final=True)]
     elif case == "parse":
-        # Fetch degrades to full floor on the unparseable turn; narrate#1
-        # then fails to parse on the second unparseable turn.
-        turns = ["not json", "not json"]
+        # Narrate#1 fails to parse on the first turn.
+        turns = ["not json"]
     elif case == "transport":
         turns = []
     elif case == "gate":
-        # The agent pulls the reads; the fake store reports thin tape for
-        # the gate case and the DATA gate refuses (llm_calls == 1).
-        turns = [fetch_turn]
+        # Phase R7: there is no DATA gate — the cycle runs comprehension ->
+        # plan-bound acquisition and dies at narrate#1 (llm_calls == 1).
+        turns = [p1_read]
     elif case == "budget":
-        turns = [fetch_turn] + [_staged_narration("P6", final=True)] * 12
+        turns = [_staged_narration("P6", final=True)] * 12
     else:
         turns = success_turns
     engine, store, postgres, memory = _engine(llm_responses=turns)
@@ -130,8 +103,6 @@ async def capture(case, stage_trace=None):
             return _spy
         _stage_wraps = [
             (core.wake, "run_wake"),
-            (core.gather, "run_agent_fetch"),
-            (core.gather, "run_data_gate"),
             (core.wake, "run_comprehension"),
             (core.gather, "run_plan_bound_acquisition"),
             (core.reasoning, "run_evidence"),
@@ -186,11 +157,11 @@ def test_cycle_characterization(case):
 def test_staged_cycle_converges_and_preserves_placement_order():
     stages = []
     result = asyncio.run(capture("success", stages))
-    # run_validation appears TWICE: the first pass rejects the final on the
-    # missing discipline citation, the recovery turn dispatches the audit,
-    # and validation re-runs to accept the repaired final. That two-phase
-    # entry is the repair mechanics the settlement depends on.
-    assert stages == ["run_wake", "run_agent_fetch", "run_data_gate", "run_comprehension",
+    # Phase R7 stage table: run_validation appears TWICE — the first pass
+    # rejects the final on the missing discipline citation, the recovery
+    # turn dispatches the audit, and validation re-runs to accept the
+    # repaired final. The fetch/data-gate stages no longer exist.
+    assert stages == ["run_wake", "run_comprehension",
                     "run_plan_bound_acquisition", "run_evidence",
                     "run_reasoning", "run_validation", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
@@ -207,5 +178,9 @@ def test_staged_cycle_converges_and_preserves_placement_order():
 def test_gate_refusal_stops_stage_execution():
     stages = []
     result = asyncio.run(capture("gate", stages))
-    assert stages == ["run_wake", "run_agent_fetch", "run_data_gate"]
+    # Phase R7: no DATA gate — the cycle runs comprehension and dies at
+    # narrate#1 (the scripted turn is consumed there). The stage table
+    # stops at evidence (narrate#1 lives inside run_evidence).
+    assert stages == ["run_wake", "run_comprehension",
+                    "run_plan_bound_acquisition", "run_evidence"]
     assert result["meta"]["llm_calls"] == 1

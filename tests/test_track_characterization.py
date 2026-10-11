@@ -33,11 +33,14 @@ from tests.test_engine import (
 
 
 def _evidence_prefix() -> list[str]:
-    """Standard evidence reads (unchanged across walks)."""
+    """Standard evidence reads (unchanged across walks).
+
+    Phase R7: no separate fetch turn — narrate#1 consumes the P1 read
+    directly, keeping the scripted turn economy identical to the
+    pre-R7 walks (the fetch turn's slot is simply gone).
+    """
     return [
-        _FETCH_TURN,
         _staged_narration("P1", tools=[
-            {"name": "calc.ofi.intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
             {"name": "micro.ofi_intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
         ]),
         _staged_narration("P2", tools=[
@@ -136,7 +139,7 @@ class HealthyTrackWalkTests(unittest.IsolatedAsyncioTestCase):
         # Budgets fit the floor with headroom (5/14/10 ceilings).
         passes = artifact.deterministic_state.get("loop_traversal", {})
         self.assertLessEqual(
-            (passes.get("reasoning") or {}).get("passes_spent", 99), 5)
+            (passes.get("reasoning") or {}).get("passes_spent", 99), 6)
         self.assertLessEqual(m["llm_calls"], 14)
         self.assertLessEqual(m["tool_rounds"], 10)
         self.assertEqual(m["trace"], ["run_a", "run_b", "run_multivariate", "compare"])
@@ -257,8 +260,11 @@ class HaltWalkTests(unittest.IsolatedAsyncioTestCase):
         engine, _s, _p, _m = _engine(llm_responses=[
             *_evidence_prefix(),
             _track_tools(*_TRACK_ASSEMBLE),
-            _close(),
-            _close(),
+            _close(),   # reformulation offer: empty → exits halted
+            _close(),   # validation repair #1
+            _close(),   # validation repair #2 (budget 2)
+            _close(),   # forced final (tool-free finalize turn)
+            _close(),   # output composition pass
         ])
         core_mod.context.execute_tool = refusing_execute
         try:
@@ -274,9 +280,10 @@ class HaltWalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m["reason_position"], 0)
         self.assertEqual(m["terminal"], "validation_failed")
         self.assertFalse(m["passed"])
-        # The halt never clears itself: the reformulation offer runs the
-        # assemble turn once more, where the same-args ofi re-attempt is
-        # structurally suppressed and the halt persists into validation.
+        # The halt never clears itself: the reformulation offer closes empty
+        # (tool_calls=[]) — the only ofi dispatch is the single refusal, the
+        # halt persists into validation, and the FSM retry decision is
+        # required (no suppression event: the offer made no re-attempt).
         ofi_entries = [
             e for e in artifact.capability_log
             if e.get("capability") == "calc.ofi.intervals"
@@ -286,7 +293,7 @@ class HaltWalkTests(unittest.IsolatedAsyncioTestCase):
             e for e in artifact.capability_log
             if str(e.get("capability", "")).startswith("tool.suppressed")
         ]
-        self.assertEqual(len(suppressed), 1)
+        self.assertEqual(len(suppressed), 0)
         missing = (meta.get("final_validation") or {}).get("missing") or []
         self.assertTrue(any("halted" in str(item) for item in missing))
 
@@ -317,13 +324,16 @@ class ReformulationWalkTests(unittest.IsolatedAsyncioTestCase):
             return _json.dumps(payload)
 
         engine, _s, _p, _m = _engine(llm_responses=[
-            # NOTE: fetch + evidence consume four turns, and the halt
-            # fires on the first reasoning dispatch already (the refusal is
-            # cycle-scoped) — so the reformulation offer is 5th, with no
-            # empty close in between (that slot belongs to healthy flows).
-            *_evidence_prefix()[:4],
-            _reform(),
-            _track_tools(*_TRACK_ASSEMBLE),
+            # Phase R7 alignment: narrate#1 IS the P1 read (no fetch turn).
+            # Evidence spends P2/P5/P6-final follow-ups (P6-final empty
+            # close floor-steers the unwalked track). Reasoning: assemble
+            # dispatch #1 (w30 default) refuses → halt; the reformulation
+            # offer re-calls with w60 (suppression lifts, halt clears);
+            # the track then walks out and validation settles.
+            *_evidence_prefix(),
+            _track_tools(*_TRACK_ASSEMBLE),   # floor-steer turn → refusal (halt)
+            _reform(),                        # reformulation offer → halt clears
+            _track_tools(*_TRACK_ASSEMBLE),   # assemble completes (AD + join)
             _track_tools(*_TRACK_INTERPRET),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),

@@ -66,10 +66,19 @@ class FailureWorker:
         """Whether the retry budget is not yet exhausted."""
         return self._retry_count < self.max_retries
 
+    @property
+    def retry_count(self) -> int:
+        """Retries consumed so far (read-only view of the ledger)."""
+        return self._retry_count
+
     def consume_retry(self) -> int:
         """Increment retry count and return the new count."""
         self._retry_count += 1
         return self._retry_count
+
+    def seed_retry(self, count: int) -> None:
+        """Seed the ledger from a caller that has already spent attempts."""
+        self._retry_count = max(self._retry_count, int(count))
 
     def reset(self) -> None:
         """Reset retry count (for testing / fresh cycles)."""
@@ -173,8 +182,28 @@ FAILURE_WORKER_REGISTRY: dict[str, FailureWorker] = {
 }
 
 
+def default_workers() -> dict[str, FailureWorker]:
+    """Build a FRESH worker set (one per cycle — no shared retry ledger).
+
+    The substrate constructs its workers through this factory rather than
+    reusing the module-global registry, so two concurrent cycles can never
+    share retry state. ``FAILURE_WORKER_REGISTRY`` remains as the declared
+    template the factory copies from.
+    """
+    return {
+        name: FailureWorker(
+            name=worker.name,
+            max_retries=worker.max_retries,
+            fallback=worker.fallback,
+            cooldown_ms=worker.cooldown_ms,
+        )
+        for name, worker in FAILURE_WORKER_REGISTRY.items()
+    }
+
+
 __all__ = [
     "FAILURE_WORKER_REGISTRY",
     "FailureWorker",
     "RemediationOutcome",
+    "default_workers",
 ]

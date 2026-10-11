@@ -6,7 +6,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Mapping
 
 from market_service.nooa_harness.inference import execute_tool  # noqa: F401  (re-export: mock point)
 from ..controller import CycleController
@@ -69,6 +69,7 @@ def _govern(
     controller: CycleController,
     kind: GovernanceEventKind,
     target: Any = None,
+    cadence_verdict: Mapping[str, Any] | None = None,
 ) -> tuple[CycleController, MembraneVerdict]:
     """Authorize exactly one move through the membrane.
 
@@ -76,8 +77,11 @@ def _govern(
     sub-loop, retries a different event, or mutates the observation on behalf
     of the caller.  Callers that require progress use ``_must_govern`` and
     receive an explicit failure instead of silently drifting.
+
+    ``cadence_verdict`` carries the ADOPT_CADENCE payload (Phase G2); it is
+    ignored for every other event kind.
     """
-    event = GovernanceEvent(kind, target)
+    event = GovernanceEvent(kind, target, cadence_verdict=cadence_verdict)
     # Keep one transition seam: the immutable controller asks the FSM for
     # legality, applies the successor only when allowed, and records denials
     # without changing the observation.
@@ -88,9 +92,11 @@ def _must_govern(
     controller: CycleController,
     kind: GovernanceEventKind,
     target: Any = None,
+    cadence_verdict: Mapping[str, Any] | None = None,
 ) -> tuple[CycleController, MembraneVerdict]:
     """Apply one transition or fail closed at the governance boundary."""
-    successor, verdict = _govern(controller, kind, target)
+    successor, verdict = _govern(
+        controller, kind, target, cadence_verdict=cadence_verdict)
     if not verdict.allowed:
         raise GovernanceDenied(
             f"{kind.value} denied"
@@ -106,11 +112,13 @@ def _authorize_work(
     *,
     nested_loop: NestedLoop,
     sub_loop: SubLoop | None = None,
-    bootstrap: bool = False,
 ) -> MembraneVerdict:
-    """Ask the FSM whether work may execute at the current observation."""
+    """Ask the FSM whether work may execute at the current observation.
+
+    Phase R4: the bootstrap flag is gone with the fetch semantic.
+    """
     return controller.authorize_work(
-        nested_loop=nested_loop, sub_loop=sub_loop, bootstrap=bootstrap,
+        nested_loop=nested_loop, sub_loop=sub_loop,
     )
 
 
@@ -119,11 +127,9 @@ def _must_authorize_work(
     *,
     nested_loop: NestedLoop,
     sub_loop: SubLoop | None = None,
-    bootstrap: bool = False,
 ) -> MembraneVerdict:
     verdict = _authorize_work(
         controller, nested_loop=nested_loop, sub_loop=sub_loop,
-        bootstrap=bootstrap,
     )
     if not verdict.allowed:
         raise GovernanceDenied(f"work denied: {verdict.reason}")
@@ -211,16 +217,17 @@ class _CycleContext:
 DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     # task-directive roots (gather init + inference_runner persist)
     "task", "scenario", "task_directive", "task_plan", "task_workflow",
-    # wake + gather surface roots
+    # wake + acquisition surface roots (Phase R7: data_gate /
+    # bootstrap_basis / fetch_note retired with the fetch semantic)
     "wake", "capture_status", "microstructure_evidence",
     "forecast_result", "forward_scenario", "forward_scenario_note",
-    "forward_gate", "gate", "data_gate", "bootstrap_basis", "fetch_note",
+    "forward_gate", "gate",
     # pass/loop-carried verdict roots
     "assessment_note", "chain_gaps", "chain_halt", "comprehension",
     "congruence", "failure", "failure_report", "terminal",
     "loop_traversal", "validation_issue", "understanding_receipt",
     "statistical_chain", "governance_trace",
-    # re-ordered cycle roots (agent_fetch/data_gate plane)
+    # re-ordered cycle roots (comprehension/acquisition plane)
     "data_quality", "seeded_plan", "plan_gate", "persistence",
     "narration_tiers",
 })
@@ -248,7 +255,7 @@ class CycleRuntimeState:
     validation_entered: bool = False
     opened_subs: set[str] = field(default_factory=set)
     passes_per_loop: dict[str, int] = field(default_factory=lambda: {
-        "fetch": 0, "comprehension": 0, "evidence": 0, "reasoning": 0,
+        "comprehension": 0, "evidence": 0, "reasoning": 0,
         "validation": 0, "output": 0,
     })
     dispatched_in_pass: int = 0
@@ -361,52 +368,68 @@ def freeze_chain(
     }
 
 
-# Failure-kind -> FSM event-kind mapping for terminal routing. Lifted out so
-# the two terminal emitters stay aligned if a new failure category is added.
-_FAILURE_TO_EVENT: dict[str, GovernanceEventKind] = {
-    "narration_failed": GovernanceEventKind.NARRATION_FAILED,
-    "parse_failed": GovernanceEventKind.PARSE_FAILED,
-    "budget_exhausted": GovernanceEventKind.BUDGET_EXHAUSTED,
-}
+def failure_event(kind: str | None) -> GovernanceEvent:
+    """The main FSM's ONE failure edge: the CYCLE_FAILED intake.
+
+    The failure KIND rides on the event; the terminal is delegated to the
+    primary failure node. This is the only place the runtime builds a
+    failure event — every failure site routes through here.
+    """
+    return GovernanceEvent(GovernanceEventKind.CYCLE_FAILED, failure_kind=kind)
+
+
+def failure_substrate_for(st: CycleRuntimeState) -> Any:
+    """The per-cycle failure substrate (its retry ledger is cycle-scoped)."""
+    sub = getattr(st, "_failure_substrate", None)
+    if sub is None:
+        from ..failure_substrate import FailureSubstrate
+
+        sub = FailureSubstrate()
+        st._failure_substrate = sub  # type: ignore[attr-defined]
+    return sub
 
 
 async def signal_and_route_failure(
     engine: Any, ctx: Any, st: CycleRuntimeState,
 ) -> tuple[Any, dict[str, Any]] | None:
-    """Signal failure to the substrate; return continuation or None for terminal.
+    """The canonical failure NODE entry: Failure FSM -> substrate -> worker.
 
-    This is the integration seam between the runtime and the failure substrate.
-    The substrate classifies the failure, applies remediation (retry/fallback/
-    degrade), and returns a ``FailureOutcome``. When the outcome says the
-    failure was resolved, this function resets the failure state and returns
-    None so the loop continues. When the outcome says terminate, this calls
-    ``run_runtime_failure()`` and returns its result.
+    Layer 1 (governance): ``FAILURE_FSM`` classifies the kind and decides
+    the policy + terminal. Layer 2 (mechanics): the per-cycle substrate
+    coordinates the bounded worker. When remediation resolves the failure
+    the loop continues; when it terminates, the failure routes through the
+    main FSM's ``CYCLE_FAILED`` intake edge to the delegated terminal.
 
     Usage in the runtime:
 
         outcome = await signal_and_route_failure(engine, ctx, st)
         if outcome is not None:
-            return outcome  # terminated via substrate
+            return outcome  # terminated via the failure node
         # else: resolved — continue the loop
     """
-    from ..failure_substrate import signal_failure
+    from ..failure_fsm import FAILURE_FSM
 
     kind = st.failure_kind or "infra_failed"
     detail = st.failure_detail
 
-    outcome = await signal_failure(kind, detail)
+    verdict = FAILURE_FSM.classify(kind)
+    outcome = await failure_substrate_for(st).mediate(verdict, detail=detail)
 
     st.deterministic_state["failure_report"] = outcome.failure_report.to_dict()
     st.deterministic_state["failure"] = st.deterministic_state.get("failure", {}) | {
-        "kind": kind, "detail": detail,
-        "verdict": outcome.verdict.reason,
+        "kind": kind,
+        "detail": detail,
+        "class": verdict.failure_class.value,
+        "severity": verdict.severity.value,
+        "remediation": outcome.remediation.value,
+        "worker": outcome.worker_name,
+        "terminal": verdict.terminal.value,
     }
 
     if not outcome.terminate_now:
         st.failure_kind = None
         st.failure_detail = None
         st.deterministic_state["failure"]["resolved"] = outcome.resolved
-        st.deterministic_state["failure"]["verdict"] = outcome.verdict.reason
         return None
 
     return await run_runtime_failure(engine, ctx, st)
@@ -415,10 +438,14 @@ async def signal_and_route_failure(
 async def run_runtime_failure(
     engine: Any, ctx: Any, st: CycleRuntimeState,
 ) -> tuple[Any, dict[str, Any]]:
-    """Route a transport/parse failure through the canonical FSM terminal."""
+    """Route a transport/parse failure through the failure node's terminal.
+
+    The terminal is decided by the Failure FSM and delegated through the
+    main FSM's ``CYCLE_FAILED`` intake edge — the main membrane holds no
+    failure semantics of its own.
+    """
     kind = st.failure_kind or "infra_failed"
-    event_kind = _FAILURE_TO_EVENT.get(kind, GovernanceEventKind.INFRA_FAILED)
-    st.controller = st.controller.advance(GovernanceEvent(event_kind))
+    st.controller = st.controller.advance(failure_event(kind))
     terminal = st.controller.terminal.value if st.controller.terminal else kind
     st.deterministic_state["terminal"] = terminal
     st.deterministic_state["failure"] = {
@@ -477,7 +504,7 @@ async def run_validation_terminal(
         ("gate", "recovery"), completed=False,
     )
     st.controller = st.controller.advance(
-        GovernanceEvent(GovernanceEventKind.VALIDATION_FAILED)
+        failure_event("validation_failed")
     )
     terminal = (
         st.controller.terminal.value if st.controller.terminal

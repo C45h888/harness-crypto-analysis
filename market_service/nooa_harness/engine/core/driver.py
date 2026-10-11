@@ -54,6 +54,34 @@ from .chain import (
     position_steer,
 )
 from ..principles import evaluate_principles, render_findings
+from ..gates import evaluate_budget_gate
+from ..cadence import INTERVAL_SECONDS, WINDOW_MINUTES
+
+
+def _cadence_arg_refusals(canonical: str, args: dict[str, Any]) -> list[str]:
+    """Validate cadence arguments against the frozen vocabulary (pure).
+
+    Phase G6: the FSM authorizes the TOOL; the cadence ARGUMENTS are
+    checked against engine.cadence's frozen sets before anything executes.
+    Only keys the tool actually passed are checked (defaults are the
+    executor's business, and every default is already in-vocabulary).
+    ``horizon_ms`` is horizon-charter territory (validated by the tool
+    bodies with the supported-horizons refusal) and is NOT re-checked here.
+    """
+    refusals: list[str] = []
+    if "interval_seconds" in args:
+        value = args["interval_seconds"]
+        if value not in INTERVAL_SECONDS:
+            refusals.append(
+                f"interval_seconds {value!r} outside {list(INTERVAL_SECONDS)}"
+            )
+    if "window_minutes" in args:
+        value = args["window_minutes"]
+        if value not in WINDOW_MINUTES:
+            refusals.append(
+                f"window_minutes {value!r} outside {list(WINDOW_MINUTES)}"
+            )
+    return refusals
 
 
 def _derived_hypothesis_id(
@@ -297,15 +325,27 @@ class InferenceEngine:
         tool_calls = st.parsed_current.get("tool_calls")
         if not (isinstance(tool_calls, list) and tool_calls):
             return
-        pass_remaining = MAX_DISPATCHES_PER_PASS - st.dispatched_in_pass
         dict_calls = [c for c in tool_calls if isinstance(c, dict)]
-        if st.tool_rounds_used >= AGENTIC_MAX_TOOL_ROUNDS or pass_remaining <= 0:
-            # Budget spent: name everything pending (never silently dropped).
+        # Phase G4 (budget governance): the ceiling is adjudicated by the
+        # BUDGET gate (gates.py — governance-owned verdict over config-owned
+        # numbers), never decided inline. A refused gate is a finding that
+        # names what will not run: everything pending moves to unexecuted
+        # and the round ends — the loop continues its closing semantics.
+        _budget = evaluate_budget_gate(
+            tool_rounds_used=st.tool_rounds_used,
+            dispatched_in_pass=st.dispatched_in_pass,
+            max_tool_rounds=AGENTIC_MAX_TOOL_ROUNDS,
+            max_dispatches_per_pass=MAX_DISPATCHES_PER_PASS,
+        )
+        if _budget.refused:
+            for reason in _budget.reasons:
+                log.warning("budget gate refused: %s", reason)
             for call in dict_calls:
                 raw_name = str(call.get("name") or call.get("tool") or "").strip()
                 if raw_name:
                     st.unexecuted.append(raw_name)
             return
+        pass_remaining = MAX_DISPATCHES_PER_PASS - st.dispatched_in_pass
         # The canonical per-round cap is enforced here; overflow is named on
         # unexecuted, never silently dropped.
         to_execute = dict_calls[:pass_remaining]
@@ -324,6 +364,34 @@ class InferenceEngine:
             args.setdefault("symbol", self.symbol)
             args.setdefault("venue", self.venue)
             canonical = _normalize_tool_name(raw_name) or raw_name
+            # Phase G6 (cadence-arg governance): the FSM authorizes the
+            # TOOL at its home; the cadence ARGUMENTS are validated here
+            # against the frozen cadence vocabulary (engine.cadence) — the
+            # single owner of interval/window domains. Out-of-vocabulary
+            # values become a tool.denied-cadence finding: never
+            # dispatched, never executed, never re-called blind. The
+            # finding carries the supported set so the model can reform.
+            _cadence_reasons = _cadence_arg_refusals(canonical, args)
+            if _cadence_reasons:
+                cadence_log = capability_log_entry(
+                    f"tool.denied-cadence:{canonical}",
+                    {"symbol": self.symbol, "venue": self.venue},
+                    "denied",
+                    detail={
+                        "reason": "cadence_args_out_of_vocabulary",
+                        "refusals": _cadence_reasons,
+                        "supported": {
+                            "interval_seconds": list(INTERVAL_SECONDS),
+                            "window_minutes": list(WINDOW_MINUTES),
+                        },
+                    },
+                )
+                st.dispatched_in_pass += 1
+                st.capability_log.append(cadence_log)
+                if raw_name and raw_name not in st.unexecuted:
+                    st.unexecuted.append(raw_name)
+                round_results[canonical] = None
+                continue
             if canonical == "calc.hypothesis.test":
                 # Pre-registration is ENGINE-SUPPLIED (deterministic): the
                 # directive's hypothesis_seed (or the task text) IS the
@@ -525,7 +593,10 @@ class InferenceEngine:
             st_chain["missing"] = st_render["missing"]
             st_chain["refused"] = st_render["refused"]
             st_chain["complete"] = st_render["complete"]
-            chain_block = f"\n{st_render['render']}\n"
+            # The TRACK block above already renders chain status
+            # (done/missing/refused) — chain_block carries only the
+            # actionable steer, never a second status render.
+            chain_block = ""
             steer = chain_steer(st_render)
             if steer:
                 chain_block += f"{steer}\n"

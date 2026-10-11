@@ -500,33 +500,18 @@ TOOL_WINDOWS: dict[str, str] = {
         "Refusals are findings to record with reasons, never failures to repair."
     ),
     "reasoning": (
-        "YOUR TOOLS THIS LOOP — three forced positions, in order (the loop cannot exit "
-        "before all three complete; tools from a later position are denied until it is active): "
-        "POSITION 1/3 ASSEMBLE — re-derive the substrates, no interpretation: state your "
-        "paper-grounded prior from the recalled facts, then calc.ofi.intervals (Route A OFI first) → "
-        "calc.depth.average (Route B AD) → calc.forward.join (multivariate X_t joined to Y(h)). "
-        "POSITION 2/3 INTERPRET — fit the equation and read the distribution: calc.forward.fit → "
-        "calc.forward.distribution (expected delta, validation_state, probability_status, assumptions, "
-        "route disagreement, chain_trace receipt) → calc.decay.report (which horizons survive — quote it "
-        "before trusting any horizon); calc.forward.forecast re-reads are allowed for cross-checking. "
-        "POSITION 3/3 HYPOTHESIZE — think against the user prompt, form the testable H0 (only now that "
-        "the distribution exists) and run calc.hypothesis.test with hypothesis_id + horizon_ms + m_tests "
-        "(post-fit only; p<0.05 is evidence, never execution), plus calc.forward.scenario with horizon_ms + "
-        "targets/invalidations when horizons are present (P_ge/P_le only when calibration passes; legacy "
-        "scenario stays the flow-requirement baseline — report agreement AND disagreement); "
-        "calc.events.absorption/walls for E[dP|event] conditioning when liquidity language is present. "
-        "Then close with tool_calls=[]. Validation (calc.discipline.audit) and output composition are later "
-        "loops, not this one. Refusals are findings to record with reasons, never failures to repair."
-    ),
-    "fetch": (
-        "YOUR TOOLS THIS TURN — establish tape quality + snapshot context, nothing else: "
-        "micro.capture_status (capture state) → micro.fit_beta (fit status + observations). "
-        "You may add micro.ofi_intervals / micro.events for a first look, market.read (snapshot) "
-        "for regime context, and substrate.read (projections only — no invokes) for a first "
-        "warm-plane glance. You may set interval_seconds (10/15/30) and window_minutes "
-        "(15/30/60) in args. Do not conclude, do not test hypotheses, do not invoke workers. "
-        "What you do not pull, the deterministic floor pulls at defaults — prefer to pull it "
-        "yourself at the cadence the task needs."
+        "YOUR TOOLS THIS LOOP — the positioned track, in order (one position "
+        "per pass minimum; tools from a later position are denied until it is "
+        "active): 1/3 ASSEMBLE — calc.ofi.intervals → calc.depth.average → "
+        "calc.forward.join. 2/3 INTERPRET — calc.forward.fit → "
+        "calc.forward.distribution → calc.decay.report. 3/3 HYPOTHESIZE — "
+        "calc.hypothesis.test (+ calc.forward.scenario when horizons/targets "
+        "are present; calc.events.* when liquidity language is present). Then "
+        "close with tool_calls=[]. Your current position and its missing links "
+        "render below every turn — work those first. Validation "
+        "(calc.discipline.audit) and output composition are later loops, not "
+        "this one. Refusals are findings to record with reasons, never failures "
+        "to repair."
     ),
     "validation": (
         "YOUR TOOLS THIS LOOP — calc.discipline.audit (pull it), then stop. "
@@ -534,7 +519,7 @@ TOOL_WINDOWS: dict[str, str] = {
         "One repair round exists; a second rejection ends the cycle with "
         "findings preserved — do not thrash."
     ),
-    "output": "No tools this pass — compose only. Any tool_calls returned are dropped unread.",
+    "output": "No tools this pass — compose only. Any tool_calls returned are dropped.",
 }
 
 
@@ -676,7 +661,7 @@ def envelope_digest(deterministic_state: dict[str, Any], cap: int = 4_000) -> st
             ),
             "task_directive_kind": directive.get("kind"),
             "task_plan_kind": (deterministic_state.get("task_plan") or {}).get("kind"),
-            "bootstrap_basis": deterministic_state.get("bootstrap_basis"),
+            "cadence": (deterministic_state.get("task_plan") or {}).get("cadence"),
         }
         text = json.dumps(digest, default=str)
     except Exception:
@@ -743,41 +728,6 @@ def compose_output_prompt(
         "TRAVERSAL (loops walked this cycle — ground the composition in it):\n"
         f"{json.dumps(traversal, default=str)[:2_000]}\n"
         f"{chain_line}\n"
-    )
-
-
-def compose_fetch_prompt(
-    *,
-    controller: Any,
-    task_block: str,
-    scenario_block: str,
-    wake_block: str,
-    dispatches_left: int,
-) -> str:
-    """Compose the agent-first fetch turn (Option-2 bootstrap).
-
-    The agent owns acquisition from turn zero: it commands the tape-quality
-    reads itself at the cadence the task needs. The deterministic floor fills
-    whatever it does not pull. Interpretation is not demanded — nulls fine.
-    Pure."
-    """
-    header = build_loop_state_block(
-        controller=controller,
-        loop="context", sub_loop=None, intent=None,
-        passes_spent=0, pass_budget=LOOP_PASS_BUDGET["fetch"],
-        dispatches_left=dispatches_left,
-        traversal=controller.loop_coverage(),
-        gate=None,
-    )
-    return (
-        f"{header}\n\n"
-        f"{TOOL_WINDOWS['fetch']}\n\n"
-        f"{task_block}"
-        f"{scenario_block}"
-        f"WAKE: {wake_block}\n\n"
-        f"{TURN_CONTRACT_LINE}\n"
-        "Fill tool_calls with the reads above (phase P1); leave summary/evidence/"
-        "hypothesis null — this turn only fetches."
     )
 
 

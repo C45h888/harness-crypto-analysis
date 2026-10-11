@@ -372,7 +372,6 @@ class LoopTag:
     (config budgets, context.passes_per_loop, driver crosswalk) resolves
     to this namespace."""
 
-    FETCH = "fetch"
     COMPREHENSION = "comprehension"
     EVIDENCE = "evidence"
     REASONING = "reasoning"
@@ -381,11 +380,10 @@ class LoopTag:
 
 
 LOOP_TAG_CROSSWALK: dict[str, tuple[NestedLoop, "SubLoop | None"]] = {
-    # Declarative homes for tags the engine does not currently assign
-    # (fetch = the pre-gate gate-read turn; output = the finalize stage).
-    # They document the intended FSM home so a future producer resolves
-    # without re-inventing a mapping.
-    LoopTag.FETCH: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
+    # Declarative home for the comprehension tag the engine does not
+    # currently assign (documenting the intended FSM home so a future
+    # producer resolves without re-inventing a mapping). Phase R7 removed
+    # the fetch tag with the fetch semantic.
     LoopTag.COMPREHENSION: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
     # Live tags (assigned by reasoning.py) — byte-identical to the previous
     # driver map.

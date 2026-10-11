@@ -136,23 +136,33 @@ from .fsm import (
     GovernanceEventKind,
     MembraneVerdict,
     GOVERNANCE_MEMBRANE,
-    FAILURE_EVENT_KINDS,
-    FAILURE_EVENT_WORKERS,
 )
 
-# --- Failure substrate (Layer 3: remediation over FSM-designated failures) ---
-# The FSM designates the failure state; this substrate classifies, remediates,
-# and reports. See failure_substrate/README.md.
+# --- The primary failure node (governance over all failure semantics) ---
+# engine/failure_fsm.py owns classification, severity, policy and terminal
+# routing. The main FSM keeps only the CYCLE_FAILED intake edge and
+# delegates here.
+from .failure_fsm import (
+    FAILURE_FSM,
+    FAILURE_TERMINAL,
+    FailureFSM,
+    FailureKind,
+    FailureVerdict,
+)
+
+# --- Failure substrate (mechanics: coordinate bounded workers) ---
+# The substrate receives a decided FailureVerdict and coordinates a worker.
 from . import failure_substrate as failure_substrate
 from .failure_substrate import (
     FAILURE_CLASSIFICATION,
+    FAILURE_SUBSTRATE,
     FAILURE_WORKER_REGISTRY,
+    WORKER_FOR_KIND,
     FailureClass,
     FailureOutcome,
     FailureReport,
     FailureSeverity,
-    FailureSubstrateMembrane,
-    FailureVerdict,
+    FailureSubstrate,
     FailureWorker,
     MAX_RETRIES,
     RemediationKind,
@@ -246,17 +256,22 @@ __all__ = [
     "GovernanceEventKind",
     "MembraneVerdict",
     "GOVERNANCE_MEMBRANE",
-    "FAILURE_EVENT_KINDS",
-    "FAILURE_EVENT_WORKERS",
-    # failure substrate (Layer 3 — remediation)
+    # failure node (governance over failure semantics)
+    "FAILURE_FSM",
+    "FAILURE_TERMINAL",
+    "FailureFSM",
+    "FailureKind",
+    "FailureVerdict",
+    # failure substrate (mechanics — coordinate bounded workers)
     "FAILURE_CLASSIFICATION",
+    "FAILURE_SUBSTRATE",
     "FAILURE_WORKER_REGISTRY",
+    "WORKER_FOR_KIND",
     "FailureClass",
     "FailureOutcome",
     "FailureReport",
     "FailureSeverity",
-    "FailureSubstrateMembrane",
-    "FailureVerdict",
+    "FailureSubstrate",
     "FailureWorker",
     "MAX_RETRIES",
     "RemediationKind",

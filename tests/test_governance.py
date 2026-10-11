@@ -279,7 +279,8 @@ class ControllerGovernanceUnitTests(unittest.TestCase):
             .with_membrane(M)
             .with_observation(M.initial())
         )
-        c2 = c.advance(GovernanceEvent(GovernanceEventKind.GATE_REFUSED))
+        c2 = c.advance(GovernanceEvent(
+            GovernanceEventKind.CYCLE_FAILED, failure_kind="gate_refused"))
         self.assertEqual(c2.terminal, LoopTerminal.GATE_REFUSED)
         self.assertIsNone(c2.observation)
         self.assertIsNone(c.terminal)  # original untouched
@@ -315,7 +316,12 @@ class ControllerGovernanceUnitTests(unittest.TestCase):
 
 
 class EvidenceBoundaryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pre_gate_reads_use_initial_bootstrap_then_open_intake(self):
+    async def test_wake_opens_intake_and_comprehension_advances_in_order(self):
+        """Phase R7 revision of the boundary contract: run_wake OWNS INTAKE
+        (deterministic normalization — no reads, no bootstrap), and
+        comprehension advances the cursor INTERPRETATION → FRAMING →
+        SOURCING → ACQUISITION → VERIFICATION in FSM order. No work
+        predates the observation."""
         from unittest.mock import patch
 
         from market_service.nooa_harness.engine import core
@@ -323,41 +329,33 @@ class EvidenceBoundaryTests(unittest.IsolatedAsyncioTestCase):
         engine, _s, _p, _m = _engine(llm_responses=[_FETCH_TURN],
                                      capture_state="starting")
         govern = core.context._govern
-        execute = core.context.execute_tool
-        observation = None
         requests = []
-        reads = []
 
-        def observe_govern(controller, kind, target=None):
-            nonlocal observation
-            successor, verdict = govern(controller, kind, target)
-            observation = successor.observation
-            requests.append((kind, target, verdict.allowed))
+        def observe_govern(controller, kind, target=None, cadence_verdict=None):
+            successor, verdict = govern(controller, kind, target,
+                                        cadence_verdict=cadence_verdict)
+            requests.append((kind, (target.value if target is not None else None),
+                             verdict.allowed))
             return successor, verdict
 
-        async def observe_read(store, name, args, **kwargs):
-            reads.append((name, observation))
-            return await execute(store, name, args, **kwargs)
-
-        with patch.object(core.context, "_govern", side_effect=observe_govern), patch.object(
-            core.context, "execute_tool", side_effect=observe_read,
-        ):
+        with patch.object(core.context, "_govern", side_effect=observe_govern):
             artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
 
-        # Gate reads are explicitly authorized as wake bootstrap work at the
-        # initial observation (no sub-loop open). The agent's fetch pull runs
-        # there; INTAKE opens once bootstrap-authorized work is done — the
-        # traversal never fabricates an EVIDENCE/ACQUISITION observation.
         from market_service.nooa_harness.engine.fsm import GovernanceEventKind
-        self.assertEqual(
-            [(kind, (target.value if target is not None else None), allowed)
-             for kind, target, allowed in requests],
-            [(GovernanceEventKind.OPEN_SUBLOOP, "intake", True)],
-        )
-        self.assertEqual([name for name, _ in reads], [
-            "micro.capture_status", "micro.fit_beta",
-        ])
-        self.assertTrue(all(position is None for _, position in reads))
+        kinds = [kind for kind, _, _ in requests]
+        # INTAKE opens at wake; comprehension walks INTERPRETATION →
+        # FRAMING, and the merged CONTEXT loop opens SOURCING →
+        # ACQUISITION for plan-bound acquisition + evidence narration.
+        # (This thin-tape cycle dies at narrate#1, so VERIFICATION and the
+        # terminator loops never open — their in-order opens are pinned by
+        # the successful settled cycle elsewhere in this suite.)
+        self.assertEqual(requests[0],
+                         (GovernanceEventKind.OPEN_SUBLOOP, "intake", True))
+        for expected in ("interpretation", "framing", "sourcing", "acquisition"):
+            self.assertIn((GovernanceEventKind.OPEN_SUBLOOP, expected, True),
+                          requests)
+        self.assertIn((GovernanceEventKind.SET_TASK, "infer_order_flow", True),
+                      requests)
         self.assertEqual(meta["llm_calls"], 1)
         self.assertEqual(artifact.deterministic_state["terminal"], meta["terminal"])
 
@@ -415,14 +413,21 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.deterministic_state.get("terminal"), "settled")
         self.assertTrue(meta["final_validation"]["passed"])
 
-    async def test_gate_insufficient_terminals_gate_refused(self):
+    async def test_thin_tape_no_gate_terminal(self):
+        # Phase R7 (DATA gate removed): thin tape no longer routes a
+        # pre-receipt terminal. The cycle runs comprehension → plan-bound
+        # acquisition → evidence narration (the single LLM response is
+        # consumed by narrate#1) and the transcript ends at the canonical
+        # narration-failure terminal with the receipt preserved. Tape
+        # quality is the deterministic plane's job (per-tool refusals).
         engine, _s, _p, _m = _engine(
             llm_responses=[_FETCH_TURN], capture_state="starting",
         )
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["terminal"], "gate_refused")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "gate_refused")
+        self.assertEqual(meta["terminal"], "narration_failed")
+        self.assertEqual(artifact.deterministic_state.get("terminal"), "narration_failed")
         self.assertEqual(meta["llm_calls"], 1)
+        self.assertIsNotNone(artifact.deterministic_state.get("understanding_receipt"))
 
     async def test_parse_failure_terminals_parse_failed(self):
         engine, _s, _p, _m = _engine(llm_responses=["no json here at all",

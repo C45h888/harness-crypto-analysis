@@ -1149,3 +1149,88 @@ class PostgresRuntimeStore:
             result["ledger_created_at"] = result.pop("created_at")
             out.append(result)
         return out
+
+    # ------------------------------------------------------------------
+    # Governance ledger (docs/PLANE_GOVERNANCE_SPEC.md)
+    #
+    # The durable audit of plane legality: EVERY FSM decision lands here,
+    # allowed or denied. A denied decision is evidence about the system and
+    # must survive the process that produced it. Written only by
+    # GovernanceLedger; read by operators / NOOA.
+    # ------------------------------------------------------------------
+
+    async def record_governance_decision(
+        self, record: dict[str, Any],
+    ) -> int:
+        """Durable write of one governance decision. Returns the row id."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        decided_at_ms = record.get("decided_at_ms")
+        row = await self.pool.fetchrow(
+            """INSERT INTO governance_ledger
+               (plane, substrate, symbol, gate, allowed, rule, reason,
+                findings, observation, decided_at, schema_version)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               RETURNING id""",
+            str(record.get("plane") or ""),
+            str(record.get("substrate") or "").lower(),
+            str(record.get("symbol") or "").upper(),
+            str(record.get("gate") or ""),
+            bool(record.get("allowed")),
+            str(record.get("rule") or ""),
+            str(record.get("reason") or ""),
+            json.dumps(_json_safe(list(record.get("findings") or []))),
+            json.dumps(_json_safe(record.get("observation") or {})),
+            self._ms_to_ts(decided_at_ms) or datetime.now(tz=UTC),
+            int(record.get("schema_version") or 1),
+        )
+        return int(row["id"])
+
+    async def read_governance_ledger(
+        self, *, plane: str = "", symbol: str = "",
+        substrate: str = "", allowed: bool | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Durable read: governance decisions, newest first, filtered."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        clauses: list[str] = []
+        args: list[Any] = []
+        if plane:
+            args.append(plane.lower())
+            clauses.append(f"plane = ${len(args)}")
+        if symbol:
+            args.append(symbol.upper())
+            clauses.append(f"symbol = ${len(args)}")
+        if substrate:
+            args.append(substrate.lower())
+            clauses.append(f"substrate = ${len(args)}")
+        if allowed is not None:
+            args.append(bool(allowed))
+            clauses.append(f"allowed = ${len(args)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        args.append(int(limit))
+        rows = await self.pool.fetch(
+            f"""SELECT id, plane, substrate, symbol, gate, allowed, rule,
+                       reason, findings, observation, decided_at,
+                       schema_version
+                FROM governance_ledger{where}
+                ORDER BY decided_at DESC LIMIT ${len(args)}""",
+            *args,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            result = dict(row)
+            for col in ("findings", "observation"):
+                v = result.get(col)
+                if isinstance(v, str):
+                    try:
+                        result[col] = json.loads(v)
+                    except (ValueError, json.JSONDecodeError):
+                        result[col] = [] if col == "findings" else {}
+            if hasattr(result.get("decided_at"), "isoformat"):
+                result["decided_at"] = result["decided_at"].isoformat()
+            result["ledger_id"] = result.pop("id")
+            out.append(result)
+        return out

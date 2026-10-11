@@ -32,7 +32,7 @@ import market_service.runtime.contracts as runtime_contracts
 import market_service.runtime.horizon_spans as horizon_spans
 import market_service.runtime.horizons as horizons
 import market_service.substrate_worker.contracts as substrate_contracts
-from market_service.nooa_harness.engine.failure_substrate.membrane import FailureClass
+from market_service.nooa_harness.engine.failure_fsm import FailureClass
 
 _MARKET_DIR = pathlib.Path(horizons.__file__).parent.parent  # market_service/
 _NUMERIC_HORIZON_VALUES = {
