@@ -50,6 +50,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Mapping
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +330,66 @@ class LoopObservation:
 
 
 # ---------------------------------------------------------------------------
+# Loop receipts — the CANONICAL, engine-authored record of a loop close
+# ---------------------------------------------------------------------------
+#
+# A receipt is an engine-authored, frozen record of ONE loop/sub-loop close:
+# *what ran, what it covered, how it closed, with what provenance*. Receipts are
+# canonical and carry no model prose; the agent's own memory node is a separate
+# surface the agent calls and writes.
+#
+# Emission mechanics live in ``engine/receipts.py``; this module owns only the
+# VOCABULARY (matching the loop_states/fsm authority split: vocabulary here,
+# legality in fsm, semantics in controller).
+
+
+class ReceiptDisposition(str, Enum):
+    """How a loop/sub-loop actually closed — the honest disposition set.
+
+    ``NOT_APPLICABLE`` and ``SKIPPED`` exist so an inapplicable or unentered
+    step is disposed *explicitly* rather than fabricated (NESTED_LOOP_SPEC
+    §8.4: no invented work, no no-op event parade).
+    """
+
+    COMPLETED = "completed"          # the sub-loop's work ran and satisfied its exit
+    NOT_APPLICABLE = "not_applicable"  # the sub-loop does not apply to this cycle
+    REFUSED = "refused"              # a deterministic verdict refused the work
+    DENIED = "denied"                # the membrane denied the transition
+    SKIPPED = "skipped"              # not entered (budget/early exit) — recorded, not claimed
+
+
+@dataclass(frozen=True)
+class LoopReceipt:
+    """One engine-authored, JSON-serializable record of a loop/sub-loop close.
+
+    It answers *what happened* (structural facts + provenance). Receipts are
+    frozen so a cycle's traversal is replayable and auditable from the
+    artifact.
+
+    ``payload``       — bounded, JSON-safe STRUCTURAL facts only (never narration).
+    ``evidence_refs`` — provenance ancestors (wake_id / artifact_id / tool paths).
+    """
+
+    loop: NestedLoop
+    sub_loop: SubLoop
+    disposition: ReceiptDisposition = ReceiptDisposition.COMPLETED
+    steps: tuple[LoopStep, ...] = ()
+    payload: Mapping[str, Any] | None = None
+    evidence_refs: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection (stable key order for fixtures/artifacts)."""
+        return {
+            "loop": self.loop.value,
+            "sub_loop": self.sub_loop.value,
+            "disposition": self.disposition.value,
+            "steps": [step.value for step in self.steps],
+            "payload": dict(self.payload) if self.payload else {},
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Mappings — the single source of truth for the workflow shape
 # ---------------------------------------------------------------------------
 
@@ -380,13 +441,17 @@ class LoopTag:
 
 
 LOOP_TAG_CROSSWALK: dict[str, tuple[NestedLoop, "SubLoop | None"]] = {
-    # Declarative home for the comprehension tag the engine does not
-    # currently assign (documenting the intended FSM home so a future
-    # producer resolves without re-inventing a mapping). Phase R7 removed
-    # the fetch tag with the fetch semantic.
-    LoopTag.COMPREHENSION: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
+    # Comprehension is INTERPRETATION/FRAMING work inside CONTEXT — its
+    # declarative home is FRAMING (the receipt close), never ACQUISITION.
+    # Phase R7 removed the fetch tag with the fetch semantic.
+    LoopTag.COMPREHENSION: (NestedLoop.CONTEXT, SubLoop.FRAMING),
     # Live tags (assigned by reasoning.py) — byte-identical to the previous
-    # driver map.
+    # driver map. VALIDATION tag homes to RECOVERY (the iterating core,
+    # matching PRIMARY_SUBLOOP + the CONTEXT→ACQUISITION / REASONING→ANALYSIS
+    # / OUTPUT→PLACEMENT pattern). GATE is first-opened but resolved via
+    # the dispatch registry homes — the tag names the core, not the first
+    # sub-loop. Repair dispatches authorize via this fallback; first-pass
+    # GATE authorizes via registry homes.
     LoopTag.EVIDENCE: (NestedLoop.CONTEXT, SubLoop.ACQUISITION),
     LoopTag.REASONING: (NestedLoop.REASONING, SubLoop.ANALYSIS),
     LoopTag.VALIDATION: (NestedLoop.VALIDATION, SubLoop.RECOVERY),
@@ -437,9 +502,9 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
         iterates=False,
         purpose=(
             "Receive and normalize the raw input into a known shape. "
-            "Executed by run_wake (normalization) and run_agent_fetch "
-            "(agent fetch turn + floor fill, authorized as wake-bootstrap "
-            "before INTAKE opens — acquisition precedes all later spend)."
+            "Executed by run_wake (deterministic INTAKE, no tools). "
+            "Phase R7: fetch semantic removed — comprehension is the "
+            "first agentic step; GATE_DATA is retired (see gates.py)."
         ),
     ),
     SubLoop.INTERPRETATION: SubLoopSpec(
@@ -457,19 +522,23 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
             LoopStep.DECOMPOSE,
             LoopStep.SELECT_EVIDENCE_NEEDS,
             LoopStep.SET_ACCEPTANCE,
+            LoopStep.GATE_PLAN,
         ),
         iterates=False,
-        purpose="Decompose the task and set the acceptance bar.",
+        purpose=(
+            "Decompose the task, set the acceptance bar, and gate the "
+            "disposed plan (GATE_PLAN executes post-framing in "
+            "run_comprehension, forward-only — a refused plan ends the cycle)."
+        ),
     ),
     # --- CONTEXT (merged comprehension + evidence), continued ---
     SubLoop.SOURCING: SubLoopSpec(
-        steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS, LoopStep.GATE_PLAN),
+        steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS),
         iterates=False,
         purpose=(
             "Plan which reads and tools will satisfy the intent. "
-            "GATE_PLAN executes post-framing in run_comprehension "
-            "(forward-only — a refused plan ends the cycle); the planned "
-            "acquisition itself runs in run_plan_bound_acquisition."
+            "The planned acquisition itself runs in "
+            "run_plan_bound_acquisition under the frozen receipt."
         ),
     ),
     SubLoop.ACQUISITION: SubLoopSpec(
@@ -483,30 +552,45 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     ),
     SubLoop.VERIFICATION: SubLoopSpec(
         steps=(LoopStep.ASSESS, LoopStep.STORE_HANDOFF),
-        iterates=True,
+        iterates=False,
         purpose=(
             "Assess coverage against the plan and store the handoff package. "
             "Gaps ride forward as findings — there is no re-plan edge "
-            "(gate 2 is forward-only)."
+            "(gate 2 is forward-only). Single close at end of CONTEXT."
         ),
-        exit_condition="coverage assessed and handoff stored, or budget spent",
     ),
-    # --- REASONING ---
+    # --- REASONING (canonical staged doctrine: 2a → 2b → hypothesize) ---
+    # HYPOTHESIS frames the prior from the partition + directive seed — no
+    # tools. ANALYSIS is the staged execution core (2a base-interpret =
+    # CALCULATE+OBSERVE exiting via join.n_pairs; 2b refined-archaic = TEST
+    # against fit/distribution/forecast + COMPARE across decay/events).
+    # Position vocabulary (assemble/interpret/hypothesize) maps to LoopSteps
+    # CALCULATE/OBSERVE → TEST → COMPARE; the membrane watches sub-loops,
+    # positions never move it. SYNTHESIS reconciles (INTERPRET+RECONCILE).
+    # Old debt removed: H0 is framed as prior here AND formed as testable
+    # H0 in hypothesize — the spec no longer claims formation lives only
+    # in ANALYSIS without a framing step.
     SubLoop.HYPOTHESIS: SubLoopSpec(
         steps=(LoopStep.FRAME, LoopStep.STATE_PRIOR),
         iterates=False,
         purpose=(
-            "Reasoning entry: open the hypothesis frame. H0/H1 itself is "
-            "formed at the hypothesize position inside ANALYSIS."
+            "Frame the prior from the task-segment partition "
+            "(understanding+plan+handoff) + the directive H0/H1 seed. "
+            "No tools. The testable H0 is formed later at the hypothesize "
+            "position inside ANALYSIS — this frame is the prior it tests against."
         ),
     ),
     SubLoop.ANALYSIS: SubLoopSpec(
         steps=(LoopStep.TEST, LoopStep.COMPARE),
         iterates=True,
         purpose=(
-            "The positioned execution core: hosts the hard track "
-            "assemble → interpret → hypothesize (chain.py POSITION_ORDER), "
-            "one position per pass, out-of-position tools denied."
+            "Staged execution core: 2a BASE-INTERPRET (calculate+observe: "
+            "ofi/ad/join, exits via join.n_pairs>0 with base_summary frozen "
+            "+ base observation stored) → 2b REFINED-ARCHAIC (test: "
+            "forecast primary truth + fit/distribution/delta, gated on DATA; "
+            "compare: decay/events/scenario) → hypothesize (H0/H1 in line "
+            "with the distribution, proving/disproving the prompt). "
+            "One position per pass, out-of-position + premature denied."
         ),
         exit_condition="the hypothesis is settled or refinement stops adding signal",
     ),
@@ -548,9 +632,8 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     ),
     SubLoop.MEMORY: SubLoopSpec(
         steps=(LoopStep.PROPOSE, LoopStep.RESOLVE, LoopStep.SETTLE),
-        iterates=True,
-        purpose="Dispose memory proposals and close the cycle.",
-        exit_condition="every proposal is resolved and the cycle is settled",
+        iterates=False,
+        purpose="Dispose memory proposals and close the cycle (single pass).",
     ),
 }
 
@@ -792,6 +875,9 @@ __all__ = [
     "SubLoopSpec",
     # observation
     "LoopObservation",
+    # receipt (canonical half of the receipt/note partition)
+    "LoopReceipt",
+    "ReceiptDisposition",
     # terminal sets
     "SUCCESS_TERMINALS",
     "FAILURE_TERMINALS",

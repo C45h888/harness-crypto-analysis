@@ -233,9 +233,11 @@ class IteratingSubLoopTests(unittest.TestCase):
             self.assertEqual(iterating_sub_loops(loop), expected)
 
     def test_evidence_iterating_core(self):
+        # VERIFICATION is a single close (assess + handoff once, gaps ride
+        # forward) — only INTERPRETATION and ACQUISITION iterate.
         self.assertEqual(
             iterating_sub_loops(NestedLoop.CONTEXT),
-            (SubLoop.INTERPRETATION, SubLoop.ACQUISITION, SubLoop.VERIFICATION),
+            (SubLoop.INTERPRETATION, SubLoop.ACQUISITION),
         )
 
     def test_validation_recovery_iterates(self):

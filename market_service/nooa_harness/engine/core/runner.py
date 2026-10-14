@@ -38,6 +38,7 @@ from market_service.runtime.contracts import InferenceArtifact
 from . import context
 from . import gather, output, reasoning
 from . import wake as wake_mod
+from ..ledger import LedgerKind, record_entry
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..loop_states import NestedLoop
 
@@ -229,42 +230,26 @@ async def narrate_cycle(
 
 
 async def _place_understanding(engine: Any, ctx: Any, st: Any) -> None:
-    """Place the understanding receipt on the reason memory node.
+    """Record the comprehension close on the CENTRAL ENGINE LEDGER.
 
-    Runs once at the comprehension→evidence handoff (loop close): the
-    receipt is stored under kind ``"understanding"`` with the wake
-    envelope as provenance ancestor (the artifact does not exist yet, so
-    the wake_id — not a run/artifact id — is the evidence ref). Future
-    workers retrieve by ``(session_id, kind=\"understanding\")``
-    filtered on tags. Memory-less runs skip silently (transport pattern).
+    Runs once at the comprehension→evidence handoff (loop close).
+    UNDERSTANDING = what the task is; PLAN = what will be done. The ledger is
+    deterministic engine state — never the episodic memory node — and the LLM
+    reads it as context. Pure state mutation, so it cannot fail the cycle.
     """
-    if engine.memory is None:
-        return
     receipt = (st.deterministic_state or {}).get("understanding_receipt") or {}
+    wake_id = getattr(getattr(ctx, "wake", None), "wake_id", "") or ""
     segment = getattr(ctx, "task_id", None)
-    try:
-        await engine.memory.remember(
-            engine.session_id, "understanding",
-            json.dumps(receipt, default=str),
-            segment=segment,
-            importance=2.0,
-            tags=("wake", "comprehension", engine.symbol.lower()),
-            evidence_refs=(ctx.wake.wake_id,),
+    record_entry(
+        st.deterministic_state, LedgerKind.UNDERSTANDING, receipt,
+        evidence_refs=(wake_id,), segment=segment,
+    )
+    plan = getattr(st, "task_plan", None)
+    if plan is not None:
+        record_entry(
+            st.deterministic_state, LedgerKind.PLAN, plan,
+            evidence_refs=(wake_id,), segment=segment,
         )
-        # Plan carry (state redistribution): the disposed plan is written as
-        # its own memory kind so the next turn can gather against it.
-        plan = getattr(st, "task_plan", None)
-        if plan is not None:
-            await engine.memory.remember(
-                engine.session_id, "plan",
-                json.dumps(plan, default=str),
-                segment=segment,
-                importance=3.0,
-                tags=("wake", "plan", engine.symbol.lower()),
-                evidence_refs=(ctx.wake.wake_id,),
-            )
-    except Exception:
-        log.exception("understanding placement failed")
 
 
 async def degraded_artifact(
