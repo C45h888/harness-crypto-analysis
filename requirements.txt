@@ -3,6 +3,10 @@ asyncpg==0.30.0
 redis[hiredis]==6.4.0
 alembic==1.13.3
 psycopg2-binary==2.9.12
+# SQLAlchemy 2.1 changed the default driver for postgresql:// URLs to psycopg
+# (v3); the image must ship it or alembic/db-init and all postgresql://
+# connections fail with ModuleNotFoundError: No module named 'psycopg'.
+psycopg[binary]==3.2.13
 # NOOA base runtime and CLI. The analyst suite and `market` harness group are
 # mounted through harness.py and the repo-root `nooa` CLI; canonical
 # collection, calculation, persistence, and execution stay outside it.
