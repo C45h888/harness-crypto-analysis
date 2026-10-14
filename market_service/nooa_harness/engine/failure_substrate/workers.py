@@ -16,6 +16,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..failure_fsm import FailureClass, FailureSeverity, RemediationKind
+from .contracts import FailureTask, FailureTransport, WorkerStatus
+
+#: Defaults for the legacy ``invoke()`` shim (a plain RETRY-policy task).
+_DEFAULT_CLASS = FailureClass.INFRA
+_DEFAULT_SEVERITY = FailureSeverity.TRANSIENT
+
 
 class RemediationOutcome:
     """What happened when the worker ran remediation.
@@ -95,10 +102,64 @@ class FailureWorker:
             "detail": detail,
         }
 
-    # ---- Remediation implementations ----
-    # Each worker type overrides these to implement its actual logic.
-    # The base class provides identity-style implementations suitable for
-    # tools that just need the report.
+    # ---- Remediation (the boundary contract) ----------------------------
+    # A worker OWNS the transport while it handles a task: `execute()` is the
+    # one method the substrate dispatches, and it is where a worker may call
+    # `transport.execute_tool(...)` / `transport.call_llm(...)` to ACT.
+    #
+    # The base implementations below are bounded and deterministic — they
+    # honour the governance POLICY on the task (DEGRADE continues; RETRY /
+    # FALLBACK consume the retry budget). Workers with real bodies override
+    # `execute()`.
+
+    async def execute(
+        self,
+        task: FailureTask,
+        transport: FailureTransport | None = None,
+    ) -> WorkerStatus:
+        """Handle one dispatched task (never raises). The worker owns `transport`.
+
+        Base implementation: DEGRADE resolves immediately; RETRY/FALLBACK
+        consume the retry budget and, on exhaustion, apply the declared
+        fallback. Workers that need actual remediation override this.
+        """
+        task_id = task.task_id if task is not None else ""
+        remediation = task.remediation if task is not None else RemediationKind.RETRY
+
+        if remediation is RemediationKind.DEGRADE:
+            return WorkerStatus(
+                outcome="degraded",
+                resolved=True,
+                degraded=True,
+                retry_count=self._retry_count,
+                findings=(f"degraded: continuing without retry ({task.detail or ''})",),
+                task_id=task_id,
+            )
+
+        # RETRY / FALLBACK — one bounded attempt.
+        if self.can_retry():
+            self.consume_retry()
+            return WorkerStatus(
+                outcome="retrying",
+                resolved=False,
+                retry_count=self._retry_count,
+                findings=(f"retry {self._retry_count}/{self.max_retries}",),
+                task_id=task_id,
+            )
+        # Budget exhausted; apply the declared fallback.
+        resolved = self.fallback != "terminate"
+        return WorkerStatus(
+            outcome=(
+                "degraded" if self.fallback == "degrade"
+                else ("resolved" if resolved else "failed")
+            ),
+            resolved=resolved,
+            degraded=(self.fallback == "degrade"),
+            retry_count=self._retry_count,
+            fallback_applied=True,
+            findings=(f"retries exhausted; fallback={self.fallback}",),
+            task_id=task_id,
+        )
 
     async def invoke(
         self,
@@ -106,26 +167,26 @@ class FailureWorker:
         *,
         extra: dict[str, Any] | None = None,
     ) -> RemediationOutcome:
-        """Run the worker's remediation (retry or fallback).
+        """Compatibility shim over ``execute()`` (legacy call shape).
 
-        Base implementation: if can_retry, consume a retry and return
-        resolved=False (caller retries the actual operation). If exhausted,
-        apply the fallback. Workers that need actual logic override this.
+        Prefer ``execute(task, transport)``; this exists so older callers and
+        tests keep working. It synthesises a RETRY-policy task.
         """
-        if self.can_retry():
-            self.consume_retry()
-            return RemediationOutcome(
-                resolved=False,
-                retry_count=self._retry_count,
-                report=self.report(None, detail),
-            )
-        # Retries exhausted; apply fallback
+        task = FailureTask(
+            kind="",
+            failure_class=_DEFAULT_CLASS,
+            severity=_DEFAULT_SEVERITY,
+            remediation=RemediationKind.RETRY,
+            detail=detail,
+            intent=extra,
+        )
+        status = await self.execute(task, None)
         return RemediationOutcome(
-            resolved=self.fallback != "terminate",
-            retry_count=self._retry_count,
-            fallback_applied=True,
-            degraded=(self.fallback == "degrade"),
-            report=self.report(None, f"retries exhausted; fallback={self.fallback}: {detail or ''}"),
+            resolved=status.resolved,
+            retry_count=status.retry_count,
+            fallback_applied=status.fallback_applied,
+            degraded=status.degraded,
+            report=self.report(None, detail),
         )
 
 

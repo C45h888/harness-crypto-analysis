@@ -49,6 +49,7 @@ from market_service.nooa_harness.engine.failure_substrate import (
     FailureSubstrate,
     FailureWorker,
     RemediationOutcome,
+    WorkerStatus,
     default_workers,
     signal_failure,
     worker_for_verdict,
@@ -450,6 +451,163 @@ class TestFailureReport:
         d = r.to_dict()
         assert d["retries_used"] == 1
         json.dumps(d)
+
+
+# ========================================================================
+# 6b — The inversion contract: substrate DISPATCHES, worker OWNS transport
+# ========================================================================
+
+
+class TestInversionContract:
+    """The ownership inversion: FSM=legality, substrate=assess+dispatch,
+    worker=owner of transport."""
+
+    def test_fsm_owns_legality_only(self):
+        # The Failure FSM classifies + routes; it holds no worker and no transport.
+        verdict = FAILURE_FSM.classify("narration_failed")
+        assert not hasattr(verdict, "worker_name")
+        assert not hasattr(verdict, "transport")
+
+    def test_substrate_dispatches_the_worker(self):
+        class Spy(FailureWorker):
+            calls = 0
+
+            async def execute(self, task, transport=None):
+                type(self).calls += 1
+                return WorkerStatus(outcome="resolved", resolved=True, task_id=task.task_id)
+
+        sub = FailureSubstrate(workers={"narration": Spy(name="narration", max_retries=1)})
+        out = asyncio.run(sub.dispatch(FAILURE_FSM.classify("narration_failed")))
+        assert Spy.calls == 1, "the substrate must DISPATCH the worker"
+        assert out.resolved is True
+        assert out.status is not None and out.status.outcome == "resolved"
+        assert out.continue_cycle is True
+
+    def test_degrade_also_dispatches_the_worker(self):
+        # Regression for the old bug where the DEGRADE branch never invoked the worker.
+        class Spy(FailureWorker):
+            calls = 0
+
+            async def execute(self, task, transport=None):
+                type(self).calls += 1
+                return WorkerStatus(outcome="degraded", resolved=True, degraded=True)
+
+        sub = FailureSubstrate(workers={"tool": Spy(name="tool", max_retries=2)})
+        out = asyncio.run(sub.dispatch(FAILURE_FSM.classify("tool_suppressed")))
+        assert Spy.calls == 1
+        assert out.resolved is True and out.continue_cycle is True
+
+    def test_governance_terminate_dispatches_no_worker(self):
+        class Spy(FailureWorker):
+            calls = 0
+
+            async def execute(self, task, transport=None):
+                type(self).calls += 1
+                return WorkerStatus(outcome="resolved", resolved=True)
+
+        sub = FailureSubstrate(workers={"narration": Spy(name="narration", max_retries=1)})
+        out = asyncio.run(sub.dispatch(FAILURE_FSM.classify("parse_failed")))  # PERMANENT
+        assert Spy.calls == 0, "a governance TERMINATE must not dispatch a worker"
+        assert out.terminate_now is True and out.continue_cycle is False
+
+    def test_worker_owns_the_transport(self):
+        """A worker uses the transport to ACT — the substrate injects it."""
+        ran: list[str] = []
+
+        class TransportProbe:
+            async def execute_tool(self, name, args, **kwargs):
+                ran.append(name)
+                return {"value": "mirrored"}, {"capability": name, "result": "ok"}
+
+            async def call_llm(self, prompt):
+                return "{}"
+
+        class MirrorWorker(FailureWorker):
+            async def execute(self, task, transport=None):
+                # The worker OWNS transport while handling the task.
+                result, _log = await transport.execute_tool("calc.depth.average", {})
+                return WorkerStatus(
+                    outcome="resolved", resolved=True,
+                    mirrored=("calc.depth.average",),
+                )
+
+        sub = FailureSubstrate(workers={"narration": MirrorWorker(name="narration", max_retries=1)})
+        out = asyncio.run(sub.dispatch(
+            FAILURE_FSM.classify("narration_failed"),
+            transport=TransportProbe(),
+        ))
+        assert ran == ["calc.depth.average"], "the worker must reach the engine via transport"
+        assert out.status.mirrored == ("calc.depth.average",)
+
+    def test_dispatch_composes_a_task_from_the_verdict(self):
+        sub = FailureSubstrate()
+        out = asyncio.run(sub.dispatch(FAILURE_FSM.classify("narration_failed"), detail="blip"))
+        assert out.verdict.kind == "narration_failed"
+        assert out.continue_cycle is True            # retrying
+        assert out.status.outcome == "retrying"
+
+    def test_continue_cycle_only_false_on_terminate(self):
+        sub = FailureSubstrate()
+        first = asyncio.run(sub.dispatch(FAILURE_FSM.classify("narration_failed")))
+        assert first.continue_cycle is True
+        second = asyncio.run(sub.dispatch(FAILURE_FSM.classify("narration_failed")))
+        assert second.terminate_now is True and second.continue_cycle is False
+
+
+# ========================================================================
+# 6c — Runtime recovery: the narration RETRY re-attempts the call
+# ========================================================================
+
+
+class TestRuntimeRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_recover_narration_call_reattempts_then_escalates(self):
+        """A transport failure retries once (worker budget) then escalates."""
+        from market_service.nooa_harness.engine.core import context as ctx_mod
+
+        attempts = {"n": 0}
+
+        class FlakyEngine:
+            store = postgres = memory = settings = None
+
+            async def _call_llm(self, prompt):
+                attempts["n"] += 1
+                raise RuntimeError("transport blip")
+
+        engine, _store, _pg, _mem, ctx, st = _build_failure_context()
+        engine = FlakyEngine()
+        st.failure_kind = "narration_failed"
+        st.failure_detail = "transport blip"
+
+        raw = await ctx_mod.recover_narration_call(engine, ctx, st, "prompt")
+        assert raw is None
+        assert attempts["n"] == 1, "the substrate's retry budget is 1 → one re-attempt"
+        # Budget exhausted → escalated; the failure kind is LEFT SET for the caller.
+        assert st.failure_kind == "narration_failed"
+        assert st.deterministic_state["failure"]["worker"] == "narration"
+
+    async def test_recover_narration_call_succeeds_on_retry(self):
+        from market_service.nooa_harness.engine.core import context as ctx_mod
+
+        calls = {"n": 0}
+
+        class OnceFlakyEngine:
+            store = postgres = memory = settings = None
+
+            async def _call_llm(self, prompt):
+                calls["n"] += 1
+                # The retry (1 re-attempt) succeeds — the original call already
+                # failed before recover_narration_call was entered.
+                return '{"ok": true}'
+
+        engine, _store, _pg, _mem, ctx, st = _build_failure_context()
+        engine = OnceFlakyEngine()
+        st.failure_kind = "narration_failed"
+        st.failure_detail = "blip"
+
+        raw = await ctx_mod.recover_narration_call(engine, ctx, st, "prompt")
+        assert raw == '{"ok": true}'
+        assert st.failure_kind is None, "recovered → failure state cleared"
+        assert calls["n"] == 1
 
 
 # ------------------------------------------------------------------------

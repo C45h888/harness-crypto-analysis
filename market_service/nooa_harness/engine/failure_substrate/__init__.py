@@ -37,6 +37,7 @@ from ..failure_fsm import (
 )
 
 # --- the mechanical plane ---------------------------------------------------
+from .contracts import FailureTask, FailureTransport, WorkerStatus
 from .report import FailureReport
 from .signal import FailureOutcome, signal_failure
 from .substrate import (
@@ -65,6 +66,10 @@ __all__ = [
     "FailureSeverity",
     "FailureVerdict",
     "RemediationKind",
+    # contracts (the semantic boundary)
+    "FailureTask",
+    "FailureTransport",
+    "WorkerStatus",
     # mechanical plane
     "FAILURE_SUBSTRATE",
     "MAX_RETRIES",

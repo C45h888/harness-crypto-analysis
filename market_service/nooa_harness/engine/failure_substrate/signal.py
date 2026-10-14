@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..failure_fsm import FAILURE_FSM, FailureVerdict
+from .contracts import FailureTask, FailureTransport
 from .substrate import (
     FAILURE_SUBSTRATE,
     FailureOutcome,
@@ -35,22 +36,25 @@ async def signal_failure(
     *,
     retry_count: int = 0,
     is_transient_override: bool | None = None,
-    extra: dict[str, Any] | None = None,
+    transport: FailureTransport | None = None,
     substrate: FailureSubstrate | None = None,
 ) -> FailureOutcome:
-    """Classify + mediate one failure (never raises).
+    """Classify + dispatch one failure (never raises).
 
-    The runtime must check ``outcome.resolved`` / ``outcome.terminate_now``:
-      - ``resolved`` and not ``terminate_now`` -> continue the loop;
-      - ``terminate_now`` -> route to ``run_runtime_failure()`` with
+    The runtime must check ``outcome.terminate_now`` / ``outcome.continue_cycle``:
+      - ``continue_cycle`` -> resume the loop (re-attempt or go on);
+      - ``terminate_now``  -> route to ``run_runtime_failure()`` with
         ``outcome.failure_report`` attached to ``deterministic_state``.
     """
     verdict: FailureVerdict = FAILURE_FSM.classify(
         kind, is_transient_override=is_transient_override,
     )
     target = substrate if substrate is not None else FAILURE_SUBSTRATE
-    return await target.mediate(
-        verdict, detail=detail, retry_count=retry_count, extra=extra,
+    return await target.dispatch(
+        verdict,
+        task=FailureTask.from_verdict(verdict, detail=detail),
+        transport=transport,
+        retry_count=retry_count,
     )
 
 
