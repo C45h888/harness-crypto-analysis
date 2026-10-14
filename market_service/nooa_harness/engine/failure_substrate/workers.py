@@ -191,6 +191,118 @@ class FailureWorker:
 
 
 # ---------------------------------------------------------------------------
+# The deterministic output mirror — the TOOL worker's real body
+# ---------------------------------------------------------------------------
+
+
+class ToolMirrorWorker(FailureWorker):
+    """Deterministic output mirror for tool failures (the tool worker's body).
+
+    When the LLM emitted a tool call that could not be dispatched (malformed
+    shape) or whose execution raised, this worker MIRRORS the intent: it hands
+    the salvaged calls back through the transport's AUTHORIZED dispatch seam, so
+    they run through the SAME gate chain as a normal dispatch (budget, cadence,
+    position, FSM work authorization, redundancy) and end at the controller's
+    ``record_outcome``. The output is therefore byte-identical to a real dispatch.
+
+    It is deterministic — no LLM in the loop — so there is no concurrency wait;
+    it is a bounded straight-line repair.
+
+    Boundary: the worker owns the transport while it handles the task, but it
+    NEVER writes the controller and NEVER bypasses the gates (it calls
+    ``transport.dispatch_tool``, which re-enters the authorized path).
+    """
+
+    #: Only mirror on retry/fallback; degrade/terminate must not re-run tools.
+    _MIRRORABLE = (RemediationKind.RETRY, RemediationKind.FALLBACK)
+
+    async def execute(
+        self,
+        task: FailureTask,
+        transport: FailureTransport | None = None,
+    ) -> WorkerStatus:
+        task_id = task.task_id if task is not None else ""
+
+        # Honour the governance policy: only RETRY/FALLBACK mirror.
+        if task is not None and task.remediation is RemediationKind.DEGRADE:
+            return WorkerStatus(
+                outcome="degraded", resolved=True, degraded=True,
+                findings=("degrade policy: no mirror",), task_id=task_id,
+            )
+        if task is not None and task.remediation not in self._MIRRORABLE:
+            return WorkerStatus(
+                outcome="failed", resolved=False,
+                findings=("non-mirrorable remediation",), task_id=task_id,
+            )
+
+        calls = _salvage_tool_calls(task.intent if task is not None else None)
+        if not calls:
+            return WorkerStatus(
+                outcome="failed", resolved=False,
+                findings=("nothing salvageable to mirror",), task_id=task_id,
+            )
+        if transport is None or not hasattr(transport, "dispatch_tool"):
+            return WorkerStatus(
+                outcome="failed", resolved=False,
+                findings=("no authorized dispatch seam on the transport",),
+                task_id=task_id,
+            )
+
+        names = tuple(str(c.get("name")) for c in calls)
+        try:
+            # The worker OWNS the transport; the call runs AUTHORIZED.
+            ran = await transport.dispatch_tool(calls)
+        except Exception as exc:  # never let the mirror itself kill the cycle
+            return WorkerStatus(
+                outcome="failed", resolved=False,
+                mirrored=names,
+                findings=(f"mirror failed: {type(exc).__name__}: {exc}",),
+                task_id=task_id,
+            )
+        ran_set = set(ran or ())
+        if not ran_set:
+            return WorkerStatus(
+                outcome="failed", resolved=False, mirrored=names,
+                findings=(
+                    "mirror dispatched nothing (gate or budget refused the call)",
+                ),
+                task_id=task_id,
+            )
+        return WorkerStatus(
+            outcome="resolved", resolved=True, mirrored=tuple(sorted(ran_set)),
+            findings=(f"mirrored {len(ran_set)} intended call(s)",),
+            report={"mirrored": sorted(ran_set)},
+            task_id=task_id,
+        )
+
+
+def _salvage_tool_calls(intent: Any) -> list[dict[str, Any]]:
+    """Extract dispatchable calls from a snapshot intent (name required).
+
+    A call is salvageable when it carries a NAME; its args are coerced to a dict
+    (a non-dict args value becomes empty args). Entries with no usable name are
+    dropped — there is nothing to mirror.
+    """
+    if not isinstance(intent, dict):
+        return []
+    raw = intent.get("tool_calls")
+    if not isinstance(raw, list):
+        return []
+    salvaged: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or entry.get("tool") or "").strip()
+        if not name:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        salvaged.append({"name": name, "args": dict(args)})
+    return salvaged
+
+
+# ---------------------------------------------------------------------------
 # Registry — one worker per failure substrate
 # ---------------------------------------------------------------------------
 
@@ -201,7 +313,8 @@ FAILURE_WORKER_REGISTRY: dict[str, FailureWorker] = {
         fallback="json",        # fallback: accept raw JSON from LLM
         cooldown_ms=5000,
     ),
-    "tool": FailureWorker(
+    # The TOOL worker has a real body: the deterministic output mirror.
+    "tool": ToolMirrorWorker(
         name="tool",
         max_retries=2,
         fallback="skip",         # fallback: skip the tool, record finding
@@ -252,7 +365,7 @@ def default_workers() -> dict[str, FailureWorker]:
     template the factory copies from.
     """
     return {
-        name: FailureWorker(
+        name: type(worker)(
             name=worker.name,
             max_retries=worker.max_retries,
             fallback=worker.fallback,
@@ -266,5 +379,6 @@ __all__ = [
     "FAILURE_WORKER_REGISTRY",
     "FailureWorker",
     "RemediationOutcome",
+    "ToolMirrorWorker",
     "default_workers",
 ]

@@ -103,6 +103,7 @@ class FailureKind(str, Enum):
     # --- substrate-routed kinds (default terminal INFRA_FAILED) ---
     TOOL_DENIED = "tool_denied"
     TOOL_ERROR = "tool_error"
+    TOOL_PARSE_FAILED = "tool_parse_failed"
     TOOL_SUPPRESSED = "tool_suppressed"
     DISPATCH_FAILED = "dispatch_failed"
     MEMORY_FAILED = "memory_failed"
@@ -139,6 +140,7 @@ FAILURE_CLASSIFICATION: dict[str, tuple[FailureClass, FailureSeverity]] = {
     # tool
     FailureKind.TOOL_DENIED.value: (FailureClass.TOOL, FailureSeverity.PERMANENT),
     FailureKind.TOOL_ERROR.value: (FailureClass.TOOL, FailureSeverity.TRANSIENT),
+    FailureKind.TOOL_PARSE_FAILED.value: (FailureClass.TOOL, FailureSeverity.TRANSIENT),
     FailureKind.TOOL_SUPPRESSED.value: (FailureClass.TOOL, FailureSeverity.DEGRADED),
     # validation
     FailureKind.VALIDATION_FAILED.value: (FailureClass.VALIDATION, FailureSeverity.PERMANENT),

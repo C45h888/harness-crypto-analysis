@@ -47,8 +47,10 @@ from market_service.nooa_harness.engine.failure_substrate import (
     WORKER_FOR_KIND,
     FailureReport,
     FailureSubstrate,
+    FailureTask,
     FailureWorker,
     RemediationOutcome,
+    ToolMirrorWorker,
     WorkerStatus,
     default_workers,
     signal_failure,
@@ -608,6 +610,125 @@ class TestRuntimeRecovery(unittest.IsolatedAsyncioTestCase):
         assert raw == '{"ok": true}'
         assert st.failure_kind is None, "recovered → failure state cleared"
         assert calls["n"] == 1
+
+
+# ========================================================================
+# 6d — The deterministic output mirror (the tool worker's body)
+# ========================================================================
+
+
+def _tool_task(remediation=RemediationKind.RETRY, intent=None, kind="tool_parse_failed"):
+    return FailureTask(
+        kind=kind, failure_class=FailureClass.TOOL,
+        severity=FailureSeverity.TRANSIENT, remediation=remediation,
+        intent=intent,
+    )
+
+
+class TestToolMirror:
+    def test_tool_worker_is_the_mirror(self):
+        assert isinstance(FAILURE_WORKER_REGISTRY["tool"], ToolMirrorWorker)
+        assert isinstance(default_workers()["tool"], ToolMirrorWorker)
+
+    def test_classification_and_kind_routing(self):
+        v = FAILURE_FSM.classify("tool_parse_failed")
+        assert v.failure_class is FailureClass.TOOL
+        assert v.severity is FailureSeverity.TRANSIENT
+        assert v.remediation is RemediationKind.RETRY
+        assert WORKER_FOR_KIND["tool_parse_failed"] == "tool"
+
+    def test_mirror_dispatches_salvaged_calls_through_the_authorized_seam(self):
+        ran: list[str] = []
+
+        class T:
+            async def dispatch_tool(self, calls, **kw):
+                ran.extend(c["name"] for c in calls)
+                return {c["name"] for c in calls}
+
+        w = ToolMirrorWorker(name="tool", max_retries=2)
+        task = _tool_task(intent={"tool_calls": [
+            {"name": "calc.depth.average", "args": "oops-not-an-object"},
+        ]})
+        status = asyncio.run(w.execute(task, T()))
+        assert ran == ["calc.depth.average"], "the mirror runs the intended call"
+        assert status.outcome == "resolved" and status.resolved is True
+        assert status.mirrored == ("calc.depth.average",)
+
+    def test_mirror_without_a_name_is_unsalvageable(self):
+        w = ToolMirrorWorker(name="tool", max_retries=2)
+        status = asyncio.run(w.execute(_tool_task(intent={"tool_calls": [{"args": {}}]}), None))
+        assert status.outcome == "failed" and status.resolved is False
+
+    def test_mirror_honours_degrade_policy(self):
+        w = ToolMirrorWorker(name="tool", max_retries=2)
+        task = _tool_task(
+            remediation=RemediationKind.DEGRADE, kind="tool_suppressed",
+        )
+        status = asyncio.run(w.execute(task, None))
+        assert status.outcome == "degraded" and status.resolved is True
+
+    def test_mirror_reports_failed_when_the_gate_refuses_everything(self):
+        class T:
+            async def dispatch_tool(self, calls, **kw):
+                return set()
+
+        w = ToolMirrorWorker(name="tool", max_retries=2)
+        task = _tool_task(intent={"tool_calls": [{"name": "calc.depth.average", "args": {}}]})
+        status = asyncio.run(w.execute(task, T()))
+        assert status.outcome == "failed"
+        assert "gate or budget" in " ".join(status.findings)
+
+    def test_mirror_needs_a_transport_with_the_seam(self):
+        class NoSeam:
+            pass
+
+        w = ToolMirrorWorker(name="tool", max_retries=2)
+        task = _tool_task(intent={"tool_calls": [{"name": "calc.depth.average", "args": {}}]})
+        status = asyncio.run(w.execute(task, NoSeam()))
+        assert status.outcome == "failed"
+
+
+# ========================================================================
+# 6e — The transport's authorized seam (what the mirror rides)
+# ========================================================================
+
+
+class TestTransportSeam(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_tool_reenters_the_authorized_path(self):
+        from market_service.nooa_harness.engine.core.context import _EngineTransport
+
+        seen = {}
+
+        class Eng:
+            async def _dispatch_turn(self, ctx, st):
+                seen["calls"] = list(st.parsed_current.get("tool_calls"))
+                st._round_results = {"calc.depth.average": {"v": 1}}
+
+        class St:
+            parsed_current = {"tool_calls": [{"name": "original"}]}
+
+        st = St()
+        t = _EngineTransport(Eng(), ctx=None, st=st)
+        ran = await t.dispatch_tool([{"name": "calc.depth.average", "args": {}}])
+        # It re-entered the engine's dispatch with the mirrored calls…
+        assert seen["calls"] == [{"name": "calc.depth.average", "args": {}}]
+        # …and reported exactly the names that produced a result.
+        assert ran == {"calc.depth.average"}
+        # …and the original turn was restored afterwards.
+        assert st.parsed_current == {"tool_calls": [{"name": "original"}]}
+
+    async def test_dispatch_tool_does_not_recurse_while_mirroring(self):
+        from market_service.nooa_harness.engine.core.context import _EngineTransport
+
+        class Eng:
+            async def _dispatch_turn(self, ctx, st):  # pragma: no cover
+                raise AssertionError("must not re-enter while mirroring")
+
+        class St:
+            _mirroring = True
+
+        t = _EngineTransport(Eng(), ctx=None, st=St())
+        assert await t.dispatch_tool([{"name": "calc.depth.average", "args": {}}]) == set()
 
 
 # ------------------------------------------------------------------------

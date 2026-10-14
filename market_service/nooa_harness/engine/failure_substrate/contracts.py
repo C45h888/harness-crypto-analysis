@@ -112,10 +112,22 @@ class FailureTransport(Protocol):
     the worker never constructs one, and the FSM never sees one.
     """
 
+    async def dispatch_tool(
+        self, calls: list[dict[str, Any]], **kwargs: Any,
+    ) -> Any:
+        """Re-dispatch tool calls through the AUTHORIZED path.
+
+        This is the mirror's seam: it runs the calls through the SAME gate chain
+        a normal dispatch uses (budget, cadence, position, FSM work
+        authorization, redundancy) so the cycle's outcome ledger records them.
+        A worker must use THIS, never a raw executor, so the FSM stays the law.
+        """
+        ...
+
     async def execute_tool(
         self, name: str, args: dict[str, Any], **kwargs: Any,
     ) -> tuple[Any, dict[str, Any]]:
-        """Run one tool deterministically — the SAME executor the loop uses."""
+        """Run one tool directly — for remediation that is NOT a re-dispatch."""
         ...
 
     async def call_llm(self, prompt: str) -> str:

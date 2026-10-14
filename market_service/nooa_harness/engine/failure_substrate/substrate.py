@@ -62,6 +62,7 @@ WORKER_FOR_KIND: dict[str, str] = {
     "parse_failed": "narration",
     "tool_denied": "tool",
     "tool_error": "tool",
+    "tool_parse_failed": "tool",
     "tool_suppressed": "tool",
     "validation_failed": "validation",
     "budget_exhausted": "dispatch",

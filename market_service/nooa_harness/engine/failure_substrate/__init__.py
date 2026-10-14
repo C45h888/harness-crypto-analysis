@@ -51,6 +51,7 @@ from .workers import (
     FAILURE_WORKER_REGISTRY,
     FailureWorker,
     RemediationOutcome,
+    ToolMirrorWorker,
     default_workers,
 )
 
@@ -79,6 +80,7 @@ __all__ = [
     "FailureReport",
     "FailureWorker",
     "RemediationOutcome",
+    "ToolMirrorWorker",
     "FAILURE_WORKER_REGISTRY",
     "default_workers",
     "signal_failure",
