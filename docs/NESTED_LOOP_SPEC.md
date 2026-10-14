@@ -521,3 +521,52 @@ The gate does **not** yet consume the receipt vector, and `run_output`'s
 recorded but semantically inert, so characterization parity held. The
 **agent-side memory node surface (call + write) is the next change surface**,
 not an engine projection.
+
+---
+
+## 11. Agent memory surface — B1 tools + B2 skill (landed)
+
+The agent now CALLS and WRITES its own memory in flight. Full suite green at
+record time; `tests/test_agent_memory.py` pins the surface.
+
+### 11.1 The partition, now complete by OWNER
+
+| Half | Owner | Where |
+|---|---|---|
+| **Engine memory** | engine | central ledger `deterministic_state["ledger"]` + durable artifact ledger + `loop_receipts` |
+| **Agent memory** | agent | the memory node, written/read by the agent via `memory.*` |
+
+The engine never writes the agent's memory; the agent never writes the
+ledger. This is the boundary §10.3 described, now implemented.
+
+### 11.2 What was instantiated
+
+* `nooa_harness/memory_skill.py` (**B2**) — `MemorySkill`, bound to `(session_id,
+  segment)`. `remember` / `recall` / `forget` / `stats` / `render`.
+  - kind hygiene: `observation | hypothesis | note` are agent-writable; `fact`
+    and the engine carry kinds are refused.
+  - segment pinned to the skill's — a caller can never redirect a write.
+  - bounded content; explicit empty results when no store is configured.
+  - **no engine disposition**: the write lands as the agent made it.
+* **B1 tools** — `memory.remember`, `memory.recall`, `memory.forget`,
+  `memory.stats` in the registry, dispatching through the B2 skill.
+  - **phase-less**: a memory write is never coverage credit.
+  - homed across every legal `(loop, sub-loop)` so they are usable in flight;
+    the FSM still adjudicates the live observation.
+  - `execute_tool` now carries `session_id` / `segment` from the engine so the
+    skill is bound to the cycle's task segment.
+
+### 11.3 Doctrine
+
+`docs/nooa-kb/behavior/memory-protocol.md` — compiled into the system prompt —
+was rewritten to own the new surface: the agent writes directly, memory is
+context (never evidence), zero writes is a valid answer.
+
+### 11.4 Still open
+
+* The engine-observable `memory_proposals` proposal path should be retired so
+  there is exactly ONE agent write path (currently both exist).
+* `ValidMemoryKinds` still lists the engine carry kinds, which the engine no
+  longer writes (P1 moved them to the ledger); migration
+  `0015_agent_memory_carry_kinds.py` is consequently unnecessary.
+* B3 (a real NOOA Agent host) is recorded in `docs/B3_NOOA_HOST_VECTORS.md`.

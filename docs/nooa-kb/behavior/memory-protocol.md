@@ -1,71 +1,57 @@
 # Inference Engine — Memory Protocol
 
-The engine's memory is two-layered. Numbers are facts; prose is episodic.
-The LLM narrating a cycle never writes memory directly — it PROPOSES, and
-deterministic engine code DISPOSES. This protocol is compiled into the
-narration prompt every cycle.
+The engine's memory is split by **OWNER**, not by layer. Numbers are facts;
+prose is episodic. You own the episodic half — and you write it yourself.
 
-## Layer 1 — numeric feature store (deterministic, not recallable prose)
+## Layer 1 — deterministic engine memory (NOT yours)
 
-Prior InferenceArtifacts and MicrostructureEvidence are retrieved BY KEY
-(symbol, venue, time-window, status) via the durable ledger — never by
-similarity, never embedded as vectors. The engine loads prior block fits
-mechanically (they feed depth scaling); the LLM sees them already resolved
-inside `deterministic_state`. You never need to "remember" a coefficient —
-it is either in front of you or you dispatch `micro.fit_beta`.
+Engine memory is the CENTRAL LEDGER plus the durable artifact ledger:
 
-## Layer 2 — episodic memory (MemoryNode)
+- `deterministic_state` — this cycle's frozen facts and verdicts, including the
+  engine ledger (`understanding`, `plan`, `handoff`, `observation`).
+- prior `InferenceArtifact` rows — retrieved **by key** (symbol, venue, window,
+  status), never by similarity, never embedded as vectors.
+- loop receipts (`loop_receipts`) — canonical traversal records.
 
-Session: `inference-engine-{SYMBOL}-{venue}`. The engine recalls up to 12 of
-its own prior memories at cycle start (keyword-scored, importance-weighted,
-budgeted 8k context block) and renders them as provenance-tagged priors:
+You READ these as context. You never write them, and you never need to
+"remember" a coefficient — it is either in front of you or you dispatch
+`micro.fit_beta`.
 
-    [observation#ab12cd34] beta flipped negative during gap recovery
+## Layer 2 — your own memory (the memory node)
 
-Memory is CONTEXT, not evidence: fresh ledger data always outranks recalled
-conclusions. If your current narration contradicts a recalled prior, say so
-explicitly and explain what changed — the deterministic diff vs the prior
-artifact is already computed for you.
+Session `inference-engine-{SYMBOL}-{venue}`, segmented by this cycle's task.
+It is YOURS: you write it and you read it, in flight, through the `memory.*`
+tools — from any loop you are actually working in.
 
-## What you may propose (≤ 3 per cycle)
+    memory.remember  {kind, content, importance?, tags?, evidence_refs?, title?}
+    memory.recall    {kind?, query?, limit?}
+    memory.forget    {memory_id}
+    memory.stats     {}
 
-- `observation` — the cycle's headline inference (what the fits show NOW).
-- `hypothesis` — only when fit status or β sign CHANGED vs the prior
-  artifact; state what you think changed and why (e.g. regime shift,
-  capture quality).
+- You may write kinds `observation`, `hypothesis`, `note`. `fact` is reserved
+  for deterministic paper truth and is refused.
+- There is **no proposal queue and no admission gate** — the engine does not
+  dispose your writes. Structural hygiene only: kind, size, and the task
+  segment (your writes can never land in another task's partition).
+- A memory write is never coverage credit. It does not advance a phase.
 
-## What you must never propose
+Memory is CONTEXT, never evidence: fresh ledger data always outranks your own
+recalled conclusions.
 
-- `fact` — reserved for deterministic code (fit completions). LLM-proposed
-  facts are rejected.
-- Duplicates of an existing observation for the same window (dedupe key:
-  symbol + kind + window tag).
-- Restatements of ledger numbers as memory — numbers live in the ledger.
+## What is worth writing
 
-## Proposal format (inside your narration JSON)
-
-    "memory_proposals": [
-      {"kind": "observation", "content": "...", "importance": 5.0,
-       "tags": ["beta", "btcusdt-spot-30m"]}
-    ]
-
-The engine resolves each proposal: dedupe → supersede (an UPDATE of a prior
-conclusion tombstones the old one and adds the new — the audit trail keeps
-both) → importance clamped. Dispositions are logged on the artifact.
-
-## Decay and supersession
-
-- Episodic observations decay in recall (age + importance weighting).
-- On a β-sign flip or regime change, the new observation supersedes the old
-  regime-keyed conclusions; superseded memories still render with an
-  explicit "superseded" marker — history is never silently erased.
-- Deterministic fit artifacts never decay — they are ledger facts.
+Write only when a conclusion will steer a **later** cycle: a settled reading, a
+refuted hypothesis, a durable caveat, a watching brief for the next wake. One
+sentence, anchored to the evidence path you cite. No narration, no uncomputed
+numbers, no restating the prompt. **Zero writes is the correct answer** when
+nothing will matter later.
 
 ## Anti-patterns
 
-1. Echo-chamber: citing your own prior conclusions as if they were current
+1. **Echo-chamber** — citing your own prior notes as if they were current
    evidence. Memory supplies context; the ledger supplies truth.
-2. Memory bloat: proposing more than needed. If nothing material changed
-   vs the prior cycle, propose nothing — silence is valid.
-3. Stale-regime pollution: never re-assert a pre-flip conclusion without
-   noting the supersession.
+2. **Memory bloat** — writing more than you need. Silence is valid.
+3. **Stale-regime pollution** — never re-assert a pre-flip conclusion without
+   noting that it changed.
+4. **Writing `fact`, or aiming at another task's segment** — both are refused,
+   and a refusal is a finding, not a failure.
