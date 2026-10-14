@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Mapping
 
 from market_service.runtime.contracts import InferenceArtifact, WakeEnvelope
 from market_service.runtime.postgres_store import PostgresRuntimeStore
@@ -56,6 +56,7 @@ from .chain import (
 from ..principles import evaluate_principles, render_findings
 from ..gates import evaluate_budget_gate
 from ..cadence import INTERVAL_SECONDS, WINDOW_MINUTES
+from ..ledger import ledger_rows, render_ledger
 
 
 def _cadence_arg_refusals(canonical: str, args: dict[str, Any]) -> list[str]:
@@ -113,7 +114,6 @@ from ..config import (
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
     MEMORY_CONTEXT_BUDGET,
-    MEMORY_RECALL_LIMIT,
     MAX_MEMORY_PROPOSALS,
     _PRIOR_HEADLINE_MAX_CHARS,
 )
@@ -229,30 +229,39 @@ class InferenceEngine:
     async def _recall_memory(
         self, *, segment: str | None = None,
     ) -> tuple[list[Any], str]:
-        """Recall the engine's own prior conclusions, rendered as a block.
+        """Read the engine's own prior CENTRAL LEDGER as a context block.
 
-        ``segment`` scopes recall to one task segment (state redistribution);
-        ``None`` keeps legacy unsegmented recall.
+        The central ledger is the ONE home for engine memory. Cross-cycle, the
+        prior artifact carries it; this reads it by key (symbol/venue), never by
+        similarity or scoring. Returns ``(rows, rendered block)``.
         """
-        if self.memory is None:
+        prior = None
+        if self.postgres is not None:
+            try:
+                prior = await self.postgres.read_inference_artifact(self.symbol)
+            except Exception:  # noqa: BLE001 — ledger read must never kill the cycle
+                prior = None
+        if prior is None:
+            try:
+                prior = await self.store.read_latest_inference_artifact(
+                    self.symbol, self.venue,
+                )
+            except Exception:  # noqa: BLE001
+                prior = None
+        if prior is None:
             return [], ""
-        try:
-            query = f"{self.symbol} beta fit regime capture"
-            memories = await self.memory.recall(
-                self.session_id, query=query, segment=segment,
-                limit=MEMORY_RECALL_LIMIT,
-            )
-        except Exception:
-            log.exception("memory recall failed; continuing without memory")
+        if isinstance(prior, Mapping):
+            ds = prior.get("deterministic_state")
+        else:
+            ds = getattr(prior, "deterministic_state", None)
+        if not isinstance(ds, Mapping):
             return [], ""
-        block = ""
-        try:
-            block = self.memory.render_context_block(
-                memories, budget=MEMORY_CONTEXT_BUDGET,
-            )
-        except Exception:
-            log.exception("memory render failed; continuing without block")
-        return memories, block
+        rows = ledger_rows(ds, segment=segment)
+        if not rows:
+            return [], ""
+        return rows, render_ledger(
+            ds, segment=segment, budget=MEMORY_CONTEXT_BUDGET,
+        )
 
     async def _prior_change_note(self) -> str:
         """Deterministic self-consistency diff vs the prior artifact."""
@@ -432,6 +441,33 @@ class InferenceEngine:
                         st.unexecuted.append(raw_name)
                     round_results[canonical] = None
                     continue
+            # Phase 1 (staged ANALYSIS): DATA-READY preconditions gate the
+            # refined stack PRE-DISPATCH (after position: a later-position
+            # call stays out_of_position, never premature — position owns
+            # the track, data owns readiness within it). A premature refined
+            # call becomes a tool.premature finding: named needs, never
+            # executed, never burning a tool round, controller NOT_CALLED.
+            if st.loop_tag == "reasoning":
+                try:
+                    from .chain import check_tool_preconditions as _check_pre
+                    _pre_ok, _pre_needs = _check_pre(
+                        canonical, st.accumulated_tool_results)
+                except Exception:
+                    _pre_ok, _pre_needs = True, []
+                if not _pre_ok:
+                    pre_log = capability_log_entry(
+                        f"tool.premature:{canonical}",
+                        {"symbol": self.symbol, "venue": self.venue},
+                        "denied",
+                        detail={"reason": "data_not_ready",
+                                "needs": list(_pre_needs)},
+                    )
+                    st.dispatched_in_pass += 1
+                    st.capability_log.append(pre_log)
+                    if raw_name and raw_name not in st.unexecuted:
+                        st.unexecuted.append(raw_name)
+                    round_results[canonical] = None
+                    continue
             # Phase S-1 (docs/STATE_CHARTER_SPEC.md): ONE crosswalk in the
             # loop-identity owner (loop_states.LOOP_TAG_CROSSWALK) resolves
             # the runtime loop tag to its FSM (NestedLoop, SubLoop)
@@ -554,6 +590,45 @@ class InferenceEngine:
                 canonical, tool_log, result,
                 raw_name=raw_name, args=args,
             )
+            # Digest-fallback (failure substrate, bounded once per cycle):
+            # a failed 2b forecast call reveals the receipt digest SUMMARY
+            # (Y_pred/regime/status only — never the full payload) so the
+            # reformulation has numbers to aim at. Proof still requires a
+            # successful agent re-call; the digest never satisfies the chain.
+            if (st.loop_tag == "reasoning"
+                    and canonical == "calc.forward.forecast"
+                    and not getattr(st, "digest_revealed", False)):
+                _failed = (result is None) or (tool_log.get("result") != "ok")
+                try:
+                    _det = tool_log.get("detail")
+                    _failed = _failed or (isinstance(_det, dict)
+                                           and _det.get("status") == "refused")
+                except Exception:
+                    pass
+                if _failed:
+                    try:
+                        _digest = (st.deterministic_state.get("forecast_result")
+                                 if isinstance(st.deterministic_state, dict) else None)
+                        if isinstance(_digest, dict):
+                            _ft = _digest.get("forward_target") or {}
+                            _fb = {
+                                "y_pred": _ft.get("y_pred") if isinstance(_ft, dict) else None,
+                                "validation_state": _digest.get("validation_state"),
+                                "note": ("receipt digest fallback (bounded once): reform "
+                                         "calc.forward.forecast with different args; "
+                                         "this summary is not proof"),
+                            }
+                            st.accumulated_tool_results["forecast.digest_fallback"] = _fb
+                            st.capability_log.append(capability_log_entry(
+                                "engine.forecast.digest_fallback",
+                                {"symbol": self.symbol, "venue": self.venue},
+                                "ok",
+                                detail={"bounded": "once_per_cycle",
+                                        "y_pred": _fb["y_pred"]},
+                            ))
+                    except Exception:
+                        pass
+                    st.digest_revealed = True
             if result is None:
                 result_payload = None
             else:
@@ -616,6 +691,23 @@ class InferenceEngine:
                     f"\nREASONING POSITION {st.reason_position + 1}/3: "
                     f"{active_position}\n{position_steer(pstat)}\n"
                 )
+                # Slice B: hypothesize renders the deterministic H0/H1
+                # frame (prompt variable × actual data) so the LLM's
+                # hypothesis stays in line with the distribution it got.
+                if active_position == "hypothesize":
+                    try:
+                        from .chain import build_hypothesis_frame as _bhf
+                        from .chain import hypothesis_steer as _hs
+                        _frame = _bhf(
+                            ctx.task,
+                            st.task_directive
+                            if isinstance(getattr(st, "task_directive", None), dict)
+                            else (st.task_plan or {}).get("directive"),
+                            st.accumulated_tool_results,
+                        )
+                        chain_block += f"\n{_hs(_frame)}\n"
+                    except Exception:
+                        pass
         # Principles (advisory guard, never denials): the frozen plan + the
         # just-dispatched turn render as steer findings on every follow-up.
         _pfindings = evaluate_principles(
@@ -627,6 +719,28 @@ class InferenceEngine:
         # Compose the follow-up prompt via the prompt-ecosystem composer so
         # follow-up layout stays in lock-step with the narrate-1 and repair
         # composers.
+        # Reasoning first stages refer to the partition writes: the entry
+        # block rides the early reasoning passes (position 0 / first two
+        # passes) so agents act on what previous sub-loops concluded.
+        # Phase 2: ids persist for ALL reasoning passes (full block early
+        # only) so 2b still cites 2a/partition conclusions without repaying
+        # the full-text budget.
+        _entry_block = ""
+        if st.loop_tag == "reasoning":
+            _entry_block = getattr(st, "reasoning_memory_block", "") or ""
+            if st.passes_per_loop.get("reasoning", 0) > 1:
+                _entry_block = ""
+            _stage_ids = list(getattr(st, "analysis_memory_ids", 
+) or [])
+            _entry_ids = list(getattr(st, "reasoning_memory_ids", 
+) or [])
+            _all_ids = [i for i in (_entry_ids + _stage_ids) if i]
+            if not _entry_block and _all_ids:
+                _entry_block = (
+                    "Prior stage conclusions (cite these ids; full text "
+                    "was shown on early passes): "
+                    + ", ".join(_all_ids)
+                )
         user_prompt_next = kb.compose_followup_prompt(
             controller=st.controller,
             loop=("context" if st.loop_tag == "evidence" else st.loop_tag),
@@ -644,15 +758,26 @@ class InferenceEngine:
             phase_guidance=st.phase_guidance,
             next_phase=next_phase,
             chain_block=chain_block,
+            reasoning_entry_block=_entry_block,
         )
         try:
             raw_next = await self._call_llm(user_prompt_next)
             context.record_tier(st)
         except Exception as exc:
-            log.exception("pass narration round failed; ending loop early")
+            log.exception("pass narration round failed; dispatching to the failure node")
             st.failure_kind = "narration_failed"
             st.failure_detail = f"{type(exc).__name__}: {exc}"
-            return None
+            # Bounded RETRY remediation: the substrate dispatches the narration
+            # worker, which re-attempts the LLM call (the worker owns transport).
+            # On escalation the failure kind stays set, so the caller's existing
+            # `if st.failure_kind: return run_runtime_failure(...)` writes the
+            # terminal exactly once.
+            raw_next = await context.recover_narration_call(
+                self, ctx, st, user_prompt_next,
+            )
+            if raw_next is None:
+                return None
+            context.record_tier(st)
         st.llm_calls += 1
         st.passes_per_loop[st.loop_tag] = st.passes_per_loop.get(st.loop_tag, 0) + 1
         parsed_next = coerce_turn(extract_json_object(raw_next))
@@ -734,7 +859,11 @@ class InferenceEngine:
     async def _remember(
         self, accepted: list[dict[str, Any]], run_meta: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Persist accepted proposals through MemoryNode (engine disposes)."""
+        """Persist accepted proposals through MemoryNode (engine disposes).
+
+        Task-segment isolation: proposals carry the cycle's task segment so
+        plan/handoff carry never bleeds across tasks (state redistribution).
+        """
         written: list[dict[str, Any]] = []
         if self.memory is None:
             return written
@@ -748,6 +877,7 @@ class InferenceEngine:
                     importance=proposal["importance"],
                     tags=proposal["tags"],
                     evidence_refs=(run_meta.get("artifact_id"),),
+                    segment=run_meta.get("segment"),
                 )
                 written.append({"memory_id": memory.memory_id,
                                 "kind": memory.kind})

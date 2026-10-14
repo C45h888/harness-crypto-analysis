@@ -227,9 +227,15 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     "congruence", "failure", "failure_report", "terminal",
     "loop_traversal", "validation_issue", "understanding_receipt",
     "statistical_chain", "governance_trace",
+    # canonical loop-receipt vector (engine/receipts.py; the canonical half of
+    # the receipt/note partition — see docs/NESTED_LOOP_SPEC §8)
+    "loop_receipts",
+    # central engine ledger (engine/ledger.py) — the ONE deterministic home
+    # for engine-authored memory, sectioned by LedgerKind
+    "ledger",
     # re-ordered cycle roots (comprehension/acquisition plane)
     "data_quality", "seeded_plan", "plan_gate", "persistence",
-    "narration_tiers",
+    "narration_tiers", "base_summary",
 })
 
 
@@ -254,6 +260,12 @@ class CycleRuntimeState:
     validation_retries_used: int = 0
     validation_entered: bool = False
     opened_subs: set[str] = field(default_factory=set)
+    # Loop receipts (canonical, engine-authored): one close record per
+    # loop/sub-loop, mirrored into the chartered
+    # ``deterministic_state["loop_receipts"]`` root by
+    # ``engine.receipts.emit_receipt``. Receipts are authoritative structural
+    # facts and carry no model prose (the agent's memory node is separate).
+    loop_receipts: list[Any] = field(default_factory=list)
     passes_per_loop: dict[str, int] = field(default_factory=lambda: {
         "comprehension": 0, "evidence": 0, "reasoning": 0,
         "validation": 0, "output": 0,
@@ -264,6 +276,31 @@ class CycleRuntimeState:
     task_reminder: str = ""
     scenario_reminder: str = ""
     phase_guidance: dict[str, str] = field(default_factory=dict)
+    # Prompt-scope blocks (chartered carrier fields — never ad-hoc attrs).
+    # Normalized once in run_wake / run_comprehension; loops read these.
+    task_block: str = ""
+    scenario_block: str = ""
+    wake_block: str = ""
+    workflow_block: str = ""
+    memory_block: str = ""
+    prior_note: str = ""
+    # Reasoning-entry partition context (first semantic of REASONING).
+    # Recalled at REASONING entry from the task-segment partition writes
+    # (understanding + plan + handoff) so the first passes reason over
+    # what previous sub-loops/nested loops concluded, never from scratch.
+    reasoning_memory_block: str = ""
+    reasoning_memory_ids: list[str] = field(default_factory=list)
+    # Phase 0 (staged ANALYSIS): frozen 2a exit payload + inter-stage
+    # memory carry. base_summary is frozen at assemble close from
+    # accumulated_tool_results (chain.base_summary); analysis_memory_ids
+    # cites the base/refined observation writes threaded through the
+    # task segment so 2b reasons over 2a conclusions, never from scratch.
+    base_summary: dict[str, Any] = field(default_factory=dict)
+    analysis_memory_ids: list[str] = field(default_factory=list)
+    # Digest-fallback bound (failure substrate): the plan-bound forecast
+    # digest is revealed to the agent at most ONCE per cycle, and only
+    # after an agent forecast call failed in 2b. Guards double-see.
+    digest_revealed: bool = False
     comprehension: dict[str, Any] | None = None
     seed_plan: dict[str, Any] | None = None
     task_workflow: dict[str, Any] | None = None
@@ -365,6 +402,10 @@ def freeze_chain(
         },
         "reason_position": st.reason_position,
         "chain_halt": st.chain_halt,
+        # Slice D: base pointer — the halt/retry reader gets base + position
+        # in one snapshot instead of joining two roots.
+        "base_summary": dict(getattr(st, "base_summary", {}) or {}),
+        "stage_ids": list(getattr(st, "analysis_memory_ids", []) or []),
     }
 
 
@@ -389,32 +430,53 @@ def failure_substrate_for(st: CycleRuntimeState) -> Any:
     return sub
 
 
-async def signal_and_route_failure(
-    engine: Any, ctx: Any, st: CycleRuntimeState,
-) -> tuple[Any, dict[str, Any]] | None:
-    """The canonical failure NODE entry: Failure FSM -> substrate -> worker.
+class _EngineTransport:
+    """The capability handle a worker OWNS while it handles a task.
 
-    Layer 1 (governance): ``FAILURE_FSM`` classifies the kind and decides
-    the policy + terminal. Layer 2 (mechanics): the per-cycle substrate
-    coordinates the bounded worker. When remediation resolves the failure
-    the loop continues; when it terminates, the failure routes through the
-    main FSM's ``CYCLE_FAILED`` intake edge to the delegated terminal.
+    Deliberately thin: it exposes ONLY the two acts a bounded worker may take —
+    run a tool deterministically, or make one narration LLM call. It never
+    exposes the FSM, the controller, or the engine class itself.
+    """
 
-    Usage in the runtime:
+    __slots__ = ("_engine",)
 
-        outcome = await signal_and_route_failure(engine, ctx, st)
-        if outcome is not None:
-            return outcome  # terminated via the failure node
-        # else: resolved — continue the loop
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    async def execute_tool(
+        self, name: str, args: dict[str, Any], **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        return await execute_tool(
+            self._engine.store, name, args,
+            postgres=self._engine.postgres,
+            memory=self._engine.memory,
+            settings=self._engine.settings,
+        )
+
+    async def call_llm(self, prompt: str) -> str:
+        return await self._engine._call_llm(prompt)
+
+
+async def dispatch_failure(engine: Any, ctx: Any, st: CycleRuntimeState) -> Any:
+    """Classify the signalled failure and DISPATCH it through the failure node.
+
+    The substrate ASSESSES and DISPATCHES; the worker owns the transport and
+    returns a status the substrate consumes. This records the verdict + worker
+    status on the state and returns the ``FailureOutcome`` — it does NOT write a
+    terminal (that is the caller's decision, exactly once, via
+    ``signal_and_route_failure`` or the caller's own terminal route).
     """
     from ..failure_fsm import FAILURE_FSM
+    from ..failure_substrate import FailureTask
 
     kind = st.failure_kind or "infra_failed"
     detail = st.failure_detail
-
     verdict = FAILURE_FSM.classify(kind)
-    outcome = await failure_substrate_for(st).mediate(verdict, detail=detail)
-
+    task = FailureTask.from_verdict(verdict, detail=detail, loop_tag=st.loop_tag)
+    transport = _EngineTransport(engine)
+    outcome = await failure_substrate_for(st).dispatch(
+        verdict, task=task, transport=transport,
+    )
     st.deterministic_state["failure_report"] = outcome.failure_report.to_dict()
     st.deterministic_state["failure"] = st.deterministic_state.get("failure", {}) | {
         "kind": kind,
@@ -424,15 +486,69 @@ async def signal_and_route_failure(
         "remediation": outcome.remediation.value,
         "worker": outcome.worker_name,
         "terminal": verdict.terminal.value,
+        "continuing": outcome.continue_cycle,
     }
+    status = outcome.status
+    if status is not None:
+        st.deterministic_state["failure"]["worker_outcome"] = status.outcome
+        if status.mirrored:
+            st.deterministic_state["failure"]["mirrored"] = list(status.mirrored)
+        if status.findings:
+            st.deterministic_state["failure"]["findings"] = list(status.findings)
+    return outcome
 
-    if not outcome.terminate_now:
+
+async def signal_and_route_failure(
+    engine: Any, ctx: Any, st: CycleRuntimeState,
+) -> tuple[Any, dict[str, Any]] | None:
+    """Dispatch the signalled failure; on escalation write the terminal once.
+
+    Returns the terminal ``(artifact, meta)`` when the failure escalates, or
+    ``None`` when the substrate says the cycle continues (resolved / retrying).
+
+    Usage in the runtime:
+
+        result = await signal_and_route_failure(engine, ctx, st)
+        if result is not None:
+            return result          # escalated → terminal
+        # else: the failure is handled — resume the loop
+    """
+    outcome = await dispatch_failure(engine, ctx, st)
+    if outcome.continue_cycle:
         st.failure_kind = None
         st.failure_detail = None
         st.deterministic_state["failure"]["resolved"] = outcome.resolved
         return None
-
     return await run_runtime_failure(engine, ctx, st)
+
+
+async def recover_narration_call(
+    engine: Any, ctx: Any, st: CycleRuntimeState, prompt: str,
+) -> str | None:
+    """Bounded re-attempt of a failed LLM narration call (the RETRY remediation).
+
+    While the failure substrate says CONTINUE, dispatch the failure and
+    re-attempt the narration (bounded by the worker's retry budget). Returns the
+    raw narration on success with the failure state cleared, or ``None``.
+    On escalation the failure kind is LEFT SET so the caller's existing
+    ``if st.failure_kind: return run_runtime_failure(...)`` writes the terminal
+    exactly once — no double advance.
+    """
+    while st.failure_kind:
+        outcome = await dispatch_failure(engine, ctx, st)
+        if outcome.terminate_now:
+            return None                     # caller routes to the terminal
+        st.failure_kind = None
+        st.failure_detail = None
+        if not outcome.continue_cycle:
+            return None
+        try:
+            return await engine._call_llm(prompt)
+        except Exception as exc:
+            st.failure_kind = "narration_failed"
+            st.failure_detail = f"{type(exc).__name__}: {exc}"
+            continue
+    return None
 
 
 async def run_runtime_failure(

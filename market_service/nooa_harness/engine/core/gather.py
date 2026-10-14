@@ -58,29 +58,64 @@ async def run_plan_bound_acquisition(
         DEFAULT_INTERVAL_SECONDS,
         DEFAULT_WINDOW_MINUTES,
     )
-    _interval = controller.cadence_value("interval_seconds") or DEFAULT_INTERVAL_SECONDS
-    _window = controller.cadence_value("window_minutes") or DEFAULT_WINDOW_MINUTES
+    # Cadence floor transparency (G1): adopted cadence wins; any fallback
+    # to deterministic defaults is an explicit floor, logged as a finding
+    # — never a silent default masquerading as a binding.
+    _adopted_interval = controller.cadence_value("interval_seconds")
+    _adopted_window = controller.cadence_value("window_minutes")
+    _adopted_horizon = controller.cadence_value("horizon_ms")
+    _interval = _adopted_interval or DEFAULT_INTERVAL_SECONDS
+    _window = _adopted_window or DEFAULT_WINDOW_MINUTES
     _planned_horizon = task_plan.get("forecast_horizon_ms")
     _forecast_horizon_ms = int(_planned_horizon) if _planned_horizon else (
-        controller.cadence_value("horizon_ms") or DEFAULT_FORECAST_MS)
+        _adopted_horizon or DEFAULT_FORECAST_MS)
+    if _adopted_interval is None or _adopted_window is None or _adopted_horizon is None:
+        capability_log.append({
+            "capability": "engine.cadence.floor",
+            "scope": {"symbol": engine.symbol, "venue": engine.venue},
+            "result": "ok",
+            "detail": {
+                "interval_seconds": int(_interval),
+                "window_minutes": int(_window),
+                "horizon_ms": int(_forecast_horizon_ms),
+                "adopted": {
+                    "interval_seconds": _adopted_interval,
+                    "window_minutes": _adopted_window,
+                    "horizon_ms": _adopted_horizon,
+                },
+            },
+            "governance": "deterministic floor (unadopted controller) — not a binding",
+        })
     _forecast_args = {"symbol": engine.symbol, "venue": engine.venue,
                       "horizon_ms": _forecast_horizon_ms,
                       "window_minutes": int(_window)}
     context._must_authorize_work(
         controller, nested_loop=NestedLoop.CONTEXT,
     )
+    # Digest authority (not agent proof): the plan-bound forecast is
+    # computed for the GATE + envelope + artifact digest, but it confers
+    # NO chain/position/phase credit and is NEVER placed in accumulated
+    # (agent-visible). The agent earns the multivariate truth with its own
+    # 2b call; on a failed 2b call the digest is revealed once as a bounded
+    # failure-substrate fallback (driver, st.digest_revealed). This ends
+    # the double-see: digest status travels, digest numbers do not — unless
+    # the agent fails, exactly once.
     forecast_result, forecast_log = await context.execute_tool(
         engine.store, "calc.forward.forecast",
         _forecast_args,
         postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
     )
     capability_log.append(forecast_log)
-    controller = controller.record_outcome(
-        "calc.forward.forecast", forecast_log, forecast_result,
-        args=_forecast_args,
-    )
-    accumulated_tool_results["calc.forward.forecast"] = forecast_result
-    tool_results["calc.forward.forecast"] = forecast_result
+    capability_log.append({
+        "capability": "engine.forecast.digest",
+        "scope": {"symbol": engine.symbol, "venue": engine.venue},
+        "result": "ok",
+        "detail": {
+            "authority": "receipt_digest_not_proof",
+            "note": ("plan-bound digest for gate/envelope only; "
+                       "agent proof requires a 2b calc.forward.forecast call"),
+        },
+    })
     forward_status = (
         forecast_result.get("validation_state")
         if isinstance(forecast_result, dict) else None

@@ -47,7 +47,8 @@ from ..kb import (
     default_comprehension,
     seed_evidence_plan,
 )
-from ..loop_states import NestedLoop, SubLoop
+from ..loop_states import LoopStep, NestedLoop, SubLoop
+from .. import receipts
 
 log = logging.getLogger(__name__)
 
@@ -348,9 +349,9 @@ async def run_comprehension(
         if scenario else ""
     )
     st.task_reminder = prompt.reminder_500
-    st.task_block = task_block  # type: ignore[attr-defined]
-    st.scenario_block = scenario_block  # type: ignore[attr-defined]
-    st.wake_block = wake_block  # type: ignore[attr-defined]
+    st.task_block = task_block
+    st.scenario_block = scenario_block
+    st.wake_block = wake_block
     # STATE REDISTRIBUTION: task-scoped recall. The plan/handoff carry for
     # this task segment is recalled into the prompt block so the agent
     # reasons over its own prior conclusions, segment-isolated from other
@@ -358,7 +359,7 @@ async def run_comprehension(
     _memories, st.memory_block = await engine._recall_memory(
         segment=ctx.task_id,
     )
-    st.prior_note = ""  # type: ignore[attr-defined]  # fetch_note removed (R7)
+    st.prior_note = ""  # fetch_note removed (R7)
     st.scenario_reminder = (
         f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
         f"given horizon; frame H0/H1 as not-reachable/reachable): "
@@ -384,7 +385,7 @@ async def run_comprehension(
         "COMMAND the read tools and cite their paths):\n"
         f"{json.dumps(st.deterministic_state, default=str)[:60_000]}\n\n"
     )
-    st.user_prompt_1 = user_prompt_1  # type: ignore[attr-defined]
+    # user_prompt_1 is a local compose (not a carrier field) — kept local.
 
     # --- COMPREHENSION PASS (1 LLM call, no tools) ---
     # --- TASK DIRECTIVE (Phase A reparse + Phase B assessment) ---
@@ -442,7 +443,7 @@ async def run_comprehension(
         + "\n".join(f"- {step}" for step in st.task_workflow["steps"])
         + f"\n{st.task_workflow['handoff']}\n"
     )
-    st.workflow_block = workflow_block  # type: ignore[attr-defined]
+    st.workflow_block = workflow_block
     # COMPREHENSION is a real governed traversal, but it is deterministic:
     # envelope normalization, task classification and evidence framing do
     # not spend an additional model turn before the agent's first proposal.
@@ -513,7 +514,8 @@ async def run_comprehension(
     # Loop 2 consumes this instead of re-parsing: what the agent was given
     # (preview), what was understood (directive/plan), the answer shape
     # (workflow kind), the disposal outcome, and the agent's raw proposal.
-    st.deterministic_state["understanding_receipt"] = {
+    import copy as _copy
+    st.deterministic_state["understanding_receipt"] = _copy.deepcopy({
         "prompt_preview": prompt.preview_200,
         "directive": st.task_directive,
         "plan_kind": plan["kind"],
@@ -526,7 +528,9 @@ async def run_comprehension(
         # (agent-visible, logged, provenance-stamped by the resolver).
         "cadence": (st.task_plan or {}).get("cadence"),
         "loop_visit": ("intake", "interpretation", "framing"),
-    }
+    })
+    # Track actually-opened CONTEXT sub-loops for the honest visit at close.
+    st.opened_subs.update(("intake", "interpretation", "framing"))
     # GATE_PLAN (post-framing): the deterministic plan-adequacy guard.
     # Forward-only — a refused plan routes to the canonical gate terminal;
     # the verdict is the frozen data contract, never inline judgement.
@@ -550,6 +554,21 @@ async def run_comprehension(
             {"llm_calls": st.llm_calls, "terminal": terminal,
              "plan_gate": plan_gate.to_dict()},
         )
+    # Canonical receipt: FRAMING closed (the comprehension half of CONTEXT).
+    # Structural facts only — no model prose enters the receipt.
+    receipts.emit_receipt(
+        st, loop=NestedLoop.CONTEXT, sub_loop=SubLoop.FRAMING,
+        steps=(LoopStep.RECEIVE, LoopStep.DECODE, LoopStep.NORMALIZE,
+               LoopStep.CLASSIFY_INTENT, LoopStep.EXTRACT_CONSTRAINTS,
+               LoopStep.IDENTIFY_QUESTIONS, LoopStep.DECOMPOSE,
+               LoopStep.SELECT_EVIDENCE_NEEDS, LoopStep.SET_ACCEPTANCE),
+        payload={
+            "plan_kind": (st.task_plan or {}).get("kind"),
+            "workflow_kind": (st.task_workflow or {}).get("kind"),
+            "cadence": (st.task_plan or {}).get("cadence"),
+        },
+        evidence_refs=(getattr(ctx.wake, "wake_id", "") or "",),
+    )
     # The CONTEXT loop visit is recorded once at its true close (end of
     # verification in run_evidence), covering all six sub-loops.
     return st, None

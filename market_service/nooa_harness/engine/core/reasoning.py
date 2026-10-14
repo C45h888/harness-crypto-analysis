@@ -46,6 +46,8 @@ from .context import (
 )
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from .. import kb
+from .. import receipts
+from ..ledger import LedgerKind, ledger_rows, record_entry, render_ledger
 from ..kb import (
     build_output_format,
     compose_narrate1_prompt,
@@ -56,13 +58,43 @@ from .chain import (
     POSITION_ORDER,
     POSITION_TOOLS,
     TOOL_POSITION,
+    base_summary as _base_summary,
     chain_completion,
     chain_halt_for,
     chain_steer,
     position_status,
     position_steer,
 )
-from ..loop_states import NestedLoop, SubLoop, TaskIntent
+
+
+async def _store_stage_observation(
+    engine: Any, ctx: Any, st: CycleRuntimeState,
+    stage: str, payload: dict[str, Any],
+) -> None:
+    """Record an inter-stage reading on the CENTRAL ENGINE LEDGER.
+
+    2a close records the base reading; 2b close records the refined reading.
+    The ledger is deterministic engine state (never the episodic memory node),
+    and the LLM reads it as context. Pure state mutation — cannot fail the
+    cycle.
+    """
+    segment = getattr(ctx, "task_id", None)
+    wake_id = getattr(getattr(ctx, "wake", None), "wake_id", "") or ""
+    entry = record_entry(
+        st.deterministic_state, LedgerKind.OBSERVATION,
+        {"stage": stage, **payload},
+        evidence_refs=(wake_id,),
+        segment=segment,
+    )
+    st.analysis_memory_ids.append(f"{stage}#{entry.seq}")
+    st.capability_log.append({
+        "capability": "engine.ledger.stage_record",
+        "scope": {"symbol": engine.symbol, "venue": engine.venue},
+        "result": "ok",
+        "detail": {"stage": stage, "seq": entry.seq, "segment": segment},
+    })
+from ..loop_states import LoopStep, NestedLoop, SubLoop, TaskIntent
+from ..loop_states import ReceiptDisposition
 from ..principles import evaluate_principles as _evaluate_principles
 
 log = logging.getLogger(__name__)
@@ -99,9 +131,11 @@ async def run_evidence(
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.SOURCING
     )
+    st.opened_subs.add(SubLoop.SOURCING.value)
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.ACQUISITION
     )
+    st.opened_subs.add(SubLoop.ACQUISITION.value)
     # Adopt the acquisition intent for the merged loop's evidence work (legal:
     # INFER_ORDER_FLOW is served by CONTEXT). This keeps the live observation
     # and the prompt label in agreement.
@@ -186,57 +220,62 @@ async def run_evidence(
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.VERIFICATION
     )
+    st.opened_subs.add(SubLoop.VERIFICATION.value)
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )
-    # STORE_HANDOFF (state redistribution): the end-of-CONTEXT package for
-    # the reasoning loop — what was gathered, what the prompt asked, and what
-    # reasoning still needs. Written to the task segment so the next turn
-    # reasons over data, never from scratch. Best-effort: memory-less runs
-    # skip silently (transport pattern).
-    try:
-        if engine.memory is not None:
-            from .chain import chain_completion as _chain_completion
-            _snap = _chain_completion(
-                st.controller, task=ctx.task, scenario=ctx.scenario,
-            )
-            _coverage = st.controller.phase_coverage
-            _handoff = {
-                "prompt_preview": (ctx.task[:200] if ctx.task else None),
-                "plan_kind": (st.task_plan or {}).get("kind"),
-                "gathered": sorted(st.accumulated_tool_results.keys()),
-                "chain_missing": list(_snap.get("missing") or []),
-                "chain_refused": list(_snap.get("refused") or []),
-                "phase_coverage": {
-                    p: sorted(s) for p, s in _coverage.items()
-                },
-                "reasoning_needs": sorted(
-                    list(_snap.get("missing") or [])
-                    + [f"phase {p} uncovered"
-                       for p in ("P1", "P2", "P3", "P5")
-                       if not _coverage.get(p)]
-                ),
-            }
-            import json as _json
-            await engine.memory.remember(
-                engine.session_id, "handoff",
-                _json.dumps(_handoff, default=str),
-                segment=getattr(ctx, "task_id", None),
-                importance=2.0,
-                tags=("wake", "handoff", engine.symbol.lower()),
-                evidence_refs=(ctx.wake.wake_id,),
-            )
-    except Exception:
-        log.exception("handoff placement failed")
-    # The CONTEXT loop visit is recorded once, at the loop's true close,
-    # covering all six sub-loops (its deterministic passes + the evidence pass).
+    # STORE_HANDOFF (central ledger): the end-of-CONTEXT package for the
+    # reasoning loop — what was gathered, what the prompt asked, and what
+    # reasoning still needs. Deterministic engine state; the LLM reads it.
+    from .chain import chain_completion as _chain_completion
+    _snap = _chain_completion(
+        st.controller, task=ctx.task, scenario=ctx.scenario,
+    )
+    _coverage = st.controller.phase_coverage
+    _handoff = {
+        "prompt_preview": (ctx.task[:200] if ctx.task else None),
+        "plan_kind": (st.task_plan or {}).get("kind"),
+        "gathered": sorted(st.accumulated_tool_results.keys()),
+        "chain_missing": list(_snap.get("missing") or []),
+        "chain_refused": list(_snap.get("refused") or []),
+        "phase_coverage": {
+            p: sorted(s) for p, s in _coverage.items()
+        },
+        "reasoning_needs": sorted(
+            list(_snap.get("missing") or [])
+            + [f"phase {p} uncovered"
+               for p in ("P1", "P2", "P3", "P5")
+               if not _coverage.get(p)]
+        ),
+    }
+    record_entry(
+        st.deterministic_state, LedgerKind.HANDOFF, _handoff,
+        evidence_refs=(getattr(getattr(ctx, "wake", None), "wake_id", "") or "",),
+        segment=getattr(ctx, "task_id", None),
+    )
+    # Honest CONTEXT visit: only sub-loops actually opened this cycle are
+    # claimed. The deterministic passes (wake) recorded intake/interpretation/
+    # framing on st.opened_subs; evidence added sourcing/acquisition/
+    # verification above. A path that skipped a handler cannot claim it.
+    _ordered = ("intake", "interpretation", "framing", "sourcing",
+                "acquisition", "verification")
+    _visited = tuple(s for s in _ordered if s in st.opened_subs)
     st.controller = st.controller.record_loop_visit(
         "context",
         st.passes_per_loop.get("comprehension", 0)
         + st.passes_per_loop.get("evidence", 0),
-        ("intake", "interpretation", "framing", "sourcing",
-         "acquisition", "verification"),
-        completed=True,
+        _visited,
+        completed=len(_visited) == len(_ordered),
+    )
+    # Canonical receipt: the evidence half of CONTEXT closed. Only sub-loops
+    # that actually opened are claimed (no invented work).
+    receipts.emit_receipt(
+        st, loop=NestedLoop.CONTEXT, sub_loop=SubLoop.VERIFICATION,
+        steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS, LoopStep.READ,
+               LoopStep.CALCULATE, LoopStep.OBSERVE, LoopStep.ASSESS,
+               LoopStep.STORE_HANDOFF),
+        payload={"passes": st.passes_per_loop.get("evidence", 0)},
+        evidence_refs=(getattr(ctx.wake, "wake_id", "") or "",),
     )
     return None
 
@@ -253,6 +292,48 @@ async def run_reasoning(
     the FSM retry decision (no synthesis, visit marked incomplete).
     """
     st.loop_tag = "reasoning"
+    # FIRST SEMANTIC (reasoning entry): read the CENTRAL LEDGER for this task
+    # segment — understanding + plan (comprehension close) + handoff (evidence
+    # close). Deterministic: by kind and append order, never by similarity or
+    # scoring. This is what the LLM reasons over, never from scratch.
+    _segment = getattr(ctx, "task_id", None)
+    _kinds = (LedgerKind.UNDERSTANDING, LedgerKind.PLAN, LedgerKind.HANDOFF)
+    _rows = ledger_rows(st.deterministic_state, _kinds, segment=_segment)
+    st.reasoning_memory_block = render_ledger(
+        st.deterministic_state, _kinds, segment=_segment, budget=3_000,
+    )
+    st.reasoning_memory_ids = [
+        f"{row.get('kind')}#{row.get('seq')}" for row in _rows
+    ]
+    st.capability_log.append({
+        "capability": "engine.ledger.reasoning_recall",
+        "scope": {"symbol": engine.symbol, "venue": engine.venue},
+        "result": "ok",
+        "detail": {
+            "segment": _segment,
+            "kinds": [k.value for k in _kinds],
+            "entries": len(_rows),
+        },
+    })
+    # Slice B frame capability (distinct data layer): the HYPOTHESIS prior
+    # frame is logged at entry (prompt basis with empty data — truth fills
+    # in at hypothesize). The artifact trace proves which basis governed H0.
+    try:
+        from .chain import build_hypothesis_frame as _bhf_entry
+        _dir = getattr(st, "task_directive", None)
+        _entry_frame = _bhf_entry(ctx.task, _dir if isinstance(_dir, dict) else None, {})
+        st.capability_log.append({
+            "capability": "engine.hypothesis.frame",
+            "scope": {"symbol": engine.symbol, "venue": engine.venue},
+            "result": "ok",
+            "detail": {
+                "basis": _entry_frame.get("basis"),
+                "prompt_bearing": _entry_frame.get("prompt_bearing"),
+                "H0": str(_entry_frame.get("H0") or "")[:200],
+            },
+        })
+    except Exception:
+        pass
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.ENTER_LOOP, NestedLoop.REASONING
     )
@@ -268,6 +349,12 @@ async def run_reasoning(
                 and st.parsed_current.get("tool_calls")):
             if st.reason_position >= len(POSITION_ORDER):
                 break  # track complete; candidate stands; validation decides
+            # Floor + retry-reserve guard (Phase 2): the floor steer must not
+            # consume the validation reserve (repairs + forced-final). When
+            # fewer than 4 LLM turns remain, close the track so validation
+            # still has its bounded retries.
+            if st.llm_calls >= AGENTIC_MAX_LLM_TURNS - 4:
+                break
             # Floor: the track is unwalked — steer into another positioned
             # pass instead of breaking (bounded by the pass/turn ceilings).
             st.dispatched_in_pass = 0
@@ -330,7 +417,45 @@ async def run_reasoning(
             # Advance on no-missing: assemble refusals already halted above;
             # interpret/hypothesize refusals ride forward as findings.
             if not status["missing"] and st.position_hits.get(active_position, 0) >= 1:
+                completed = active_position
                 st.reason_position += 1
+                # Phase 2 inter-stage carry: freeze + store at each 2a/2b
+                # close so the next stage reasons over stored conclusions.
+                if completed == "assemble":
+                    try:
+                        st.base_summary = dict(
+                            _base_summary(st.accumulated_tool_results))
+                        st.deterministic_state["base_summary"] = dict(
+                            st.base_summary)
+                    except Exception:
+                        log.exception("base_summary freeze failed")
+                    await _store_stage_observation(
+                        engine, ctx, st, "base",
+                        {"base_summary": dict(getattr(st, "base_summary", {})),
+                         "task": (ctx.task or "")[:200] or None},
+                    )
+                elif completed == "interpret":
+                    try:
+                        from ..tool_schemas import build_data_check_block as _dc
+                        _dc_text = _dc(st.accumulated_tool_results)
+                    except Exception:
+                        _dc_text = ""
+                    await _store_stage_observation(
+                        engine, ctx, st, "refined",
+                        {"data_checks": _dc_text[:1500],
+                         "base_summary": dict(getattr(st, "base_summary", {})),
+                         "task": (ctx.task or "")[:200] or None},
+                    )
+                # Slice D: per-position progress marker — the FSM reads
+                # progress without new enums; the final exit visit stays
+                # the honest (hypothesis, analysis, synthesis) close.
+                try:
+                    st.controller = st.controller.record_loop_visit(
+                        "reasoning", st.passes_per_loop.get("reasoning", 0),
+                        ("analysis",), completed=False,
+                    )
+                except Exception:
+                    pass
         if await engine._followup_turn(ctx, st) is None:
             if st.failure_kind:
                 return await run_runtime_failure(engine, ctx, st)
@@ -347,6 +472,13 @@ async def run_reasoning(
         "reasoning", st.passes_per_loop["reasoning"],
         ("hypothesis", "analysis", "synthesis"),
         completed=True,
+    )
+    # Canonical receipt: the REASONING loop closed its full track.
+    receipts.emit_receipt(
+        st, loop=NestedLoop.REASONING, sub_loop=SubLoop.SYNTHESIS,
+        steps=(LoopStep.FRAME, LoopStep.STATE_PRIOR, LoopStep.TEST,
+               LoopStep.COMPARE, LoopStep.INTERPRET, LoopStep.RECONCILE),
+        payload={"reason_position": st.reason_position},
     )
     return None
 
@@ -384,6 +516,7 @@ async def run_validation(
         judged, st.controller.phase_coverage, scenario=ctx.scenario,
         scenario_status=st.controller.scenario_state(),
         scenario_refusal_reason=st.controller.scenario_refusal_reason(),
+        accumulated=st.accumulated_tool_results,
     )
     # Steady-track gate (core-owned): required-but-never-attempted chain
     # links join missing[] and ride the existing repair path. Refused links
@@ -466,6 +599,12 @@ async def run_validation(
             else ("gate", "recovery"),
             completed=True,
         )
+        # Canonical receipt: the final passed the GATE sub-loop.
+        receipts.emit_receipt(
+            st, loop=NestedLoop.VALIDATION, sub_loop=SubLoop.GATE,
+            steps=(LoopStep.VALIDATE, LoopStep.CLASSIFY_FINDINGS),
+            payload={"retries_used": st.validation_retries_used},
+        )
         ctx.controller = st.controller
         ctx.reasoned = st.to_reasoned()
         return None
@@ -494,6 +633,13 @@ async def run_validation(
         st.controller, _ = context._must_govern(
             st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.RECOVERY
         )
+        # Canonical receipt: the gate REFUSED the candidate and recovery opened.
+        receipts.emit_receipt(
+            st, loop=NestedLoop.VALIDATION, sub_loop=SubLoop.RECOVERY,
+            disposition=ReceiptDisposition.REFUSED,
+            steps=(LoopStep.DIAGNOSE, LoopStep.STEER, LoopStep.REVALIDATE),
+            payload={"missing": [str(m)[:200] for m in list(missing)[:8]]},
+        )
     scenario_steer = st.controller.scenario_steer()
     repair_prompt = compose_repair_prompt(
         controller=st.controller,
@@ -513,10 +659,17 @@ async def run_validation(
         raw_repair = await engine._call_llm(repair_prompt)
         context.record_tier(st)
     except Exception as exc:
-        log.exception("repair turn failed; ending validation")
+        log.exception("repair turn failed; dispatching to the failure node")
         st.failure_kind = "narration_failed"
         st.failure_detail = f"{type(exc).__name__}: {exc}"
-        return await run_runtime_failure(engine, ctx, st)
+        # Bounded RETRY: substrate dispatches the narration worker, which
+        # re-attempts the repair call (worker owns the transport).
+        raw_repair = await context.recover_narration_call(
+            engine, ctx, st, repair_prompt,
+        )
+        if raw_repair is None:
+            return await run_runtime_failure(engine, ctx, st)
+        context.record_tier(st)
     st.llm_calls += 1
     st.passes_per_loop["validation"] = st.passes_per_loop.get("validation", 0) + 1
     parsed_repair = coerce_turn(extract_json_object(raw_repair))
@@ -708,6 +861,7 @@ def validate_final_turn(
     *,
     scenario_status: "ScenarioEvalStatus | None" = None,
     scenario_refusal_reason: str | None = None,
+    accumulated: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
     """Phase-aware final gate: depth is structural, not advisory.
 
@@ -912,6 +1066,79 @@ def validate_final_turn(
                 "scenario cycles frame TWO hypotheses: H0 (target NOT reachable) "
                 "and H1 (target reachable), both non-empty"
             )
+    # Slice E — value-echo verify (path-correct + value-wrong = missing).
+    # NARROW: only entries whose path HEAD names the tool we compare
+    # against. A deterministic_state beta citation is a different source
+    # than the forward fit — never cross-compared (that false-positive
+    # broke the healthy walk: canned deterministic_state values vs live
+    # fit payloads). Heads without a truth source are skipped.
+    try:
+        _acc = accumulated if isinstance(accumulated, dict) else {}
+
+        def _data(_v: Any) -> Any:
+            if isinstance(_v, dict) and "tool" in _v and "data" in _v:
+                return _v.get("data")
+            return _v
+
+        def _norm(_v: Any) -> str | None:
+            if _v is None:
+                return None
+            try:
+                from decimal import Decimal
+                return str(Decimal(str(_v)))
+            except Exception:
+                return str(_v).strip() or None
+        _truth_by_head: dict[str, dict[str, Any]] = {}
+        _fit_d = _data(_acc.get("calc.forward.fit"))
+        if isinstance(_fit_d, dict):
+            _est = _fit_d.get("estimates") or {}
+            _truth_by_head["calc.forward.fit"] = {
+                "r2": _fit_d.get("r2", _est.get("r2") if isinstance(_est, dict) else None),
+                "beta": _fit_d.get("beta", _est.get("beta") if isinstance(_est, dict) else None),
+            }
+        _dist_d = _data(_acc.get("calc.forward.distribution"))
+        if isinstance(_dist_d, dict):
+            _truth_by_head["calc.forward.distribution"] = {
+                "expected_delta": _dist_d.get("expected_delta"),
+                "pi_95_lo": _dist_d.get("pi_95_lo"),
+                "pi_95_hi": _dist_d.get("pi_95_hi"),
+            }
+        _fore_d = _data(_acc.get("calc.forward.forecast"))
+        if isinstance(_fore_d, dict):
+            _ft = _fore_d.get("forward_target") or {}
+            if isinstance(_ft, dict) and _ft.get("y_pred") is not None:
+                _truth_by_head["calc.forward.forecast"] = {"y_pred": _ft.get("y_pred")}
+        _scen_d = _data(_acc.get("calc.scenario.evaluate"))
+        if isinstance(_scen_d, dict):
+            _truth_by_head["calc.scenario.evaluate"] = {
+                "required_ofi": _scen_d.get("required_ofi"),
+                "exceedance": _scen_d.get("exceedance"),
+            }
+        _ev = parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else []
+        for _entry in _ev:
+            if not isinstance(_entry, dict):
+                continue
+            _path = str(_entry.get("path") or "")
+            _val = _entry.get("value")
+            if _val is None or not _path:
+                continue
+            _head = _path.split("→")[0].strip()
+            _truths = _truth_by_head.get(_head)
+            if not _truths:
+                continue
+            _tail = _path.lower()
+            for _key, _truth in _truths.items():
+                if _truth is None:
+                    continue
+                if _key.lower() in _tail:
+                    if _norm(_val) != _norm(_truth):
+                        missing.append(
+                            f"evidence value mismatch on {_path!r}: cited {_val!r} "
+                            f"!= tool payload {_truth!r} — echo the tool value, never recompute"
+                        )
+                    break
+    except Exception:
+        pass
     return (not missing), missing
 
 

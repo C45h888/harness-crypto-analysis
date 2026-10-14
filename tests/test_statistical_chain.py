@@ -212,7 +212,7 @@ def test_interpret_and_hypothesize_positions():
 
     c = CycleController()
     for tool in ("calc.forward.fit", "calc.forward.distribution",
-                 "calc.decay.report"):
+                 "calc.decay.report", "calc.forward.forecast"):
         c = _ok_outcome(c, tool)
     assert position_status(c.outcomes, "interpret")["complete"] is True
     c = _ok_outcome(c, "calc.hypothesis.test")

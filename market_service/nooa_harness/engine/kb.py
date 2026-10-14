@@ -357,7 +357,7 @@ TASK_CHAINS: dict[str, list[str]] = {
 
 CHAIN_MEANING: dict[str, str] = {
     "market.read": "current price + regime context (snapshot first)",
-    "calc.forward.forecast": "canonical ForecastResult: schema-checked X_t, forward Y(h), train-only OOS, calibration gate, assumptions, and Route A/B diagnostics",
+    "calc.forward.forecast": "2b PROOF ONLY (never a context seed): schema-checked X_t, forward Y(h), train-only OOS, calibration gate, assumptions, and Route A/B diagnostics — earned by your interpret-position call; the plan-bound digest is context, not proof",
     "calc.feature.build": "condition on X_t — versioned state vector (diagnostic sub-step)",
     "calc.forward.join": "forward targets Y(h) + exclusion log (diagnostic sub-step)",
     "calc.forward.fit": "per-horizon fit + comparator + OOS (diagnostic sub-step)",
@@ -493,22 +493,35 @@ TOOL_WINDOWS: dict[str, str] = {
     "context": (
         "YOUR TOOLS THIS LOOP — gather in this order, cite each link: "
         "micro.capture_status + micro.fit_beta (gate reads already done — do not re-pull); "
-        "market.read snapshot (current price + regime); "
-        "calc.forward.forecast (canonical ForecastResult: X_t, Y(h), train-only OOS, calibration gate, "
-        "forecast regime, assumptions, and Route A/B diagnostics). "
+        "market.read snapshot (current price + regime). "
+        "The plan-bound calc.forward.forecast digest is CONTEXT (receipt authority, "
+        "not agent proof) — read it from the envelope, do NOT re-call forecast here: "
+        "the multivariate primary truth is earned agent-side in REASONING 2b only "
+        "(out-of-position denied elsewhere). "
         "Gather only: do not conclude, do not test hypotheses. "
         "Refusals are findings to record with reasons, never failures to repair."
     ),
     "reasoning": (
         "YOUR TOOLS THIS LOOP — the positioned track, in order (one position "
         "per pass minimum; tools from a later position are denied until it is "
-        "active): 1/3 ASSEMBLE — calc.ofi.intervals → calc.depth.average → "
-        "calc.forward.join. 2/3 INTERPRET — calc.forward.fit → "
-        "calc.forward.distribution → calc.decay.report. 3/3 HYPOTHESIZE — "
-        "calc.hypothesis.test (+ calc.forward.scenario when horizons/targets "
-        "are present; calc.events.* when liquidity language is present). Then "
-        "close with tool_calls=[]. Your current position and its missing links "
-        "render below every turn — work those first. Validation "
+        "active). STAGE 2a BASE-INTERPRET — re-derive the substrates, no "
+        "interpretation: calc.ofi.intervals (Route A OFI first) → "
+        "calc.depth.average (Route B AD) → calc.forward.join (multivariate "
+        "X_t joined to Y(h); join.n_pairs>0 is the 2a EXIT GATE — nothing "
+        "refined is callable until pairs exist; base mean_ofi/mean_ad freeze "
+        "to the ledger and a base observation is stored to task memory). "
+        "STAGE 2b REFINED-ARCHAIC — primary statistical truth first: "
+        "calc.forward.forecast (multivariate A→B→C + distribution, earned "
+        "here only — the CONTEXT digest is not proof) → calc.forward.fit "
+        "(needs join.n_pairs>0) → DATA CHECK fit.status "
+        "(validated/provisional advances; insufficient reforms the window) → "
+        "calc.forward.distribution + calc.price.delta (needs usable fit) → "
+        "calc.decay.report (needs ≥1 fit). 3/3 HYPOTHESIZE — "
+        "calc.hypothesis.test with its engine-supplied hypothesis_id (+ "
+        "calc.forward.scenario when horizons/targets are present; "
+        "calc.events.* when liquidity language is present). Then "
+        "close with tool_calls=[]. Your current position, DATA CHECKS, and "
+        "missing links render below every turn — work those first. Validation "
         "(calc.discipline.audit) and output composition are later loops, not "
         "this one. Refusals are findings to record with reasons, never failures "
         "to repair."
@@ -567,9 +580,10 @@ def seed_evidence_plan(
     task/scenario (no I/O, no LLM).
     """
     seeds: list[str] = [
-        "calc.forward.forecast",
+        "market.read",
     ]
-    rationale = ["canonical deterministic forward ForecastResult always seeded"]
+    rationale = ["context seeds are reads only — the multivariate proof "
+                 "(calc.forward.forecast) is earned agent-side in 2b, never seeded"]
     blob = f"{task or ''} {json.dumps(scenario or {})}".lower()
     if scenario is not None:
         seeds += ["calc.scenario.evaluate", "calc.forward.scenario"]
@@ -827,6 +841,7 @@ def compose_followup_prompt(
     phase_guidance: dict[str, str],
     next_phase: str,
     chain_block: str = "",
+    reasoning_entry_block: str = "",
 ) -> str:
     """Compose the per-pass follow-up prompt.
 
@@ -846,7 +861,7 @@ def compose_followup_prompt(
         congruence=(controller.congruence() if loop == "reasoning" else None),
         comprehension=None,
     )
-    from .tool_schemas import build_phase_summary_block
+    from .tool_schemas import build_data_check_block, build_phase_summary_block
 
     # Wrap raw tool results in the ToolResult envelope so the LLM sees
     # uniform tool/status/reason/data/null_fields structure. Results that
@@ -866,10 +881,26 @@ def compose_followup_prompt(
         if name not in round_results
     }
     phase_block = build_phase_summary_block(wrapped_round)
+    # Phase 1 (staged ANALYSIS): deterministic DATA CHECKS on reasoning
+    # follow-ups — core-computed reads (base means, fit status, legal next)
+    # so the model checks actual data before its next refined call.
+    _data_checks = ""
+    if loop == "reasoning":
+        try:
+            _data_checks = build_data_check_block(accumulated) or ""
+        except Exception:
+            _data_checks = ""
 
+    _entry = (
+        "REASONING ENTRY CONTEXT (partition writes — FIRST SEMANTIC; "
+        "reason over these, cite their ids, never from scratch):\n"
+        f"{reasoning_entry_block}\n\n"
+        if reasoning_entry_block else ""
+    )
     return (
         f"{loop_header}\n\n"
         f"{TOOL_WINDOWS.get(loop, '')}\n\n"
+        f"{_entry}"
         f"{render_track(chain, accumulated, controller.phase_coverage, next_phase, phase_guidance)}"
         f"{chain_block}\n"
         f"{task_reminder}"
@@ -879,6 +910,7 @@ def compose_followup_prompt(
         f"{json.dumps(wrapped_round, default=str)[:40_000]}\n\n"
         f"PRIOR PASSES (earlier results, for citation):\n"
         f"{_bounded_dump(wrapped_accum, 24_000)}\n\n"
+        f"{_data_checks}"
         f"{phase_block}"
         f"{TURN_CONTRACT_LINE}\n"
         f"{FINAL_SHAPE_BLOCK}\n"

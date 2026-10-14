@@ -24,6 +24,7 @@ from tests.test_engine import (
     _TRACK_ASSEMBLE,
     _TRACK_DISCIPLINE,
     _TRACK_HYPOTHESIZE,
+    _TRACK_FORECAST,
     _TRACK_INTERPRET,
     _engine,
     _staged_narration,
@@ -121,6 +122,7 @@ class HealthyTrackWalkTests(unittest.IsolatedAsyncioTestCase):
             *_evidence_prefix(),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -141,14 +143,72 @@ class HealthyTrackWalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(
             (passes.get("reasoning") or {}).get("passes_spent", 99), 6)
         self.assertLessEqual(m["llm_calls"], 14)
-        self.assertLessEqual(m["tool_rounds"], 10)
+        self.assertLessEqual(m["tool_rounds"], 11)
         self.assertEqual(m["trace"], ["run_a", "run_b", "run_multivariate", "compare"])
+
+
+class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
+    """Item-5 trace-shape: distinct data layers are provable off the artifact.
+
+    DIGEST (receipt authority) vs PROOF (agent 2b calls) vs PROMPT (frame
+    basis): the healthy walk must carry the hypothesis-frame capability,
+    both inter-stage stores, a complete base_summary, the digest-authority
+    note, and the chain snapshot's base pointer — the behavioural-
+    sovereignty pass reads these, never narration text.
+    """
+
+    async def test_provenance_layers_present_on_settled_walk(self):
+        engine, _s, _p, _m = _engine(llm_responses=[
+            *_evidence_prefix(),
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _close(),
+            _track_tools(*_TRACK_DISCIPLINE),
+            _close(),
+            _close(),  # spare: composition pass
+        ])
+        artifact, meta = await engine.narrate_cycle(
+            _wake(), {"decision": "fire"}, task="prove the provenance layers")
+        self.assertEqual(meta.get("terminal"), "settled")
+        log = artifact.capability_log or []
+        by_cap: dict[str, list[dict[str, Any]]] = {}
+        for entry in log:
+            by_cap.setdefault(str(entry.get("capability") or ""), []).append(entry)
+        # PROMPT layer: the entry frame names its basis.
+        self.assertIn("engine.hypothesis.frame", by_cap)
+        frame_detail = by_cap["engine.hypothesis.frame"][0].get("detail") or {}
+        self.assertIn(frame_detail.get("basis"),
+                      ("prompt_targets", "directive_seed",
+                       "prompt_text", "data_autonomous"))
+        # DIGEST layer: receipt authority, explicitly not proof.
+        self.assertIn("engine.forecast.digest", by_cap)
+        digest_detail = by_cap["engine.forecast.digest"][0].get("detail") or {}
+        self.assertEqual(digest_detail.get("authority"),
+                         "receipt_digest_not_proof")
+        # LEDGER layer: both inter-stage readings recorded on the central
+        # ledger (deterministic engine state — not episodic MemoryNode rows).
+        stages = [e.get("detail", {}).get("stage")
+                  for e in by_cap.get("engine.ledger.stage_record", [])]
+        self.assertEqual(stages, ["base", "refined"])
+        # Frozen base + chain pointer travel on the artifact.
+        base = artifact.deterministic_state.get("base_summary") or {}
+        self.assertTrue(base.get("base_complete"))
+        self.assertGreater(int(base.get("n_pairs") or 0), 0)
+        chain = artifact.deterministic_state.get("statistical_chain") or {}
+        self.assertTrue((chain.get("base_summary") or {}).get("base_complete"))
+        # Stage ids are central-ledger seq pointers (base -> refined).
+        self.assertEqual(chain.get("stage_ids"), ["base#3", "refined#4"])
+        # Digest fallback never fired on a healthy walk (proof earned).
+        self.assertNotIn("engine.forecast.digest_fallback", by_cap)
 
     async def test_price_target_walk_settles_with_scenario_finding(self):
         engine, _s, _p, _m = _engine(llm_responses=[
             *_evidence_prefix(),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario", "calc.scenario.evaluate"),
             _scenario_close(),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -180,6 +240,7 @@ class JumpAheadWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*jump_first, hypothesis_id="H-early"),
             _track_tools("calc.forward.join"),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE, hypothesis_id="H-ontime"),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -222,6 +283,7 @@ class RefusalCarryWalkTests(unittest.IsolatedAsyncioTestCase):
             *_evidence_prefix(),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -335,6 +397,7 @@ class ReformulationWalkTests(unittest.IsolatedAsyncioTestCase):
             _reform(),                        # reformulation offer → halt clears
             _track_tools(*_TRACK_ASSEMBLE),   # assemble completes (AD + join)
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),

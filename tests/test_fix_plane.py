@@ -374,8 +374,9 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
 
         from tests.test_engine import (
             _FETCH_TURN,
-            _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
-            _TRACK_INTERPRET, _engine, _good_narration, _track_tools, _wake,
+            _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_FORECAST,
+            _TRACK_HYPOTHESIZE, _TRACK_INTERPRET, _engine,
+            _good_narration, _track_tools, _wake,
         )
         final = _json.dumps({
             "phase": "P6", "tool_calls": [],
@@ -398,6 +399,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             _good_narration(),                 # thin, no tools
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _good_narration(),                 # thin close, no H0
             # repair #1 pulls the audit AND covers P3 (market reads)
@@ -442,8 +444,9 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
 
         from tests.test_engine import (
             _FETCH_TURN,
-            _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
-            _TRACK_INTERPRET, _engine, _good_narration, _track_tools, _wake,
+            _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_FORECAST,
+            _TRACK_HYPOTHESIZE, _TRACK_INTERPRET, _engine,
+            _good_narration, _track_tools, _wake,
         )
         shell = _json.dumps({"phase": "P6", "tool_calls": [],
                              "summary": None, "evidence": [],
@@ -465,6 +468,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             _good_narration(),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _good_narration(),
             _track_tools("market.read", "market.derivatives",

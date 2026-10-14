@@ -403,10 +403,12 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
                    "calc.forward.join"),
             _track("calc.forward.fit", "calc.forward.distribution",
                    "calc.decay.report"),
+            _track("calc.forward.forecast"),  # 2b proof (pass-ceiling split)
             _track("calc.hypothesis.test"),
             _staged_narration("P6", final=True),
             _track("calc.discipline.audit"),
             _staged_narration("P6", final=True),
+            _staged_narration("P6", final=True),  # spare: proof pass added one turn
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["terminal"], "settled")

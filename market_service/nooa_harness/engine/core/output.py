@@ -13,7 +13,14 @@ from ..schemas import extract_json_object
 from ..controller import scenario_verdict as _scenario_verdict
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..kb import build_task_workflow, chain_status, compose_output_prompt
-from ..loop_states import NestedLoop, SubLoop
+from ..loop_states import (
+    LoopReceipt,
+    LoopStep,
+    NestedLoop,
+    ReceiptDisposition,
+    SubLoop,
+)
+from .. import receipts
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +85,10 @@ async def run_output(
             'forecast_result': deterministic_state.get('forecast_result'),
             'forward_scenario': deterministic_state.get('forward_scenario'),
             'task_directive': deterministic_state.get('task_directive'),
+            # Slice E: frozen base + stage ids ride synthesis so the final
+            # grounds base numbers from the ledger, never narration text.
+            'base_summary': deterministic_state.get('base_summary'),
+            'statistical_chain': deterministic_state.get('statistical_chain'),
         },
         accumulated_keys=list(accumulated_tool_results),
         traversal=controller.loop_coverage(),
@@ -278,11 +289,28 @@ async def run_output(
         controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.MEMORY
     )
     written = await engine._remember(
-        accepted, {"artifact_id": pending.artifact_id},
+        accepted, {"artifact_id": pending.artifact_id,
+                   "segment": getattr(ctx, "task_id", None)},
     )
     memory_failed = any(
         isinstance(row, dict) and row.get("error") for row in written
     )
+    # Canonical receipt: the OUTPUT loop's four sub-loops closed. The final
+    # terminal is recorded separately (deterministic_state["terminal"] +
+    # loop_traversal); this receipt records the WORK, not the SETTLE transition.
+    receipts.append_receipt(deterministic_state, LoopReceipt(
+        loop=NestedLoop.OUTPUT, sub_loop=SubLoop.MEMORY,
+        disposition=(ReceiptDisposition.COMPLETED
+                     if durable_ok and not memory_failed
+                     else ReceiptDisposition.REFUSED),
+        steps=(LoopStep.ASSEMBLE, LoopStep.GROUND,
+               LoopStep.UNDERSTAND_SURFACE, LoopStep.LOCATE_OUTPUT,
+               LoopStep.PERSIST, LoopStep.CONFIRM,
+               LoopStep.PROPOSE, LoopStep.RESOLVE, LoopStep.SETTLE),
+        payload={"durable_ok": bool(durable_ok),
+                 "memory_failed": bool(memory_failed)},
+        evidence_refs=(pending.artifact_id,),
+    ))
     controller, _ = context._must_govern(
         controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )

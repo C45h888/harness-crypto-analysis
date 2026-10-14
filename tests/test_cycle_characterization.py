@@ -9,6 +9,7 @@ import pytest
 from tests.test_governance import _engine, _wake, _staged_narration
 from tests.test_engine import (
     _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
+    _TRACK_FORECAST,
     _TRACK_INTERPRET, _track_tools,
 )
 from market_service.nooa_harness.engine import core
@@ -39,6 +40,7 @@ async def capture(case, stage_trace=None):
                                        {"name": "calc.price.delta"}]),
         _track_tools(*_TRACK_ASSEMBLE),
         _track_tools(*_TRACK_INTERPRET),
+        _track_tools(*_TRACK_FORECAST),
         _track_tools(*_TRACK_HYPOTHESIZE),
         _staged_narration("P6", final=True),
         _track_tools(*_TRACK_DISCIPLINE),
@@ -74,6 +76,31 @@ async def capture(case, stage_trace=None):
             result = {"input_hash": "fixture", "price_impact_fit": {
                 "status": "validated", "n_observations": 40, "beta": "0.001",
             }, "coverage": {"events_in_window": 5000}}
+        elif name == "calc.ofi.intervals":
+            result = [{"start_ts_ms": 1, "end_ts_ms": 2, "ofi": "12.5",
+                       "event_count": 10, "quality": "exact_feed"}]
+        elif name == "calc.depth.average":
+            result = {"window_minutes": 30, "n_intervals": 4,
+                      "ad_per_interval": ["10", "11"], "mean_ad": "10.5",
+                      "depth_estimator": "test"}
+        elif name == "calc.forward.join":
+            result = {"n_pairs": 20, "exclusion_log": {}, "sample": []}
+        elif name == "calc.forward.fit":
+            result = {"status": "validated", "r2": "0.31", "train_n": 100,
+                      "horizon_ms": 5000}
+        elif name == "calc.forward.distribution":
+            result = {"horizon_ms": 5000, "expected_delta": "0.5",
+                      "pi_95_lo": "-1.0", "pi_95_hi": "2.0",
+                      "status": "validated"}
+        elif name == "calc.decay.report":
+            result = {"finalized_horizons": [5000]}
+        elif name == "calc.forward.scenario":
+            result = {"horizon_ms": 5000, "targets": [], "fit_id": "fx"}
+        elif name == "calc.hypothesis.test":
+            result = {"hypothesis_id": "H-track", "p_value": "0.03",
+                      "status": "ok"}
+        elif name == "calc.discipline.audit":
+            result = {"go": True, "memo": "fixture"}
         else:
             result = {"value": "fixture"}
         return result, {"capability": name, "scope": {}, "result": "ok"}
@@ -166,12 +193,13 @@ def test_staged_cycle_converges_and_preserves_placement_order():
                     "run_reasoning", "run_validation", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
     assert result["meta"]["final_validation"]["passed"]
-    # Understanding + plan placement (two memory writes, at the
-    # comprehension→evidence handoff) plus the end-of-CONTEXT handoff
-    # package precede the two-phase settlement side effects: pending
+    # P1 central ledger: the engine's own memory (understanding/plan/handoff
+    # + the base/refined observations) is now deterministic engine state, NOT
+    # episodic MemoryNode writes. The only remaining memory write is the
+    # agent's own proposal at OUTPUT. Settlement side effects: pending
     # projection, memory disposition, final projection, final-trace refresh.
     assert [effect[0] for effect in result["effects"] if effect[0] in ("postgres", "redis", "memory")] == [
-        "memory", "memory", "memory", "postgres", "redis", "memory", "redis", "redis",
+        "postgres", "redis", "memory", "redis", "redis",
     ]
 
 

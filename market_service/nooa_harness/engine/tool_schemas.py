@@ -503,12 +503,99 @@ def build_phase_summary_block(results: dict[str, Any]) -> str:
     return "PHASE SUMMARIES (key fields extracted from tool outputs):\n" + "\n".join(sections) + "\n\n"
 
 
+def build_data_check_block(accumulated: dict[str, Any]) -> str:
+    """Deterministic DATA CHECKS for the refined stage (pure, never raises).
+
+    Core-computed reads over the accumulated payloads — the model checks
+    THESE values before its next call instead of guessing readiness:
+    base means / n_pairs exit gate, fit status / r2 / n, distribution
+    presence, and the legal-next list derived from
+    ``chain.TOOL_PRECONDITIONS``. Rendered on reasoning follow-ups only.
+    Empty when nothing has accumulated yet.
+    """
+    try:
+        from .core.chain import base_summary as _base_summary
+        from .core.chain import check_tool_preconditions as _check
+        from .core.chain import (
+            DECAY_TOOL as _DECAY,
+            DELTA_TOOL as _DELTA,
+            DISTRIBUTION_TOOL as _DIST,
+            FIT_TOOL as _FIT,
+            FORWARD_SCENARIO_TOOL as _SCEN,
+            HYPOTHESIS_TOOL as _HYP,
+        )
+    except Exception:
+        return ""
+    try:
+        def _data(value: Any) -> Any:
+            if isinstance(value, dict) and "tool" in value and "data" in value:
+                return value.get("data")
+            return value
+        base = _base_summary(accumulated)
+        fit_data = _data(accumulated.get(_FIT))
+        fit_status = fit_data.get("status") if isinstance(fit_data, dict) else None
+        fit_r2: Any = None
+        fit_n: Any = None
+        if isinstance(fit_data, dict):
+            est = fit_data.get("estimates") or {}
+            fit_r2 = fit_data.get("r2", est.get("r2") if isinstance(est, dict) else None)
+            fit_n = fit_data.get("train_n", fit_data.get("n"))
+        dist_present = _data(accumulated.get(_DIST)) is not None
+        delta_present = _data(accumulated.get(_DELTA)) is not None
+        if not accumulated:
+            return ""
+        lines = [
+            "DATA CHECKS (deterministic reads — check these before your next call; "
+            "PROOF = your 2b tool calls this cycle, DIGEST = receipt status only, "
+            "never proof):",
+            f"  base: mean_ofi={base.get('mean_ofi')} mean_ad={base.get('mean_ad')} "
+            f"n_pairs={base.get('n_pairs')} qualities={base.get('qualities') or []} "
+            f"exit_gate={'OPEN' if base.get('base_complete') else 'CLOSED (earn join.n_pairs>0 first)'}",
+            f"  fit: status={fit_status} r2={fit_r2} n={fit_n}",
+            f"  distribution: {'present' if dist_present else 'absent'}; "
+            f"delta: {'present' if delta_present else 'absent'}",
+        ]
+        legal: list[str] = []
+        for tool in (_FIT, _DIST, _DELTA, _DECAY, _SCEN, _HYP):
+            try:
+                ok, _ = _check(tool, accumulated)
+            except Exception:
+                ok = False
+            if ok:
+                legal.append(tool)
+        lines.append(
+            f"  legal next (preconditions met): {', '.join(legal) or 'none — earn the base/fit first'}"
+        )
+        if fit_status == "insufficient":
+            lines.append(
+                "  fit insufficient → reform window_minutes (wider) and re-call "
+                "calc.forward.fit; do NOT advance to distribution/delta"
+            )
+        # Digest-fallback line (failure substrate, bounded once): shown only
+        # after a failed 2b forecast call — a reform aim, never proof.
+        try:
+            _fb = accumulated.get("forecast.digest_fallback")
+            if isinstance(_fb, dict):
+                lines.append(
+                    f"  DIGEST FALLBACK (failed-call aim only, not proof): "
+                    f"forecast Y={_fb.get('y_pred')} "
+                    f"state={_fb.get('validation_state')} — re-call "
+                    "calc.forward.forecast with different args to earn proof"
+                )
+        except Exception:
+            pass
+        return "\n".join(lines) + "\n\n"
+    except Exception:
+        return ""
+
+
 __all__ = [
     "TOOL_OUTPUT_SCHEMAS",
     "TOOL_ARG_CONTRACTS",
     "wrap_tool_result",
     "tool_schema_block",
     "tool_arg_block",
+    "build_data_check_block",
     "extract_p1_summary",
     "extract_p2_summary",
     "extract_p3_summary",

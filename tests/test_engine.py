@@ -204,6 +204,9 @@ _TRACK_ASSEMBLE = ("calc.ofi.intervals", "calc.depth.average",
                    "calc.forward.join")
 _TRACK_INTERPRET = ("calc.forward.fit", "calc.forward.distribution",
                     "calc.decay.report")
+# 2b proof turn (pass-ceiling split): the multivariate primary truth is
+# earned on its own interpret pass — never packed early, never seeded.
+_TRACK_FORECAST = ("calc.forward.forecast",)
 _TRACK_HYPOTHESIZE = ("calc.hypothesis.test",)
 _TRACK_DISCIPLINE = ("calc.discipline.audit",)
 
@@ -301,6 +304,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             # Hard track: three forced reasoning positions, then close.
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _staged_narration("P6", final=True),
             # Validation rejects on the missing discipline audit; the
@@ -309,7 +313,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 11)
+        self.assertEqual(meta["llm_calls"], 12)
         self.assertTrue(meta["tool_round"])
         self.assertEqual(meta["repairs"], 1)
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
@@ -397,6 +401,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _good_narration(),  # thin, no tools → evidence breaks at once
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _good_narration(),  # thin close, still no H0
             _track_tools(*_TRACK_DISCIPLINE),  # repair #1 pulls the audit
@@ -404,7 +409,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _good_narration(),  # repair #2 close (budget 2 since 2026-09-27)
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertEqual(meta["llm_calls"], 9)
+        self.assertEqual(meta["llm_calls"], 10)
         self.assertEqual(meta["repairs"], 2)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
@@ -452,6 +457,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             # Hard track walks its three positions before the finals below.
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             json.dumps(final),
             json.dumps(final),
@@ -459,6 +465,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(final),
             json.dumps(final),
             json.dumps(final),
+            json.dumps(final),  # spare: forecast proof pass added one reasoning turn
         ])
         scenario = {"target_price": "100.50", "horizon": "15m"}
         artifact, meta = await engine.narrate_cycle(
@@ -466,8 +473,8 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # Comprehension is deterministic and validation stops after the
         # bounded repair budget (VALIDATION_RETRY_PASSES = 2); the hard track
         # spends its positions first (the unwalked forward-scenario link costs
-        # one extra steered pass).
-        self.assertEqual(meta["llm_calls"], 12)
+        # one extra steered pass, the forecast proof pass one more).
+        self.assertEqual(meta["llm_calls"], 14)
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["terminal"], "validation_failed")
         self.assertIsNone(artifact.interpretation)
@@ -532,6 +539,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             # Hard track walks its three positions before closing.
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _staged_narration("P6", final=True),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -893,6 +901,7 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
             # Hard track walks its three positions before closing.
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _staged_narration("P6", final=True),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -986,6 +995,7 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
             # (keyed calls coerce identically inside positions).
             _trackkey(*_TRACK_ASSEMBLE),
             _trackkey(*_TRACK_INTERPRET),
+            _trackkey(*_TRACK_FORECAST),
             _trackkey(*_TRACK_HYPOTHESIZE),
             _toolkey("P6", final=True),
             _trackkey(*_TRACK_DISCIPLINE),
@@ -1260,6 +1270,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             # against the fake tape world — an attempted finding).
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario"),
             json.dumps(self._refused_final_turn()),
             _track_tools(*_TRACK_DISCIPLINE),
@@ -1334,6 +1345,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             # Hard track positions before the close.
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario"),
             json.dumps(bad_final),    # final without refusal citation → repair
             json.dumps(re_call_discipline),  # re-call suppressed + audit pulled

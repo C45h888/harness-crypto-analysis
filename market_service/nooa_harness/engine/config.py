@@ -49,7 +49,11 @@ DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
 # --- Cycle budgets (the agentic loop). ---
 # live-proven: fallback-path models burn rounds on redundant re-invocation;
 # budget must survive waste + repairs + final.
-AGENTIC_MAX_TOOL_ROUNDS = 10
+# Proof-pass doctrine (2b forecast proof): the agent earns the multivariate
+# truth with its own interpret-position call — one required dispatch more
+# than the digest era, so the ceiling moves 10 → 11. The reformulation walk
+# (refusal + reform + re-walk + proof) is what spends it.
+AGENTIC_MAX_TOOL_ROUNDS = 11
 # narrate#1 + tool follow-ups + repairs + forced-final, with headroom for
 # redundant rounds.
 AGENTIC_MAX_LLM_TURNS = 16
@@ -68,10 +72,12 @@ AGENTIC_PER_ROUND_CALL_CAP = 3
 LOOP_PASS_BUDGET: dict[str, int] = {
     "comprehension": 1,
     "evidence": 3,
-    # R7 + floor-steer: three forced positions + the empty-close floor
-    # steer + one slack pass — the hard-track floor is what the steady
-    # statistical track spends, not a suggestion.
-    "reasoning": 7,
+    # R7 + floor-steer + proof-pass doctrine: three forced positions (2b
+    # interpret spends TWO passes: fit/dist/decay, then the forecast proof —
+    # the pass ceiling fits three calls) + the empty-close floor steer +
+    # halt-reform headroom + one slack pass. The hard-track floor is what
+    # the steady statistical track spends, not a suggestion.
+    "reasoning": 8,
     "validation": 1,
     "output": 1,
 }
