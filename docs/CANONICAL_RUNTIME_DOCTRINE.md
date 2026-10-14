@@ -139,8 +139,44 @@ The runtime's state model is chartered: one canonical owner per state axis
 `nooa_harness/loop_states.py` incl. the `LoopTag` crosswalk; the
 deterministic_state keyspace → `engine/core/context.py` roots registry;
 schema versions → `runtime/contracts.py` registry; status families → their
-per-plane owners, pairwise disjoint). Planes consume owners by IMPORT, never
-by mirrored constants; silent defaults that map unknown state identities to
-authorized behavior are governance errors. Enforcement lives in
-`tests/test_state_charter.py` + `tests/test_outer_cycle_charter.py`; the
-full doctrine is `docs/STATE_CHARTER_SPEC.md`.
+per-plane owners, pairwise disjoint; **read/calc cadence →
+`engine/cadence.py`** — `INTERVAL_SECONDS` {10,15,30} × `WINDOW_MINUTES`
+{15,30,60}, bound by the plan, adopted by the controller). Planes consume
+owners by IMPORT, never by mirrored constants; silent defaults that map
+unknown state identities to authorized behavior are governance errors.
+Enforcement lives in `tests/test_state_charter.py` +
+`tests/test_outer_cycle_charter.py` + `tests/test_governance_boundary.py`;
+the full doctrine is `docs/STATE_CHARTER_SPEC.md`.
+
+## Governance boundary (agentic plane)
+
+The FSM (`engine/fsm.py`) is the SOLE source of legality and semantic
+authority over the agentic loops:
+
+- **Transitions** — every loop/sub-loop/intent move is a governed event;
+  denials are findings, never silent auto-advance.
+- **Work authorization** — every tool dispatch authorizes against the live
+  `(loop, sub-loop)` observation; the tool registry's declared homes are
+  FSM-audited at import (a home the board cannot express fails at load).
+- **Cadence** — the CLI is the SOLE approval channel; the LLM can never
+  bind cadence. The pure resolver refuses non-CLI sources and
+  out-of-charter horizons (no silent defaults); the FSM adjudicates the
+  verdict at adoption; agent-side cadence ARGS are validated against the
+  frozen vocabulary at the dispatch seam (out-of-vocabulary values are
+  denied findings carrying the supported set).
+- **Budgets** — governance owns the verdict (`GateKind.BUDGET`), config
+  owns the numbers; the driver consults the gate before every round and
+  names everything that will not run on `unexecuted` (never a silent drop).
+- **Failure** — all failure semantics live in the Failure FSM
+  (`engine/failure_fsm.py`) behind the single `CYCLE_FAILED` intake edge;
+  the main membrane routes, it does not classify.
+
+The controller is the FSM's sole semantic executive (classification,
+credit, tri-state, adoption); the driver is the transport (consults,
+never self-authorizes). The LLM proposes; every proposal crosses a
+deterministic boundary before it can touch state. The outer cycle is the
+receipt-gated 7-stage traversal (wake → comprehension →
+plan_bound_acquisition → evidence → reasoning → validation → output) —
+no stage runs on another stage's promise, and no pre-INTAKE acquisition
+exists anywhere (the fetch semantic and DATA gate are dissolved; run_wake
+owns INTAKE deterministically).

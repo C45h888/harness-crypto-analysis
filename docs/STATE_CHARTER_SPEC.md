@@ -1,10 +1,27 @@
 # Runtime State Wiring Spec — One Namespace Per State Axis (S-0..S-5)
 
-Status: **implemented and green** (1147 tests incl. 31 charter tests;
-tree hash-verified stable across the full-suite run). Governing doctrine:
-`CANONICAL_RUNTIME_DOCTRINE.md` (null discipline: measured, not claimed).
-Companion spec: `HORIZON_RETENTION_SPEC.md` (the worker-plane horizon
-namespace, already implemented and green).
+Status: **implemented and green** (verified: pytest 1226 passed / unittest
+1118 OK, 10 skipped — incl. the charter + governance-boundary suites).
+Governing doctrine: `CANONICAL_RUNTIME_DOCTRINE.md` (null discipline:
+measured, not claimed). Companion spec: `HORIZON_RETENTION_SPEC.md` (the
+worker-plane horizon namespace, already implemented and green).
+
+> **GOVERNANCE-BOUNDARY SUPERSESSION (R-pass + G-pass, post-S-5).** Two
+> passes landed after this spec's implementation record and supersede parts
+> of §9: the **R-pass** dissolved the fetch semantic (run_agent_fetch,
+> run_data_gate, the DATA gate, and the wake-bootstrap exception are DELETED
+> — the outer cycle is the 7-stage receipt-gated table wake → comprehension
+> → plan_bound_acquisition → evidence → reasoning → validation → output;
+> run_wake owns INTAKE deterministically; comprehension is the first agentic
+> step; cadence is plan-bound via `engine/cadence.py`). The **G-pass** made
+> the FSM the SOLE legality authority over the agentic plane: cadence
+> binding is FSM-adjudicated (`ADOPT_CADENCE`, CLI-only approval channel),
+> budgets are gate-adjudicated (`GateKind.BUDGET` — config owns the
+> numbers, gates.py owns the verdict), the tool registry's home surface is
+> FSM-audited at import, and dispatch-time cadence args are validated
+> against the frozen vocabulary. Where §9 below describes the pre-R stage
+> chain (agent_fetch/data_gate), read it as the historical record; §9.4 is
+> the current truth.
 
 > **CORRECTION RECORD (spec integrity).** An earlier draft of this spec
 > carried four claims inherited from the `docs/nooa-kb/` monorepo
@@ -370,3 +387,82 @@ the §2 audit — each folded onto its owner in the same pass:
 | S-3 | `engine/core/context.py` `DETERMINISTIC_STATE_ROOTS` (34 roots, bidirectional AST-pinned) | `tests/test_state_charter.py::TestDeterministicRoots` (4 tests incl. dynamic-key ban) |
 | S-4 | `runtime/contracts.py` `SCHEMA_VERSION_REGISTRY` (12 entries) + 6 planes resolve to it; `capture.py` `STATUS_TRANSITIONS` + registry-derived schema_version | `tests/test_state_charter.py::TestSchemaRegistry` + `::TestStatusFamilyTests` (8 tests incl. pairwise family disjointness) |
 | S-5 | `tests/test_state_charter.py` keystone scans (AST over the whole package) | 31 charter tests total; suite 1147 green, tree-hash stable |
+### 9.4 Governance-boundary record (R-pass + G-pass — current truth)
+
+Two passes after S-5 re-shaped the state axes this spec charters. Both are
+landed and suite-verified (pytest 1226 / unittest 1118, both green).
+
+**R-pass — cadence-into-plan + fetch dissolution (R1–R7).**
+
+* New axis owner: `engine/cadence.py` — the ONE owner of the read/calc
+  cadence vocabulary (`INTERVAL_SECONDS` {10,15,30} × `WINDOW_MINUTES`
+  {15,30,60}), same charter shape as `runtime/horizons.py` owns horizons.
+* `task_directive.build_plan` binds `plan["cadence"]` (the plan factor is
+  the only writer); `CycleController.with_cadence` adopts it (immutable,
+  `compare=False`); `run_plan_bound_acquisition` threads it (no hardcoded
+  30m/5000ms); the wake boundary logs the adoption
+  (`engine.cadence` capability entry) and `understanding_receipt.cadence`
+  carries the resolved values.
+* Stage table: `OUTER_SEQUENCE` is the 7-stage receipt-gated traversal
+  wake → comprehension → plan_bound_acquisition → evidence → reasoning →
+  validation → output. `run_agent_fetch`, `run_data_gate`, `run_gather`,
+  `_FetchedReads`, `compose_fetch_prompt`, the fetch tool window,
+  `LOOP_PASS_BUDGET["fetch"]`, `LoopTag.FETCH` + its crosswalk entry,
+  `passes_per_loop["fetch"]`, and the charter roots
+  `data_gate`/`bootstrap_basis`/`fetch_note` are DELETED.
+* `run_wake` owns INTAKE deterministically (RECEIVE→DECODE→NORMALIZE, no
+  tools, no LLM); `run_comprehension` constructs the carrier and forms the
+  gathered receipt at its close (comprehension owns the deterministic
+  keyspace; `capture_status`/`microstructure_evidence`/`data_quality` are
+  None placeholders — null = not-provided, never zero).
+* The FSM bootstrap exception is GONE (R4): every dispatch authorizes
+  against the live (loop, sub-loop) observation; comprehension is the
+  first agentic step.
+* Budget note: `LOOP_PASS_BUDGET["reasoning"]` = 8 (three forced positions —
+  2b interpret spends two passes: fit/dist/decay, then the forecast proof —
+  + the empty-close floor steer + halt-reform headroom + one slack pass).
+
+**G-pass — the FSM as sole legality authority (G1–G8).**
+
+* Cadence verdicts: `resolve_cadence` returns `CadenceVerdict` — it REFUSES
+  non-CLI directive sources and out-of-charter horizons instead of
+  silently defaulting (§2 rule 3 applied to the new axis). The CLI is the
+  SOLE cadence approval channel: the LLM can never bind cadence.
+* FSM adjudication: `GovernanceEventKind.ADOPT_CADENCE` carries the verdict
+  payload; the membrane re-checks the deterministic conditions it owns
+  (CLI-only provenance + vocabulary membership). A refusal is a FINDING
+  (`engine.cadence.refused` capability entry) — the cycle continues at the
+  deterministic floor, never a terminal, and the board never moves.
+* Budget gate: `gates.evaluate_budget_gate` (GateKind.BUDGET) owns the
+  verdict; config.py owns the numbers (`AGENTIC_MAX_TOOL_ROUNDS`,
+  `MAX_DISPATCHES_PER_PASS`). The driver consults the gate before every
+  dispatch round — no inline budget decision remains. Overflow names the
+  pending calls on `unexecuted` (findings, never silent drops).
+* Tool-home audit: `AgenticLoopMembrane.self_check` now audits the tool
+  registry's entire home surface — every `tool_homes()` declaration must
+  resolve to a legal FSM observation (`REGISTRY_HOME_LOOPS` reconciles the
+  registry's legacy home names to `NestedLoop`). A rogue home fails at
+  import. `audit_tool_homes()` is the viewable report (charter-tested).
+* Cadence-arg validation: `_cadence_arg_refusals` (driver) validates
+  agent-supplied `interval_seconds`/`window_minutes` against the frozen
+  vocabulary BEFORE authorization — out-of-vocabulary values are
+  `tool.denied-cadence` findings carrying the supported set; they are
+  never dispatched, never executed, never re-called blind.
+* Positions: the reasoning hard-track (assemble/interpret/hypothesize)
+  executes inside ANALYSIS; position legality consults the FSM-anchored
+  position machinery — the driver consults, it does not self-decide.
+* Charter tests: `tests/test_governance_boundary.py` (28 tests) pins the
+  whole boundary — resolver verdicts, CLI-only binding, membrane
+  adjudication, budget-gate purity, home audit, arg validation, and
+  vocabulary identity. The pytest-only characterization modules
+  (`test_cycle_characterization.py`, fixture regen; `test_p0_alignment.py`)
+  were re-pinned to the R7 stage table and the no-bootstrap contract.
+
+Spec-conformance notes: this record keeps §2's doctrine intact — the
+cadence axis gained one owner (`engine/cadence.py`) with import-based
+consumers; the two silent defaults the G-pass removed (cadence
+auto-defaulting, inline budget decisions) were governance errors under
+§2 rule 3; the tool-home audit extends §9.3's S-1 "no silent authorized
+default" rule to the registry layer. Payload shapes and persistence keys
+are unchanged (§8 scope holds) except the deleted fetch-plane roots,
+which were chartered state, not payloads.

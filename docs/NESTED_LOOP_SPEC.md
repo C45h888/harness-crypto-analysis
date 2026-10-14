@@ -1,9 +1,24 @@
 # Nested Loop Spec — the in-depth workflow inside each loop state
 
-Status: **workflow vocabulary and governance membrane implemented; runtime
-alignment incomplete.** Vocabulary lives in `engine/loop_states.py`, legality
-in `engine/fsm.py`, and semantics in `engine/controller.py` (under
+Status: **vocabulary, governance membrane, and runtime alignment
+implemented; governance-boundary pass (R + G) landed and green.**
+Vocabulary lives in `engine/loop_states.py`, legality in `engine/fsm.py`,
+and semantics in `engine/controller.py` (under
 `market_service/nooa_harness/`). `engine/membrane.py` has been deleted.
+
+> **SUPERSESSION RECORD (R-pass + G-pass).** The five-loop stage table in
+> §2 is the DESIGN vocabulary; the runtime's outer cycle is the merged
+> 4-loop traversal derived by `OUTER_SEQUENCE` (wake → comprehension →
+> plan_bound_acquisition → evidence → reasoning → validation → output),
+> with CONTEXT hosting the six sub-loops (INTAKE INTERPRETATION FRAMING
+> SOURCING ACQUISITION VERIFICATION) as one merged loop. The agent-fetch
+> turn and the DATA gate named in §8.3 are DELETED (R-pass): run_wake owns
+> INTAKE deterministically and comprehension is the first agentic step.
+> The FSM is the sole legality authority (G-pass): cadence binding is
+> FSM-adjudicated (CLI-only approval), budgets are gate-adjudicated, tool
+> homes are FSM-audited at import. `tests/test_governance_boundary.py`
+> pins the boundary; `tests/test_outer_cycle_charter.py` pins the stage
+> table.
 
 **Section 8 is the current P3b implementation contract.** Sections 5–7 below
 record the original pass plan, not current implementation status; their
@@ -244,7 +259,7 @@ contract unchanged. Extract four private methods:
 | Method | Exact existing-code seam | Vocabulary it hosts |
 |---|---|---|
 | `_stage_wake` | timestamp, wake log, governed controller initialization; stop before pre-gate reads | WAKE / COMPREHENSION |
-| `_stage_gather` | agent-first fetch turn + floor fill, ledger, deterministic state and hard-gate early return; stop before memory recall | GATHER / CONTEXT |
+| `_stage_gather` | *(historical — R-pass removed the fetch turn and DATA gate; today `run_wake` + `run_comprehension` + `run_plan_bound_acquisition` host this seam)* | GATHER / CONTEXT |
 | `_stage_reason_and_check` | memory recall, prompts, initial narration, tool rounds, validation/repair and final-turn bookkeeping; stop before interpretation assembly | REASON / REASONING and CHECK / VALIDATION |
 | `_stage_output` | interpretation/fallback, hypothesis, calculations, terminal, artifact persistence and memory disposition | FINALIZE / OUTPUT |
 
@@ -252,8 +267,10 @@ The combined reason/check method is a feedback coordinator, not a new stage.
 During P3b-A these associations identify implementation seams; they do not
 claim that all nested sub-loops are already operational.
 
-The orchestrator creates a context, runs the agent fetch, verdicts the
-data gate, propagates any completed
+The orchestrator creates a context, runs the deterministic wake
+(normalization — R-pass: run_wake owns INTAKE), runs comprehension
+(understand + plan + cadence adoption under FSM adjudication), runs
+plan-bound acquisition, propagates any completed
 result, calls reason/check, propagates any completed result, then calls output.
 Gather and reason/check return `None` to continue or the existing artifact/meta
 tuple to finish. Failure-path persistence stays in its existing branch.
@@ -361,3 +378,146 @@ runtime-alignment gate, not in extraction.
 only when P3b-B drives real nested-loop work through the canonical mappings,
 all design gates are resolved, and the full suite is green. Resumability,
 arbitrary new tools and new persistence destinations remain out of scope.
+
+---
+
+## 9. Governance-boundary record (R-pass + G-pass — landed)
+
+Supersedes the historical pass sequencing in §6 and the deferred items in
+§5. Full suite green at record time: pytest 1226 passed / unittest 1118 OK
+(10 skipped), including `tests/test_governance_boundary.py` (28 tests),
+`tests/test_outer_cycle_charter.py`, and `tests/test_state_charter.py`.
+
+### 9.1 R-pass — cadence-into-plan + fetch dissolution (R1–R7)
+
+* `engine/cadence.py` is the ONE owner of the read/calc cadence
+  vocabulary: `INTERVAL_SECONDS` {10,15,30} × `WINDOW_MINUTES`
+  {15,30,60}, `DEFAULT_FORECAST_MS` identity-imported from
+  `runtime/horizons.py` (never a local literal).
+* `build_plan` binds `plan["cadence"]` — the plan factor is the only
+  writer. The controller ADOPTS it at comprehension close
+  (`with_cadence`, immutable field, frozen via `MappingProxyType`).
+  `run_plan_bound_acquisition` threads interval/window/horizon from the
+  controller (`cadence_value`) — the hardcoded 30m window and 5000ms
+  horizon are gone from acquisition.
+* The fetch semantic is DISSOLVED by deletion: `run_agent_fetch`,
+  `run_data_gate`, `run_gather`, `_FetchedReads`, `compose_fetch_prompt`,
+  the fetch tool window, `LOOP_PASS_BUDGET["fetch"]`,
+  `LoopTag.FETCH` + crosswalk entry, `passes_per_loop["fetch"]`, charter
+  roots `data_gate`/`bootstrap_basis`/`fetch_note`, the FSM bootstrap
+  branch, and the principles fetch-window vocabulary.
+* `run_wake` owns INTAKE (opens the sub-loop; normalization is the
+  RECEIVE→DECODE→NORMALIZE work — no tools, no LLM).
+  `run_comprehension` constructs the carrier and forms the gathered
+  receipt at its close; the comprehension plane owns the deterministic
+  keyspace (`capture_status`/`microstructure_evidence`/`data_quality`
+  are None placeholders — null = not-provided, never zero).
+* `OUTER_SEQUENCE` = wake → comprehension → plan_bound_acquisition →
+  evidence → reasoning → validation → output (7 receipt-gated stages).
+* Budget: `LOOP_PASS_BUDGET["reasoning"]` = 7 (three forced positions +
+  the empty-close floor steer + one slack pass).
+
+### 9.2 G-pass — the FSM as sole legality authority (G1–G8)
+
+* Cadence verdicts (`engine/cadence.CadenceVerdict`): the resolver
+  REFUSES non-CLI directive sources and out-of-charter horizons — no
+  silent default maps an unknown identity to authorized behavior (§2's
+  own doctrine applied to the cadence axis).
+* CLI-only approval channel: a cadence triple binds ONLY from a
+  `source == "cli"` directive. `dispose_assessment` already forbids the
+  LLM from overriding CLI fields; now the LLM cannot bind cadence at all.
+* FSM adjudication: `GovernanceEventKind.ADOPT_CADENCE` carries the
+  verdict; the membrane re-checks provenance + vocabulary membership.
+  Refusal = a recorded finding (`engine.cadence.refused`); the cycle
+  continues at the deterministic floor; the board never moves on this
+  event (no next observation, no terminal).
+* Budget gate: `gates.evaluate_budget_gate` (GateKind.BUDGET) —
+  governance owns the verdict, config owns the numbers. The driver
+  consults it before every dispatch round; overflow names pending calls
+  on `unexecuted` (findings, never silent drops).
+* Tool-home audit: `AgenticLoopMembrane.self_check` audits the tool
+  registry's entire home surface at import — every declared home must
+  resolve to a legal FSM observation (`REGISTRY_HOME_LOOPS` reconciles
+  the registry's legacy home names). `audit_tool_homes()` is the
+  viewable report; a rogue home fails at import.
+* Cadence-arg validation: `_cadence_arg_refusals` validates agent-supplied
+  `interval_seconds`/`window_minutes` against the frozen vocabulary at
+  the dispatch seam — out-of-vocabulary values become
+  `tool.denied-cadence` findings carrying the supported set; never
+  dispatched, never executed, never re-called blind.
+* Positions: the reasoning hard-track (assemble → interpret →
+  hypothesize) executes inside ANALYSIS; position legality consults the
+  FSM-anchored position machinery (the driver consults, not self-decides).
+
+### 9.3 What governs what now (the one-paragraph constitution)
+
+The FSM owns LEGALITY: transitions (enter/set_task/open/close/settle),
+work authorization at the live observation, cadence-binding adjudication,
+budget adjudication (via the gate verdict shape), and the tool-home audit.
+The controller is the FSM's sole semantic EXECUTIVE: outcome
+classification, coverage credit, redundancy suppression, scenario
+tri-state, cadence adoption, loop-visit projection (only FSM-opened
+sub-loops count). The driver is the TRANSPORT: it consults the membrane
+before every dispatch and never self-authorizes. Gates own verdicts
+(plan adequacy, budget); principles own advisory findings; the Failure
+FSM (`engine/failure_fsm.py`) owns all failure semantics behind the
+single `CYCLE_FAILED` intake edge. The LLM proposes; every proposal
+crosses a deterministic boundary before it can touch state.
+
+---
+
+## 10. Loop receipts — the canonical, engine-authored layer (landed)
+
+Receipts are now first-class and canonical. Full suite green at record time:
+pytest **1259 passed / 1 skipped** (incl. `tests/test_loop_receipts.py`).
+
+### 10.1 What a receipt is
+
+A `LoopReceipt` (`engine/loop_states.py`, emitted by `engine/receipts.py`) is
+an engine-authored, frozen record of ONE loop/sub-loop close: *what ran, what
+it covered, how it closed, with what provenance*. It carries **no model
+prose** — narration never enters a receipt.
+
+| Field | Meaning |
+|---|---|
+| `loop` / `sub_loop` | the closed workflow position |
+| `disposition` | `completed \| not_applicable \| refused \| denied \| skipped` |
+| `steps` | the fine `LoopStep`s covered |
+| `payload` | bounded STRUCTURAL facts (JSON-safe) |
+| `evidence_refs` | provenance ancestors (wake_id / artifact_id) |
+
+### 10.2 What was instantiated (parity-preserving)
+
+* `LoopReceipt` + `ReceiptDisposition` vocabulary (`loop_states.py`).
+* `engine/receipts.py`: `emit_receipt` (carrier + chartered root),
+  `append_receipt`, `receipts_of`, `render_receipts_block`.
+* Chartered surface: `deterministic_state["loop_receipts"]`
+  (`context.DETERMINISTIC_STATE_ROOTS`), pinned by the state charter.
+* Emission at the five loop closes (comprehension, evidence, reasoning,
+  validation, output). Emission adds **zero LLM calls** (characterization
+  `llm_calls` unchanged: success 11, budget 12, gate 1).
+
+### 10.3 The agent's memory node is a SEPARATE surface
+
+Receipts do **not** enter the agent's episodic memory node
+(`market_service.nooa_harness.memory.MemoryNode`). The memory node belongs to
+the agent, which calls it (`memory.recall_paper`) and writes it
+(`memory_proposals`, disposed by the engine per
+`docs/nooa-kb/behavior/memory-protocol.md`). The engine does not project its
+bookkeeping into the agent's memory.
+
+> **Superseded design (reversed).** An earlier pass added an engine→memory
+> projection (memory kind `receipt` carrying the receipt vector + an LLM
+> `reasoning_note`) alongside a second LLM turn field `reasoning_note`. That
+> inverted the direction of control (the engine wrote the agent's memory) and
+> duplicated the existing `memory_proposals` channel. Both were removed — the
+> projection, the `receipt` memory kind, `reasoning_note`, and the note-binding
+> machinery (`turn_indices`, `receipt_turn_cursor`, `_ReasonedCycle.turn_log`).
+
+### 10.4 Deliberately NOT wired yet
+
+The gate does **not** yet consume the receipt vector, and `run_output`'s
+`synthesis_material` does not yet compose from it. The receipt layer is
+recorded but semantically inert, so characterization parity held. The
+**agent-side memory node surface (call + write) is the next change surface**,
+not an engine projection.
