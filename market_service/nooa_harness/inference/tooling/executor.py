@@ -35,6 +35,10 @@ from .tools_market import (
     dispatch_assemble_evidence,
     dispatch_market_read,
     dispatch_memory_recall_paper,
+    dispatch_memory_remember,
+    dispatch_memory_recall,
+    dispatch_memory_forget,
+    dispatch_memory_stats,
     dispatch_read_capture_status,
     dispatch_read_derivatives,
     dispatch_read_events,
@@ -51,6 +55,7 @@ async def execute_tool(
     store: RedisRuntimeStore, name: str, args: dict[str, Any],
     *, postgres: Any | None = None, memory: Any | None = None,
     settings: Any | None = None,
+    session_id: str | None = None, segment: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Execute one tool call by public name with scope validation + audit.
 
@@ -212,6 +217,26 @@ async def execute_tool(
             store, symbol, venue, window_minutes=int(args.get("window_minutes") or 30),
             tick_size=_resolved_tick_for_dispatch(symbol, venue, args),
             cost_statement=args.get("cost_statement"), postgres=postgres)
+    if name == "memory.remember":
+        return await dispatch_memory_remember(
+            symbol, venue, args=args, memory=memory,
+            session_id=session_id, segment=segment,
+        )
+    if name == "memory.recall":
+        return await dispatch_memory_recall(
+            symbol, venue, args=args, memory=memory,
+            session_id=session_id, segment=segment,
+        )
+    if name == "memory.forget":
+        return await dispatch_memory_forget(
+            symbol, venue, args=args, memory=memory,
+            session_id=session_id, segment=segment,
+        )
+    if name == "memory.stats":
+        return await dispatch_memory_stats(
+            symbol, venue, args=args, memory=memory,
+            session_id=session_id, segment=segment,
+        )
     if name == "memory.recall_paper":
         return await dispatch_memory_recall_paper(
             symbol, venue, query=str(args.get("query") or "Cont OFI AD beta"),

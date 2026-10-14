@@ -415,3 +415,134 @@ async def dispatch_memory_recall_paper(
     except Exception as exc:
         return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# memory.* — the AGENT's OWN segmented episodic memory (B1 surface for the B2
+# ``MemorySkill``). The agent writes and reads its own observations in flight;
+# the engine does NOT dispose these writes — only structural hygiene (kind /
+# size / pinned segment) applies, and it lives in the skill.
+# ---------------------------------------------------------------------------
+
+
+def _agent_memory_skill(memory: Any, session_id: Any, segment: Any):
+    """Build the B2 skill bound to this cycle's session + task segment."""
+    from market_service.nooa_harness.memory_skill import MemorySkill
+    return MemorySkill(
+        memory=memory,
+        session_id=str(session_id),
+        segment=(str(segment) if segment else None),
+    )
+
+
+async def dispatch_memory_remember(
+    symbol: str, venue: str, *, args: dict[str, Any],
+    memory: Any = None, session_id: Any = None, segment: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Tool: memory.remember — the agent writes one of ITS OWN observations."""
+    args = args or {}
+    cap = CAPABILITIES["memory.remember"]
+    scope = {"symbol": symbol.upper(), "venue": venue,
+             "kind": str(args.get("kind") or "observation")}
+    try:
+        cap.validate_scope(symbol, venue)
+    except CapabilityDenied as exc:
+        return {"stored": False}, capability_log_entry(
+            cap.name, scope, "denied", detail=str(exc))
+    if memory is None or not session_id:
+        result = {"stored": False, "reason": "memory_node_not_configured"}
+        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+    try:
+        skill = _agent_memory_skill(memory, session_id, segment)
+        result = await skill.remember(
+            str(args.get("kind") or "observation"),
+            str(args.get("content") or ""),
+            importance=args.get("importance", 5.0),
+            tags=args.get("tags") or (),
+            evidence_refs=args.get("evidence_refs") or (),
+            title=args.get("title"),
+        )
+        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+    except Exception as exc:  # noqa: BLE001
+        return {"stored": False}, capability_log_entry(
+            cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_memory_recall(
+    symbol: str, venue: str, *, args: dict[str, Any],
+    memory: Any = None, session_id: Any = None, segment: Any = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Tool: memory.recall — the agent reads back ITS OWN segment memory."""
+    args = args or {}
+    cap = CAPABILITIES["memory.recall"]
+    scope = {"symbol": symbol.upper(), "venue": venue,
+             "kind": args.get("kind"), "query": args.get("query")}
+    try:
+        cap.validate_scope(symbol, venue)
+    except CapabilityDenied as exc:
+        return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    if memory is None or not session_id:
+        return [], capability_log_entry(
+            cap.name, scope, "ok", detail={"rows": 0, "reason": "memory_node_not_configured"})
+    try:
+        skill = _agent_memory_skill(memory, session_id, segment)
+        rows = await skill.recall(
+            kind=(str(args["kind"]) if args.get("kind") else None),
+            query=(str(args["query"]) if args.get("query") else None),
+            limit=args.get("limit", 8),
+        )
+        return rows, capability_log_entry(
+            cap.name, scope, "ok", detail={"rows": len(rows)})
+    except Exception as exc:  # noqa: BLE001
+        return [], capability_log_entry(
+            cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_memory_forget(
+    symbol: str, venue: str, *, args: dict[str, Any],
+    memory: Any = None, session_id: Any = None, segment: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Tool: memory.forget — tombstone one of the agent's OWN memories."""
+    args = args or {}
+    cap = CAPABILITIES["memory.forget"]
+    scope = {"symbol": symbol.upper(), "venue": venue,
+             "memory_id": str(args.get("memory_id") or "")}
+    try:
+        cap.validate_scope(symbol, venue)
+    except CapabilityDenied as exc:
+        return {"forgotten": False}, capability_log_entry(
+            cap.name, scope, "denied", detail=str(exc))
+    if memory is None or not session_id:
+        result = {"forgotten": False, "reason": "memory_node_not_configured"}
+        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+    try:
+        skill = _agent_memory_skill(memory, session_id, segment)
+        result = await skill.forget(str(args.get("memory_id") or ""))
+        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+    except Exception as exc:  # noqa: BLE001
+        return {"forgotten": False}, capability_log_entry(
+            cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def dispatch_memory_stats(
+    symbol: str, venue: str, *, args: dict[str, Any],
+    memory: Any = None, session_id: Any = None, segment: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Tool: memory.stats — per-kind counts for the agent's session."""
+    args = args or {}
+    cap = CAPABILITIES["memory.stats"]
+    scope = {"symbol": symbol.upper(), "venue": venue}
+    try:
+        cap.validate_scope(symbol, venue)
+    except CapabilityDenied as exc:
+        return {}, capability_log_entry(cap.name, scope, "denied", detail=str(exc))
+    if memory is None or not session_id:
+        return {"configured": False, "counts": {}}, capability_log_entry(
+            cap.name, scope, "ok", detail={"configured": False})
+    try:
+        skill = _agent_memory_skill(memory, session_id, segment)
+        result = await skill.stats()
+        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+    except Exception as exc:  # noqa: BLE001
+        return {}, capability_log_entry(
+            cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
+

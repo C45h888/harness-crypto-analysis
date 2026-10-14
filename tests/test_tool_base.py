@@ -76,8 +76,9 @@ class ToolRegistryTests(unittest.TestCase):
         # 6 micro + 6 Pass-C split calc + calc.price.delta + calc.scenario.evaluate
         # + memory.recall_paper + 4 market (group removed with run_cycle) + 14 substrate
         # + 11 Track A forward stack (canonical forecast + feature/forward x4/
-        # hypothesis/events x2/decay/discipline).
-        self.assertEqual(len(TOOL_NAMES), 44)
+        # hypothesis/events x2/decay/discipline) + 4 agent memory tools
+        # (memory.remember/recall/forget/stats).
+        self.assertEqual(len(TOOL_NAMES), 48)
 
     def test_every_tool_backed_by_a_capability(self):
         for tool, capability in TOOL_NAMES.items():

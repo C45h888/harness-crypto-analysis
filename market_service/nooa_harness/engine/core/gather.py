@@ -104,6 +104,7 @@ async def run_plan_bound_acquisition(
         engine.store, "calc.forward.forecast",
         _forecast_args,
         postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
+        session_id=engine.session_id, segment=getattr(ctx, "task_id", None),
     )
     capability_log.append(forecast_log)
     capability_log.append({
@@ -151,6 +152,7 @@ async def run_plan_bound_acquisition(
             engine.store, "calc.forward.scenario",
             _scenario_args,
             postgres=engine.postgres, memory=engine.memory, settings=engine.settings,
+            session_id=engine.session_id, segment=getattr(ctx, "task_id", None),
         )
         capability_log.append(forward_scenario_log)
         controller = controller.record_outcome(

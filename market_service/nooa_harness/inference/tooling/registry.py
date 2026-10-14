@@ -38,6 +38,12 @@ TOOL_NAMES: dict[str, str] = {
     "calc.decay.report": "calc.decay.report",
     "calc.discipline.audit": "calc.discipline.audit",
     "memory.recall_paper": "memory.recall_paper",
+    # The AGENT's own segmented episodic memory (B1 surface for the B2 skill).
+    # No phase: a memory write is never coverage credit.
+    "memory.remember": "memory.remember",
+    "memory.recall": "memory.recall",
+    "memory.forget": "memory.forget",
+    "memory.stats": "memory.stats",
     # T2 — market correlation (canonical pipeline seams)
     "market.read": "market.read",
     "market.derivatives": "market.read_derivatives",
@@ -116,6 +122,21 @@ TOOL_PHASE: dict[str, str] = {
 
 TOOL_HOME_DEFAULT: tuple[str, str] = ("evidence", "acquisition")
 
+# Every legal (loop, sub-loop) observation — the agent may use its own memory
+# anywhere it actually works. Declared as data (charter: the registry cannot
+# invent an authorization the FSM does not own; the home audit verifies each
+# of these resolves to a legal observation).
+_MEMORY_HOMES: tuple[tuple[str, str], ...] = (
+    ("context", "intake"), ("context", "interpretation"),
+    ("context", "framing"), ("context", "sourcing"),
+    ("context", "acquisition"), ("context", "verification"),
+    ("reasoning", "hypothesis"), ("reasoning", "analysis"),
+    ("reasoning", "synthesis"),
+    ("validation", "gate"), ("validation", "recovery"),
+    ("output", "composition"), ("output", "architecture"),
+    ("output", "placement"), ("output", "memory"),
+)
+
 
 TOOL_HOME_OVERRIDES: dict[str, tuple[str, str]] = {
     # Preferred homes.  P5 deterministic calculations may be requested on
@@ -127,6 +148,15 @@ TOOL_HOME_OVERRIDES: dict[str, tuple[str, str]] = {
 
 
 TOOL_HOME_OPTIONS_OVERRIDES: dict[str, tuple[tuple[str, str], ...]] = {
+    # memory.* is the AGENT's own memory: callable IN FLIGHT from any loop /
+    # sub-loop the agent actually works in. The FSM still adjudicates the
+    # live observation — this only declares that every one of these homes is
+    # a legal place to remember or recall.
+    **({
+        tool: _MEMORY_HOMES
+        for tool in ("memory.remember", "memory.recall",
+                     "memory.forget", "memory.stats")
+    }),
     "memory.recall_paper": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.ofi.intervals": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.depth.average": (("evidence", "acquisition"), ("reasoning", "analysis")),

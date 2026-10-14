@@ -228,6 +228,16 @@ TOOL_OUTPUT_SCHEMAS: dict[str, str] = {
         "tags: array[str], session_id: str, created_at: str}] — "
         "empty array when unseeded"
     ),
+    "memory.remember": (
+        "{stored: bool, kind: str, memory_id: str|null, segment: str|null, "
+        "reason: str|null} — the agent's OWN segment memory"
+    ),
+    "memory.recall": (
+        "array[{id: str, kind: str, content: str, importance: float, "
+        "tags: array[str], created_at: str}] — the agent's OWN segment"
+    ),
+    "memory.forget": "{forgotten: bool, memory_id: str|null, reason: str|null}",
+    "memory.stats": "{configured: bool, counts: {kind: int}}",
 }
 
 # ---------------------------------------------------------------------------
@@ -329,6 +339,13 @@ TOOL_ARG_CONTRACTS: dict[str, str] = {
     "substrate.read": "{substrate: str|null, mode: compact|full}",
     "substrate.invoke|substrate.*": "{substrate: str (worker name)}",
     "memory.recall_paper": "{query: str}",
+    "memory.remember": (
+        "{kind: observation|hypothesis|note, content: str, importance: float, "
+        "tags: array[str], evidence_refs: array[str], title: str|null}"
+    ),
+    "memory.recall": "{kind: str|null, query: str|null, limit: int <= 32}",
+    "memory.forget": "{memory_id: str}",
+    "memory.stats": "{}",
 }
 
 
