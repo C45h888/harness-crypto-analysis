@@ -193,13 +193,13 @@ def test_staged_cycle_converges_and_preserves_placement_order():
                     "run_reasoning", "run_validation", "run_validation", "run_output"]
     assert result["meta"]["terminal"] == "settled"
     assert result["meta"]["final_validation"]["passed"]
-    # P1 central ledger: the engine's own memory (understanding/plan/handoff
-    # + the base/refined observations) is now deterministic engine state, NOT
-    # episodic MemoryNode writes. The only remaining memory write is the
-    # agent's own proposal at OUTPUT. Settlement side effects: pending
-    # projection, memory disposition, final projection, final-trace refresh.
+    # P1 central ledger + retirement: engine memory is deterministic state (NOT
+    # MemoryNode rows) AND the engine no longer disposes the agent's memory.
+    # This scripted walk never calls memory.remember, so NO memory write occurs
+    # — the agent's memory is written only through the memory.* tools.
+    # Settlement side effects: pending projection, final projection, final-trace.
     assert [effect[0] for effect in result["effects"] if effect[0] in ("postgres", "redis", "memory")] == [
-        "postgres", "redis", "memory", "redis", "redis",
+        "postgres", "redis", "redis", "redis",
     ]
 
 

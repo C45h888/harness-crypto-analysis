@@ -15,8 +15,7 @@ The split:
   - DEFAULT_NARRATION_MAX_TOKENS / NARRATION_MAX_TOKENS_ENV /
     DEFAULT_CONTEXT_WINDOW drive the per-call generation cap (25% of the
     context window, clamped).
-  - MEMORY_RECALL_LIMIT / MEMORY_CONTEXT_BUDGET / MAX_MEMORY_PROPOSALS are
-    the memory-plane budgets.
+  - MEMORY_RECALL_LIMIT / MEMORY_CONTEXT_BUDGET are the memory-plane budgets.
   - SESSION_TEMPLATE is the canonical session-id pattern (kept for callers
     that synthesise an id outside the engine).
   - KB paths are file-system anchors for the prompt-payload docs the
@@ -98,7 +97,6 @@ SUMMARY_MIN_CHARS = 200
 # Expanded for paper KB cross-check.
 MEMORY_RECALL_LIMIT = 12
 MEMORY_CONTEXT_BUDGET = 8_000
-MAX_MEMORY_PROPOSALS = 3
 
 # --- Headline bound for the prior-artifact block in the prompt. ---
 _PRIOR_HEADLINE_MAX_CHARS = 4_000
@@ -166,7 +164,6 @@ __all__ = [
     "SUMMARY_MIN_CHARS",
     "MEMORY_RECALL_LIMIT",
     "MEMORY_CONTEXT_BUDGET",
-    "MAX_MEMORY_PROPOSALS",
     "_PRIOR_HEADLINE_MAX_CHARS",
     "_STRUCTURED_OK",
     "_TOOL_MANIFEST",

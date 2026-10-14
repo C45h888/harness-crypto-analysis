@@ -187,9 +187,9 @@ class _CycleContext:
     # once in run_wake; loops read fields off it instead of re-slicing raw
     # task. Compat passthroughs task/scenario retained until Phase-3 cleanup.
     prompt: Any | None = None
-    # Task-scoped memory segment (state redistribution): a deterministic id
-    # derived from the normalized prompt, threaded to every memory write and
-    # to segment-scoped recall so plan/handoff carry never bleeds across tasks.
+    # Task-scoped segment (state redistribution): a deterministic id derived
+    # from the normalized prompt, threaded to every CENTRAL-LEDGER entry AND to
+    # the agent's own memory writes/reads so neither bleeds across tasks.
     task_id: str | None = None
 
 
@@ -282,21 +282,21 @@ class CycleRuntimeState:
     scenario_block: str = ""
     wake_block: str = ""
     workflow_block: str = ""
-    memory_block: str = ""
+    ledger_block: str = ""
     prior_note: str = ""
     # Reasoning-entry partition context (first semantic of REASONING).
     # Recalled at REASONING entry from the task-segment partition writes
     # (understanding + plan + handoff) so the first passes reason over
     # what previous sub-loops/nested loops concluded, never from scratch.
-    reasoning_memory_block: str = ""
-    reasoning_memory_ids: list[str] = field(default_factory=list)
-    # Phase 0 (staged ANALYSIS): frozen 2a exit payload + inter-stage
-    # memory carry. base_summary is frozen at assemble close from
-    # accumulated_tool_results (chain.base_summary); analysis_memory_ids
-    # cites the base/refined observation writes threaded through the
+    reasoning_ledger_block: str = ""
+    reasoning_ledger_ids: list[str] = field(default_factory=list)
+    # Phase 0 (staged ANALYSIS): frozen 2a exit payload + inter-stage ledger
+    # carry. base_summary is frozen at assemble close from
+    # accumulated_tool_results (chain.base_summary); ledger_stage_ids
+    # cites the base/refined LEDGER observations threaded through the
     # task segment so 2b reasons over 2a conclusions, never from scratch.
     base_summary: dict[str, Any] = field(default_factory=dict)
-    analysis_memory_ids: list[str] = field(default_factory=list)
+    ledger_stage_ids: list[str] = field(default_factory=list)
     # Digest-fallback bound (failure substrate): the plan-bound forecast
     # digest is revealed to the agent at most ONCE per cycle, and only
     # after an agent forecast call failed in 2b. Guards double-see.
@@ -405,7 +405,7 @@ def freeze_chain(
         # Slice D: base pointer — the halt/retry reader gets base + position
         # in one snapshot instead of joining two roots.
         "base_summary": dict(getattr(st, "base_summary", {}) or {}),
-        "stage_ids": list(getattr(st, "analysis_memory_ids", []) or []),
+        "stage_ids": list(getattr(st, "ledger_stage_ids", []) or []),
     }
 
 
@@ -433,15 +433,41 @@ def failure_substrate_for(st: CycleRuntimeState) -> Any:
 class _EngineTransport:
     """The capability handle a worker OWNS while it handles a task.
 
-    Deliberately thin: it exposes ONLY the two acts a bounded worker may take —
-    run a tool deterministically, or make one narration LLM call. It never
-    exposes the FSM, the controller, or the engine class itself.
+    Deliberately thin: it exposes ONLY the acts a bounded worker may take — run
+    tool calls through the AUTHORIZED dispatch path, run one tool directly, or
+    make one narration LLM call. It never exposes the FSM, the controller, or
+    the engine class itself.
     """
 
-    __slots__ = ("_engine",)
+    __slots__ = ("_engine", "_ctx", "_st")
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, ctx: Any = None, st: Any = None) -> None:
         self._engine = engine
+        self._ctx = ctx
+        self._st = st
+
+    async def dispatch_tool(self, calls: list[dict[str, Any]], **kwargs: Any) -> set[str]:
+        """Re-dispatch through the AUTHORIZED path (the mirror's seam).
+
+        Re-enters the engine's own per-call gate chain by presenting the calls as
+        the turn's ``tool_calls``, so budget / cadence / position / FSM work
+        authorization / redundancy suppression / ``record_outcome`` all apply
+        exactly once — the FSM stays the law. Returns the names actually
+        dispatched (empty when a gate refused).
+        """
+        st = self._st
+        if st is None or getattr(st, "_mirroring", False):
+            return set()                       # no recursion into the mirror
+        prev = getattr(st, "parsed_current", None)
+        st._mirroring = True                    # type: ignore[attr-defined]
+        try:
+            st.parsed_current = {"tool_calls": list(calls)}
+            await self._engine._dispatch_turn(self._ctx, st)
+        finally:
+            st._mirroring = False               # type: ignore[attr-defined]
+            st.parsed_current = prev
+        results = getattr(st, "_round_results", {}) or {}
+        return {str(c.get("name")) for c in calls} & set(results)
 
     async def execute_tool(
         self, name: str, args: dict[str, Any], **kwargs: Any,
@@ -451,13 +477,17 @@ class _EngineTransport:
             postgres=self._engine.postgres,
             memory=self._engine.memory,
             settings=self._engine.settings,
+            session_id=self._engine.session_id,
         )
 
     async def call_llm(self, prompt: str) -> str:
         return await self._engine._call_llm(prompt)
 
 
-async def dispatch_failure(engine: Any, ctx: Any, st: CycleRuntimeState) -> Any:
+async def dispatch_failure(
+    engine: Any, ctx: Any, st: CycleRuntimeState,
+    *, kind: str | None = None, intent: dict[str, Any] | None = None,
+) -> Any:
     """Classify the signalled failure and DISPATCH it through the failure node.
 
     The substrate ASSESSES and DISPATCHES; the worker owns the transport and
@@ -469,11 +499,14 @@ async def dispatch_failure(engine: Any, ctx: Any, st: CycleRuntimeState) -> Any:
     from ..failure_fsm import FAILURE_FSM
     from ..failure_substrate import FailureTask
 
-    kind = st.failure_kind or "infra_failed"
+    kind = kind or st.failure_kind or "infra_failed"
     detail = st.failure_detail
     verdict = FAILURE_FSM.classify(kind)
-    task = FailureTask.from_verdict(verdict, detail=detail, loop_tag=st.loop_tag)
-    transport = _EngineTransport(engine)
+    task = FailureTask.from_verdict(
+        verdict, detail=detail, loop_tag=st.loop_tag,
+        intent=intent if intent is not None else getattr(st, "tool_intent", None),
+    )
+    transport = _EngineTransport(engine, ctx, st)
     outcome = await failure_substrate_for(st).dispatch(
         verdict, task=task, transport=transport,
     )
@@ -549,6 +582,37 @@ async def recover_narration_call(
             st.failure_detail = f"{type(exc).__name__}: {exc}"
             continue
     return None
+
+
+async def recover_tool_failure(
+    engine: Any, ctx: Any, st: CycleRuntimeState, *,
+    kind: str = "tool_parse_failed",
+    intent: dict[str, Any] | None = None,
+) -> Any:
+    """Dispatch a TOOL failure through the failure node (the mirror's caller).
+
+    The substrate dispatches the TOOL worker (the deterministic output mirror),
+    which re-dispatches the salvaged calls through the authorized path — so the
+    mirrored results land in the cycle's outcome ledger exactly once. Returns
+    ``None`` when the failure is resolved (the caller resumes the loop with the
+    mirrored results present), or the escalated ``FailureOutcome`` when the
+    failure terminates (the caller leaves ``st.failure_kind`` set and writes the
+    terminal once).
+    """
+    intent = intent if intent is not None else getattr(st, "tool_intent", None)
+    if not intent or not intent.get("tool_calls"):
+        # Nothing salvageable — fall back to the canonical terminal route.
+        return await run_runtime_failure(engine, ctx, st)
+    outcome = await dispatch_failure(
+        engine, ctx, st, kind=kind, intent=intent,
+    )
+    if outcome.continue_cycle:
+        st.failure_kind = None
+        st.failure_detail = None
+        st.tool_intent = None                  # type: ignore[attr-defined]
+        st.deterministic_state["failure"]["resolved"] = outcome.resolved
+        return None
+    return outcome
 
 
 async def run_runtime_failure(

@@ -110,8 +110,9 @@ async def run_output(
         if isinstance(maybe_composed, dict):
             if maybe_composed.pop("tool_calls", None):
                 log.warning("output pass: tool_calls dropped (non-agentic)")
-            if maybe_composed.get("memory_proposals") is None:
-                maybe_composed["memory_proposals"] = staged_final.get("memory_proposals")
+            # Legacy proposal fields are ignored: the agent's memory is written
+            # through the memory.* tools, never proposed in a turn.
+            maybe_composed.pop("memory_proposals", None)
             parsed_final = maybe_composed
     except Exception:
         log.exception("output composition pass failed; keeping staged final")
@@ -249,7 +250,7 @@ async def run_output(
     )
 
     # Persist a pending artifact first.  The final terminal is written only
-    # after memory disposition and the durable update receipt are known.
+    # after the durable update receipt is known.
     deterministic_state["terminal"] = "pending_settlement"
     deterministic_state["loop_traversal"] = controller.loop_coverage()
     deterministic_state["congruence"] = controller.congruence()
@@ -281,19 +282,13 @@ async def run_output(
         else persistence.get("redis")
     )
 
-    # --- MEMORY PROPOSAL RESOLUTION (LLM proposes; engine disposes) ---
-    accepted, dispositions = engine.resolve_memory_proposals(
-        parsed_final.get("memory_proposals"), artifact_status=gate_status,
-    )
+    # --- AGENT MEMORY (the agent owns it) ---
+    # The agent writes its own memory through the memory.* tools, in flight, at
+    # the moment it decides to. The engine does NOT dispose memory: there is no
+    # proposal queue and no post-hoc write here. The MEMORY sub-loop still
+    # closes the OUTPUT traversal.
     controller, _ = context._must_govern(
         controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.MEMORY
-    )
-    written = await engine._remember(
-        accepted, {"artifact_id": pending.artifact_id,
-                   "segment": getattr(ctx, "task_id", None)},
-    )
-    memory_failed = any(
-        isinstance(row, dict) and row.get("error") for row in written
     )
     # Canonical receipt: the OUTPUT loop's four sub-loops closed. The final
     # terminal is recorded separately (deterministic_state["terminal"] +
@@ -301,21 +296,20 @@ async def run_output(
     receipts.append_receipt(deterministic_state, LoopReceipt(
         loop=NestedLoop.OUTPUT, sub_loop=SubLoop.MEMORY,
         disposition=(ReceiptDisposition.COMPLETED
-                     if durable_ok and not memory_failed
+                     if durable_ok
                      else ReceiptDisposition.REFUSED),
         steps=(LoopStep.ASSEMBLE, LoopStep.GROUND,
                LoopStep.UNDERSTAND_SURFACE, LoopStep.LOCATE_OUTPUT,
                LoopStep.PERSIST, LoopStep.CONFIRM,
                LoopStep.PROPOSE, LoopStep.RESOLVE, LoopStep.SETTLE),
-        payload={"durable_ok": bool(durable_ok),
-                 "memory_failed": bool(memory_failed)},
+        payload={"durable_ok": bool(durable_ok)},
         evidence_refs=(pending.artifact_id,),
     ))
     controller, _ = context._must_govern(
         controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )
 
-    final_terminal = "settled" if durable_ok and not memory_failed else "infra_failed"
+    final_terminal = "settled" if durable_ok else "infra_failed"
     deterministic_state["terminal"] = final_terminal
     deterministic_state["persistence"] = persistence
     deterministic_state["loop_traversal"] = controller.loop_coverage()
@@ -323,8 +317,6 @@ async def run_output(
     final_errors = list(pending.errors)
     if not durable_ok:
         final_errors.append({"source": "persistence", "error": "durable artifact receipt missing"})
-    if memory_failed:
-        final_errors.append({"source": "memory", "error": "one or more memory writes failed"})
     artifact = replace(
         pending,
         deterministic_state=dict(deterministic_state),
@@ -387,8 +379,6 @@ async def run_output(
         "phase_coverage": {p: sorted(s) for p, s in phase_coverage.items()},
         "final_validation": final_validation,
         "persistence": persistence,
-        "memory": {"accepted": accepted, "dispositions": dispositions,
-                   "written": written},
     }
     return artifact, cycle_meta
 

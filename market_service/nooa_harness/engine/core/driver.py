@@ -114,7 +114,6 @@ from ..config import (
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
     MEMORY_CONTEXT_BUDGET,
-    MAX_MEMORY_PROPOSALS,
     _PRIOR_HEADLINE_MAX_CHARS,
 )
 
@@ -226,7 +225,7 @@ class InferenceEngine:
     # Memory (episodic layer)
     # ------------------------------------------------------------------
 
-    async def _recall_memory(
+    async def _recall_ledger(
         self, *, segment: str | None = None,
     ) -> tuple[list[Any], str]:
         """Read the engine's own prior CENTRAL LEDGER as a context block.
@@ -335,6 +334,18 @@ class InferenceEngine:
         if not (isinstance(tool_calls, list) and tool_calls):
             return
         dict_calls = [c for c in tool_calls if isinstance(c, dict)]
+        # Malformed tool-call SHAPES are no longer silently dropped. Shapes that
+        # carry a NAME are SALVAGED for the deterministic mirror (the TOOL
+        # worker), which re-runs them through the authorized dispatch path.
+        _dropped = [c for c in tool_calls if not isinstance(c, dict)]
+        if _dropped:
+            st.capability_log.append(capability_log_entry(
+                "tool.parse_failed:shape",
+                {"symbol": self.symbol, "venue": self.venue},
+                "error",
+                detail={"reason": "tool_call_not_an_object", "count": len(_dropped)},
+            ))
+        _malformed: list[dict[str, Any]] = []
         # Phase G4 (budget governance): the ceiling is adjudicated by the
         # BUDGET gate (gates.py — governance-owned verdict over config-owned
         # numbers), never decided inline. A refused gate is a finding that
@@ -369,7 +380,20 @@ class InferenceEngine:
         round_results: dict[str, Any] = {}
         for call in to_execute:
             raw_name = str(call.get("name", ""))
-            args = dict(call.get("args") or {})
+            try:
+                args = dict(call.get("args") or {})
+            except (TypeError, ValueError):
+                # args was NOT an object (a string/list): the call cannot be
+                # dispatched as-is. SALVAGE the intent (the name survives) so the
+                # deterministic mirror can re-run it, and record the finding.
+                if raw_name.strip():
+                    _malformed.append({"name": raw_name, "args": {}})
+                st.capability_log.append(capability_log_entry(
+                    f"tool.parse_failed:{raw_name or '?'}",
+                    {"symbol": self.symbol, "venue": self.venue},
+                    "error", detail={"reason": "args_not_an_object"},
+                ))
+                continue
             args.setdefault("symbol", self.symbol)
             args.setdefault("venue", self.venue)
             canonical = _normalize_tool_name(raw_name) or raw_name
@@ -559,6 +583,8 @@ class InferenceEngine:
                 result, tool_log = await context.execute_tool(
                     self.store, raw_name, args, postgres=self.postgres,
                     memory=self.memory, settings=self.settings,
+                    session_id=self.session_id,
+                    segment=getattr(ctx, "task_id", None),
                 )
             except Exception as exc:  # one bad tool never kills the cycle
                 log.exception("pass loop: tool %s raised", raw_name)
@@ -641,6 +667,17 @@ class InferenceEngine:
             st.accumulated_tool_results[canonical] = result_payload
         st.tool_results.update(round_results)
         st._round_results = round_results  # type: ignore[attr-defined]
+        # Deterministic output mirror: a malformed intended call is SALVAGED and
+        # re-dispatched through the failure node (the TOOL worker mirrors it via
+        # the authorized path), so its result lands in the outcome ledger. The
+        # `_mirroring` guard stops the mirrored round from re-salvaging itself.
+        if _malformed and not getattr(st, "_mirroring", False):
+            st.tool_intent = {"tool_calls": _malformed}  # type: ignore[attr-defined]
+            st.failure_kind = "tool_parse_failed"
+            st.failure_detail = f"{len(_malformed)} malformed tool call(s)"
+            # None ⇒ resolved (mirror ran, results present); else escalation,
+            # and the caller's `if st.failure_kind: …terminate` writes it once.
+            await context.recover_tool_failure(self, ctx, st)
 
     async def _followup_turn(self, ctx: Any, st: CycleRuntimeState) -> dict[str, Any] | None:
         """One follow-up LLM turn for ``st.loop_tag``. Returns parsed or None.
@@ -727,12 +764,12 @@ class InferenceEngine:
         # the full-text budget.
         _entry_block = ""
         if st.loop_tag == "reasoning":
-            _entry_block = getattr(st, "reasoning_memory_block", "") or ""
+            _entry_block = getattr(st, "reasoning_ledger_block", "") or ""
             if st.passes_per_loop.get("reasoning", 0) > 1:
                 _entry_block = ""
-            _stage_ids = list(getattr(st, "analysis_memory_ids", 
+            _stage_ids = list(getattr(st, "ledger_stage_ids", 
 ) or [])
-            _entry_ids = list(getattr(st, "reasoning_memory_ids", 
+            _entry_ids = list(getattr(st, "reasoning_ledger_ids", 
 ) or [])
             _all_ids = [i for i in (_entry_ids + _stage_ids) if i]
             if not _entry_block and _all_ids:
@@ -800,91 +837,6 @@ class InferenceEngine:
                     raw_name = str(call.get("name") or call.get("tool") or "").strip()
                     if raw_name and raw_name not in st.unexecuted:
                         st.unexecuted.append(raw_name)
-
-    # ------------------------------------------------------------------
-    # Memory proposal resolution (LLM proposes; engine disposes)
-    # ------------------------------------------------------------------
-
-    def resolve_memory_proposals(
-        self, proposals: Any, *, artifact_status: str | None = None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Deterministically resolve LLM memory proposals.
-
-        Returns (accepted, dispositions). Rules (spec §3):
-        - non-dict / unknown kind / empty content → rejected
-        - kind 'fact' is NEVER accepted from the LLM
-        - more than MAX_MEMORY_PROPOSALS → the excess is rejected
-        - proposal never carries run numbers as prose claims — tagging only
-        """
-        accepted: list[dict[str, Any]] = []
-        dispositions: list[dict[str, Any]] = []
-        if not isinstance(proposals, list):
-            dispositions.append({"proposal": None, "disposition": "rejected",
-                                 "reason": "proposals_not_a_list"})
-            return accepted, dispositions
-        valid_kinds = {"observation", "hypothesis", "note"}
-        for index, proposal in enumerate(proposals):
-            if len(accepted) >= MAX_MEMORY_PROPOSALS:
-                dispositions.append({"proposal": proposal, "disposition": "rejected",
-                                     "reason": "budget_exceeded"})
-                continue
-            if not isinstance(proposal, dict):
-                dispositions.append({"proposal": proposal, "disposition": "rejected",
-                                     "reason": "not_an_object"})
-                continue
-            kind = str(proposal.get("kind", ""))
-            content = str(proposal.get("content", "")).strip()
-            if kind == "fact":
-                dispositions.append({"proposal": proposal, "disposition": "rejected",
-                                     "reason": "fact_kind_is_llm_forbidden"})
-                continue
-            if kind not in valid_kinds or not content:
-                dispositions.append({"proposal": proposal, "disposition": "rejected",
-                                     "reason": "invalid_kind_or_empty_content"})
-                continue
-            try:
-                importance = float(proposal.get("importance", 5.0))
-            except (TypeError, ValueError):
-                importance = 5.0
-            importance = min(max(importance, 0.0), 10.0)
-            tags = tuple(str(t) for t in (proposal.get("tags") or ()))
-            accepted.append({
-                "kind": kind,
-                "content": content,
-                "importance": importance,
-                "tags": tags + (f"{self.symbol.lower()}-{self.venue}",),
-            })
-        return accepted, dispositions
-
-    async def _remember(
-        self, accepted: list[dict[str, Any]], run_meta: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Persist accepted proposals through MemoryNode (engine disposes).
-
-        Task-segment isolation: proposals carry the cycle's task segment so
-        plan/handoff carry never bleeds across tasks (state redistribution).
-        """
-        written: list[dict[str, Any]] = []
-        if self.memory is None:
-            return written
-        for proposal in accepted:
-            try:
-                memory = await self.memory.remember(
-                    self.session_id,
-                    proposal["kind"],
-                    proposal["content"],
-                    run_id=run_meta.get("artifact_id"),
-                    importance=proposal["importance"],
-                    tags=proposal["tags"],
-                    evidence_refs=(run_meta.get("artifact_id"),),
-                    segment=run_meta.get("segment"),
-                )
-                written.append({"memory_id": memory.memory_id,
-                                "kind": memory.kind})
-            except Exception:
-                log.exception("memory write failed for proposal %s", proposal["kind"])
-                written.append({"error": "write_failed", "kind": proposal["kind"]})
-        return written
 
     # ------------------------------------------------------------------
     # The cycle

@@ -160,11 +160,6 @@ def _good_narration(with_tools: bool = False) -> str:
         "confidence": "medium",
         "limitations": ["provisional status"],
         "model_separation": "nu*OFI is heteroskedastic; never merged.",
-        "memory_proposals": [
-            {"kind": "observation",
-             "content": "Beta positive on the 30m window",
-             "importance": 6.0, "tags": ["beta"]},
-        ],
     }
     if with_tools:
         payload["tool_calls"] = [
@@ -205,11 +200,6 @@ def _staged_narration(phase: str, tools: list[dict] | None = None, *, final: boo
             "evidence_refs": ["calc.ofi.intervals", "calc.depth.average"],
         } if final else None,
         "tool_calls": tools if tools is not None else [],
-        "memory_proposals": [
-            {"kind": "observation",
-             "content": "Beta positive on the 30m window",
-             "importance": 6.0, "tags": ["beta"]},
-        ] if final else [],
     }
     return json.dumps(payload)
 

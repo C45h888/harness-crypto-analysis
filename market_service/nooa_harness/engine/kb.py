@@ -170,7 +170,8 @@ class SystemPromptCache:
 TURN_CONTRACT_LINE = (
     'Return ONE JSON object per turn with keys {phase, summary, evidence, '
     'confidence, limitations, model_separation, hypothesis, scenario, '
-    'tool_calls, memory_proposals} — the tool-name key is EXACTLY "name".'
+    'forward_scenario, hypothesis_evidence, tool_calls} — the tool-name key is '
+    'EXACTLY "name".'
 )
 
 # The single citation grammar every prompt uses (L1 unification — one dialect,
@@ -233,7 +234,6 @@ def build_output_format() -> str:
         '  "hypothesis_evidence": {"hypothesis_id": "…", "effect": "…", "se": "…", "ci": ["…", "…"], "p_value": "…", "n": N, "multiplicity_adj": "…"} or null (OPTIONAL — calc.hypothesis.test → … ledger entry, post-fit only; p<0.05 is evidence, never execution),\n'
         '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
         '  KEY RULE: the tool-name key is EXACTLY "name" — never "tool", "tool_name", or any other key. Entries under any other key are dropped unread.\n'
-        '  "memory_proposals": [{"kind": "observation|hypothesis", "content": "…", "importance": 5.0, "tags": ["…"]}] or null\n'
         "}\n"
         "REGISTRY TOOL NAMES (use EXACTLY — any other name is denied):\n"
         "  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n"
@@ -246,6 +246,11 @@ def build_output_format() -> str:
         "calc.decay.report, calc.discipline.audit;\n"
         "  P3 events (Track D typed): calc.events.absorption, calc.events.walls;\n"
         "  P6 output: no tools — synthesis only.\n"
+        "  MEMORY (YOUR OWN, usable in flight from any loop; never coverage credit): "
+        "memory.remember (kind observation|hypothesis|note — write what you concluded, "
+        "bounded, in YOUR task segment), memory.recall (read your own prior notes back), "
+        "memory.forget, memory.stats. This is your memory, not the ledger's: the engine "
+        "does not dispose it, and it is never evidence.\n"
         "STAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n"
         "  P1 OFI inference → P2 AD inference (split — never merged) → P3 warm-plane correlation "
         "(TWO-BEAT: invoke ≥1 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; "
@@ -264,7 +269,7 @@ def build_output_format() -> str:
         "Every tool result arrives in a ToolResult envelope ``{tool, status, reason, data, null_fields}``. "
         f"{CITATION_LINE} "
         "``null_fields`` explicitly names what was not computed (never zero).\n"
-        "memory_proposals max 3, kind fact forbidden."
+        "Your memory is written with the memory.* tools, never proposed in a turn."
     )
 
 
@@ -729,7 +734,7 @@ def compose_output_prompt(
         "return will be dropped): compose the FINAL artifact JSON strictly "
         "from this run's material below. Return ONLY one JSON object with "
         "EXACTLY {summary, evidence, confidence, limitations, "
-        "model_separation, hypothesis, scenario, memory_proposals} — every "
+        "model_separation, hypothesis, scenario} — every "
         f"numeric claim already cited; invent no values. {CITATION_LINE}\n\n"
         f"{directive_block}"
         "SYNTHESIS MATERIAL:\n"
@@ -760,7 +765,7 @@ def compose_narrate1_prompt(
     wake_block: str,
     deterministic_state: dict[str, Any],
     prior_note: str,
-    memory_block: str,
+    ledger_block: str,
     output_format: str,
     workflow_block: str,
     traversal: dict[str, Any] | None = None,
@@ -785,10 +790,11 @@ def compose_narrate1_prompt(
         f"{envelope_digest(deterministic_state)}\n\n"
         f"{prior_note}\n\n"
     )
-    if memory_block:
+    if ledger_block:
         context_block += (
-            "RECALLED MEMORY (provenance-tagged priors; subordinate to the "
-            f"ledger):\n{memory_block}\n\n"
+            "RECALLED ENGINE LEDGER (deterministic, segment-scoped priors — "
+            "context, never evidence; subordinate to current readings):\n"
+            f"{ledger_block}\n\n"
         )
     context_block += output_format
     return (
@@ -971,7 +977,7 @@ def compose_forced_final_prompt(
         f"{FINAL_SHAPE_BLOCK}\n\n"
         'Return ONE JSON object with EXACTLY {phase: "P6", summary, evidence, '
         "confidence, limitations, model_separation, hypothesis, scenario, "
-        'tool_calls: [], memory_proposals}. No prose before or after it.'
+        'tool_calls: []}. No prose before or after it.'
     )
 
 

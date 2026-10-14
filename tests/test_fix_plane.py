@@ -253,7 +253,7 @@ class SchemaParityTests(unittest.TestCase):
         contract_keys = {
             "phase", "summary", "evidence", "confidence", "limitations",
             "model_separation", "hypothesis", "scenario", "forward_scenario",
-            "hypothesis_evidence", "tool_calls", "memory_proposals",
+            "hypothesis_evidence", "tool_calls",
         }
         fields = set(NarrationTurn.model_fields)
         self.assertEqual(contract_keys - fields, set())

@@ -54,7 +54,6 @@ from .config import (
     AGENTIC_PER_ROUND_CALL_CAP,
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_NARRATION_MAX_TOKENS,
-    MAX_MEMORY_PROPOSALS,
     MEMORY_CONTEXT_BUDGET,
     MEMORY_RECALL_LIMIT,
     NARRATION_MAX_TOKENS_ENV,
@@ -171,6 +170,7 @@ from .failure_substrate import (
     MAX_RETRIES,
     RemediationKind,
     RemediationOutcome,
+    ToolMirrorWorker,
     WorkerStatus,
     signal_failure,
 )
@@ -191,7 +191,6 @@ __all__ = [
     "AGENTIC_PER_ROUND_CALL_CAP",
     "DEFAULT_CONTEXT_WINDOW",
     "DEFAULT_NARRATION_MAX_TOKENS",
-    "MAX_MEMORY_PROPOSALS",
     "MEMORY_CONTEXT_BUDGET",
     "MEMORY_RECALL_LIMIT",
     "NARRATION_MAX_TOKENS_ENV",

@@ -86,7 +86,7 @@ async def _store_stage_observation(
         evidence_refs=(wake_id,),
         segment=segment,
     )
-    st.analysis_memory_ids.append(f"{stage}#{entry.seq}")
+    st.ledger_stage_ids.append(f"{stage}#{entry.seq}")
     st.capability_log.append({
         "capability": "engine.ledger.stage_record",
         "scope": {"symbol": engine.symbol, "venue": engine.venue},
@@ -155,7 +155,7 @@ async def run_evidence(
         wake_block=st.wake_block,
         deterministic_state=st.deterministic_state,
         prior_note=st.prior_note,
-        memory_block=st.memory_block,
+        ledger_block=st.ledger_block,
         output_format=engine._output_format(),
         workflow_block=st.workflow_block,
         traversal=st.controller.loop_coverage(),
@@ -299,10 +299,10 @@ async def run_reasoning(
     _segment = getattr(ctx, "task_id", None)
     _kinds = (LedgerKind.UNDERSTANDING, LedgerKind.PLAN, LedgerKind.HANDOFF)
     _rows = ledger_rows(st.deterministic_state, _kinds, segment=_segment)
-    st.reasoning_memory_block = render_ledger(
+    st.reasoning_ledger_block = render_ledger(
         st.deterministic_state, _kinds, segment=_segment, budget=3_000,
     )
-    st.reasoning_memory_ids = [
+    st.reasoning_ledger_ids = [
         f"{row.get('kind')}#{row.get('seq')}" for row in _rows
     ]
     st.capability_log.append({

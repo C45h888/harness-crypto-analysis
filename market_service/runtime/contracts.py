@@ -41,20 +41,12 @@ SPECIALIST_REPORT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["specialist_report"]
 AGENT_MEMORY_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["agent_memory"]
 INFERENCE_ARTIFACT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["inference_artifact"]
 WAKE_ENVELOPE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["wake_envelope"]
-# Agent-artifact kinds the memory node can persist. Mirrors the agent-owned
-# write surfaces from NOOA_HARNESS_ARCHITECTURE.md: observations, hypotheses,
-# requests, briefings — plus 'fact'/'note' for durable analyst notes.
+# Agent-artifact kinds the memory node can persist — the AGENT's own
+# observation kinds plus 'fact' (deterministic paper truth, seed-only). The
+# engine's loop carries (understanding/plan/handoff) are NOT here: they live on
+# the central ledger (engine/ledger.py), never in the agent's memory node.
 ValidMemoryKinds: tuple[str, ...] = (
     "observation", "hypothesis", "request", "briefing", "fact", "note",
-    # Loop-internal carry kinds (agentic-surface state redistribution). These
-    # are written by the runtime between loops, not proposed by the LLM:
-    #   "understanding" — the frozen comprehension receipt placed at the
-    #       comprehension->acquisition handoff (runner._place_understanding).
-    #   "plan"          — the disposed task plan the acquisition loop is bound
-    #       to (state redistribution: FRAMING -> memory segment).
-    #   "handoff"       — the gathered context package + reasoning needs
-    #       written at the end of acquisition for the reasoning loop.
-    "understanding", "plan", "handoff",
 )
 # Valid wake trigger sources (who materialized the envelope).
 ValidWakeSources: tuple[str, ...] = ("manual", "watcher", "hook")

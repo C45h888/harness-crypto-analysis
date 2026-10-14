@@ -352,11 +352,11 @@ async def run_comprehension(
     st.task_block = task_block
     st.scenario_block = scenario_block
     st.wake_block = wake_block
-    # STATE REDISTRIBUTION: task-scoped recall. The plan/handoff carry for
-    # this task segment is recalled into the prompt block so the agent
-    # reasons over its own prior conclusions, segment-isolated from other
-    # tasks. Empty when no prior carry exists.
-    _memories, st.memory_block = await engine._recall_memory(
+    # CENTRAL LEDGER recall: the engine's own prior conclusions for this task
+    # segment are rendered into the prompt block (deterministic, by key and
+    # append order) so the agent reasons over the ledger, never from scratch.
+    # Empty when no prior ledger exists for the segment.
+    _ledger_rows, st.ledger_block = await engine._recall_ledger(
         segment=ctx.task_id,
     )
     st.prior_note = ""  # fetch_note removed (R7)

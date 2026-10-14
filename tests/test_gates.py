@@ -79,14 +79,19 @@ class RequireGateTests(unittest.TestCase):
 
 
 class MemorySegmentContractTests(unittest.TestCase):
-    def test_carry_kinds_are_valid(self):
-        for kind in ("understanding", "plan", "handoff"):
+    def test_agent_kinds_valid_and_engine_carries_are_not(self):
+        # The AGENT's own kinds are writable memory-node kinds.
+        for kind in ("observation", "hypothesis", "note", "fact"):
             self.assertIn(kind, ValidMemoryKinds)
+        # The engine's loop carries live on the CENTRAL LEDGER now
+        # (engine/ledger.py) — they are NOT memory-node kinds.
+        for kind in ("understanding", "plan", "handoff"):
+            self.assertNotIn(kind, ValidMemoryKinds)
 
     def test_segment_round_trips(self):
         memory = AgentMemory(
             session_id="00000000-0000-0000-0000-000000000001",
-            kind="plan", content="plan body", segment="task-abc123",
+            kind="note", content="plan body", segment="task-abc123",
         )
         restored = AgentMemory.from_mapping(memory.to_dict())
         self.assertEqual(restored.segment, "task-abc123")

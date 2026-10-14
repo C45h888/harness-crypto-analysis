@@ -4,9 +4,9 @@ Covers the full engine cycle with fakes (no Redis, no Postgres, no litellm):
 
 - Staged cycle: wake → gather → gate → narrate#1 → P1→P5 tool rounds
   (phase coverage credited from executed tool families) → validated final
-  or repair-then-final → artifact persisted (PG-first, Redis after) →
-  memory proposals resolved. Thin finals are rejected for repair while
-  LLM budget (8 turns, 5 tool rounds) remains.
+  or repair-then-final → artifact persisted (PG-first, Redis after).
+  Memory is the AGENT's: the engine no longer disposes proposals. Thin
+  finals are rejected for repair while LLM budget remains.
 - Hard gate: insufficient inputs → NULL interpretation, ONE fetch turn,
   gate observation remembered deterministically.
 - Final validation: P1/P2/P3/P5 tool coverage + H0 + ≥200-char P4
@@ -27,7 +27,6 @@ from typing import Any
 from unittest.mock import patch
 
 from market_service.nooa_harness.engine import (
-    MAX_MEMORY_PROPOSALS,
     InferenceEngine,
     _extract_json_object,
 )
@@ -166,11 +165,6 @@ def _good_narration(with_tools: bool = False) -> str:
         "confidence": "medium",
         "limitations": ["provisional status"],
         "model_separation": "nu*OFI is heteroskedastic; never merged.",
-        "memory_proposals": [
-            {"kind": "observation",
-             "content": "Beta positive on the 30m window",
-             "importance": 6.0, "tags": ["beta"]},
-        ],
     }
     if with_tools:
         payload["tool_calls"] = [
@@ -244,11 +238,6 @@ def _staged_narration(phase: str, tools: list[dict] | None = None, *, final: boo
             "evidence_refs": ["calc.ofi.intervals", "calc.depth.average"],
         } if final else None,
         "tool_calls": tools if tools is not None else [],
-        "memory_proposals": [
-            {"kind": "observation",
-             "content": "Beta positive on the 30m window",
-             "importance": 6.0, "tags": ["beta"]},
-        ] if final else [],
     }
     return json.dumps(payload)
 
@@ -333,7 +322,10 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(store.published), 3)
         assert store.published[0].deterministic_state["terminal"] == "pending_settlement"
         # Memory proposal accepted and written
-        self.assertTrue(any(kind == "observation" for kind, _, _ in memory.remembered))
+        # Retirement: the ENGINE no longer disposes memory. An observation
+        # only lands if the agent called the memory.remember tool — which this
+        # scripted walk never does, so nothing is written by the engine.
+        self.assertEqual(memory.remembered, [])
 
     async def test_thin_tape_no_early_exit(self):
         # Phase R7 (DATA gate removed): thin tape no longer refuses the
@@ -526,7 +518,6 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "micro.evidence", "args": {}},
                 {"name": "micro.events", "args": {}},  # 4th → must be ignored
             ],
-            "memory_proposals": [],
         })
         engine, _s, _p, _m = _engine(llm_responses=[
             _FETCH_TURN,
@@ -573,52 +564,6 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["terminal"], "parse_failed")
         self.assertFalse(meta["final_validation"]["passed"])
         self.assertEqual(meta["repairs"], 0)
-
-
-class MemoryProposalTests(unittest.TestCase):
-    def _engine(self):
-        return InferenceEngine(_FakeStore(), _FakePostgres(), None, None,
-                               symbol="BTCUSDT", venue="spot")
-
-    def test_fact_kind_never_accepted(self):
-        engine = self._engine()
-        accepted, dispositions = engine.resolve_memory_proposals([
-            {"kind": "fact", "content": "beta is 0.001"},
-        ])
-        self.assertEqual(accepted, [])
-        self.assertEqual(dispositions[0]["reason"], "fact_kind_is_llm_forbidden")
-
-    def test_budget_capped(self):
-        engine = self._engine()
-        proposals = [
-            {"kind": "observation", "content": f"obs {i}"} for i in range(6)
-        ]
-        accepted, dispositions = engine.resolve_memory_proposals(proposals)
-        self.assertEqual(len(accepted), MAX_MEMORY_PROPOSALS)
-        excess = [d for d in dispositions if d["reason"] == "budget_exceeded"]
-        self.assertEqual(len(excess), len(proposals) - MAX_MEMORY_PROPOSALS)
-
-    def test_invalid_kind_and_empty_content_rejected(self):
-        engine = self._engine()
-        accepted, _d = engine.resolve_memory_proposals([
-            {"kind": "alien", "content": "x"},
-            {"kind": "observation", "content": "  "},
-        ])
-        self.assertEqual(accepted, [])
-
-    def test_importance_clamped_and_symbol_tag_appended(self):
-        engine = self._engine()
-        accepted, _d = engine.resolve_memory_proposals([
-            {"kind": "observation", "content": "ok", "importance": 99.0},
-        ])
-        self.assertEqual(accepted[0]["importance"], 10.0)
-        self.assertIn("btcusdt-spot", accepted[0]["tags"])
-
-    def test_non_list_rejected(self):
-        engine = self._engine()
-        accepted, dispositions = engine.resolve_memory_proposals("not a list")
-        self.assertEqual(accepted, [])
-        self.assertEqual(dispositions[0]["reason"], "proposals_not_a_list")
 
 
 class SessionIdTests(unittest.TestCase):

@@ -54,7 +54,6 @@ if BaseModel is not None:
         hypothesis_evidence: dict[str, Any] | None = None
         phase: str = "P1"
         tool_calls: list[NarrationToolCall] = Field(default_factory=list)
-        memory_proposals: list[dict[str, Any]] | None = None
 else:
     NarrationToolCall = None  # type: ignore[assignment]
     NarrationTurn = None  # type: ignore[assignment]
