@@ -279,7 +279,7 @@ CREATE TABLE IF NOT EXISTS substrate_calculation (
     freshness JSONB NOT NULL DEFAULT '{}'::jsonb,
     missing_inputs JSONB NOT NULL DEFAULT '[]'::jsonb,
     payload JSONB NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL DEFAULT 2 CHECK (schema_version IN (1, 2)),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
