@@ -235,7 +235,10 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     "ledger",
     # re-ordered cycle roots (comprehension/acquisition plane)
     "data_quality", "seeded_plan", "plan_gate", "persistence",
-    "narration_tiers", "base_summary",
+    "narration_tiers", "base_summary", "assembly_dropped",
+    # agentic synthesis (core/synthesize.py): FSM-visible failure note for
+    # the semantics-review surface; the cycle degrades, never dies on it
+    "synthesis_note",
 })
 
 
@@ -301,6 +304,10 @@ class CycleRuntimeState:
     # digest is revealed to the agent at most ONCE per cycle, and only
     # after an agent forecast call failed in 2b. Guards double-see.
     digest_revealed: bool = False
+    # Adjudication recall (validation entry): the verdict-basis ledger rows
+    # (reasoning-close frame + truth) rendered for the repair/forced-final
+    # turns, so the agent weighs against recalled conclusions, never fresh.
+    adjudication_ledger_block: str = ""
     comprehension: dict[str, Any] | None = None
     seed_plan: dict[str, Any] | None = None
     task_workflow: dict[str, Any] | None = None

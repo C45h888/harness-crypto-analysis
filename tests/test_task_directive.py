@@ -193,7 +193,7 @@ class DirectiveVerdictReadTests(unittest.TestCase):
     """Task-conformance read (validator home, pure)."""
 
     def test_directive_path_citation_detected(self):
-        from market_service.nooa_harness.engine.core.reasoning import has_directive_verdict
+        from market_service.nooa_harness.engine.core.validation import has_directive_verdict
         self.assertTrue(has_directive_verdict({"evidence": [
             {"path": "deterministic_state.task_directive.targets[0]", "value": "220"}]}))
         self.assertTrue(has_directive_verdict({"evidence": [

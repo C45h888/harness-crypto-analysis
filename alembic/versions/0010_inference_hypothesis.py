@@ -9,7 +9,7 @@ The engine now forms a hypothesis via MemoryNode paper recall,
 validates it with split AD/OFI calculations, and the final
 DeltaP formula remains a derived statistical hypothesis, not a shortcut.
 
-- hypothesis: JSONB {H0, H1, evidence_refs, paper_refs}
+- hypothesis: JSONB {H0, H1, evidence_refs}
 - hypothesis_verdict: TEXT validated|invalidated|inconclusive
 - verdict_reason: TEXT
 - calculations: JSONB {ofi_blocks, ad_blocks, observations_preview, derived_diagnostic}

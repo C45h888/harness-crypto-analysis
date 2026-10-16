@@ -62,7 +62,6 @@ READ_SURFACE_TOOLS: dict[str, str] = {
     "micro.ofi_intervals": "interval-attached OFI series (bounded)",
     "micro.evidence": "price-impact / depth-scaling fit evidence",
     "substrate.read": "substrate worker inventory + freshness (age_ms)",
-    "memory.recall_paper": "provenance-tagged paper KB priors",
 }
 
 

@@ -225,6 +225,53 @@ def test_interpret_and_hypothesize_positions():
     assert hypo_plain["complete"] is True
 
 
+def test_echo_comparator_baseline_never_compared_to_multivariate():
+    """Run-6 regression: a correct `comparator.oos_r2` citation must pass.
+
+    Live SOLUSDT run 6 died here: the agent cited the univariate BASELINE
+    `data.comparator.oos_r2 = 0.1101…` and the substring-era validator
+    compared it against top-level (multivariate) `r2 = 0.1298…` — a false
+    positive that burned both repairs on a true citation. Field-aware
+    echo resolves each citation inside its own namespace.
+    """
+    from market_service.nooa_harness.engine.core.validation import (
+        validate_final_turn,
+    )
+    from market_service.nooa_harness.inference import _REQUIRED_PHASES
+
+    baseline = "0.11019307937046609723184677216071909483188722499992"
+    main = "0.12982804143038731592590015585423550708183831951845"
+    accumulated = {
+        "calc.forward.fit": {
+            "r2": main, "oos_r2": main,
+            "comparator": {"oos_r2": baseline},
+        },
+    }
+    coverage = {phase: {"t"} for phase in _REQUIRED_PHASES} | {"P6": {"declared"}}
+
+    def _parsed(value: str) -> dict:
+        return {
+            "summary": "x" * 250,
+            "hypothesis": {"H0": "flat", "H1": "edge"},
+            "confidence": "medium",
+            "evidence": [
+                {"path": "calc.forward.fit → data.comparator.oos_r2",
+                 "value": value, "interpretation": "univariate baseline OOS"},
+                {"path": "calc.price.delta → route_a_direct.delta_ticks",
+                 "value": "+0.53", "interpretation": "derived move with band"},
+            ],
+        }
+    _, missing_ok = validate_final_turn(
+        _parsed(baseline), coverage, scenario=None, accumulated=accumulated,
+    )
+    assert not [m for m in missing_ok if "value mismatch" in str(m)], missing_ok
+    _, missing_bad = validate_final_turn(
+        _parsed(main), coverage, scenario=None, accumulated=accumulated,
+    )
+    assert any("value mismatch" in str(m) and "comparator" in str(m)
+               for m in missing_bad), missing_bad
+
+
 def test_tool_position_ordering():
     from market_service.nooa_harness.engine.core.chain import (
         POSITION_ORDER,

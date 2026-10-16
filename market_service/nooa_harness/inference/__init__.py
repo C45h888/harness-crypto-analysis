@@ -55,7 +55,6 @@ from .dispatch import (
     dispatch_calc_observation_build,
     dispatch_calc_ofi_intervals,
     dispatch_market_read,
-    dispatch_memory_recall_paper,
     dispatch_read_capture_status,
     dispatch_read_derivatives,
     dispatch_read_events,

@@ -190,6 +190,7 @@ class LoopStep(str, Enum):
 
     # --- GATE ---
     VALIDATE = "validate"                # run the final gate
+    ADJUDICATE = "adjudicate"            # weigh hypotheses probabilistically, choose
     CLASSIFY_FINDINGS = "classify_findings"  # classify pass / missing items
 
     # --- RECOVERY ---
@@ -197,7 +198,9 @@ class LoopStep(str, Enum):
     STEER = "steer"                      # synthesize the repair steer
     REVALIDATE = "revalidate"            # re-run the gate after repair
 
-    # --- COMPOSITION ---
+    # --- COMPOSITION (agentic synthesis: collapse → derive, then assemble) ---
+    COLLAPSE = "collapse"              # read every vector, emit strict collapse object
+    DERIVE = "derive"                  # derive the final JSON from collapse + material
     ASSEMBLE = "assemble"                # assemble the output artifact
     GROUND = "ground"                    # ground every claim in evidence
 
@@ -429,7 +432,7 @@ LOOP_STAGE: dict[NestedLoop, AgenticStage] = {
 # ---------------------------------------------------------------------------
 class LoopTag:
     """Frozen runtime loop-tag vocabulary. Members are plain strings (the
-    runtime's loop_tag grain); every producer (reasoning.py) and consumer
+    runtime's loop_tag grain); every producer (reasoning.py / validation.py) and consumer
     (config budgets, context.passes_per_loop, driver crosswalk) resolves
     to this namespace."""
 
@@ -445,7 +448,7 @@ LOOP_TAG_CROSSWALK: dict[str, tuple[NestedLoop, "SubLoop | None"]] = {
     # declarative home is FRAMING (the receipt close), never ACQUISITION.
     # Phase R7 removed the fetch tag with the fetch semantic.
     LoopTag.COMPREHENSION: (NestedLoop.CONTEXT, SubLoop.FRAMING),
-    # Live tags (assigned by reasoning.py) — byte-identical to the previous
+    # Live tags (assigned by reasoning.py / validation.py) — byte-identical to the previous
     # driver map. VALIDATION tag homes to RECOVERY (the iterating core,
     # matching PRIMARY_SUBLOOP + the CONTEXT→ACQUISITION / REASONING→ANALYSIS
     # / OUTPUT→PLACEMENT pattern). GATE is first-opened but resolved via
@@ -601,9 +604,16 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     ),
     # --- VALIDATION ---
     SubLoop.GATE: SubLoopSpec(
-        steps=(LoopStep.VALIDATE, LoopStep.CLASSIFY_FINDINGS),
+        steps=(LoopStep.VALIDATE, LoopStep.ADJUDICATE,
+               LoopStep.CLASSIFY_FINDINGS),
         iterates=False,
-        purpose="Run the final gate and classify pass/missing findings.",
+        purpose=(
+            "Run the final gate (paths + values), adjudicate: weigh each "
+            "live hypothesis probabilistically against the distribution + "
+            "recalled verdict-basis and choose the argmax (probabilities "
+            "inform, never execute; unevaluable bypasses), then classify "
+            "pass/missing findings."
+        ),
     ),
     SubLoop.RECOVERY: SubLoopSpec(
         steps=(LoopStep.DIAGNOSE, LoopStep.STEER, LoopStep.REVALIDATE),
@@ -613,16 +623,26 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     ),
     # --- OUTPUT ---
     SubLoop.COMPOSITION: SubLoopSpec(
-        steps=(LoopStep.ASSEMBLE, LoopStep.GROUND),
-        iterates=False,
-        purpose="Assemble the output and ground every claim in evidence.",
+        steps=(LoopStep.COLLAPSE, LoopStep.DERIVE,
+               LoopStep.ASSEMBLE, LoopStep.GROUND),
+        iterates=True,
+        purpose=(
+            "Agentic synthesis: COLLAPSE every independent vector into a "
+            "strict, deterministically-validated object, DERIVE the final "
+            "JSON from collapse + full material, then ASSEMBLE ledger-led "
+            "(proof over digest, verdict conformance). Synthesis may reword, "
+            "never re-decide."
+        ),
+        exit_condition="synthesis converges (valid collapse + derived final) "
+            "or the output pass budget is spent (degrades to single-call compose)",
     ),
     SubLoop.ARCHITECTURE: SubLoopSpec(
         steps=(LoopStep.UNDERSTAND_SURFACE, LoopStep.LOCATE_OUTPUT),
         iterates=False,
         purpose=(
-            "Understand the agentic surface plane architecture and locate "
-            "where this output belongs inside it."
+            "Ordered governance handoff between composition and placement on "
+            "the output surface; no handler work runs here (the placement "
+            "rule lives in composition). Claimed as cursor, never as work."
         ),
     ),
     SubLoop.PLACEMENT: SubLoopSpec(
@@ -633,7 +653,11 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
     SubLoop.MEMORY: SubLoopSpec(
         steps=(LoopStep.PROPOSE, LoopStep.RESOLVE, LoopStep.SETTLE),
         iterates=False,
-        purpose="Dispose memory proposals and close the cycle (single pass).",
+        purpose=(
+            "Close the cycle. Agent memory is agent-owned in flight "
+            "(memory.* tools, any loop); the engine writes, reads, and "
+            "disposes nothing here — the sub-loop marks the traversal close."
+        ),
     ),
 }
 

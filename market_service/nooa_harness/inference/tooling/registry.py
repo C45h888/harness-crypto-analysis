@@ -37,7 +37,6 @@ TOOL_NAMES: dict[str, str] = {
     "calc.events.walls": "calc.events.walls",
     "calc.decay.report": "calc.decay.report",
     "calc.discipline.audit": "calc.discipline.audit",
-    "memory.recall_paper": "memory.recall_paper",
     # The AGENT's own segmented episodic memory (B1 surface for the B2 skill).
     # No phase: a memory write is never coverage credit.
     "memory.remember": "memory.remember",
@@ -101,8 +100,7 @@ TOOL_PHASE: dict[str, str] = {
     "substrate.technicals": "P3",
     "substrate.tiers": "P3",
     "substrate.volume_profile": "P3",
-    # P5 — paper grounding + derived ΔP + Track D forward stack
-    "memory.recall_paper": "P5",
+    # P5 — derived ΔP + Track D forward stack
     "calc.derived_diagnostic": "P5",
     "calc.price.delta": "P5",
     "calc.scenario.evaluate": "P5",
@@ -157,7 +155,6 @@ TOOL_HOME_OPTIONS_OVERRIDES: dict[str, tuple[tuple[str, str], ...]] = {
         for tool in ("memory.remember", "memory.recall",
                      "memory.forget", "memory.stats")
     }),
-    "memory.recall_paper": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.ofi.intervals": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.depth.average": (("evidence", "acquisition"), ("reasoning", "analysis")),
     "calc.observation.build": (("evidence", "acquisition"), ("reasoning", "analysis")),

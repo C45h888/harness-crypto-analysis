@@ -34,7 +34,6 @@ from .tools_legacy import (
 from .tools_market import (
     dispatch_assemble_evidence,
     dispatch_market_read,
-    dispatch_memory_recall_paper,
     dispatch_memory_remember,
     dispatch_memory_recall,
     dispatch_memory_forget,
@@ -66,7 +65,7 @@ async def execute_tool(
     Injected dependencies (two-plane boundary pass, 2026-09-04):
     - ``store``    — the engine's own Redis connection (shared, never rebuilt)
     - ``postgres`` — the engine's durable store, for fit tools' prior cycles
-    - ``memory``   — the engine's MemoryNode, for memory.recall_paper
+    - ``memory``   — the engine's MemoryNode, for the agent memory.* tools
     - ``settings`` — the operator Settings (tolerated by every tool).
     """
     canonical = _normalize_tool_name(name)
@@ -236,11 +235,6 @@ async def execute_tool(
         return await dispatch_memory_stats(
             symbol, venue, args=args, memory=memory,
             session_id=session_id, segment=segment,
-        )
-    if name == "memory.recall_paper":
-        return await dispatch_memory_recall_paper(
-            symbol, venue, query=str(args.get("query") or "Cont OFI AD beta"),
-            memory=memory,
         )
     return None, capability_log_entry(
         "tool.unrouted", {"name": name}, "denied", detail="no dispatch path",

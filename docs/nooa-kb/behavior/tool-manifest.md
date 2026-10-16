@@ -150,14 +150,15 @@ worker's own cadence.
 - Bounded fire-tick request (12 workers: tape, density, delta, ladders, anchors, tiers, volume_profile, technicals, migration, oi, signals, large_print).
 - Cooldowns gate inside the core; `invoked:false` is a finding. Same worker never twice per cycle; invoke BEFORE read in one array.
 
-## Package memory — paper grounding + episodic priors
+## Package memory — the agent's own episodic priors
 
-Purpose: Cont-Kukanov-Stoikov facts for H0/H1 grounding (evidence home) and
-provenance-tagged priors subordinate to fresh ledger data. Contradicting a prior is allowed, stated explicitly.
+Purpose: provenance-tagged priors subordinate to fresh ledger data. Contradicting a prior is allowed, stated explicitly. This is the AGENT's own memory — the engine does not dispose it, and it is never coverage credit.
 
-### `memory.recall_paper`
-- Paper facts from the real MemoryNode KB (kind=fact, paper session). Args: `query`.
-- Empty = unseeded KB: report it, never invent paper claims. `fact` kind is LLM-forbidden in proposals.
+### `memory.remember` / `memory.recall` / `memory.forget` / `memory.stats`
+- `remember` {kind: observation|hypothesis|note, content, importance?, tags?, evidence_refs?, title?} — writes into this cycle's task segment.
+- `recall` {kind?, query?, limit?} — reads the agent's own segment back, bounded.
+- `forget` {memory_id} tombstones one entry; `stats` reports per-kind counts.
+- Kind `fact` and cross-segment writes are refused — structural hygiene, not semantic judgement.
 
 ## Loop walk (runtime values injected per turn — see LOOP STATE block)
 

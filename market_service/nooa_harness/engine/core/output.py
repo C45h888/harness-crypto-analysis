@@ -9,10 +9,9 @@ from typing import Any
 
 from market_service.runtime.contracts import InferenceArtifact
 from . import context
-from ..schemas import extract_json_object
-from ..controller import scenario_verdict as _scenario_verdict
 from ..fsm import GovernanceEvent, GovernanceEventKind
-from ..kb import build_task_workflow, chain_status, compose_output_prompt
+from ..kb import build_task_workflow, chain_status
+from ..ledger import LedgerKind, ledger_rows
 from ..loop_states import (
     LoopReceipt,
     LoopStep,
@@ -25,10 +24,87 @@ from .. import receipts
 log = logging.getLogger(__name__)
 
 
+def _assemble_final(
+    composed: dict[str, Any], staged: dict[str, Any],
+    deterministic_state: dict[str, Any],
+    accumulated: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Deterministic assembly post-pass: narration from ledger (pure).
+
+    - Evidence entries whose path resolves nowhere (accumulated proof,
+      deterministic_state, ledger, digest) are dropped — narration carries
+      zero numbers the ledger cannot back.
+    - Null/empty sections (summary, evidence, hypothesis,
+      hypothesis_probabilities) fall back to the staged final so a thin
+      composition never erases judged content.
+    - The weighed choice is aligned to the recorded `verdict-chosen` row
+      when present (decision receipt authority over composition words).
+    Returns (final, dropped_paths).
+    """
+    try:
+        final = dict(composed)
+        dropped: list[str] = []
+        allowed_state = set(deterministic_state.keys()) | {"ledger", "digest"}
+
+        def _resolves(_path: str) -> bool:
+            _head = str(_path or "").split("→")[0].strip()
+            if not _head:
+                return False
+            if _head in accumulated:
+                return True
+            if _head.split(".")[0] in ("deterministic_state", "ledger", "digest"):
+                return True
+            if _head in allowed_state:
+                return True
+            return False
+        ev = final.get("evidence")
+        if isinstance(ev, list):
+            kept = []
+            for entry in ev:
+                if not isinstance(entry, dict) or not str(entry.get("path") or "").strip():
+                    dropped.append(str((entry or {}).get("path") or "<empty>"))
+                    continue
+                if not _resolves(entry.get("path")):
+                    dropped.append(str(entry.get("path")))
+                    continue
+                if not str(entry.get("interpretation") or "").strip():
+                    dropped.append(str(entry.get("path")))
+                    continue
+                kept.append(entry)
+            final["evidence"] = kept
+        for _key in ("summary", "hypothesis", "hypothesis_probabilities"):
+            _v = final.get(_key)
+            _empty = _v is None or _v == [] or _v == {} or (
+                isinstance(_v, str) and not _v.strip())
+            if _empty and staged.get(_key) is not None:
+                final[_key] = staged.get(_key)
+        try:
+            from ..ledger import LedgerKind as _LK
+            from ..ledger import ledger_rows as _lr
+            _vc = [r for r in _lr(
+                deterministic_state, (_LK.OBSERVATION,))
+                if (r.get("payload") or {}).get("stage") == "verdict-chosen"]
+            if _vc:
+                _choice = ((_vc[-1].get("payload") or {}).get("chosen"))
+                _hp = final.get("hypothesis_probabilities")
+                if _choice in ("H0", "H1") and isinstance(_hp, dict) \
+                        and _hp.get("chosen") != _choice:
+                    _hp = dict(_hp)
+                    _hp["chosen"] = _choice
+                    final["hypothesis_probabilities"] = _hp
+                    dropped.append(f"<choice realigned to ledger verdict-chosen:{_choice}>")
+        except Exception:
+            pass
+        return final, dropped
+    except Exception:
+        log.exception("assembly post-pass failed open; keeping composed")
+        return dict(composed), []
+
+
 async def run_output(
-    engine: Any, ctx: "_CycleContext",
+    engine: Any, ctx: "_CycleContext", st: Any,
 ) -> tuple[InferenceArtifact, dict[str, Any]]:
-    """OUTPUT loop (FINALIZE seam) — compose, persist, dispose memory."""
+    """OUTPUT loop (FINALIZE seam) — synthesize, persist, settle."""
     gathered, reasoned = ctx.gathered, ctx.reasoned
     if gathered is None or reasoned is None:
         raise RuntimeError("output requires gathered evidence and reasoning")
@@ -72,50 +148,77 @@ async def run_output(
             "paths; preserve refusals as findings, never paraphrased numbers):\n"
             f"{json.dumps(deterministic_state.get('task_directive'), default=str)[:6_000]}\n\n"
         )
-    compose_prompt = compose_output_prompt(
-        directive_block=directive_block,
-        synthesis_material={
-            'summary': staged_final.get('summary'),
-            'evidence': staged_final.get('evidence'),
-            'confidence': staged_final.get('confidence'),
-            'limitations': staged_final.get('limitations'),
-            'model_separation': staged_final.get('model_separation'),
-            'hypothesis': staged_final.get('hypothesis'),
-            'scenario': staged_final.get('scenario'),
-            'forecast_result': deterministic_state.get('forecast_result'),
-            'forward_scenario': deterministic_state.get('forward_scenario'),
-            'task_directive': deterministic_state.get('task_directive'),
-            # Slice E: frozen base + stage ids ride synthesis so the final
-            # grounds base numbers from the ledger, never narration text.
-            'base_summary': deterministic_state.get('base_summary'),
-            'statistical_chain': deterministic_state.get('statistical_chain'),
-        },
-        accumulated_keys=list(accumulated_tool_results),
-        traversal=controller.loop_coverage(),
-        chain_line=chain_status(
-            task_workflow['chain'], list(accumulated_tool_results)),
-    )
+    # Loop-surface completion (verdict recall): the adjudication decision
+    # rows travel with synthesis so composition conforms to the weighed
+    # choice. Pure ledger read on this task's segment (never the digest).
+    _verdict_rows = [
+        row for row in ledger_rows(
+            deterministic_state, (LedgerKind.OBSERVATION,),
+            segment=getattr(ctx, "task_id", None),
+        )
+        if (row.get("payload") or {}).get("stage")
+        in ("verdict-basis", "verdict-chosen")
+    ]
+    # --- AGENTIC SYNTHESIS (core/synthesize.py owns COLLAPSE → DERIVE) ---
+    # The agent reasons over the vectors here (collapse object, then final
+    # from collapse + full material); failures are FSM-visible and degrade
+    # to the legacy single call. Tiers accrue on st via record_tier.
+    from .synthesize import synthesize_final
+    _material = {
+        'summary': staged_final.get('summary'),
+        'evidence': staged_final.get('evidence'),
+        'confidence': staged_final.get('confidence'),
+        'limitations': staged_final.get('limitations'),
+        'model_separation': staged_final.get('model_separation'),
+        'hypothesis': staged_final.get('hypothesis'),
+        'scenario': staged_final.get('scenario'),
+        'forecast_result': deterministic_state.get('forecast_result'),
+        'forward_scenario': deterministic_state.get('forward_scenario'),
+        'task_directive': deterministic_state.get('task_directive'),
+        # Slice E: frozen base + stage ids ride synthesis so the final
+        # grounds base numbers from the ledger, never narration text.
+        'base_summary': deterministic_state.get('base_summary'),
+        # Loop-surface completion (verdict recall): the adjudication
+        # decision rows (verdict-basis + verdict-chosen) ride synthesis
+        # so composition conforms to the weighed choice.
+        'verdict_rows': _verdict_rows,
+        # The weighed vector rides synthesis so the choice survives
+        # composition (one-home rule: decision lives here + ledger).
+        'hypothesis_probabilities': staged_final.get(
+            'hypothesis_probabilities'),
+        'statistical_chain': deterministic_state.get('statistical_chain'),
+    }
+    _chain_line = chain_status(
+        task_workflow['chain'], list(accumulated_tool_results))
     try:
-        raw_compose = await engine._call_llm(compose_prompt)
-        llm_calls += 1
-        try:
-            from ..llm import last_tier as _last_tier
-            _compose_tier = _last_tier() or "unknown"
-        except Exception:
-            _compose_tier = "unknown"
-        deterministic_state["narration_tiers"] = list(
-            reasoned.llm_tiers) + [_compose_tier]
-        passes_per_loop["output"] = passes_per_loop.get("output", 0) + 1
-        maybe_composed = extract_json_object(raw_compose)
+        maybe_composed = await synthesize_final(
+            engine, ctx, st,
+            directive_block=directive_block,
+            synthesis_material=_material,
+            accumulated_keys=list(accumulated_tool_results),
+            traversal=controller.loop_coverage(),
+            chain_line=_chain_line,
+        )
         if isinstance(maybe_composed, dict):
-            if maybe_composed.pop("tool_calls", None):
-                log.warning("output pass: tool_calls dropped (non-agentic)")
-            # Legacy proposal fields are ignored: the agent's memory is written
-            # through the memory.* tools, never proposed in a turn.
-            maybe_composed.pop("memory_proposals", None)
+            # Narration-from-ledger: deterministic assembly over the derived
+            # object before it becomes the final (drops surface here).
+            maybe_composed, _dropped = _assemble_final(
+                maybe_composed, staged_final,
+                deterministic_state, accumulated_tool_results,
+            )
+            for _d in _dropped:
+                log.warning("assembly dropped: %s", _d[:160])
+            _assembly_prev = deterministic_state.get("assembly_dropped") or []
+            deterministic_state["assembly_dropped"] = list(_assembly_prev) + _dropped[:8]
             parsed_final = maybe_composed
     except Exception:
-        log.exception("output composition pass failed; keeping staged final")
+        log.exception("output synthesis failed; keeping staged final")
+    # Sync the handoff counters with what synthesis spent (tiers accrued on
+    # st via record_tier; narration_tiers freezes the full cycle sequence).
+    llm_calls = st.llm_calls
+    passes_per_loop = dict(reasoned.passes_per_loop or {})
+    passes_per_loop["output"] = st.passes_per_loop.get("output", 0)
+    deterministic_state["narration_tiers"] = list(st.llm_tiers)
     # Composition completed; architecture is a real governed sub-loop.  The
     # placement and memory sub-loops are opened below only when their actual
     # handlers run, so the trace cannot claim work that was merely planned.
@@ -130,10 +233,8 @@ async def run_output(
         "limitations": parsed_final.get("limitations"),
         "model_separation": parsed_final.get("model_separation"),
     }
-    if isinstance(deterministic_state.get("forecast_result"), dict):
-        # Persist the deterministic object beside narration. The agent may
-        # explain it, but this copy is never sourced from LLM text.
-        interpretation["forecast_result"] = deterministic_state["forecast_result"]
+    # One-home rule: forecast payloads live in calculations + deterministic
+    # state only — interpretation carries citation paths, never object copies.
     # Validator hardening: coerce confidence blends conservatively so the
     # persisted artifact never stores "low-medium" (contract enum only).
     try:
@@ -162,8 +263,6 @@ async def run_output(
             interpretation["confidence"] = _coerced2
     except Exception:
         pass
-    if isinstance(deterministic_state.get("forecast_result"), dict):
-        interpretation["forecast_result"] = deterministic_state["forecast_result"]
     # Scenario block rides the interpretation JSON (no migration): the agent's
     # verdict/probability/rationale over the deterministic requirement.
     if scenario is not None and isinstance(parsed_final.get("scenario"), dict):
@@ -171,38 +270,19 @@ async def run_output(
     # Pass C: hypothesis formed from the track's own evidence + calc.* tools
     # (memory node pruned from the track — transport retained),
     # final DeltaP is derived diagnostic heteroskedastic ν·OFI.
-    # Scenario cycles ALWAYS take their verdict from the deterministic
-    # tool payload — even when the agent formed no H0/H1 (live-proven:
-    # budget exhaustion can strand tool calls in an undispatched final
-    # turn, and the verdict must not depend on narration surviving).
-    scenario_verdict: tuple[str, str] | None = None
-    if scenario is not None:
-        scenario_verdict = _scenario_verdict(
-            tool_results.get("calc.scenario.evaluate"), capability_log,
-            gate_status, list(gate_reasons),
-        )
+    # Scenario verdicts are judged in validation (checker-enforced equality
+    # against the deterministic derivation) — output keeps the agent's block
+    # verbatim and computes nothing. The reachability answer lives in
+    # interpretation.scenario; hypothesis_verdict below stays evidence-strength.
     hypothesis = parsed_final.get("hypothesis")
     if not isinstance(hypothesis, dict) and hypothesis is not None:
         hypothesis = {"raw": hypothesis}
     beta = (evidence or {}).get("price_impact_fit", {}).get("beta") if isinstance(evidence, dict) else None
     betastr = str(beta)[:12] if beta is not None else "unknown"
     if hypothesis is None:
-        hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "paper_refs": ["Cont 1011.6402 OFI_k, AD_i, derived ΔP diagnostic"], "evidence_refs": ["calc.ofi.intervals","calc.depth.average"]}
-        if scenario_verdict is not None:
-            hypothesis_verdict, verdict_reason = (
-                scenario_verdict[0],
-                scenario_verdict[1] + " ; agent formed no H0/H1 this cycle",
-            )
-        else:
-            hypothesis_verdict = "inconclusive"
-            verdict_reason = "Agent did not explicitly form H0/H1; calculations split but hypothesis implicit"
-    elif scenario_verdict is not None:
-        # Scenario cycles: reachability verdict computed deterministically
-        # from the accumulated scenario tool payload — never from LLM text.
-        hypothesis_verdict, verdict_reason = scenario_verdict
-        if isinstance(hypothesis, dict) and hypothesis.get("H0") \
-                and hypothesis.get("H1"):
-            verdict_reason += " ; H0/H1 reachability pair via calc.scenario.evaluate"
+        hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "evidence_refs": ["calc.ofi.intervals","calc.depth.average"]}
+        hypothesis_verdict = "inconclusive"
+        verdict_reason = "Agent did not explicitly form H0/H1; calculations split but hypothesis implicit"
     else:
         if gate_status == "provisional":
             hypothesis_verdict = "inconclusive"
@@ -215,6 +295,17 @@ async def run_output(
             verdict_reason = "; ".join(gate_reasons)
         if isinstance(hypothesis, dict) and "H0" in hypothesis:
             verdict_reason += " ; H0 grounded in track evidence (position-3 formation)"
+    # Scenario refusal note (not a verdict — validation owns verdicts): when
+    # the scenario tool refused, the reachability answer is unevaluated and
+    # the reason carries the deterministic cause beside the gate reading.
+    if scenario is not None:
+        try:
+            from ..controller import ScenarioEvalStatus as _SES_out
+            if controller.scenario_state() is _SES_out.REFUSED:
+                _rr = controller.scenario_refusal_reason() or "refusal"
+                verdict_reason += f" ; scenario unevaluated ({_rr})"
+        except Exception:
+            pass
     # Read-plane state assembly: the artifact's calculations block is the
     # controller-classified calc-family outcomes the agent pulled during
     # the loop — no pre-gather spine exists anymore.
@@ -224,7 +315,7 @@ async def run_output(
     }
     calculations["split_note"] = (
         "AD and OFI read as separate tools by the agent; final DeltaP is "
-        "derived hypothesis, not shortcut — per Cont 1011.6402"
+        "derived hypothesis, not shortcut"
     )
     # --- GOVERNANCE: OUTPUT loop (FINALIZE stage) ---
     # Composition is already open.  Architecture, placement and memory are

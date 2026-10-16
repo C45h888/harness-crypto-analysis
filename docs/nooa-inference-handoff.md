@@ -20,7 +20,7 @@
 | `market_service/nooa_harness/engine.py` | `InferenceEngine.run_cycle(wake)`: gather → gate → recall → narrate#1 → **staged P1→P6 loop** → persist → memory dispose | Staged loop live; see §3 |
 | `market_service/nooa_harness/inference.py` | `resolve_inference_status` (hard gate) + `TOOL_NAMES` (**19 tools**) + `execute_tool` (sole dispatch) + `TOOL_PHASE` map + alias normalization | Numeric ΔP live; see §3 |
 | `market_service/nooa_harness/backends.py` | `NOOA_MODEL_*` → litellm routing; only nooa import site | Working |
-| `market_service/nooa_harness/memory.py` | `MemoryNode` over `agent_memory` (PG durable → Redis stream); exports `paper_kb_session_id()` | Working; paper KB seeded (10 facts) |
+| `market_service/nooa_harness/memory.py` | `MemoryNode` over `agent_memory` (PG durable → Redis stream) | Working |
 | `market_service/nooa_harness/inference_runner.py` | `run_inference_once(force/task/envelope)` — the ONLY invocation seam; lazy LLM/memory builds | Working |
 
 ### Deterministic stack (agent must CALL, never recompute)
@@ -35,13 +35,11 @@
 | `runtime/contracts.py` | `InferenceArtifact` (+hypothesis/verdict/calculations; `validate()` forbids `combined_prediction` and non-null interpretation on `insufficient`) |
 | `runtime/postgres_store.py` | `insert/read_inference_artifact` + **`read_recent_inference_artifacts()` (full rows, new)** |
 | `runtime/redis_store.py` | Artifact projection, event/status streams, memory streams |
-| `scripts/seed_paper_kb.py` | Seeds 10 Cont-1011.6402 facts; shares `paper_kb_session_id()` with `memory.py` |
 
 ### Docs / KB on disk (loaded into prompt every cycle)
 
 - `docs/nooa-kb/behavior/tool-manifest.md` — registry + staged P1→P6 protocol (update when tools/phases change)
 - `docs/nooa-kb/behavior/memory-protocol.md` — propose-never-write, recall 12 / 8k budget
-- `docs/nooa-kb/nooa-micro-structure-archieture.md` — paper prose (fallback; live paper source is MemoryNode)
 
 ---
 
@@ -94,7 +92,6 @@ Open design defaults currently in force (reconfirm if revisiting): OFI = arg-els
 3. **`redis-cli` on PATH is a wrapper** (`~/bin/redis-cli` → `docker exec instagram-test-redis`, nonexistent). Use `docker exec crypto-ai-anal-redis-1 redis-cli` and `docker exec crypto-ai-anal-postgres-1 psql -U marketflow -d marketflow`.
 4. **Live runs cost real API calls.** `./nooa market inference run SOLUSDT --venue futures --force` ≈ 4–8 LLM turns, ~50s. `tail` full stdout — `cycle_meta` (phase coverage, repairs) is NOT persisted, only the artifact is.
 5. **Behavioral contract with the owner:** discussion passes are discussion-only. Never implement fromassumptions — spec first, approval second. (A rushed numeric-derivation pass was fully reverted for this reason; the approved version above is its disciplined successor.)
-6. **Paper session stability:** `paper_kb_session_id()` = uuid5(`paper-kb://cont1011`); never change the URI or 10 seeded facts orphan.
 
 ## 5. Quick commands
 

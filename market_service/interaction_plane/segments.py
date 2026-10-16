@@ -40,12 +40,6 @@ SEGMENTS: dict[str, dict] = {
         "tools": ("market.keystone_history", "market.wall_history"),
         "description": "cross-cycle keystone / wall ledgers + migration verdict",
     },
-    "memory": {
-        "planes": ("redis", "postgres"),
-        "modes": ("compact",),
-        "tools": ("memory.recall_paper",),
-        "description": "provenance-tagged paper KB priors (subordinate to ledger)",
-    },
     "inference": {
         "planes": ("redis", "postgres"),
         "modes": ("snapshot",),

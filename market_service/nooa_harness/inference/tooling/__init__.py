@@ -75,7 +75,6 @@ from .tools_legacy import (
 from .tools_market import (
     dispatch_assemble_evidence,
     dispatch_market_read,
-    dispatch_memory_recall_paper,
     dispatch_memory_remember,
     dispatch_memory_recall,
     dispatch_memory_forget,
@@ -138,7 +137,6 @@ __all__ = [
     "dispatch_calc_ofi_intervals",
     "dispatch_calc_scenario_evaluate",
     "dispatch_market_read",
-    "dispatch_memory_recall_paper",
     "dispatch_memory_remember",
     "dispatch_memory_recall",
     "dispatch_memory_forget",

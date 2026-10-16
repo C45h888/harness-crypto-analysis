@@ -223,11 +223,6 @@ TOOL_OUTPUT_SCHEMAS: dict[str, str] = {
     "substrate.large_print": "same as substrate.invoke — invokes the large_print worker",
 
     # ---- memory ----
-    "memory.recall_paper": (
-        "array[{kind: str, content: str, importance: float, "
-        "tags: array[str], session_id: str, created_at: str}] — "
-        "empty array when unseeded"
-    ),
     "memory.remember": (
         "{stored: bool, kind: str, memory_id: str|null, segment: str|null, "
         "reason: str|null} — the agent's OWN segment memory"
@@ -338,7 +333,6 @@ TOOL_ARG_CONTRACTS: dict[str, str] = {
     "market.keystone_history|market.wall_history": "{count: int <= 100}",
     "substrate.read": "{substrate: str|null, mode: compact|full}",
     "substrate.invoke|substrate.*": "{substrate: str (worker name)}",
-    "memory.recall_paper": "{query: str}",
     "memory.remember": (
         "{kind: observation|hypothesis|note, content: str, importance: float, "
         "tags: array[str], evidence_refs: array[str], title: str|null}"

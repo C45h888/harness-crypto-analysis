@@ -111,7 +111,6 @@ class TestToolSchemaBlock(unittest.TestCase):
             "substrate.read",
             "substrate.invoke",
             "market.read",
-            "memory.recall_paper",
         ]
         for tool in expected:
             self.assertIn(tool, TOOL_OUTPUT_SCHEMAS,

@@ -239,7 +239,6 @@ async def dispatch_calc_derived_diagnostic(
                               "bands widen on large flow; diagnostic, never a point prediction"),
             },
             "status": "derived_ok",
-            "paper": "Cont 1011.6402 §3",
         }
         route_a = derived.get("route_a_direct") or {}
         return result, capability_log_entry(
@@ -368,7 +367,6 @@ async def dispatch_calc_scenario_evaluate(
         result["price_source"] = price_source
         result["units"] = {"price_unit": "ticks", "tick_size": str(tick_dec)}
         result["status"] = "evaluated_ok"
-        result["paper"] = "Cont 1011.6402 §3"
         result["forecast_result"] = fm.assemble_forecast_result(
             symbol=symbol, venue=venue,
             generated_at_ms=events[-1].current.exchange_ts_ms if events else 0,

@@ -205,12 +205,36 @@ _TRACK_HYPOTHESIZE = ("calc.hypothesis.test",)
 _TRACK_DISCIPLINE = ("calc.discipline.audit",)
 
 
+def _collapse_turn() -> str:
+    """Valid COLLAPSE object turn for the synthesis stage (output entry)."""
+    return json.dumps({
+        "readings": [
+            {"vector": "verdict", "path": "ledger.observation.verdict-basis",
+             "value": "H0", "meaning": "weighed choice is H0"},
+            {"vector": "base", "path": "calc.ofi.intervals → ofi",
+             "value": "12.5", "meaning": "sustained one-sided flow"},
+            {"vector": "chain", "path": "calc.forward.fit → data.status",
+             "value": "validated", "meaning": "fit usable"},
+            {"vector": "proof", "path": "calc.forward.distribution → data.expected_delta",
+             "value": "0.5", "meaning": "positive drift"},
+            {"vector": "frame", "path": "deterministic_state.task_directive",
+             "value": "general", "meaning": "autonomous read"},
+            {"vector": "directive", "path": "deterministic_state.task_directive",
+             "value": "general", "meaning": "no targets bound"},
+            {"vector": "gate", "path": "deterministic_state.gate",
+             "value": "provisional", "meaning": "held diagnostic"},
+        ],
+        "contradictions": [],
+        "direction": "flow-backed drift with unmanaged tape risk",
+    })
+
+
 _STAGED_SUMMARY = (
     "OFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the "
     "P1 verdict holds. Average depth is stable across the window, giving a clean P2 "
     "observation set with beta positive and moderate explanatory power. Market correlation "
     "confirms taker flow aligns with the OFI sign, which is why this regime persists now: "
-    "steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402."
+    "steady passive depth plus one-sided initiation."
 )
 
 
@@ -232,10 +256,19 @@ def _staged_narration(phase: str, tools: list[dict] | None = None, *, final: boo
         "limitations": ["synthetic window"] if final else None,
         "model_separation": "nu*OFI is heteroskedastic; never merged." if final else None,
         "hypothesis": {
-            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H0": "beta > 0 per OFI block (derived empirical model)",
             "H1": "beta <= 0 (flow no longer moves price)",
-            "paper_refs": ["Cont 1011.6402"],
             "evidence_refs": ["calc.ofi.intervals", "calc.depth.average"],
+        } if final else None,
+        # Adjudication vector (validation GATE): weighed on the fit truth,
+        # chosen = argmax (H0 medium outranks H1 low), values echoed live
+        # by the agent — fixtures cite paths only, values stay null.
+        "hypothesis_probabilities": {
+            "H0": {"probability": "medium", "p": None,
+                   "basis_path": "calc.forward.fit → data.status"},
+            "H1": {"probability": "low", "p": None,
+                   "basis_path": "calc.forward.fit → data.status"},
+            "chosen": "H0", "tiebreak": None,
         } if final else None,
         "tool_calls": tools if tools is not None else [],
     }
@@ -286,7 +319,6 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "market.derivatives", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
             ]),
             _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
                 {"name": "calc.price.delta", "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
             ]),
             _staged_narration("P6", final=True),
@@ -299,6 +331,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             # Validation rejects on the missing discipline audit; the
             # bounded repair pulls it, then the final passes.
             _track_tools(*_TRACK_DISCIPLINE),
+
             _staged_narration("P6", final=True),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
@@ -419,8 +452,6 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                  "value": "0.02", "interpretation": "derived ΔP"},
                 {"path": "calc.scenario.evaluate → exceedance",
                  "value": "none", "interpretation": "tool never called"},
-                {"path": "memory.recall_paper → fact",
-                 "value": "linear impact", "interpretation": "paper grounding"},
             ],
             "confidence": "low", "limitations": ["thin tape"],
             "model_separation": "beta and c/lambda read separately",
@@ -443,7 +474,6 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "market.derivatives", "args": {}},
             ]),
             _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
             ]),
             # Hard track walks its three positions before the finals below.
@@ -524,7 +554,6 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             narration,
             _staged_narration("P3", tools=[
                 {"name": "market.derivatives", "args": {}},
-                {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
             ]),
             # Hard track walks its three positions before closing.
@@ -534,6 +563,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _staged_narration("P6", final=True),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _staged_narration("P6", final=True),
         ])
         _artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
@@ -715,10 +745,17 @@ class FinalValidationTests(unittest.TestCase):
                  self._ev("calc.ofi.intervals → ofi"),
                  self._ev("calc.price.delta → route_a_direct.delta_ticks"),
              ],
-             "hypothesis": {"H0": "beta > 0"}},
+             "hypothesis": {"H0": "beta > 0"},
+             "hypothesis_probabilities": {
+                 "H0": {"probability": "medium", "p": None,
+                        "basis_path": "calc.forward.fit → data.status"},
+                 "H1": {"probability": "low", "p": None,
+                        "basis_path": "calc.forward.fit → data.status"},
+                 "chosen": "H0", "tiebreak": None}},
             {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
              "P3": {"market.derivatives"}, "P4": set(),
              "P5": {"calc.price.delta"}, "P6": {"declared"}},
+            accumulated={"calc.forward.fit": {"status": "validated", "r2": "0.31"}}
         )
         self.assertTrue(passed, missing)
 
@@ -769,10 +806,17 @@ class FinalValidationTests(unittest.TestCase):
                  self._ev("calc.ofi.intervals → ofi"),
                  self._ev("calc.price.delta → route_a_direct.delta_ticks"),
              ],
-             "hypothesis": {"H0": "beta > 0"}},
+             "hypothesis": {"H0": "beta > 0"},
+             "hypothesis_probabilities": {
+                 "H0": {"probability": "medium", "p": None,
+                        "basis_path": "calc.forward.fit → data.status"},
+                 "H1": {"probability": "low", "p": None,
+                        "basis_path": "calc.forward.fit → data.status"},
+                 "chosen": "H0", "tiebreak": None}},
             {"P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
              "P3": {"market.derivatives"}, "P4": set(),
              "P5": {"calc.price.delta"}, "P6": {"declared"}},
+            accumulated={"calc.forward.fit": {"status": "validated", "r2": "0.31"}}
         )
         # low-medium normalizes conservatively to low, so it PASSES validation
         # but the persisted artifact must store the coerced enum, never the blend.
@@ -850,6 +894,7 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _staged_narration("P6", final=True),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _staged_narration("P6", final=True),
         ])
 
@@ -933,7 +978,6 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "market.derivatives", "args": {}},
             ]),
             _toolkey("P5", tools=[
-                {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
             ]),
             # Hard track walks its three positions before closing
@@ -1025,8 +1069,6 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
              "value": "0.02", "interpretation": "derived ΔP with band"},
             {"path": "calc.ofi.intervals → ofi",
              "value": "12.5", "interpretation": "tape flow"},
-            {"path": "memory.recall_paper → fact",
-             "value": "linear", "interpretation": "paper grounding"},
         ]
         if good_citation:
             evidence.append({
@@ -1115,10 +1157,16 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
         turn["scenario"]["exceedance"] = "0"
         turn["scenario"]["fit_status"] = "provisional"
         turn["scenario"]["n_windows_usable"] = 61
+        turn["hypothesis_probabilities"] = {
+            "H0": {"probability": "medium", "p": None,
+                   "basis_path": "calc.forward.fit → data.status"},
+            "H1": {"probability": "low", "p": None,
+                   "basis_path": "calc.forward.fit → data.status"},
+            "chosen": "H0", "tiebreak": None}
         passed, missing = validate_final_turn(
             turn, self._coverage_all(),
             scenario={"target_price": "100.50", "horizon": "15m"},
-        )
+            accumulated={"calc.forward.fit": {"status": "provisional"}})
         self.assertTrue(passed, missing)
 
     # --- controller: classification + tri-state ---
@@ -1206,7 +1254,6 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P3", tools=[
                 {"name": "market.derivatives", "args": {}}]),
             _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
                 {"name": "calc.scenario.evaluate",
                  "args": {"target_price": "100.50", "horizon": "15m"}},
@@ -1219,6 +1266,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario"),
             json.dumps(self._refused_final_turn()),
             _track_tools(*_TRACK_DISCIPLINE),
+
             json.dumps(self._refused_final_turn()),
         ])
         engine_run = engine
@@ -1282,7 +1330,6 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P3", tools=[
                 {"name": "market.derivatives", "args": {}}]),
             _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
                 {"name": "calc.scenario.evaluate",
                  "args": {"target_price": "100.50", "horizon": "15m"}},

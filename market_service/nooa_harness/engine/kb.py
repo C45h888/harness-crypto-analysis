@@ -6,7 +6,7 @@ compose them. This is the file the prompt-consolidation pass touches.
 
 Three artefacts live here:
 
-  - ``load_kb(path)`` / ``load_paper_kb()`` — bounded doc reads; failure
+  - ``load_kb(path)`` — bounded doc reads; failure
     is non-fatal (the engine continues without the KB rather than killing
     the cycle).
   - ``SYSTEM_PROMPT_TEMPLATE`` — the role + invariants + KB injection
@@ -16,9 +16,9 @@ Three artefacts live here:
   - ``build_output_format()`` — the JSON turn contract + registry tool
     names + staged workflow (~40 lines, re-sent every turn).
 
-The system prompt is ~3 KB; the manifest injection is ~10 KB; the paper
-KB is up to ~18 KB. Total payload per turn ≈ 34 KB re-sent on every
-follow-up turn. This is the seam the prompt-economy work lives at.
+The system prompt is ~3 KB; the manifest injection is ~10 KB. Total
+payload per turn ≈ 16 KB re-sent on every follow-up turn. This is the
+seam the prompt-economy work lives at.
 """
 
 from __future__ import annotations
@@ -34,9 +34,7 @@ from .config import (
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
     VALIDATION_RETRY_PASSES,
-    _CALC_KB_PATHS,
     _MEMORY_PROTOCOL,
-    _PAPER_KB,
     _TOOL_MANIFEST,
 )
 from .tool_schemas import tool_schema_block, wrap_tool_result
@@ -57,30 +55,13 @@ def load_kb(path: Path) -> str:
         return ""
 
 
-def load_paper_kb() -> str:
-    """Bounded paper KB (Cont et al.) for cross-check — failure is non-fatal."""
-    try:
-        if _PAPER_KB.exists():
-            return _PAPER_KB.read_text(encoding="utf-8")[:20_000]
-    except OSError:
-        pass
-    # fallback: behavior docs that encode the paper semantics
-    for p in _CALC_KB_PATHS:
-        try:
-            if p.exists():
-                return p.read_text(encoding="utf-8")[:20_000]
-        except OSError:
-            continue
-    return ""
-
-
 SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}) — an AGENTIC loop, not a controlled output generator.
 
 You are a loop-walking conditional-inference engine. Your core purpose is to produce statistical evidence — never a trading instruction — by walking four loops in order: context (understand + gather), reason, submit to validation, compose. Closed loops are never revisited; findings (including refusals and nulls) travel forward on the ledger.
 
 You receive ONE deterministic_state object: microstructure fits, coverage,
 and gate reasons computed by deterministic Python from the Redis ledgers.
-You also receive recalled memory (priors + paper KB) and a deterministic diff vs prior artifact.
+You also receive recalled memory (priors) and a deterministic diff vs prior artifact.
 
 YOUR JOB — VALID inference, not predefined addition:
 1. VALIDATE the deterministic fits by invoking calculation modules via tools — do not accept the formula output as final.
@@ -100,12 +81,9 @@ ABSOLUTE RULES:
 3. Respect deterministic status: 'insufficient' must not be interpreted; 'provisional' must be caveated. You cannot override status.
 4. Null means not-provided — never substitute zero.
 5. Cite exact deterministic_state or tool-result paths for every numeric claim.
-6. Cross-check memory/KB: recalled entries include Cont-Kukanov-Stoikov paper excerpts — reference them when relevant.
 
 MEMORY: recalled entries are provenance-tagged priors, subordinate to fresh ledger data. If you contradict a prior conclusion, say so explicitly.
 {memory_protocol_section}
-PAPER KB (Cont et al. 1011.6402 excerpts — bounded):
-{paper_kb}
 {workflow_brief}
 TOOL MANIFEST (commandable, deterministic — USE IT):
 {tool_manifest}
@@ -130,7 +108,6 @@ def build_system_prompt(symbol: str, venue: str, max_rounds: int) -> str:
             + load_kb(_MEMORY_PROTOCOL)
             if _MEMORY_PROTOCOL.exists() else ""
         ),
-        paper_kb=load_paper_kb()[:18_000],
         workflow_brief=build_workflow_brief(),
         tool_manifest=(
             "TOOL MANIFEST:\n" + load_kb(_TOOL_MANIFEST)
@@ -143,8 +120,8 @@ def build_system_prompt(symbol: str, venue: str, max_rounds: int) -> str:
 class SystemPromptCache:
     """Cycle-scoped system prompt: KB disk reads + formatting once, reused.
 
-    ``build_system_prompt`` reads up to three KB files from disk and formats
-    a ~34 KB payload. The engine calls it once per LLM turn (up to 12), so a
+    ``build_system_prompt`` reads up to two KB files from disk and formats
+    a ~16 KB payload. The engine calls it once per LLM turn (up to 12), so a
     cycle re-read the same files and re-paid the same formatting every turn.
     The engine constructs one of these per cycle and passes the rendered
     string to every narration call — the KB payload is cycle-constant anyway
@@ -170,7 +147,7 @@ class SystemPromptCache:
 TURN_CONTRACT_LINE = (
     'Return ONE JSON object per turn with keys {phase, summary, evidence, '
     'confidence, limitations, model_separation, hypothesis, scenario, '
-    'forward_scenario, hypothesis_evidence, tool_calls} — the tool-name key is '
+    'forward_scenario, hypothesis_evidence, hypothesis_probabilities, tool_calls} — the tool-name key is '
     'EXACTLY "name".'
 )
 
@@ -193,8 +170,14 @@ FINAL_SHAPE_BLOCK = (
     "what earlier turns said, but do NOT rely on that: finalize with these "
     "filled):\n"
     '  "summary": string ≥200 chars — what the fits show AND why it is happening now\n'
-    '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], '
-    '"evidence_refs": ["<tool-name>", …]}  (H0/H1 ground in recalled paper facts)\n'
+    '  "hypothesis": {"H0": "…", "H1": "…", '
+    '"evidence_refs": ["<tool-name>", …]}  (H0/H1 in line with the distribution + '
+    'hypothesis frame: prove/disprove the prompt, never from scratch)\n'
+    '  "hypothesis_probabilities": {"H0": {"probability": "low|medium|high", '
+    '"p": 0.0–1.0|null, "basis_path": "<tool> → data.<field>", "basis_value": "…"}, '
+    '"H1": {…}, "chosen": "H0|H1", "tiebreak": "…|null"} — weigh each live '
+    'hypothesis against the distribution (comparator.* = baseline, top-level = '
+    'multivariate), then choose the argmax; probabilities inform, never execute\n'
     '  "evidence": [{"path": "<tool-name> → data.<field>" | "deterministic_state.…", '
     '"value": …, "interpretation": "…"}] — ≥2 distinct roots (different tool heads) '
     "including ≥1 fresh tool result and a calc.price.delta → … ΔP path\n"
@@ -228,10 +211,11 @@ def build_output_format() -> str:
         '  "confidence": "low|medium|high" or null,\n'
         '  "limitations": ["…"] or null,\n'
         '  "model_separation": "one sentence on why beta and c/lambda are read separately" or null,\n'
-        '  "hypothesis": {"H0": "…", "H1": "…", "paper_refs": ["Cont 1011.6402 §…"], "evidence_refs": ["calc.ofi.intervals", …]} or null (REQUIRED at final),\n'
+        '  "hypothesis": {"H0": "…", "H1": "…", "evidence_refs": ["calc.ofi.intervals", …]} or null (REQUIRED at final),\n'
         '  "scenario": {"target_price": "…", "horizon": "15m|1h|4h", "direction": "up|down", "required_ofi": "…", "required_ofi_range": […] or null, "exceedance": "…", "exceedance_range": […] or null, "fit_status": "validated|provisional", "n_windows_usable": N, "r2": "…" or null, "probability": "low|medium|high", "verdict": "reachable|not_reachable|unevaluable", "rationale": "… (≥80 chars, name fit_status + usable windows + r2 beside the verdict)"} or null (REQUIRED at final ONLY when a SCENARIO block was given — echo numerics from calc.scenario.evaluate → … paths, never compute),\n'
         '  "forward_scenario": {"horizon_ms": N, "targets": [{"T": "…", "p_ge": "…", "p_lo": "…", "p_hi": "…"}], "invalidations": [{"S": "…", "p_le": "…"}], "fit_id": "…"} or null (OPTIONAL — horizon-native P(T)/P(S) from calc.forward.scenario → … paths; cite when the task bears horizons/targets),\n'
         '  "hypothesis_evidence": {"hypothesis_id": "…", "effect": "…", "se": "…", "ci": ["…", "…"], "p_value": "…", "n": N, "multiplicity_adj": "…"} or null (OPTIONAL — calc.hypothesis.test → … ledger entry, post-fit only; p<0.05 is evidence, never execution),\n'
+        '  "hypothesis_probabilities": {"H0": {"probability": "low|medium|high", "p": 0.0–1.0|null, "basis_path": "<tool> → data.<field>", "basis_value": "…"}, "H1": {…}, "chosen": "H0|H1", "tiebreak": "…|null"} or null (REQUIRED at final: weigh each live hypothesis against the distribution — comparator.* is the univariate baseline, top-level the multivariate fit — then choose the argmax; probabilities inform, never execute),\n'
         '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
         '  KEY RULE: the tool-name key is EXACTLY "name" — never "tool", "tool_name", or any other key. Entries under any other key are dropped unread.\n'
         "}\n"
@@ -532,7 +516,11 @@ TOOL_WINDOWS: dict[str, str] = {
         "to repair."
     ),
     "validation": (
-        "YOUR TOOLS THIS LOOP — calc.discipline.audit (pull it), then stop. "
+        "YOUR TOOLS THIS LOOP — calc.discipline.audit (pull it), then weigh, then stop. "
+        "Weigh each live hypothesis (low|medium|high + exact basis_path, chosen = argmax; "
+        "probabilities inform, never execute; unevaluable bypasses). "
+        "Your own notebook is reachable here too (memory.recall/remember — read your prior "
+        "notes, write what you concluded; it is never evidence and never gated). "
         "Cite refusals as `tool → refusal` findings with verdict unevaluable. "
         "One repair round exists; a second rejection ends the cycle with "
         "findings preserved — do not thrash."
@@ -556,7 +544,7 @@ __all__ = [
     "default_comprehension",
     "json_dumps_short",
     "load_kb",
-    "load_paper_kb",
+
     "seed_evidence_plan",
     "build_system_prompt",
     "build_output_format",
@@ -722,6 +710,7 @@ def compose_output_prompt(
     accumulated_keys: list[str],
     traversal: dict[str, Any],
     chain_line: str,
+    collapse_block: str = "",
 ) -> str:
     """Compose the OUTPUT composition pass prompt (non-agentic, tools forbidden).
 
@@ -734,9 +723,24 @@ def compose_output_prompt(
         "return will be dropped): compose the FINAL artifact JSON strictly "
         "from this run's material below. Return ONLY one JSON object with "
         "EXACTLY {summary, evidence, confidence, limitations, "
-        "model_separation, hypothesis, scenario} — every "
+        "model_separation, hypothesis, hypothesis_probabilities, scenario} — every "
         f"numeric claim already cited; invent no values. {CITATION_LINE}\n\n"
+        "LEDGER-LED COMPOSITION (proof over narration, always):\n"
+        "- Numbers come from the ledger/digest rows in SYNTHESIS MATERIAL "
+        "(base_summary, forecast proof payloads, verdict_rows) — never from "
+        "recalled narration text. When narration and ledger disagree, the ledger wins.\n"
+        "- The 2b agent proof outranks the plan-bound digest: cite proof payload "
+        "paths, not digest status lines.\n"
+        "- H0/H1 must conform to the weighed choice in verdict_rows "
+        "(verdict-chosen): keep the adjudicated winner, preserve the "
+        "probability + basis_path alongside it.\n"
+        "- hypothesis_probabilities: carry the weighed vector through (chosen "
+        "must equal verdict-chosen); you may reword interpretations, never "
+        "the choice or the cited values.\n"
+        "- comparator.* fields are the univariate baseline, top-level fit fields "
+        "the multivariate — cite each under its own path, never swap them.\n\n"
         f"{directive_block}"
+        f"{collapse_block}"
         "SYNTHESIS MATERIAL:\n"
         f"{json.dumps(synthesis_material, default=str)[:30_000]}\n\n"
         "The canonical ForecastResult is deterministic evidence. Preserve its "
@@ -933,6 +937,8 @@ def compose_forced_final_prompt(
     evidence_digest: str,
     scenario: Any | None = None,
     strict: bool = False,
+    adjudication_block: str = "",
+    data_checks_block: str = "",
 ) -> str:
     """The FORCED FINAL turn — the one that actually produces the artifact JSON.
 
@@ -972,12 +978,44 @@ def compose_forced_final_prompt(
         f"{scenario_block}"
         "WHY THE PREVIOUS FINAL WAS REJECTED — EVERY item below must be fixed:\n"
         + "\n".join(f"- {item}" for item in missing)
+        + f"\n\n{adjudication_block}"
+        + f"{data_checks_block}"
         + "\n\nTHIS RUN'S TOOL EVIDENCE (cite these exact paths in evidence):\n"
         f"{evidence_digest}\n\n"
         f"{FINAL_SHAPE_BLOCK}\n\n"
         'Return ONE JSON object with EXACTLY {phase: "P6", summary, evidence, '
         "confidence, limitations, model_separation, hypothesis, scenario, "
         'tool_calls: []}. No prose before or after it.'
+    )
+
+
+def compose_adjudication_block(
+    *,
+    frame_steer: str = "",
+    memory_block: str = "",
+) -> str:
+    """Adjudication layer for validation turns (pure).
+
+    The repair/forced-final turn weighs before it fixes: the deterministic
+    H0/H1 frame (prompt × data) plus the recalled verdict-basis ledger rows.
+    Probabilities inform, never execute. Empty inputs render empty (the turn
+    still judges — adjudication degrades to unguided, never blocks).
+    """
+    parts: list[str] = []
+    if frame_steer:
+        parts.append(frame_steer)
+    if memory_block:
+        parts.append(
+            "ADJUDICATION MEMORY (recalled verdict-basis + stage observations — "
+            "weigh against these, cite their ids, never from scratch):\n"
+            f"{memory_block}"
+        )
+    if not parts:
+        return ""
+    return (
+        "ADJUDICATION (weigh each live hypothesis, then choose — probabilities "
+        "inform, never execute; unevaluable bypasses weighing):\n"
+        + "\n\n".join(parts) + "\n\n"
     )
 
 
@@ -996,6 +1034,8 @@ def compose_repair_prompt(
     scenario_steer: str,
     phase_guidance: dict[str, str],
     next_phase: str,
+    adjudication_block: str = "",
+    data_checks_block: str = "",
 ) -> str:
     """Compose the validation-loop repair-turn prompt.
 
@@ -1033,6 +1073,8 @@ def compose_repair_prompt(
         f"{scenario_reminder}"
         f"{scenario_steer}"
         f"{CITATION_LINE}\n"
+        f"{adjudication_block}"
+        f"{data_checks_block}"
         "FINAL REJECTED — staged inference incomplete. Missing:\n"
         + "\n".join(f"- {item}" for item in missing)
         + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{_bounded_dump(wrapped_accum, 24_000)}\n\n"
@@ -1087,7 +1129,7 @@ PHASE_GUIDANCE: dict[str, str] = {
            "strictly from this run's reasoning: H0/H1 verdict, numeric ΔP with band, regime explanation, "
            "confidence, limitations. Every numeric claim cites its tool path, including a "
            "calc.price.delta → … path for the ΔP. Return FINAL JSON: tool_calls=[], full summary/evidence/"
-           "confidence/limitations/model_separation/hypothesis{H0,H1,paper_refs,evidence_refs}."),
+           "confidence/limitations/model_separation/hypothesis{H0,H1,evidence_refs}."),
 }
 
 

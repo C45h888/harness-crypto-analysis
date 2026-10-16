@@ -289,7 +289,7 @@ def memory_forget(session_id, memory_id) -> None:
 # --------------------------------------------------------------------------
 # microstructure — Pass-3 deterministic OFI/AD fit + evidence + interpretation
 #
-# Authority split (docs/nooa-kb/nooa-micro-structure-archieture.md):
+# Authority split:
 # fitting lives in market_service.microstructure.fitting (pure, no I/O);
 # this group is the ONLY sanctioned caller; NOOA agents read the resulting
 # evidence and never recompute any value. The agent never opens Binance,

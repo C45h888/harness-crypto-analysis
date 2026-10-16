@@ -36,8 +36,7 @@ async def capture(case, stage_trace=None):
         p1_read,
         _staged_narration("P2", tools=[{"name": "calc.depth.average"},
                                        {"name": "market.derivatives"}]),
-        _staged_narration("P5", tools=[{"name": "memory.recall_paper"},
-                                       {"name": "calc.price.delta"}]),
+        _staged_narration("P5", tools=[{"name": "calc.price.delta"}]),
         _track_tools(*_TRACK_ASSEMBLE),
         _track_tools(*_TRACK_INTERPRET),
         _track_tools(*_TRACK_FORECAST),
@@ -134,7 +133,7 @@ async def capture(case, stage_trace=None):
             (core.gather, "run_plan_bound_acquisition"),
             (core.reasoning, "run_evidence"),
             (core.reasoning, "run_reasoning"),
-            (core.reasoning, "run_validation"),
+            (core.validation, "run_validation"),
             (core.output, "run_output"),
         ]
 

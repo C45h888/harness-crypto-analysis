@@ -405,7 +405,7 @@ class TestCycleFailureEndToEnd:
             _staged_narration("P2", tools=[{"name": "calc.depth.average"}]),
             _staged_narration("P3", tools=[{"name": "market.derivatives"}]),
             _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper"}, {"name": "calc.price.delta"}]),
+                {"name": "calc.price.delta"}]),
             _staged_narration("P6", final=True),
         ] * 10
         engine, store, postgres, memory = _engine(llm_responses=turns)

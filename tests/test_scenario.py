@@ -153,15 +153,20 @@ class ScenarioSemanticsTests(unittest.TestCase):
                  "value": "0.27", "interpretation": "derived ΔP"},
                 {"path": "calc.scenario.evaluate → exceedance",
                  "value": "0", "interpretation": "no window reaches required flow"},
-                {"path": "memory.recall_paper → fact",
-                 "value": "OFI impact linear", "interpretation": "paper grounding"},
             ],
             "confidence": "low",
             "limitations": ["provisional fit"],
             "model_separation": "beta and c/lambda read separately",
             "hypothesis": {"H0": "target not reachable", "H1": "target reachable",
-                             "paper_refs": ["Cont 1011.6402 §3"],
                              "evidence_refs": ["calc.scenario.evaluate"]},
+            "hypothesis_probabilities": {
+                "H0": {"probability": "high", "p": 0.9,
+                       "basis_path": "calc.scenario.evaluate → exceedance",
+                       "basis_value": "0"},
+                "H1": {"probability": "low", "p": 0.1,
+                       "basis_path": "calc.scenario.evaluate → exceedance",
+                       "basis_value": "0"},
+                "chosen": "H0", "tiebreak": None},
             "scenario": {
                 "target_price": "100.50", "horizon": "15m", "direction": "up",
                 "required_ofi": "50000", "required_ofi_range": None,
@@ -182,7 +187,12 @@ class ScenarioSemanticsTests(unittest.TestCase):
     def test_scenario_complete_passes(self):
         from market_service.nooa_harness.engine import _validate_final_turn
         passed, missing = _validate_final_turn(
-            self._final(), self._coverage(), scenario=self.SCEN)
+            self._final(), self._coverage(), scenario=self.SCEN,
+            accumulated={"calc.scenario.evaluate": {
+                "exceedance": "0", "required_ofi": "50000"},
+                "calc.forward.distribution": {
+                    "expected_delta": "-5.2", "pi_95_lo": "-9.1",
+                    "pi_95_hi": "-1.3", "p_ge_zero": "0.02"}})
         self.assertTrue(passed, missing)
 
     def test_scenario_absent_unchanged(self):
@@ -190,8 +200,14 @@ class ScenarioSemanticsTests(unittest.TestCase):
         final = self._final()
         del final["scenario"]
         final["hypothesis"] = {"H0": "beta positive", "H1": "",
-                                 "paper_refs": [], "evidence_refs": []}
-        passed, missing = _validate_final_turn(final, self._coverage())
+                                 "evidence_refs": []}
+        passed, missing = _validate_final_turn(
+            final, self._coverage(),
+            accumulated={"calc.scenario.evaluate": {
+                "exceedance": "0", "required_ofi": "50000"},
+                "calc.forward.distribution": {
+                    "expected_delta": "-5.2", "pi_95_lo": "-9.1",
+                    "pi_95_hi": "-1.3", "p_ge_zero": "0.02"}})
         self.assertTrue(passed, missing)
 
     def test_scenario_missing_block_and_h1(self):
@@ -199,7 +215,7 @@ class ScenarioSemanticsTests(unittest.TestCase):
         final = self._final()
         del final["scenario"]
         final["hypothesis"] = {"H0": "x", "H1": "",
-                                 "paper_refs": [], "evidence_refs": []}
+                                 "evidence_refs": []}
         passed, missing = _validate_final_turn(
             final, self._coverage(), scenario=self.SCEN)
         self.assertFalse(passed)
@@ -219,6 +235,32 @@ class ScenarioSemanticsTests(unittest.TestCase):
         self.assertTrue(any("scenario.fit_status" in m for m in missing))
         self.assertTrue(any("scenario.n_windows_usable" in m for m in missing))
         self.assertTrue(any("scenario.rationale" in m for m in missing))
+
+    def test_scenario_verdict_obeys_deterministic_derivation(self):
+        # Slice 1: validation owns the verdict equality — output keeps the
+        # block verbatim. Zero exceedance on a validated gate invalidates:
+        # only not_reachable passes; reachable is repaired.
+        from types import SimpleNamespace
+        from market_service.nooa_harness.engine.controller import CycleController
+        from market_service.nooa_harness.engine.core.validation import (
+            check_scenario_equality,
+        )
+        judged = {"scenario": dict(self._final()["scenario"])}
+        judged["scenario"]["verdict"] = "reachable"
+        st = SimpleNamespace(
+            controller=CycleController(),
+            deterministic_state={"gate": {"status": "validated", "reasons": []}},
+            accumulated_tool_results={"calc.scenario.evaluate": {
+                "direction": "up", "target_price": "100.50", "horizon": "15m",
+                "exceedance": "0", "exceedance_range": ["0", "0"],
+                "n_windows_usable": 61}},
+            capability_log=[],
+        )
+        ctx = SimpleNamespace(scenario=self.SCEN, task=None, task_id=None)
+        missing = check_scenario_equality(judged, st, ctx)
+        self.assertTrue(any("not_reachable" in m for m in missing), missing)
+        judged["scenario"]["verdict"] = "not_reachable"
+        self.assertEqual(check_scenario_equality(judged, st, ctx), [])
 
     def test_scenario_bad_verdict_and_probability(self):
         from market_service.nooa_harness.engine import _validate_final_turn

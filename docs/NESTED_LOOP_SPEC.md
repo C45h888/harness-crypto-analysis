@@ -501,8 +501,8 @@ prose** — narration never enters a receipt.
 
 Receipts do **not** enter the agent's episodic memory node
 (`market_service.nooa_harness.memory.MemoryNode`). The memory node belongs to
-the agent, which calls it (`memory.recall_paper`) and writes it
-(`memory_proposals`, disposed by the engine per
+the agent, which reads and writes it through the `memory.*` tools
+(`memory.remember` / `memory.recall`, per
 `docs/nooa-kb/behavior/memory-protocol.md`). The engine does not project its
 bookkeeping into the agent's memory.
 

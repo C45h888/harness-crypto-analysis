@@ -111,7 +111,6 @@ _MARKET_TOOLS: dict[str, Capability] = {
         "calc.fit_depth_scaling": "Log-log ln β = ln c - λ ln AD across blocks — needs ≥3 distinct AD_i, derived diagnostic only.",
         "calc.derived_diagnostic": "NUMERIC derived ΔP (alias: calc.price.delta): pass ofi (else latest interval OFI) → route A ΔP=α+β·OFI with 95% band + route B depth-scaled when c/λ exist. Refuses on insufficient fits. Heteroskedastic ν·OFI — diagnostic, not prediction.",
         "calc.scenario.evaluate": "SCENARIO price-target evaluation (interaction plane): pass target_price + horizon 15m|1h|4h → required horizon flow OFI_req=(Δ−n·α)/β vs empirical rolling-sum OFI distribution at that horizon → direction-matched exceedance + SE-band range + route-B cross-check. Current price resolved inside the tool from market.read (never agent-supplied). Refuses on insufficient fits, β≈0, missing price, thin tapes.",
-        "memory.recall_paper": "Recall Cont-Kukanov-Stoikov paper facts from real MemoryNode (kind=fact, paper-kb session) — not prompt.",
         "memory.remember": "Write one of the AGENT's OWN observations into its task-segment memory. No engine disposition: kind/size/segment hygiene only.",
         "memory.recall": "Read back the AGENT's own task-segment memories (kind/query filtered, bounded).",
         "memory.forget": "Tombstone one of the agent's own memories (audit row survives).",

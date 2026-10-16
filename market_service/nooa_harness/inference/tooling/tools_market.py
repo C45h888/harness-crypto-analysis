@@ -377,45 +377,6 @@ def _single_report(report: dict[str, Any], target: str) -> dict[str, Any]:
     }
 
 
-async def dispatch_memory_recall_paper(
-    symbol: str, venue: str, *, query: str = "Cont OFI AD beta",
-    memory: Any | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Tool: memory.recall_paper — recall paper facts through the ENGINE's own
-    MemoryNode (two-plane boundary pass, 2026-09-04).
-
-    The node and the paper-KB session are injected; this dispatcher never
-    constructs stores and never re-reads the environment. The paper session
-    UUID comes from the single source of truth ``memory.paper_kb_session_id``
-    shared with scripts/seed_paper_kb.py. With no memory node (Redis-only
-    deployment) the result is an explicit null payload — never a fabricated
-    recall and never a second connection pool.
-    """
-    from market_service.nooa_harness.memory import paper_kb_session_id
-
-    cap = CAPABILITIES["memory.recall_paper"]
-    scope = {"symbol": symbol.upper(), "venue": venue, "query": query}
-    try:
-        cap.validate_scope(symbol, venue)
-        if memory is None:
-            return [], capability_log_entry(
-                cap.name, scope, "ok",
-                detail={"facts": 0, "reason": "memory_node_not_configured"},
-            )
-        mems = await memory.recall(paper_kb_session_id(), query=query, limit=8)
-        projected = [{"content": m.content[:600], "tags": list(m.tags),
-                      "importance": m.importance} for m in mems]
-        return projected, capability_log_entry(
-            cap.name, scope, "ok",
-            detail={"facts": len(projected), "query": query,
-                    "session": "paper-kb (injected MemoryNode)"},
-        )
-    except CapabilityDenied as exc:
-        return [], capability_log_entry(cap.name, scope, "denied", detail=str(exc))
-    except Exception as exc:
-        return [], capability_log_entry(cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")
-
-
 # ---------------------------------------------------------------------------
 # memory.* — the AGENT's OWN segmented episodic memory (B1 surface for the B2
 # ``MemorySkill``). The agent writes and reads its own observations in flight;

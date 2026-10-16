@@ -173,7 +173,7 @@ _STAGED_SUMMARY = (
     "P1 verdict holds. Average depth is stable across the window, giving a clean P2 "
     "observation set with beta positive and moderate explanatory power. Market correlation "
     "confirms taker flow aligns with the OFI sign, which is why this regime persists now: "
-    "steady passive depth plus one-sided initiation. Paper grounding holds via Cont 1011.6402."
+    "steady passive depth plus one-sided initiation."
 )
 
 
@@ -194,10 +194,18 @@ def _staged_narration(phase: str, tools: list[dict] | None = None, *, final: boo
         "limitations": ["synthetic window"] if final else None,
         "model_separation": "nu*OFI is heteroskedastic; never merged." if final else None,
         "hypothesis": {
-            "H0": "beta > 0 per OFI block (Cont 1011.6402 empirical model)",
+            "H0": "beta > 0 per OFI block (derived empirical model)",
             "H1": "beta <= 0 (flow no longer moves price)",
-            "paper_refs": ["Cont 1011.6402"],
             "evidence_refs": ["calc.ofi.intervals", "calc.depth.average"],
+        } if final else None,
+        # Adjudication vector (validation GATE): H0 medium outranks H1 low;
+        # fixtures cite paths only, live agents echo values.
+        "hypothesis_probabilities": {
+            "H0": {"probability": "medium", "p": None,
+                   "basis_path": "calc.forward.fit → data.status"},
+            "H1": {"probability": "low", "p": None,
+                   "basis_path": "calc.forward.fit → data.status"},
+            "chosen": "H0", "tiebreak": None,
         } if final else None,
         "tool_calls": tools if tools is not None else [],
     }
@@ -380,8 +388,6 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
                  "args": {"symbol": "BTCUSDT", "venue": "spot"}},
             ]),
             _staged_narration("P5", tools=[
-                {"name": "memory.recall_paper",
-                 "args": {"symbol": "BTCUSDT", "venue": "spot"}},
                 {"name": "calc.price.delta",
                  "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
             ]),

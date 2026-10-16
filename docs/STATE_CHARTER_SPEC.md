@@ -63,7 +63,7 @@ semantic boundaries. Five axes, each verified against the live tree:
   re-reconciles `loop_tag` → FSM loop/sub_loop by hand.
 * `context.py:224` — `loop_tag: str = "evidence"` — the runtime's loop
   identity is an untyped string; its vocabulary lives in convention
-  (config.py's budget keys, reasoning.py's three assignments), not in a type.
+  (config.py's budget keys, the loop modules' assignments), not in a type.
 
 ### B. The horizon vocabulary — the {15m,1h,4h} widths are defined in six places
 

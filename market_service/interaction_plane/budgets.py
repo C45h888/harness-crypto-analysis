@@ -27,7 +27,6 @@ SEGMENT_LIST_CAP: dict[str, int] = {
     "ledger": 60,
     "micro": 200,
     "history": 100,
-    "memory": 16,
     "control": 64,
     "inference": 60,
 }

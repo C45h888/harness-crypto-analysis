@@ -36,7 +36,7 @@ from typing import Any, Awaitable, Callable
 from market_service.runtime.contracts import InferenceArtifact
 
 from . import context
-from . import gather, output, reasoning
+from . import gather, output, reasoning, validation
 from . import wake as wake_mod
 from ..ledger import LedgerKind, record_entry
 from ..fsm import GovernanceEvent, GovernanceEventKind
@@ -122,12 +122,12 @@ async def _stage_reasoning(engine, ctx, st, wake, wake_meta, task, scenario):
 
 
 async def _stage_validation(engine, ctx, st, wake, wake_meta, task, scenario):
-    completed = await reasoning.run_validation(engine, ctx, st)
+    completed = await validation.run_validation(engine, ctx, st)
     return st, ctx, completed
 
 
 async def _stage_output(engine, ctx, st, wake, wake_meta, task, scenario):
-    artifact = await output.run_output(engine, ctx)
+    artifact = await output.run_output(engine, ctx, st)
     return st, ctx, artifact
 
 

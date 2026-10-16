@@ -52,6 +52,11 @@ if BaseModel is not None:
         scenario: dict[str, Any] | None = None
         forward_scenario: dict[str, Any] | None = None
         hypothesis_evidence: dict[str, Any] | None = None
+        # Probabilistic adjudication (validation GATE): per-hypothesis enum
+        # (low|medium|high, required) + optional numeric P, each with the
+        # exact tool+field basis path and the argmax choice. Probabilities
+        # inform, never execute.
+        hypothesis_probabilities: dict[str, Any] | None = None
         phase: str = "P1"
         tool_calls: list[NarrationToolCall] = Field(default_factory=list)
 else:

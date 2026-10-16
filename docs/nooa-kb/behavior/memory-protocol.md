@@ -29,7 +29,7 @@ tools — from any loop you are actually working in.
     memory.stats     {}
 
 - You may write kinds `observation`, `hypothesis`, `note`. `fact` is reserved
-  for deterministic paper truth and is refused.
+  and is refused.
 - There is **no proposal queue and no admission gate** — the engine does not
   dispose your writes. Structural hygiene only: kind, size, and the task
   segment (your writes can never land in another task's partition).

@@ -49,7 +49,6 @@ def _evidence_prefix() -> list[str]:
             {"name": "market.derivatives", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
         ]),
         _staged_narration("P5", tools=[
-            {"name": "memory.recall_paper", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
             {"name": "calc.price.delta", "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
         ]),
         _staged_narration("P6", final=True),
@@ -126,6 +125,7 @@ class HealthyTrackWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _close(),
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
@@ -166,6 +166,7 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _close(),
             _close(),  # spare: composition pass
         ])
@@ -191,17 +192,89 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
         # ledger (deterministic engine state — not episodic MemoryNode rows).
         stages = [e.get("detail", {}).get("stage")
                   for e in by_cap.get("engine.ledger.stage_record", [])]
-        self.assertEqual(stages, ["base", "refined"])
+        self.assertEqual(stages, ["base", "refined", "verdict-basis"])
         # Frozen base + chain pointer travel on the artifact.
         base = artifact.deterministic_state.get("base_summary") or {}
         self.assertTrue(base.get("base_complete"))
         self.assertGreater(int(base.get("n_pairs") or 0), 0)
         chain = artifact.deterministic_state.get("statistical_chain") or {}
         self.assertTrue((chain.get("base_summary") or {}).get("base_complete"))
-        # Stage ids are central-ledger seq pointers (base -> refined).
-        self.assertEqual(chain.get("stage_ids"), ["base#3", "refined#4"])
+        # Stage ids are central-ledger seq pointers (base -> refined ->
+        # verdict-basis, the adjudication spine's reasoning-close record).
+        self.assertEqual(chain.get("stage_ids"),
+                         ["base#3", "refined#4", "verdict-basis#5"])
         # Digest fallback never fired on a healthy walk (proof earned).
         self.assertNotIn("engine.forecast.digest_fallback", by_cap)
+
+    async def test_verdict_chosen_recorded_on_settled_and_failed_terminals(self):
+        # Loop-surface completion: the adjudication decision is frozen as
+        # OBSERVATION `verdict-chosen` on BOTH terminal paths, so composition
+        # (which recalls verdict-basis + verdict-chosen into synthesis) and
+        # the next cycle (prior-artifact recall) read the decision, never
+        # narration text.
+        from market_service.nooa_harness.engine.ledger import (
+            LedgerKind, ledger_rows,
+        )
+        engine, _s, _p, _m = _engine(llm_responses=[
+            *_evidence_prefix(),
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            _close(),
+            _track_tools(*_TRACK_DISCIPLINE),
+
+            _close(),
+            _close(),  # spare: composition pass
+        ])
+        artifact, meta = await engine.narrate_cycle(
+            _wake(), {"decision": "fire"}, task="verdict trace")
+        self.assertEqual(meta.get("terminal"), "settled")
+        ds = artifact.deterministic_state
+        chosen = ledger_rows(ds, (LedgerKind.OBSERVATION,),
+                             stage="verdict-chosen")
+        self.assertEqual(len(chosen), 1)
+        payload = chosen[0].get("payload") or {}
+        self.assertEqual(payload.get("chosen"), "H0")
+        self.assertEqual(payload.get("outcome"), "settled")
+        self.assertIn(payload.get("frame_basis"),
+                      ("prompt_targets", "directive_seed",
+                       "prompt_text", "data_autonomous"))
+        # Composition recalled the decision rows (verdict-basis present here
+        # too — the recall filter is what synthesis carries).
+        basis = ledger_rows(ds, (LedgerKind.OBSERVATION,),
+                            stage="verdict-basis")
+        self.assertEqual(len(basis), 1)
+
+    async def test_verdict_chosen_recorded_on_failed_terminal(self):
+        # Failed path: finals without H0 can never pass, but the decision
+        # receipt must still freeze (outcome=validation_failed) — the next
+        # cycle inherits the attempt, not silence.
+        from tests.test_engine import _good_narration
+        from market_service.nooa_harness.engine.ledger import (
+            LedgerKind, ledger_rows,
+        )
+        engine, _s, _p, _m = _engine(llm_responses=[
+            *_evidence_prefix(),
+            _track_tools(*_TRACK_ASSEMBLE),
+            _track_tools(*_TRACK_INTERPRET),
+            _track_tools(*_TRACK_FORECAST),
+            _track_tools(*_TRACK_HYPOTHESIZE),
+            *[_good_narration() for _ in range(8)],
+        ])
+        artifact, meta = await engine.narrate_cycle(
+            _wake(), {"decision": "fire"}, task="failed verdict trace")
+        self.assertEqual(meta.get("terminal"), "validation_failed")
+        chosen = ledger_rows(artifact.deterministic_state,
+                             (LedgerKind.OBSERVATION,),
+                             stage="verdict-chosen")
+        self.assertEqual(len(chosen), 1)
+        payload = chosen[0].get("payload") or {}
+        self.assertEqual(payload.get("outcome"), "validation_failed")
+        # The evidence-close staged final already carried a weighed vector,
+        # so the receipt names its choice even though the terminal failed on
+        # the missing H0 content — decision receipt, not pass receipt.
+        self.assertEqual(payload.get("chosen"), "H0")
 
     async def test_price_target_walk_settles_with_scenario_finding(self):
         engine, _s, _p, _m = _engine(llm_responses=[
@@ -212,6 +285,7 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE, "calc.forward.scenario", "calc.scenario.evaluate"),
             _scenario_close(),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _scenario_close(),
         ])
         scenario = {"target_price": "100.50", "horizon": "15m"}
@@ -244,6 +318,7 @@ class JumpAheadWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE, hypothesis_id="H-ontime"),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _close(),
             _close(),  # spare: output composition may spend one turn
         ])
@@ -287,6 +362,7 @@ class RefusalCarryWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _close(),
         ])
         core_mod.context.execute_tool = refusing_execute
@@ -401,6 +477,7 @@ class ReformulationWalkTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _close(),
             _track_tools(*_TRACK_DISCIPLINE),
+
             _close(),
         ])
         core_mod.context.execute_tool = refusing_execute

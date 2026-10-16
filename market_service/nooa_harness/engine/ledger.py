@@ -110,8 +110,15 @@ def ledger_rows(
     kinds: Sequence[LedgerKind] | None = None,
     *,
     segment: str | None = None,
+    stage: str | Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """The ledger rows, optionally filtered to the given kinds (fixed order)."""
+    """The ledger rows, optionally filtered to the given kinds (fixed order).
+
+    ``stage`` narrows inside the payload (OBSERVATION rows carry
+    ``stage``: base / refined / verdict-basis / verdict-chosen) without a
+    kind migration — so a reader can pull exactly the row it needs and a
+    truncation budget can never evict it from below.
+    """
     rows = deterministic_state.get(LEDGER_ROOT)
     if not isinstance(rows, list):
         return []
@@ -122,6 +129,10 @@ def ledger_rows(
         rows = [row for row in rows if row.get("kind") in wanted]
     if segment is not None:
         rows = [row for row in rows if row.get("segment") == segment]
+    if stage is not None:
+        wanted_stages = {stage} if isinstance(stage, str) else set(stage)
+        rows = [row for row in rows
+                if (row.get("payload") or {}).get("stage") in wanted_stages]
     return rows
 
 
@@ -130,14 +141,17 @@ def render_ledger(
     kinds: Sequence[LedgerKind] | None = None,
     *,
     segment: str | None = None,
+    stage: str | Sequence[str] | None = None,
     budget: int = 3_000,
 ) -> str:
     """Render the central ledger as a compact, deterministic prompt block.
 
     Sections are emitted in ``LEDGER_ORDER`` (not write order across kinds) so
-    the same state always renders the same text.
+    the same state always renders the same text. ``stage`` pre-filters rows
+    (see :func:`ledger_rows`) so truncation cuts inside the wanted section,
+    never evicts it.
     """
-    rows = ledger_rows(deterministic_state, kinds, segment=segment)
+    rows = ledger_rows(deterministic_state, kinds, segment=segment, stage=stage)
     if not rows:
         return ""
     lines = ["## Engine ledger (central, deterministic — context, never evidence)"]

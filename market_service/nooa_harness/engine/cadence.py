@@ -1,7 +1,7 @@
 """Cadence — the plan-bound read/calc cadence vocabulary (single owner).
 
 Phase R1 (cadence-into-plan): the cadence constitution lived in four
-places with no governance owner (config budgets, reasoning.py inline
+places with no governance owner (config budgets, reasoning/validation inline
 decisions, driver ceilings, carrier counters). This module is the ONE owner
 of the deterministic read/calc cadence vocabulary — the same charter shape
 as ``runtime/horizons.py`` owns horizons and ``engine/gates.py`` owns gate

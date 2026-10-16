@@ -54,8 +54,12 @@ DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
 # (refusal + reform + re-walk + proof) is what spends it.
 AGENTIC_MAX_TOOL_ROUNDS = 11
 # narrate#1 + tool follow-ups + repairs + forced-final, with headroom for
-# redundant rounds.
-AGENTIC_MAX_LLM_TURNS = 16
+# redundant rounds. Raised 16 → 30 for the quality-assessment window: the
+# proof-pass doctrine (forecast proof + frame + stage stores) spends more
+# turns per cycle, and the ceiling must never be what stops an assessment
+# run. Bounded per-loop pass budgets + the round ceiling still bound cost;
+# this backstop is unbreakable headroom, not a spending target.
+AGENTIC_MAX_LLM_TURNS = 30
 # Max dispatches per tool round.
 AGENTIC_PER_ROUND_CALL_CAP = 3
 # Per-loop-state pass allotment (Track A congruence shape, loop-surface spec v1).
@@ -68,6 +72,9 @@ AGENTIC_PER_ROUND_CALL_CAP = 3
 # evidence/reasoning/validation/output unchanged.
 # 1 + 3 + 6 + 1(+2 retries) + 1 = 12 planned, inside the backstop.
 # Headroom (16): +1 comprehension assessment + reflection/refusal reserves.
+# Synthesis doctrine: output spends COLLAPSE + DERIVE (+ legacy single-call
+# fallback when synthesis fails FSM-visibly) — bounded, tool-free, inside
+# the backstop.
 LOOP_PASS_BUDGET: dict[str, int] = {
     "comprehension": 1,
     "evidence": 3,
@@ -78,7 +85,7 @@ LOOP_PASS_BUDGET: dict[str, int] = {
     # the steady statistical track spends, not a suggestion.
     "reasoning": 8,
     "validation": 1,
-    "output": 1,
+    "output": 3,
 }
 # Bounded internal retry inside VALIDATION (diagnose -> steered repair ->
 # revalidate). Persistent failure emits a structured issue to the FSM
@@ -129,10 +136,6 @@ def structured_output_enabled() -> bool:
 _KB_BASE = Path(__file__).resolve().parents[3] / "docs" / "nooa-kb"
 _TOOL_MANIFEST = _KB_BASE / "behavior" / "tool-manifest.md"
 _MEMORY_PROTOCOL = _KB_BASE / "behavior" / "memory-protocol.md"
-_PAPER_KB = _KB_BASE / "nooa-micro-structure-archieture.md"
-_CALC_KB_PATHS = [
-    _KB_BASE / "behavior" / "B01-agents-base.md",
-]
 
 
 def narration_max_tokens() -> int:
@@ -168,7 +171,5 @@ __all__ = [
     "_STRUCTURED_OK",
     "_TOOL_MANIFEST",
     "_MEMORY_PROTOCOL",
-    "_PAPER_KB",
-    "_CALC_KB_PATHS",
     "narration_max_tokens",
 ]

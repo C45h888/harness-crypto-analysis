@@ -71,14 +71,13 @@ from .kb import (
     build_output_format,
     build_system_prompt,
     load_kb,
-    load_paper_kb,
 )
 
 # --- Narration primitives (redistributed — narration.py deleted Pass-C) ---
 from .schemas import coerce_turn, extract_json_object
 from .kb import PHASE_GUIDANCE
 from .controller import next_uncovered_phase, scenario_verdict
-from .core.reasoning import validate_final_turn
+from .core.validation import validate_final_turn
 
 # --- Cycle controller (the loop's sole deterministic authority) ---
 from .controller import (
@@ -204,7 +203,6 @@ __all__ = [
     "build_output_format",
     "build_system_prompt",
     "load_kb",
-    "load_paper_kb",
     # llm
     "bounded_envelope_view",
     "call_narration_llm",
@@ -299,7 +297,7 @@ __all__ = [
 _extract_json_object = extract_json_object
 # `from .engine import _coerce_turn` -> schemas
 _coerce_turn = coerce_turn
-# `from .engine import _validate_final_turn` -> core.reasoning
+# `from .engine import _validate_final_turn` -> core.validation
 _validate_final_turn = validate_final_turn
 # `from .engine import _scenario_verdict` -> controller
 _scenario_verdict = scenario_verdict
@@ -313,7 +311,5 @@ _narration_max_tokens = narration_max_tokens
 _next_uncovered_phase = next_uncovered_phase
 # `from .engine import _load_kb` -> kb
 _load_kb = load_kb
-# `from .engine import _load_paper_kb` -> kb
-_load_paper_kb = load_paper_kb
 # `from .engine import _PRIOR_HEADLINE_MAX_CHARS` -> config (int constant)
 from .config import _PRIOR_HEADLINE_MAX_CHARS

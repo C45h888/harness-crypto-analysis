@@ -102,7 +102,7 @@ class OuterSequenceDerivationTests(unittest.TestCase):
                       sources["plan_bound_acquisition"])
         self.assertIn("reasoning.run_evidence(", sources["evidence"])
         self.assertIn("reasoning.run_reasoning(", sources["reasoning"])
-        self.assertIn("reasoning.run_validation(", sources["validation"])
+        self.assertIn("validation.run_validation(", sources["validation"])
         self.assertIn("output.run_output(", sources["output"])
 
 

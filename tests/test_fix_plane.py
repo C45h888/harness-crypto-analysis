@@ -168,7 +168,7 @@ class MergeJudgementTests(unittest.TestCase):
     """Final validation judges the MERGED interpretation, not the last turn."""
 
     def test_bare_declaration_turn_does_not_erase_content(self):
-        from market_service.nooa_harness.engine.core.reasoning import (
+        from market_service.nooa_harness.engine.core.validation import (
             merge_interpretation,
         )
         turns = [
@@ -185,7 +185,7 @@ class MergeJudgementTests(unittest.TestCase):
         self.assertEqual(len(merged["evidence"]), 1)
 
     def test_evidence_union_dedupes_and_scenario_last_wins(self):
-        from market_service.nooa_harness.engine.core.reasoning import (
+        from market_service.nooa_harness.engine.core.validation import (
             merge_interpretation,
         )
         entry = {"path": "calc.ofi.intervals → data[0].ofi",
@@ -203,7 +203,7 @@ class RootsIdentityTests(unittest.TestCase):
     """Two different calc.* tools are TWO roots (not one root 'calc')."""
 
     def test_tool_heads_count_distinct(self):
-        from market_service.nooa_harness.engine.core.reasoning import (
+        from market_service.nooa_harness.engine.core.validation import (
             validate_final_turn,
         )
         parsed = {
@@ -225,7 +225,7 @@ class RootsIdentityTests(unittest.TestCase):
             not any("roots" in m for m in missing), missing)
 
     def test_deterministic_state_only_is_still_rejected(self):
-        from market_service.nooa_harness.engine.core.reasoning import (
+        from market_service.nooa_harness.engine.core.validation import (
             validate_final_turn,
         )
         parsed = {
@@ -253,7 +253,7 @@ class SchemaParityTests(unittest.TestCase):
         contract_keys = {
             "phase", "summary", "evidence", "confidence", "limitations",
             "model_separation", "hypothesis", "scenario", "forward_scenario",
-            "hypothesis_evidence", "tool_calls",
+            "hypothesis_evidence", "hypothesis_probabilities", "tool_calls",
         }
         fields = set(NarrationTurn.model_fields)
         self.assertEqual(contract_keys - fields, set())
@@ -391,8 +391,13 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             "limitations": ["thin tape"],
             "model_separation": "beta and c/lambda read separately",
             "hypothesis": {"H0": "no continuation", "H1": "continuation",
-                           "paper_refs": ["Cont 1011.6402"],
                            "evidence_refs": ["calc.ofi.intervals"]},
+            "hypothesis_probabilities": {
+                "H0": {"probability": "medium", "p": None,
+                       "basis_path": "calc.forward.fit → data.status"},
+                "H1": {"probability": "low", "p": None,
+                       "basis_path": "calc.forward.fit → data.status"},
+                "chosen": "H0", "tiebreak": None},
         })
         engine, _s, _p, _m = _engine(llm_responses=[
             _FETCH_TURN,
@@ -462,6 +467,12 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             ],
             "confidence": "low",
             "hypothesis": {"H0": "no continuation", "H1": "continuation"},
+            "hypothesis_probabilities": {
+                "H0": {"probability": "medium", "p": None,
+                       "basis_path": "calc.forward.fit → data.status"},
+                "H1": {"probability": "low", "p": None,
+                       "basis_path": "calc.forward.fit → data.status"},
+                "chosen": "H0", "tiebreak": None},
         })
         engine, _s, _p, _m = _engine(llm_responses=[
             _FETCH_TURN,
