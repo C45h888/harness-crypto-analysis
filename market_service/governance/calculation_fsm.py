@@ -31,6 +31,25 @@ class CalculationGovernanceFSM(PlaneGovernanceFSM):
     PLANE = GovernancePlane.CALCULATION
     PLANE_RULE_IDS = ("section-out-of-graph",)
 
+    #: Light calc substrates: point-in-time books/probes, cheap windows.
+    CALC_LIGHT: tuple[str, ...] = ("anchors", "ladders", "large_print", "tape", "tiers")
+    #: Heavy-horizon calc substrates: multi-window / horizon rebuilds.
+    CALC_HEAVY: tuple[str, ...] = (
+        "density", "delta", "migration", "oi", "signals", "technicals", "volume_profile",
+    )
+    CALC_INTRA_PARALLEL = 4
+
+    def dispatch_group_rank(self, substrate: str) -> int:
+        name = str(substrate).lower()
+        if name in self.CALC_LIGHT:
+            return 0
+        if name in self.CALC_HEAVY:
+            return 1
+        return 2
+
+    def dispatch_intra_parallel(self) -> int:
+        return self.CALC_INTRA_PARALLEL
+
     def _plane_rules(
         self,
         manifest: SubstrateManifest,

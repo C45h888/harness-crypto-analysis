@@ -76,6 +76,42 @@ class AnalysisHttpApp:
         self.app.router.add_get("/status", self._status)
         self.app.router.add_get("/governance", self._governance)
         self.app.router.add_post("/invoke", self._invoke)
+        self.app.router.add_post("/dispatch-ticket", self._dispatch_ticket)
+
+    async def _dispatch_ticket(self, request: web.Request) -> web.Response:
+        """Dry-run the analysis dispatch guard: due-check + batch plan."""
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        symbol = str(body.get("symbol") or "").strip().upper()
+        if not symbol:
+            return web.json_response({"error": "symbol is required"}, status=400)
+        analyses = body.get("analyses")
+        if analyses is not None:
+            if not isinstance(analyses, (list, tuple)):
+                return web.json_response({"error": "analyses must be a list"}, status=400)
+            analyses = [str(n).strip().lower() for n in analyses if str(n).strip()]
+            unknown = [n for n in analyses if n not in ANALYSIS_WORKER_REGISTRY]
+            if unknown:
+                return web.json_response(
+                    {"error": f"unknown analysis worker(s): {sorted(unknown)}",
+                     "registered": sorted(ANALYSIS_WORKER_REGISTRY)}, status=400)
+        try:
+            from market_service.governance import build_analysis_governor
+            governor = build_analysis_governor(self.store)
+            ticket = await governor.authorize_dispatch(
+                symbol=symbol, requested=analyses or None, dry_run=True)
+        except Exception as exc:  # noqa: BLE001 — dry-run never 500s
+            log.warning("analysis dispatch-ticket guard unavailable (%s); failing open", exc)
+            return web.json_response({
+                "symbol": symbol, "plane": "analysis",
+                "allowed": analyses or sorted(ANALYSIS_WORKER_REGISTRY),
+                "rule": "dispatch-observation-unavailable",
+            })
+        return web.json_response(ticket.to_dict())
 
     async def _governance(self, request: web.Request) -> web.Response:
         """The analysis plane's governance observability surface."""
@@ -141,9 +177,34 @@ class AnalysisHttpApp:
                     {"error": f"unknown analysis worker(s): {sorted(unknown)}",
                      "registered": sorted(ANALYSIS_WORKER_REGISTRY)},
                     status=400)
-        from market_service.analysis_worker.tools import invoke_many
-
-        result = await invoke_many(self.store, symbol, analyses or None)
+        try:
+            from market_service.governance import build_analysis_governor
+            governor = build_analysis_governor(self.store)
+            ticket = await governor.authorize_dispatch(
+                symbol=symbol, requested=analyses or None)
+        except Exception as exc:  # noqa: BLE001 — guard never bricks invokes
+            log.warning("analysis dispatch guard unavailable (%s); failing open", exc)
+            from market_service.analysis_worker.tools import invoke_many
+            result = await invoke_many(self.store, symbol, analyses or None)
+            result["dispatch_ticket"] = {
+                "plane": "analysis", "symbol": symbol,
+                "rule": "dispatch-observation-unavailable",
+            }
+            return web.json_response(result)
+        if ticket.deferred or not ticket.allowed:
+            return web.json_response({
+                "symbol": symbol, "results": {},
+                "dispatch_ticket": ticket.to_dict(),
+            })
+        try:
+            from market_service.analysis_worker.tools import invoke_many
+            result = await invoke_many(self.store, symbol, list(ticket.allowed))
+        finally:
+            try:
+                await governor.release_dispatch_lease(symbol=symbol)
+            except Exception:
+                pass
+        result["dispatch_ticket"] = ticket.to_dict()
         return web.json_response(result)
 
 
@@ -161,6 +222,17 @@ async def run_container() -> int:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)  # noqa: S104 — compose boundary
     await site.start()
+    _prov = {"GIT_SHA": "unknown", "GIT_DIRTY": "unknown", "BUILD_UTC": "unknown"}
+    try:
+        with open("/app/BUILD_PROVENANCE", encoding="utf-8") as _fh:
+            for _raw in _fh.read().splitlines():
+                _k, _, _v = _raw.partition("=")
+                if _k.strip() in _prov:
+                    _prov[_k.strip()] = _v.strip()
+    except OSError:
+        pass
+    log.info("provenance plane=analysis sha=%s dirty=%s built=%s",
+             _prov["GIT_SHA"], _prov["GIT_DIRTY"], _prov["BUILD_UTC"])
     log.info("analysis control plane on 0.0.0.0:%s (%d workers)", port, len(workers))
     try:
         results = await asyncio.gather(

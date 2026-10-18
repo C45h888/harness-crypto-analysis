@@ -26,6 +26,8 @@ from market_service.governance.analysis_fsm import AnalysisGovernanceFSM
 from market_service.governance.calculation_fsm import CalculationGovernanceFSM
 from market_service.governance.contracts import (
     GOVERNANCE_LEDGER_SCHEMA_VERSION,
+    DispatchDecision,
+    DispatchTicket,
     GovernanceEvent,
     GovernanceGate,
     GovernanceLedgerRecord,
@@ -34,7 +36,12 @@ from market_service.governance.contracts import (
     GovernanceVerdict,
     SubstrateManifest,
 )
-from market_service.governance.fsm import COMMON_RULE_IDS, PlaneGovernanceFSM
+from market_service.governance.fsm import (
+    COMMON_RULE_IDS,
+    DISPATCH_LEASE_S,
+    DISPATCH_QUARANTINE_RULES,
+    PlaneGovernanceFSM,
+)
 from market_service.governance.gates import GovernanceGovernor
 from market_service.governance.ledger import GovernanceLedger
 
@@ -94,9 +101,13 @@ def governor_for_plane(
 
 __all__ = [
     "COMMON_RULE_IDS",
+    "DISPATCH_LEASE_S",
+    "DISPATCH_QUARANTINE_RULES",
     "GOVERNANCE_LEDGER_SCHEMA_VERSION",
     "AnalysisGovernanceFSM",
     "CalculationGovernanceFSM",
+    "DispatchDecision",
+    "DispatchTicket",
     "GovernanceEvent",
     "GovernanceGate",
     "GovernanceGovernor",

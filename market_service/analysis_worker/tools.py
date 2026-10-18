@@ -85,13 +85,25 @@ async def invoke_many(
     symbol: str,
     analyses: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """One bounded fire-tick per named analysis worker (or all)."""
+    """One bounded fire-tick per named analysis worker (or all).
+
+    Batched parallel with intra-plane semaphore (analysis = 2). Unknown
+    names are errors; result keys stay lower-cased worker names.
+    """
+    import asyncio as _asyncio
+
     symbol = symbol.upper()
     names = list(analyses) if analyses else sorted(ANALYSIS_WORKER_REGISTRY)
+    sem = _asyncio.Semaphore(2)
     out: dict[str, Any] = {}
-    for name in names:
-        if name.lower() not in ANALYSIS_WORKER_REGISTRY:
-            out[name] = {"error": "unknown analysis worker"}
-            continue
-        out[name.lower()] = await invoke_one(store, symbol, name)
+
+    async def _one(name: str) -> tuple[str, dict[str, Any]]:
+        key = name.lower()
+        if key not in ANALYSIS_WORKER_REGISTRY:
+            return name, {"error": "unknown analysis worker"}
+        async with sem:
+            return key, await invoke_one(store, symbol, name)
+
+    for key, result in await _asyncio.gather(*(_one(n) for n in names)):
+        out[key] = result
     return {"symbol": symbol, "results": out}

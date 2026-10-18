@@ -162,12 +162,19 @@ async def run_validation(
     # model produced earlier in THIS cycle must not be zeroed out because the
     # last turn only declared a phase.
     judged = merge_interpretation(st.turn_log)
+    _validation_findings: list[str] = []
     passed, missing = validate_final_turn(
         judged, st.controller.phase_coverage, scenario=ctx.scenario,
         scenario_status=st.controller.scenario_state(),
         scenario_refusal_reason=st.controller.scenario_refusal_reason(),
         accumulated=st.accumulated_tool_results,
+        findings=_validation_findings,
     )
+    # F9 relaxed: presentational notes ride the artifact as findings (same
+    # pattern as principle_findings) — they inform, they never block.
+    if _validation_findings:
+        st.deterministic_state.setdefault("validation_findings", []).extend(
+            [str(_f) for _f in _validation_findings])
     # Scenario equality (validation-owned): the agent's reachability verdict
     # obeys the deterministic derivation; output keeps the block verbatim.
     missing = list(missing) + check_scenario_equality(judged, st, ctx)
@@ -602,6 +609,7 @@ def validate_final_turn(
     scenario_status: "ScenarioEvalStatus | None" = None,
     scenario_refusal_reason: str | None = None,
     accumulated: dict[str, Any] | None = None,
+    findings: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
     """Phase-aware final gate: depth is structural, not advisory.
 
@@ -649,10 +657,17 @@ def validate_final_turn(
         )
     summary = parsed.get("summary") or ""
     if not isinstance(summary, str) or len(summary.strip()) < SUMMARY_MIN_CHARS:
-        missing.append(
-            f"P4 explanation too thin ({len(summary.strip())}/{SUMMARY_MIN_CHARS} chars): "
+        # F9 structural/relaxed: thin prose is a finding, never a gate. A
+        # presentational repair re-rolls every number and manufactures
+        # recompute opportunities; only citation shape + echo truth block.
+        _note = (
+            f"P4 explanation thin ({len(summary.strip())}/{SUMMARY_MIN_CHARS} chars): "
             "say what the fits show AND why it is happening now"
         )
+        if findings is not None:
+            findings.append(_note)
+        else:
+            missing.append(_note)
     confidence = parsed.get("confidence")
     if confidence is not None and normalize_confidence(confidence) is None:
         missing.append(
@@ -665,6 +680,22 @@ def validate_final_turn(
         for idx, entry in enumerate(evidence):
             if not isinstance(entry, dict):
                 missing.append(f"evidence[{idx}] must be an object with path + interpretation")
+                continue
+            # F9 structural parse gate (deterministic, pre-resolver): an
+            # unattributed number can never reach the artifact. Missing path
+            # or null value is a gate here — except deterministic refusal
+            # findings (`→ refusal`), which carry no numeric value by null
+            # discipline. The echo check below judges path-correct +
+            # value-wrong. Interpretation stays required (the reading is
+            # what keeps prose grounded to the cited field).
+            _path_raw = str(entry.get("path") or "")
+            if not _path_raw.strip() or (
+                entry.get("value") is None and "refusal" not in _path_raw
+            ):
+                missing.append(
+                    f"evidence[{idx}] needs path+value — cite the tool+field "
+                    "you read (unattributed numbers never reach the artifact)"
+                )
                 continue
             if not str(entry.get("interpretation") or "").strip():
                 missing.append(
@@ -914,6 +945,14 @@ def validate_final_turn(
                     )
                     continue
                 _bpath = str(_entry.get("basis_path") or "")
+                # F9 structural parse gate: unattributed adjudication numbers
+                # never reach the artifact; resolver judges wrong paths below.
+                if not _bpath.strip():
+                    missing.append(
+                        f"hypothesis_probabilities.{_hk} needs basis_path — cite "
+                        "the accumulated tool field the weighing stands on"
+                    )
+                    continue
                 _bval = _entry.get("basis_value")
                 _fk, _ft = _basis_truth(_bpath)
                 if _fk is None:

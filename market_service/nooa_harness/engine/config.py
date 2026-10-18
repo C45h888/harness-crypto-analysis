@@ -41,9 +41,17 @@ SESSION_TEMPLATE = "inference-engine-{symbol}-{venue}"
 # starving the final JSON block. Operators override with NOOA_MODEL_MAX_TOKENS.
 # Calculation modules + read tools are now the primary inference path — the
 # predefined formula output is never the final word.
+# Scope: max_tokens INCLUDES reasoning preamble + final JSON (one shared
+# generation budget — see llm.py reasoning fallback). Give it room, but give
+# it walls: reasoning_reserve() names the portion reserved inside the cap so
+# a long preamble cannot silently starve the JSON block.
 DEFAULT_NARRATION_MAX_TOKENS = 50_000
 NARRATION_MAX_TOKENS_ENV = "NOOA_MODEL_MAX_TOKENS"
 DEFAULT_CONTEXT_WINDOW = 1_048_576  # Muse Spark 1.2 contributor
+#: Reasoning reserve inside max_tokens (env NOOA_REASONING_RESERVE, default
+#: 8k for timing runs; production higher but explicit, never extra).
+REASONING_RESERVE_ENV = "NOOA_REASONING_RESERVE"
+DEFAULT_REASONING_RESERVE = 8_000
 
 # --- Cycle budgets (the agentic loop). ---
 # live-proven: fallback-path models burn rounds on redundant re-invocation;
@@ -101,12 +109,20 @@ MAX_DISPATCHES_PER_PASS = AGENTIC_PER_ROUND_CALL_CAP
 SUMMARY_MIN_CHARS = 200
 
 # --- Memory recall budgets. ---
-# Expanded for paper KB cross-check.
-MEMORY_RECALL_LIMIT = 12
-MEMORY_CONTEXT_BUDGET = 8_000
+# Lean budget: recall trimmed (env restores); same mechanism, fewer rows.
+# No state change — kind/query/limit contract untouched, bounds only.
+def _recall_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(int(os.getenv(name, str(default))), hi))
+    except (TypeError, ValueError):
+        return default
+
+
+MEMORY_RECALL_LIMIT = _recall_int("NOOA_MEMORY_RECALL_LIMIT", 8, lo=2, hi=32)
+MEMORY_CONTEXT_BUDGET = _recall_int("NOOA_MEMORY_CONTEXT_BUDGET", 4_000, lo=1_000, hi=16_000)
 
 # --- Headline bound for the prior-artifact block in the prompt. ---
-_PRIOR_HEADLINE_MAX_CHARS = 4_000
+_PRIOR_HEADLINE_MAX_CHARS = _recall_int("NOOA_PRIOR_HEADLINE_CHARS", 2_000, lo=500, hi=8_000)
 
 # --- Structured-output probe flag ---
 # Module-level probe flag: once a backend rejects output_model, stop paying
@@ -153,11 +169,54 @@ def narration_max_tokens() -> int:
         return DEFAULT_NARRATION_MAX_TOKENS
 
 
+def reasoning_reserve() -> int:
+    """Reasoning portion INSIDE max_tokens (never extra, never separate)."""
+    try:
+        requested = int(os.getenv(REASONING_RESERVE_ENV, str(DEFAULT_REASONING_RESERVE)))
+        cap = narration_max_tokens() - 2_000  # always leave a final-JSON floor
+        return max(2_000, min(requested, cap))
+    except (TypeError, ValueError):
+        return DEFAULT_REASONING_RESERVE
+
+
+def token_budget_breakdown() -> dict[str, int]:
+    """Walled budget view: one shared cap split into reserve + floor."""
+    total = narration_max_tokens()
+    reserve = reasoning_reserve()
+    return {
+        "max_tokens": total,
+        "reasoning_reserve": reserve,
+        "final_floor": max(0, total - reserve),
+        "context_window": int(DEFAULT_CONTEXT_WINDOW),
+        "cap": int(DEFAULT_CONTEXT_WINDOW * 0.25),
+    }
+
+
+#: Bounded narration transport (F10): a dropped stream must fail fast into
+#: the retry plane instead of stalling a cycle for hours. Env override in
+#: seconds, clamped so a misconfiguration can neither spin (too low) nor
+#: reintroduce the unbounded stall (too high).
+NARRATION_TIMEOUT_ENV = "NOOA_NARRATION_TIMEOUT_S"
+DEFAULT_NARRATION_TIMEOUT_S = 150
+
+
+def narration_timeout_s() -> int:
+    """Per-attempt transport timeout for narration LLM calls."""
+    try:
+        return max(30, min(int(os.getenv(NARRATION_TIMEOUT_ENV, str(DEFAULT_NARRATION_TIMEOUT_S))), 600))
+    except (TypeError, ValueError):
+        return DEFAULT_NARRATION_TIMEOUT_S
+
+
 __all__ = [
     "SESSION_TEMPLATE",
     "DEFAULT_NARRATION_MAX_TOKENS",
     "NARRATION_MAX_TOKENS_ENV",
     "DEFAULT_CONTEXT_WINDOW",
+    "REASONING_RESERVE_ENV",
+    "DEFAULT_REASONING_RESERVE",
+    "NARRATION_TIMEOUT_ENV",
+    "DEFAULT_NARRATION_TIMEOUT_S",
     "AGENTIC_MAX_TOOL_ROUNDS",
     "AGENTIC_MAX_LLM_TURNS",
     "AGENTIC_PER_ROUND_CALL_CAP",
@@ -172,4 +231,7 @@ __all__ = [
     "_TOOL_MANIFEST",
     "_MEMORY_PROTOCOL",
     "narration_max_tokens",
+    "reasoning_reserve",
+    "token_budget_breakdown",
+    "narration_timeout_s",
 ]

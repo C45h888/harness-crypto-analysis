@@ -32,13 +32,14 @@ import time
 from typing import Any, Mapping
 
 from market_service.governance.contracts import (
+    DispatchTicket,
     GovernanceEvent,
     GovernanceGate,
     GovernanceObservation,
     GovernancePlane,
     GovernanceVerdict,
 )
-from market_service.governance.fsm import PlaneGovernanceFSM
+from market_service.governance.fsm import DISPATCH_LEASE_S, PlaneGovernanceFSM
 from market_service.governance.ledger import GovernanceLedger
 
 log = logging.getLogger(__name__)
@@ -262,6 +263,110 @@ class GovernanceGovernor:
             GovernanceGate.PG_WRITE, substrate=substrate, symbol=symbol,
             payload=payload, inputs=inputs, record=record,
         )
+
+    # ------------------------------------------------------------------
+    # Dispatch guard — substrates ask, the FSM allows (pre-fire, no compute)
+    # ------------------------------------------------------------------
+
+    def _dispatch_lease_key(self, plane: str, symbol: str) -> str:
+        prefix = str(getattr(self.store, "prefix", "marketflow") or "marketflow")
+        return f"{prefix}:governance:dispatch:lease:{str(plane).lower()}:{str(symbol).upper()}"
+
+    async def _dispatch_ages(
+        self, *, symbol: str, names: list[str],
+    ) -> dict[str, int | None]:
+        """Latest projection ages per substrate (None = no history)."""
+        ages: dict[str, int | None] = {}
+        is_analysis = self.plane is GovernancePlane.ANALYSIS
+        for name in names:
+            try:
+                if is_analysis:
+                    from market_service.runtime.read_paths import read_analysis_latest
+                    entry = await read_analysis_latest(self.store, name, symbol)
+                else:
+                    from market_service.runtime.read_paths import read_substrate_latest
+                    entry = await read_substrate_latest(self.store, name, symbol)
+            except Exception:
+                ages[name] = None
+                continue
+            if not isinstance(entry, dict):
+                ages[name] = None
+                continue
+            age = entry.get("age_ms")
+            if isinstance(age, (int, float)):
+                ages[name] = int(age)
+                continue
+            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+            computed = (payload or {}).get("computed_at_ms")
+            if isinstance(computed, (int, float)):
+                ages[name] = int(time.time() * 1000) - int(computed)
+            else:
+                ages[name] = None
+        return ages
+
+    async def authorize_dispatch(
+        self,
+        *,
+        symbol: str,
+        requested: list[str] | tuple[str, ...] | None = None,
+        dry_run: bool = False,
+    ) -> DispatchTicket:
+        """Pre-fire ticket: due-check, quarantine, batch, cross-plane defer.
+
+        Never spends worker compute, never blocks reads, never sleeps.
+        Fail-open is behavioral, not labelled: per-name read failures
+        degrade to cold_start, so an unreadable store bottoms out as
+        all-due `dispatch-allow` and the invoke still happens. Dry runs
+        never hold a lease. The ooAgent treats the ticket as advisory and
+        always serves reads from cache.
+        """
+        symbol_word = str(symbol).upper()
+        registered = [str(n).lower() for n in self.fsm.substrates()]
+        names = [str(n).lower() for n in (requested or registered)]
+        ages = await self._dispatch_ages(symbol=symbol_word, names=names)
+        try:
+            denials = await self.store.read_governance_denials(
+                self.plane.value, symbol_word, count=20)
+        except Exception:
+            denials = []
+        quarantined = self.fsm.quarantine_from_denials(denials)
+        other = ("analysis" if self.plane is GovernancePlane.CALCULATION else "calculation")
+        try:
+            other_busy = bool(await self.store.redis.exists(
+                self._dispatch_lease_key(other, symbol_word)))
+        except Exception:
+            other_busy = False
+        ticket = self.fsm.decide_dispatch(
+            symbol=symbol_word, requested=names or None, ages_ms=ages,
+            quarantined=quarantined, other_plane_busy=other_busy)
+        if not ticket.allowed or ticket.deferred:
+            return ticket
+        if dry_run:
+            return ticket
+        try:
+            acquired = await self.store.redis.set(
+                self._dispatch_lease_key(self.plane.value, symbol_word),
+                "1", nx=True, ex=DISPATCH_LEASE_S)
+        except Exception:
+            return ticket
+        if not acquired:
+            return DispatchTicket(
+                plane=self.plane.value, symbol=symbol_word, allowed=(),
+                denied=ticket.denied, batches=(), deferred=True,
+                defer_reason=("own plane holds an active dispatch lease; await "
+                              "lease expiry then request the next batch"),
+                rule="dispatch-deferred-own-plane",
+                reason="one compute batch at a time per plane",
+            )
+        return ticket
+
+    async def release_dispatch_lease(self, *, symbol: str) -> None:
+        """Release this plane's dispatch lease early (next batch may fire)."""
+        try:
+            await self.store.redis.delete(
+                self._dispatch_lease_key(self.plane.value, symbol))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Observability

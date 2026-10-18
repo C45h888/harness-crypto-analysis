@@ -234,6 +234,56 @@ class GovernanceVerdict:
 
 
 @dataclass(frozen=True)
+class DispatchDecision:
+    """One substrate's pre-fire dispatch verdict (pure, no compute spent)."""
+
+    substrate: str
+    allowed: bool
+    reason: str
+    rule: str
+    batch: int = 0
+    retry_after_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class DispatchTicket:
+    """The dispatch guard's answer for one request (pure, replay-safe)."""
+
+    plane: str
+    symbol: str
+    allowed: tuple[str, ...] = ()
+    denied: tuple[DispatchDecision, ...] = ()
+    batches: tuple[tuple[str, ...], ...] = ()
+    deferred: bool = False
+    defer_reason: str | None = None
+    rule: str = "dispatch-allow"
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plane": self.plane,
+            "symbol": self.symbol,
+            "allowed": list(self.allowed),
+            "denied": [
+                {
+                    "substrate": d.substrate,
+                    "allowed": d.allowed,
+                    "reason": d.reason,
+                    "rule": d.rule,
+                    "batch": d.batch,
+                    "retry_after_ms": d.retry_after_ms,
+                }
+                for d in self.denied
+            ],
+            "batches": [list(b) for b in self.batches],
+            "deferred": self.deferred,
+            "defer_reason": self.defer_reason,
+            "rule": self.rule,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class GovernanceLedgerRecord:
     """One persisted governance decision (durable audit of legality)."""
 
@@ -267,6 +317,8 @@ class GovernanceLedgerRecord:
 
 __all__ = [
     "GOVERNANCE_LEDGER_SCHEMA_VERSION",
+    "DispatchDecision",
+    "DispatchTicket",
     "GovernanceEvent",
     "GovernanceGate",
     "GovernanceLedgerRecord",

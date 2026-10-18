@@ -16,6 +16,19 @@ COPY market_service ./market_service
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 
+# F4 provenance: which tree is inside this image. Build passes
+# GIT_SHA/GIT_DIRTY/BUILD_UTC; entrypoints log the file's single line at
+# startup so every deploy — and every verdict — can quote it. Uncommitted
+# trees build fine but stamp dirty=true (visible, never silent).
+ARG GIT_SHA=unknown
+ARG GIT_DIRTY=unknown
+ARG BUILD_UTC=unknown
+LABEL crypto-ai-anal.git-sha=${GIT_SHA} \
+      crypto-ai-anal.git-dirty=${GIT_DIRTY} \
+      crypto-ai-anal.build-utc=${BUILD_UTC}
+RUN printf 'GIT_SHA=%s\nGIT_DIRTY=%s\nBUILD_UTC=%s\n' \
+      "${GIT_SHA}" "${GIT_DIRTY}" "${BUILD_UTC}" > /app/BUILD_PROVENANCE
+
 # Engine prompt-payload KBs (tool manifest, memory protocol, paper KB).
 # These are read at inference time by engine.config and injected into the
 # system prompt — without them the engine runs but ships empty KB blocks

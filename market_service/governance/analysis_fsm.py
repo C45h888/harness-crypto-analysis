@@ -33,6 +33,22 @@ class AnalysisGovernanceFSM(PlaneGovernanceFSM):
     PLANE = GovernancePlane.ANALYSIS
     PLANE_RULE_IDS = ("analysis-no-substrate-root",)
 
+    #: Analysis reductions batch smaller (over substrate state, not raw).
+    ANALYSIS_LIGHT: tuple[str, ...] = ("stage", "regime", "demand", "auction")
+    ANALYSIS_HEAVY: tuple[str, ...] = (
+        "path_absorption", "wall_migration", "macro", "liquidations", "oi", "market",
+    )
+    ANALYSIS_INTRA_PARALLEL = 2
+
+    def dispatch_group_rank(self, substrate: str) -> int:
+        name = str(substrate).lower()
+        if name in self.ANALYSIS_LIGHT:
+            return 0
+        return 1
+
+    def dispatch_intra_parallel(self) -> int:
+        return self.ANALYSIS_INTRA_PARALLEL
+
     def _plane_rules(
         self,
         manifest: SubstrateManifest,

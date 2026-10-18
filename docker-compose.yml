@@ -140,7 +140,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    profiles: ["microstructure"]
+
     # Auto-resurrect disabled — see the RESTART_POLICY note on `poller`.
     restart: ${RESTART_POLICY:-no}
 
@@ -182,7 +182,7 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
-    profiles: ["tools"]
+
     restart: "no"
 
   # CALCULATION CONTAINER — the substrate worker plane as ONE service, and the
@@ -234,7 +234,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    profiles: ["substrates"]
+
     # Auto-resurrect disabled — see the RESTART_POLICY note on `poller`.
     restart: ${RESTART_POLICY:-no}
 
@@ -281,7 +281,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    profiles: ["analysis"]
+
     restart: ${RESTART_POLICY:-no}
 
 volumes:

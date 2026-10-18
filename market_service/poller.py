@@ -307,6 +307,17 @@ async def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    _prov = {"GIT_SHA": "unknown", "GIT_DIRTY": "unknown", "BUILD_UTC": "unknown"}
+    try:
+        with open("/app/BUILD_PROVENANCE", encoding="utf-8") as _fh:
+            for _raw in _fh.read().splitlines():
+                _k, _, _v = _raw.partition("=")
+                if _k.strip() in _prov:
+                    _prov[_k.strip()] = _v.strip()
+    except OSError:
+        pass
+    log.info("provenance plane=poller sha=%s dirty=%s built=%s",
+             _prov["GIT_SHA"], _prov["GIT_DIRTY"], _prov["BUILD_UTC"])
     settings = Settings.from_redis_env()
     redis = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,

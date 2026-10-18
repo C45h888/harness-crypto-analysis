@@ -22,12 +22,22 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from market_service.governance.contracts import (
+    DispatchDecision,
+    DispatchTicket,
     GovernanceEvent,
     GovernanceGate,
     GovernanceObservation,
     GovernancePlane,
     GovernanceVerdict,
     SubstrateManifest,
+)
+
+#: Cross-plane dispatch lease TTL (bounded await, never indefinite).
+DISPATCH_LEASE_S = 30
+
+#: A binding/schema denial quarantines the substrate from dispatch until fixed.
+DISPATCH_QUARANTINE_RULES = (
+    "binding-drift", "schema-drift", "manifest-invalid", "unknown-substrate",
 )
 
 #: The common rule ids every plane FSM can emit. A plane FSM adds its own
@@ -317,6 +327,132 @@ class PlaneGovernanceFSM:
         return None
 
     # ------------------------------------------------------------------
+    # Dispatch guard (PURE pre-fire: should we spend compute at all?)
+    # Substrates ask via the governor; the FSM checks trigger predicates
+    # derived from manifests (cooldown / staleness / quarantine) and answers
+    # with a ticket. No I/O, no clock authority — ages and occupancy arrive
+    # as inputs, so the same inputs always yield the same ticket.
+    # ------------------------------------------------------------------
+
+    def dispatch_group_rank(self, substrate: str) -> int:
+        """Batch order rank for one substrate (plane override hook)."""
+        return 1
+
+    def dispatch_intra_parallel(self) -> int:
+        """Intra-plane parallelism for this plane (plane override hook)."""
+        return 4
+
+    @staticmethod
+    def quarantine_from_denials(
+        denials: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None,
+    ) -> frozenset[str]:
+        """Substrates quarantined by recent governance denials (pure)."""
+        out: set[str] = set()
+        for entry in denials or ():
+            if not isinstance(entry, Mapping):
+                continue
+            rule = str(entry.get("rule") or "")
+            substrate = str(entry.get("substrate") or "").lower()
+            if substrate and rule in DISPATCH_QUARANTINE_RULES:
+                out.add(substrate)
+        return frozenset(out)
+
+    def decide_dispatch(
+        self,
+        *,
+        symbol: str,
+        requested: list[str] | tuple[str, ...] | None,
+        ages_ms: Mapping[str, int | None],
+        quarantined: frozenset[str] | set[str] | None = None,
+        other_plane_busy: bool = False,
+    ) -> DispatchTicket:
+        """Pure dispatch plan: due-check, quarantine, batch, cross-plane defer."""
+        plane_word = self.PLANE.value
+        symbol_word = str(symbol).upper()
+        reg = [str(n).lower() for n in self.substrates()]
+        reg_set = set(reg)
+        quarantine = frozenset(str(s).lower() for s in (quarantined or frozenset()))
+        if other_plane_busy:
+            return DispatchTicket(
+                plane=plane_word, symbol=symbol_word, allowed=(), denied=(),
+                batches=(), deferred=True,
+                defer_reason=("other plane holds the dispatch lease; await lease "
+                              "expiry then request the next batch (reads remain allowed)"),
+                rule="dispatch-deferred-cross-plane",
+                reason="cross-plane mutex: one compute batch at a time",
+            )
+        names = [str(n).lower() for n in (requested or reg)]
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        allowed: list[tuple[str, int]] = []
+        denied: list[DispatchDecision] = []
+        for name in ordered:
+            manifest = self.manifest_for(name)
+            if manifest is None or name not in reg_set:
+                denied.append(DispatchDecision(
+                    substrate=name, allowed=False,
+                    reason=f"{name!r} is not a registered {plane_word} worker",
+                    rule="unknown-substrate"))
+                continue
+            if name in quarantine:
+                denied.append(DispatchDecision(
+                    substrate=name, allowed=False,
+                    reason=(f"{name!r} quarantined by recent binding/schema denial; "
+                            "fix the manifest binding before spending compute"),
+                    rule="quarantined-binding"))
+                continue
+            age = ages_ms.get(name)
+            cooldown = int(manifest.cooldown_s or 30)
+            stale = int(manifest.staleness_s or 120)
+            if age is None:
+                allowed.append((name, 0))
+                continue
+            try:
+                age_int = int(age)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                allowed.append((name, 0))
+                continue
+            if age_int >= stale * 1000:
+                allowed.append((name, 0))
+            elif age_int >= cooldown * 1000:
+                allowed.append((name, 1))
+            else:
+                denied.append(DispatchDecision(
+                    substrate=name, allowed=False,
+                    reason=(f"{name!r} cooldown-hot (age {age_int}ms < cooldown "
+                            f"{cooldown * 1000}ms); no compute spent"),
+                    rule="cooldown",
+                    retry_after_ms=max(0, cooldown * 1000 - age_int)))
+        batch0 = sorted([n for n, b in allowed if b == 0],
+                        key=lambda n: (self.dispatch_group_rank(n), n))
+        batch1 = sorted([n for n, b in allowed if b == 1],
+                        key=lambda n: (self.dispatch_group_rank(n), n))
+        batches: list[tuple[str, ...]] = []
+        if batch0:
+            batches.append(tuple(batch0))
+        if batch1:
+            batches.append(tuple(batch1))
+        flat = tuple([*batch0, *batch1])
+        if not flat:
+            reason = "no requested worker is due (all cooldown-hot or quarantined)"
+            if denied and all(d.rule == "quarantined-binding" for d in denied):
+                reason = "all requested workers quarantined by binding/schema denial"
+            return DispatchTicket(
+                plane=plane_word, symbol=symbol_word, allowed=(),
+                denied=tuple(denied), batches=(), deferred=False,
+                rule="dispatch-none-due", reason=reason)
+        return DispatchTicket(
+            plane=plane_word, symbol=symbol_word, allowed=flat,
+            denied=tuple(denied), batches=tuple(batches), deferred=False,
+            rule="dispatch-allow",
+            reason=(f"{len(flat)} due in {len(batches)} batch(es); "
+                    f"{len(denied)} denied without compute"))
+
+    # ------------------------------------------------------------------
     # Viewability
     # ------------------------------------------------------------------
 
@@ -378,4 +514,4 @@ class PlaneGovernanceFSM:
                 raise ValueError(f"{type(self).__name__}: empty plane rule id")
 
 
-__all__ = ["COMMON_RULE_IDS", "PlaneGovernanceFSM"]
+__all__ = ["COMMON_RULE_IDS", "DISPATCH_LEASE_S", "DISPATCH_QUARANTINE_RULES", "PlaneGovernanceFSM"]

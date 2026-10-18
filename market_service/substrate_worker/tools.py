@@ -105,9 +105,22 @@ async def invoke_many(
     substrates: list[str] | tuple[str, ...] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Invoke several workers (None/empty = all registered); one report each."""
+    """Invoke several workers (None/empty = all registered); one report each.
+
+    Batched parallel: batch-0 (staleness/cold) precedes batch-1 (probe) when
+    the caller passes ticket order; within a call the semaphore bounds
+    intra-plane parallelism (calc = 4). Report order stays input-sorted.
+    """
+    import asyncio as _asyncio
+
     names = [s.lower() for s in (substrates or sorted(WORKER_REGISTRY))]
-    reports = [await invoke(store, symbol, name, **kwargs) for name in names]
+    sem = _asyncio.Semaphore(4)
+
+    async def _one(name: str) -> dict[str, Any]:
+        async with sem:
+            return await invoke(store, symbol, name, **kwargs)
+
+    reports = list(await _asyncio.gather(*(_one(n) for n in names)))
     return {
         "symbol": symbol.upper(),
         "invoked": sum(1 for r in reports if r.get("invoked")),

@@ -77,6 +77,28 @@ def make_cli():
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry for the mounted NOOA CLI."""
+    import logging as _logging
+
+    # F2: ooagent never configured logging, so `nooa.observe` INFO events
+    # were invisible in `docker logs`. Every other container calls
+    # basicConfig at entry; this one never did.
+    _logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    _prov = {"GIT_SHA": "unknown", "GIT_DIRTY": "unknown", "BUILD_UTC": "unknown"}
+    try:
+        with open("/app/BUILD_PROVENANCE", encoding="utf-8") as _fh:
+            for _raw in _fh.read().splitlines():
+                _k, _, _v = _raw.partition("=")
+                if _k.strip() in _prov:
+                    _prov[_k.strip()] = _v.strip()
+    except OSError:
+        pass
+    _logging.getLogger("ooagent").info(
+        "provenance plane=ooagent sha=%s dirty=%s built=%s",
+        _prov["GIT_SHA"], _prov["GIT_DIRTY"], _prov["BUILD_UTC"])
     _load_repo_env()
     args = list(sys.argv[1:] if argv is None else argv)
     _oo.main(args=args, prog_name="nooa", standalone_mode=False)

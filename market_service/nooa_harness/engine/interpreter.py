@@ -98,9 +98,19 @@ class MicrostructureInterpretationAgent:
         "deterministic probability status and calibration refusal instead."
     )
 
-    _MAX_LLM_ENVELOPE_CHARS = 190_000
-    _LIST_CAP = 200
+    _MAX_LLM_ENVELOPE_CHARS = 60_000
+    _LIST_CAP = 100
     _MAX_TOKENS = 4000
+
+    @classmethod
+    def envelope_roof(cls) -> int:
+        """Lean-budget envelope roof (env ``INTERPRETER_ENVELOPE_ROOF`` restores)."""
+        import os as _os
+
+        try:
+            return max(10_000, min(int(_os.getenv("INTERPRETER_ENVELOPE_ROOF", "60000")), 190_000))
+        except (TypeError, ValueError):
+            return 60_000
 
     def __init__(self, symbol: str, *, llm: Any):
         self.llm = llm
@@ -171,16 +181,23 @@ class MicrostructureInterpretationAgent:
             "Evidence schema (shape reference):\n"
             f"{self._envelope_schema()}\n\n"
             "MicrostructureEvidence for this run:\n"
-            f"{bounded_envelope_view(payload, self._MAX_LLM_ENVELOPE_CHARS, self._LIST_CAP)}"
+            f"{bounded_envelope_view(payload, self.envelope_roof(), self._LIST_CAP)}"
             "\n\nIMPORTANT: Output ONLY one valid JSON object. No markdown fences."
         )
         system = self.remit
-        resp = await self.llm.acall(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=max_tokens or self._MAX_TOKENS,
+        from .config import narration_timeout_s
+        import asyncio as _asyncio
+
+        # F10: same bound as narration — a dropped stream fails fast.
+        resp = await _asyncio.wait_for(
+            self.llm.acall(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=max_tokens or self._MAX_TOKENS,
+            ),
+            timeout=narration_timeout_s(),
         )
         return response_text(resp)
 

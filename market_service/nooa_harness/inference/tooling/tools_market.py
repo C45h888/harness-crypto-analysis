@@ -411,7 +411,7 @@ async def dispatch_memory_remember(
             cap.name, scope, "denied", detail=str(exc))
     if memory is None or not session_id:
         result = {"stored": False, "reason": "memory_node_not_configured"}
-        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+        return result, capability_log_entry(cap.name, scope, "error", detail=result)
     try:
         skill = _agent_memory_skill(memory, session_id, segment)
         result = await skill.remember(
@@ -422,7 +422,9 @@ async def dispatch_memory_remember(
             evidence_refs=args.get("evidence_refs") or (),
             title=args.get("title"),
         )
-        return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+        if isinstance(result, dict) and result.get("stored"):
+            return result, capability_log_entry(cap.name, scope, "ok", detail=result)
+        return result, capability_log_entry(cap.name, scope, "denied", detail=result)
     except Exception as exc:  # noqa: BLE001
         return {"stored": False}, capability_log_entry(
             cap.name, scope, "error", detail=f"{type(exc).__name__}: {exc}")

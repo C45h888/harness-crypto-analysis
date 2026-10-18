@@ -59,6 +59,9 @@ from .workers import (
 #: by CLASS (the class value IS the worker name).
 WORKER_FOR_KIND: dict[str, str] = {
     "narration_failed": "narration",
+    # F6: explicit (was class-fallback only) so a class rename or fallback
+    # change cannot silently reroute caller-fault narration failures.
+    "narration_refused": "narration",
     "parse_failed": "narration",
     "tool_denied": "tool",
     "tool_error": "tool",

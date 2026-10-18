@@ -206,15 +206,17 @@ class RootsIdentityTests(unittest.TestCase):
         from market_service.nooa_harness.engine.core.validation import (
             validate_final_turn,
         )
+        # F9 parse gate: entries carry values (unattributed numbers never
+        # reach the artifact); the roots assertion below is unchanged.
         parsed = {
             "summary": "x" * 250,
             "confidence": "medium",
             "hypothesis": {"H0": "h0", "H1": "h1"},
             "evidence": [
                 {"path": "calc.price.delta → data.delta_ticks",
-                 "interpretation": "delta"},
+                 "value": "0.02", "interpretation": "delta"},
                 {"path": "calc.ofi.intervals → data[0].ofi",
-                 "interpretation": "flow"},
+                 "value": "12.5", "interpretation": "flow"},
             ],
         }
         passed, missing = validate_final_turn(parsed, {

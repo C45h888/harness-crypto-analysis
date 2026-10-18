@@ -48,9 +48,21 @@ from .loop_states import (
 
 
 def load_kb(path: Path) -> str:
-    """Bounded KB doc read; empty string on any failure (never raises)."""
+    """Bounded KB doc read; empty string on any failure (never raises).
+
+    Lean budget: per-doc cap defaults to 4k (env ``NOOA_KB_DOC_CAP``) so the
+    cycle-constant system prompt stays near ~20k chars. Structure unchanged —
+    same docs, same order, only the tail is cut (full docs remain on disk).
+    """
+    import os as _os
+
     try:
-        return path.read_text(encoding="utf-8")[:12_000]
+        cap = int(_os.getenv("NOOA_KB_DOC_CAP", "4000"))
+    except (TypeError, ValueError):
+        cap = 4_000
+    cap = max(1_000, min(cap, 12_000))
+    try:
+        return path.read_text(encoding="utf-8")[:cap]
     except OSError:
         return ""
 
@@ -1055,6 +1067,58 @@ def compose_repair_prompt(
     }
     phase_block = build_phase_summary_block(wrapped_accum)
 
+    # F9 steering: echo-type repairs (value mismatches AND missing citations —
+    # same disease: unattributed numbers) lead with correction blocks quoting
+    # each divergent pair, and the accumulated dump shrinks 24k -> 6k so the
+    # correction is not re-buried. Tool-absent repairs keep the full dump.
+    _echo_items = [m for m in missing if "mismatch" in str(m).lower()]
+    _cite_items = [m for m in missing
+                   if "needs path+value" in str(m).lower()
+                   or "needs basis_path" in str(m).lower()]
+    _has_absence = any("mismatch" not in str(m).lower()
+                       and "needs path+value" not in str(m).lower()
+                       and "needs basis_path" not in str(m).lower()
+                       for m in missing)
+    if (_echo_items or _cite_items) and not _has_absence:
+        _blocks: list[str] = []
+        if _echo_items:
+            _corrections = "\n".join(f"- {m}" for m in _echo_items[:3])
+            if len(_echo_items) > 3:
+                _corrections += f"\n- …plus {len(_echo_items) - 3} more mismatch items below"
+            _blocks.append(
+                "COPY CORRECTION — your cited values do not equal tool truth. "
+                "For each line below, replace the cited value with the tool-true "
+                "value verbatim in your next turn (identical `path`, tool-true "
+                "`value`). Do not re-derive, do not round, do not average:\n"
+                f"{_corrections}"
+            )
+        if _cite_items:
+            _cites = "\n".join(f"- {m}" for m in _cite_items[:3])
+            if len(_cite_items) > 3:
+                _cites += f"\n- …plus {len(_cite_items) - 3} more citation items below"
+            _blocks.append(
+                "CITE MISSING — these entries name no tool field. For each line "
+                "below, add the exact tool+field `path` and its exact `value` "
+                "in your next turn. Never invent a value: if no tool produced "
+                "the number, drop the entry instead:\n"
+                f"{_cites}"
+            )
+        _correction_block = "\n\n".join(_blocks) + "\n\n"
+        _dump_cap = 6_000
+        _close = (
+            "Return the next turn now: corrected `evidence[]` entries with "
+            "identical `path`s and tool-true `value`s; `tool_calls=[]` only "
+            "when zero Missing items remain."
+        )
+    else:
+        _correction_block = ""
+        _dump_cap = 24_000
+        _close = (
+            "Return the next turn now: declare \"phase\", include the missing "
+            "tool_calls, and finalize (tool_calls=[]) only when every missing "
+            "item is addressed."
+        )
+
     repair_header = build_loop_state_block(
         controller=controller,
         loop=loop, sub_loop=sub_loop,
@@ -1067,6 +1131,7 @@ def compose_repair_prompt(
         comprehension=None,
     )
     return (
+        f"{_correction_block}"
         f"{repair_header}\n\n"
         f"{TOOL_WINDOWS.get(loop, '')}\n\n"
         f"{task_reminder}"
@@ -1077,14 +1142,13 @@ def compose_repair_prompt(
         f"{data_checks_block}"
         "FINAL REJECTED — staged inference incomplete. Missing:\n"
         + "\n".join(f"- {item}" for item in missing)
-        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{_bounded_dump(wrapped_accum, 24_000)}\n\n"
+        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{_bounded_dump(wrapped_accum, _dump_cap)}\n\n"
         f"{phase_block}"
         f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
         f"{phase_guidance[next_phase]}\n"
         f"{TURN_CONTRACT_LINE}\n"
         f"{FINAL_SHAPE_BLOCK}\n"
-        "Return the next turn now: declare \"phase\", include the missing tool_calls, "
-        "and finalize (tool_calls=[]) only when every missing item is addressed."
+        f"{_close}"
     )
 
 

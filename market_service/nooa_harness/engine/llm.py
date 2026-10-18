@@ -31,6 +31,7 @@ the backend behaviour.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -39,6 +40,7 @@ from .config import (
     AGENTIC_MAX_TOOL_ROUNDS,
     _STRUCTURED_OK,
     narration_max_tokens,
+    narration_timeout_s,
     structured_output_enabled,
 )
 from .schemas import NarrationParseError, NarrationTurn
@@ -112,23 +114,36 @@ async def call_narration_llm(
     # attempt on every turn once a backend has refused.
     global _STRUCTURED_OK  # noqa: PLW0603 — process-global, set once per backend
     response = None
+    # F10: bounded transport. A dropped stream must surface as a transient
+    # failure into the retry plane within minutes, never stall a cycle for
+    # hours inside the transport's inner retry. A timeout is NOT a probe
+    # refusal: it propagates with the probe flag untouched.
+    timeout_s = narration_timeout_s()
     if (NarrationTurn is not None and _STRUCTURED_OK is not False
             and structured_output_enabled()):
         try:
-            response = await llm.acall(
-                messages=messages,
-                output_model=NarrationTurn,
-                max_tokens=narration_max_tokens(),
+            response = await asyncio.wait_for(
+                llm.acall(
+                    messages=messages,
+                    output_model=NarrationTurn,
+                    max_tokens=narration_max_tokens(),
+                ),
+                timeout=timeout_s,
             )
             _STRUCTURED_OK = True
+        except asyncio.TimeoutError:
+            raise
         except Exception:
             log.warning("structured narration call refused; falling back to raw JSON")
             _STRUCTURED_OK = False
             response = None
     if response is None:
-        response = await llm.acall(
-            messages=messages,
-            max_tokens=narration_max_tokens(),
+        response = await asyncio.wait_for(
+            llm.acall(
+                messages=messages,
+                max_tokens=narration_max_tokens(),
+            ),
+            timeout=timeout_s,
         )
     # 0) Structured-model surface: already validated, serialize to JSON.
     content = getattr(response, "content", None)
