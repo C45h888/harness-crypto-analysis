@@ -30,6 +30,10 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     "horizon_span": 1,
     "group_envelope": 1,
     "directive": 1,
+    # Engine scenario contract (nooa_harness/engine/scenario_contract.py) —
+    # ONE frozen price-target question + its prompt-authored divergence
+    # permission, carried by the controller and echoed on the artifact.
+    "scenario_contract": 1,
     # Plane-governance ledger (market_service/governance/contracts.py) —
     # the worker-plane FSMs' durable verdict surface. One registry entry,
     # identity-resolved by the declaring module per the charter.

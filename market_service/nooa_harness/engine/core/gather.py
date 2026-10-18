@@ -162,9 +162,61 @@ async def run_plan_bound_acquisition(
         accumulated_tool_results["calc.forward.scenario"] = forward_scenario_result
         tool_results["calc.forward.scenario"] = forward_scenario_result
 
+    # Long-horizon scenario pre-acquisition (plan alignment): build_plan
+    # advertises calc.scenario.evaluate for long-horizon targets; honor it
+    # under the SAME receipt authority as the forecast digest — computed for
+    # the envelope/gate, NEVER placed in accumulated (agent proof still
+    # requires its own 2b call). Without this the plan advertised work the
+    # runtime silently ignored.
+    scenario_digest: Any = None
+    if (task_plan.get("horizon_regime") == "long"
+            and (task_plan.get("targets") or task_plan.get("invalidations"))):
+        _digest_targets = [t["value"] for t in task_plan.get("targets") or []]
+        _digest_horizon = str(task_plan.get("scenario_horizon") or "")
+        if _digest_targets and _digest_horizon:
+            _digest_args = {
+                "symbol": engine.symbol, "venue": engine.venue,
+                "target_price": _digest_targets[0],
+                "horizon": _digest_horizon,
+                "interval_seconds": int(_interval),
+                "window_minutes": int(_window),
+            }
+            try:
+                scenario_digest, _digest_log = await context.execute_tool(
+                    engine.store, "calc.scenario.evaluate", _digest_args,
+                    postgres=engine.postgres, memory=engine.memory,
+                    settings=engine.settings, session_id=engine.session_id,
+                    segment=getattr(ctx, "task_id", None),
+                )
+                # ONE digest row, never the raw tool log: the agent's own
+                # dispatch must remain the only calc.scenario.evaluate entry
+                # in the operator ledger (proof vs digest stays legible).
+                capability_log.append({
+                    "capability": "engine.scenario.digest",
+                    "scope": {"symbol": engine.symbol, "venue": engine.venue},
+                    "result": (str((_digest_log or {}).get("result") or "ok")),
+                    "detail": {
+                        "authority": "receipt_digest_not_proof",
+                        "target_price": _digest_targets[0],
+                        "horizon": _digest_horizon,
+                        "tool_detail": (_digest_log or {}).get("detail"),
+                        "note": ("plan-bound scenario digest for envelope only; "
+                                 "agent proof requires its own "
+                                 "calc.scenario.evaluate call"),
+                    },
+                })
+            except Exception as exc:  # never kill the cycle on the digest
+                capability_log.append({
+                    "capability": "engine.scenario.digest",
+                    "scope": {"symbol": engine.symbol, "venue": engine.venue},
+                    "result": "error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                })
+
     # In-place merge (key order preserved — placeholders set by bootstrap).
     deterministic_state["forecast_result"] = forecast_result
     deterministic_state["forward_scenario"] = forward_scenario_result
+    deterministic_state["scenario_digest"] = scenario_digest
     deterministic_state["forward_scenario_note"] = (
         (forward_scenario_log or {}).get("detail")
         if isinstance(forward_scenario_log, dict) else "not_run")

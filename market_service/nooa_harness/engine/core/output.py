@@ -9,8 +9,10 @@ from typing import Any
 
 from market_service.runtime.contracts import InferenceArtifact
 from . import context
+from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..kb import build_task_workflow, chain_status
+from ..schemas import coerce_turn, extract_json_object
 from ..ledger import LedgerKind, ledger_rows
 from ..loop_states import (
     LoopReceipt,
@@ -24,39 +26,59 @@ from .. import receipts
 log = logging.getLogger(__name__)
 
 
-def _assemble_final(
-    composed: dict[str, Any], staged: dict[str, Any],
-    deterministic_state: dict[str, Any],
-    accumulated: dict[str, Any],
-) -> tuple[dict[str, Any], list[str]]:
-    """Deterministic assembly post-pass: narration from ledger (pure).
+def build_output_frame(
+    *, accumulated: dict[str, Any], deterministic_state: dict[str, Any],
+    verdict_choice: str | None, delta_required: bool,
+) -> dict[str, Any]:
+    """Base-level instantiation of the deterministic frame (pure, zero-LLM).
 
-    - Evidence entries whose path resolves nowhere (accumulated proof,
-      deterministic_state, ledger, digest) are dropped — narration carries
-      zero numbers the ledger cannot back.
-    - Null/empty sections (summary, evidence, hypothesis,
-      hypothesis_probabilities) fall back to the staged final so a thin
-      composition never erases judged content.
-    - The weighed choice is aligned to the recorded `verdict-chosen` row
-      when present (decision receipt authority over composition words).
-    Returns (final, dropped_paths).
+    The fact surface the agent authors its output ON (the relaxed loop's
+    determinism layer): every citable home of THIS run (tool heads actually
+    dispatched — memory.* excluded, memory is never evidence — plus the
+    deterministic_state keyspace and the ledger/digest namespaces), the
+    collapse vectors the material carries, the known-null fields (null
+    discipline), the adjudicated choice carried from the validation gate,
+    and whether the ΔP citation is compulsory (CONDITIONAL — only when the
+    directive bears targets/invalidations).
     """
+    citable = sorted(k for k in (accumulated or {})
+                     if not str(k).startswith("memory."))
+    state_keys = sorted((deterministic_state or {}).keys())
+    vectors = ["verdict", "base", "chain", "proof", "frame", "directive", "gate"]
+    if (deterministic_state or {}).get("forecast_result") is not None:
+        vectors.append("forecast")
+    known_nulls = sorted(
+        f"deterministic_state.{k}"
+        for k, v in (deterministic_state or {}).items() if v is None)
+    return {
+        "citable_heads": citable,
+        "state_keys": state_keys,
+        "vectors": vectors,
+        "known_nulls": known_nulls,
+        "verdict_choice": verdict_choice,
+        "delta_required": bool(delta_required),
+        "summary_floor": 80,
+        "summary_target": SUMMARY_MIN_CHARS,
+    }
+
+
+def _assemble_authored(
+    composed: dict[str, Any], frame: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Deterministic ASSEMBLE over the AUTHORED object (pure).
+
+    Fact-check, never author: evidence entries whose path is not
+    frame-backed (or cites agent memory) are dropped with a record — the one
+    doctrine that lets the engine remove content is "narration carries zero
+    numbers the ledger cannot back". Everything else is the agent's
+    AUTHENTIC output: no substitution, no backfill, no silent relabeling —
+    choice/verdict conflicts surface via ``check_authored_output``, never a
+    rewrite here. Returns (final, dropped_paths).
+    """
+    from .synthesize import path_resolves
     try:
         final = dict(composed)
         dropped: list[str] = []
-        allowed_state = set(deterministic_state.keys()) | {"ledger", "digest"}
-
-        def _resolves(_path: str) -> bool:
-            _head = str(_path or "").split("→")[0].strip()
-            if not _head:
-                return False
-            if _head in accumulated:
-                return True
-            if _head.split(".")[0] in ("deterministic_state", "ledger", "digest"):
-                return True
-            if _head in allowed_state:
-                return True
-            return False
         ev = final.get("evidence")
         if isinstance(ev, list):
             kept = []
@@ -64,40 +86,14 @@ def _assemble_final(
                 if not isinstance(entry, dict) or not str(entry.get("path") or "").strip():
                     dropped.append(str((entry or {}).get("path") or "<empty>"))
                     continue
-                if not _resolves(entry.get("path")):
-                    dropped.append(str(entry.get("path")))
-                    continue
-                if not str(entry.get("interpretation") or "").strip():
+                if not path_resolves(frame, entry.get("path")):
                     dropped.append(str(entry.get("path")))
                     continue
                 kept.append(entry)
             final["evidence"] = kept
-        for _key in ("summary", "hypothesis", "hypothesis_probabilities"):
-            _v = final.get(_key)
-            _empty = _v is None or _v == [] or _v == {} or (
-                isinstance(_v, str) and not _v.strip())
-            if _empty and staged.get(_key) is not None:
-                final[_key] = staged.get(_key)
-        try:
-            from ..ledger import LedgerKind as _LK
-            from ..ledger import ledger_rows as _lr
-            _vc = [r for r in _lr(
-                deterministic_state, (_LK.OBSERVATION,))
-                if (r.get("payload") or {}).get("stage") == "verdict-chosen"]
-            if _vc:
-                _choice = ((_vc[-1].get("payload") or {}).get("chosen"))
-                _hp = final.get("hypothesis_probabilities")
-                if _choice in ("H0", "H1") and isinstance(_hp, dict) \
-                        and _hp.get("chosen") != _choice:
-                    _hp = dict(_hp)
-                    _hp["chosen"] = _choice
-                    final["hypothesis_probabilities"] = _hp
-                    dropped.append(f"<choice realigned to ledger verdict-chosen:{_choice}>")
-        except Exception:
-            pass
         return final, dropped
     except Exception:
-        log.exception("assembly post-pass failed open; keeping composed")
+        log.exception("authored assembly failed open; keeping composed")
         return dict(composed), []
 
 
@@ -148,6 +144,20 @@ async def run_output(
             "paths; preserve refusals as findings, never paraphrased numbers):\n"
             f"{json.dumps(deterministic_state.get('task_directive'), default=str)[:6_000]}\n\n"
         )
+    if (deterministic_state.get("scenario_contract")
+            or deterministic_state.get("scenario_evaluation")):
+        directive_block += (
+            "SCENARIO CONTRACT + EVALUATION (the exact question and the exact "
+            "dispatched answer — echo these; never re-scope in composition):\n"
+            "contract: "
+            f"{json.dumps(deterministic_state.get('scenario_contract'), default=str)[:2_000]}\n"
+            "evaluation: "
+            f"{json.dumps(deterministic_state.get('scenario_evaluation'), default=str)[:2_000]}\n"
+            + ("divergence: "
+               f"{json.dumps(deterministic_state.get('scenario_divergence'), default=str)[:1_000]}\n"
+               if deterministic_state.get("scenario_divergence") else "")
+            + "\n"
+        )
     # Loop-surface completion (verdict recall): the adjudication decision
     # rows travel with synthesis so composition conforms to the weighed
     # choice. Pure ledger read on this task's segment (never the digest).
@@ -160,10 +170,11 @@ async def run_output(
         in ("verdict-basis", "verdict-chosen")
     ]
     # --- AGENTIC SYNTHESIS (core/synthesize.py owns COLLAPSE → DERIVE) ---
-    # The agent reasons over the vectors here (collapse object, then final
-    # from collapse + full material); failures are FSM-visible and degrade
-    # to the legacy single call. Tiers accrue on st via record_tier.
-    from .synthesize import synthesize_final
+    # The agent authors the output over the deterministic frame (collapse
+    # object, then the final from collapse + full material); failures are
+    # FSM-visible and degrade to the staged final. Tiers accrue on st via
+    # record_tier.
+    from .synthesize import render_frame_block, synthesize_final
     _material = {
         'summary': staged_final.get('summary'),
         'evidence': staged_final.get('evidence'),
@@ -190,6 +201,24 @@ async def run_output(
     }
     _chain_line = chain_status(
         task_workflow['chain'], list(accumulated_tool_results))
+    # Base-level instantiation (relaxed loop): the deterministic frame the
+    # agent authors on top of — citable homes, carried adjudication, and the
+    # CONDITIONAL ΔP rule (compulsory only when the directive bears targets).
+    verdict_choice = None
+    for _row in reversed(_verdict_rows):
+        _pl = _row.get("payload") or {}
+        if _pl.get("stage") == "verdict-chosen" and _pl.get("chosen") in ("H0", "H1"):
+            verdict_choice = _pl.get("chosen")
+            break
+    _plan = getattr(st, "task_plan", None) or {}
+    frame = build_output_frame(
+        accumulated=accumulated_tool_results,
+        deterministic_state=deterministic_state,
+        verdict_choice=verdict_choice,
+        delta_required=bool(_plan.get("targets") or _plan.get("invalidations")),
+    )
+    frame_block = render_frame_block(frame)
+    authored: dict[str, Any] | None = None
     try:
         maybe_composed = await synthesize_final(
             engine, ctx, st,
@@ -198,21 +227,91 @@ async def run_output(
             accumulated_keys=list(accumulated_tool_results),
             traversal=controller.loop_coverage(),
             chain_line=_chain_line,
+            frame=frame,
         )
         if isinstance(maybe_composed, dict):
-            # Narration-from-ledger: deterministic assembly over the derived
-            # object before it becomes the final (drops surface here).
-            maybe_composed, _dropped = _assemble_final(
-                maybe_composed, staged_final,
-                deterministic_state, accumulated_tool_results,
-            )
-            for _d in _dropped:
-                log.warning("assembly dropped: %s", _d[:160])
-            _assembly_prev = deterministic_state.get("assembly_dropped") or []
-            deterministic_state["assembly_dropped"] = list(_assembly_prev) + _dropped[:8]
-            parsed_final = maybe_composed
+            authored = maybe_composed
     except Exception:
         log.exception("output synthesis failed; keeping staged final")
+    authored_shipped = False
+    if authored is not None:
+        # ASSEMBLE (deterministic fact-check) + GROUND (relaxed hard gate)
+        # on the object that will SHIP — the agent's authentic output.
+        from .synthesize import check_authored_output, memory_context_block
+        authored, _dropped = _assemble_authored(authored, frame)
+        for _d in _dropped:
+            log.warning("assembly dropped (not frame-backed): %s", _d[:160])
+        _assembly_prev = deterministic_state.get("assembly_dropped") or []
+        deterministic_state["assembly_dropped"] = list(_assembly_prev) + _dropped[:8]
+        memory_block = memory_context_block(
+            getattr(st, "accumulated_tool_results", None) or accumulated_tool_results)
+        scenario_refused = False
+        try:
+            from ..controller import ScenarioEvalStatus as _SES_auth
+            scenario_refused = controller.scenario_state() is _SES_auth.REFUSED
+        except Exception:
+            pass
+        hard, findings, conflicts = check_authored_output(
+            authored, frame, scenario=scenario,
+            scenario_refused=scenario_refused, final_pass=False)
+        if scenario is not None:
+            try:
+                from .validation import check_scenario_equality as _cse
+                hard += list(_cse(authored, st, ctx))
+            except Exception:
+                log.exception("scenario equality check failed open")
+        correction_used = False
+        if hard and st.passes_per_loop.get("output", 0) < LOOP_PASS_BUDGET["output"]:
+            # ONE correction turn (the spare third output pass): the agent
+            # fixes ITS OWN output — the engine never rewrites its words.
+            from .synthesize import _one_call
+            from ..kb import compose_correction_prompt
+            raw_fix = await _one_call(
+                engine, st,
+                compose_correction_prompt(
+                    task=task, misses=list(hard), authored=authored,
+                    frame_block=frame_block, memory_block=memory_block,
+                ),
+            )
+            if raw_fix is not None:
+                correction_used = True
+                fixed = coerce_turn(extract_json_object(raw_fix))
+                if isinstance(fixed, dict):
+                    fixed, _fix_dropped = _assemble_authored(fixed, frame)
+                    for _d in _fix_dropped:
+                        log.warning("correction assembly dropped: %s", _d[:160])
+                    _prev_dropped = deterministic_state.get("assembly_dropped") or []
+                    deterministic_state["assembly_dropped"] = (
+                        list(_prev_dropped) + _fix_dropped[:8])
+                    hard, findings, conflicts = check_authored_output(
+                        fixed, frame, scenario=scenario,
+                        scenario_refused=scenario_refused, final_pass=True)
+                    if scenario is not None:
+                        try:
+                            from .validation import check_scenario_equality as _cse2
+                            conflicts += list(_cse2(fixed, st, ctx))
+                        except Exception:
+                            log.exception("scenario equality check failed open")
+                    authored = fixed
+        parsed_final = authored
+        authored_shipped = True
+        # Honest reporting: the verdict describes the object that SHIPS.
+        final_validation = {
+            "passed": not hard,
+            "missing": list(hard),
+            "quality_findings": list(findings),
+            "conflicts": list(conflicts),
+            "tier": "authored",
+            "correction_used": correction_used,
+        }
+        deterministic_state["conformance"] = {
+            "tier": "authored",
+            "dropped": list(deterministic_state.get("assembly_dropped") or [])[-8:],
+            "hard_misses": list(hard)[:8],
+            "conflicts": list(conflicts)[:8],
+            "quality_findings": list(findings)[:8],
+            "correction_used": correction_used,
+        }
     # Sync the handoff counters with what synthesis spent (tiers accrued on
     # st via record_tier; narration_tiers freezes the full cycle sequence).
     llm_calls = st.llm_calls
@@ -244,8 +343,11 @@ async def run_output(
             interpretation["confidence"] = _coerced
     except Exception:
         pass
-    # If still null after forced final, fall back to first round's interpretation
-    if interpretation["summary"] is None and parsed_1.get("summary") is not None:
+    # If still null after forced final (degrade path only — an authored
+    # output ships as authored, flagged, never replaced by older turns),
+    # fall back to first round's interpretation.
+    if (not authored_shipped and interpretation["summary"] is None
+            and parsed_1.get("summary") is not None):
         interpretation = {
             "summary": parsed_1.get("summary"),
             "evidence": parsed_1.get("evidence"),
@@ -280,9 +382,15 @@ async def run_output(
     beta = (evidence or {}).get("price_impact_fit", {}).get("beta") if isinstance(evidence, dict) else None
     betastr = str(beta)[:12] if beta is not None else "unknown"
     if hypothesis is None:
-        hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "evidence_refs": ["calc.ofi.intervals","calc.depth.average"]}
-        hypothesis_verdict = "inconclusive"
-        verdict_reason = "Agent did not explicitly form H0/H1; calculations split but hypothesis implicit"
+        if authored_shipped:
+            # Authentic output: the agent's omission ships as omission (the
+            # hard gate already flagged it) — the engine authors nothing.
+            hypothesis_verdict = "inconclusive"
+            verdict_reason = "Agent did not explicitly form H0/H1; calculations split but hypothesis implicit"
+        else:
+            hypothesis = {"H0": f"β ≈ {betastr} ticks/OFI per OFI calculation, AD separately validated", "evidence_refs": ["calc.ofi.intervals", "calc.depth.average"]}
+            hypothesis_verdict = "inconclusive"
+            verdict_reason = "Agent did not explicitly form H0/H1; calculations split but hypothesis implicit"
     else:
         if gate_status == "provisional":
             hypothesis_verdict = "inconclusive"

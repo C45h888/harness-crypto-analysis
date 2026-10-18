@@ -177,6 +177,11 @@ class _CycleContext:
     generated_at: str
     controller: CycleController
     capability_log: list[dict[str, Any]]
+    # ONE frozen scenario authority (engine.scenario_contract) — the asked
+    # target/horizon + prompt-authored divergence permission. ctx.scenario is
+    # its backward-compatible projection. Optional so legacy/direct
+    # construction (tests) keeps working.
+    scenario_contract: Any | None = None
     gathered: _GatheredEvidence | None = None
     # Agent fetch receipt (Option-2 bootstrap): the agent's own gate-read
     # pull plus the deterministic floor fill, produced by run_agent_fetch
@@ -233,12 +238,24 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     # central engine ledger (engine/ledger.py) — the ONE deterministic home
     # for engine-authored memory, sectioned by LedgerKind
     "ledger",
+    # scenario contract (interaction plane → runtime): ONE frozen question,
+    # the plan-bound evaluation, the declared divergence, and the plan-bound
+    # digest (pre-acquisition, never agent-visible accumulated state).
+    "scenario_contract", "scenario_evaluation", "scenario_divergence",
+    "scenario_digest",
     # re-ordered cycle roots (comprehension/acquisition plane)
     "data_quality", "seeded_plan", "plan_gate", "persistence",
     "narration_tiers", "base_summary", "assembly_dropped",
+    # authored-output conformance verdict (core/output.py): the honest
+    # tier/drops/conflicts record for the object that SHIPS.
+    "conformance",
     # agentic synthesis (core/synthesize.py): FSM-visible failure note for
     # the semantics-review surface; the cycle degrades, never dies on it
     "synthesis_note",
+    # relaxed-loop authored output (core/output.py): the conformance record
+    # of the object that SHIPS — dropped citations, hard misses, carried-
+    # semantics conflicts, quality findings, correction usage
+    "conformance",
 })
 
 
@@ -278,6 +295,11 @@ class CycleRuntimeState:
     unexecuted: list[str] = field(default_factory=list)
     task_reminder: str = ""
     scenario_reminder: str = ""
+    # Model-visible scenario surface: carry findings + declaration state
+    # rendered into follow-up/repair prompts (capability_log stays the
+    # operator-plane audit manifest; this is the model-visible counterpart).
+    scenario_contract: Any | None = None
+    scenario_surface: list[dict[str, Any]] = field(default_factory=list)
     phase_guidance: dict[str, str] = field(default_factory=dict)
     # Prompt-scope blocks (chartered carrier fields — never ad-hoc attrs).
     # Normalized once in run_wake / run_comprehension; loops read these.

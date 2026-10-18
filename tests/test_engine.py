@@ -1300,6 +1300,17 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(scen_entries), 1)
         self.assertEqual(artifact.hypothesis_verdict, "inconclusive")
         self.assertIn("unevaluated", artifact.verdict_reason)
+        # Contract plane: the frozen question + the evaluated (refused)
+        # dispatch are on the artifact — not reconstructed from a log scan.
+        contract = artifact.deterministic_state["scenario_contract"]
+        self.assertEqual(contract["asked_target"], "100.50")
+        self.assertEqual(contract["asked_horizon"], "15m")
+        self.assertEqual(contract["divergence"], "forbidden")
+        evaluation = artifact.deterministic_state["scenario_evaluation"]
+        self.assertEqual(evaluation["state"], "refused")
+        self.assertEqual(evaluation["target_price"], "100.50")
+        self.assertEqual(evaluation["horizon"], "15m")
+        self.assertTrue(evaluation["refused"])
 
     async def test_e2e_redundant_redispatch_suppressed(self):
         # Model re-calls the refused tool: controller suppresses structurally.

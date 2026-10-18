@@ -16,7 +16,7 @@ backward-compatible imports.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Mapping
 
 from . import context
 from ..schemas import coerce_turn, extract_json_object
@@ -37,6 +37,11 @@ from .context import (
 from ..fsm import GovernanceEventKind
 from .. import kb
 from ..kb import compose_repair_prompt
+from ..scenario_contract import (
+    numbers_equal,
+    render_status_block,
+    scenario_args_match,
+)
 from .. import receipts
 from ..ledger import LedgerKind, record_entry, render_ledger
 from ..loop_states import LoopStep, NestedLoop, SubLoop, ReceiptDisposition
@@ -249,6 +254,7 @@ async def run_validation(
     if passed:
         st.final_validation = {"passed": True, "missing": []}
         st.finalize_now = True
+        _record_scenario_evaluation(st)
         if st.controller.observation is not None and st.controller.observation.sub_loop is not None:
             st.controller, _ = context._must_govern(
                 st.controller, GovernanceEventKind.COMPLETE_SUBLOOP
@@ -339,6 +345,8 @@ async def run_validation(
         next_phase=next_uncovered_phase(st.controller.phase_coverage),
         adjudication_block=_adj_block,
         data_checks_block=_dc_block,
+        scenario_contract_block=render_status_block(
+            getattr(ctx, "scenario_contract", None), st.controller),
     )
     try:
         raw_repair = await engine._call_llm(repair_prompt)
@@ -420,6 +428,8 @@ async def _forced_final_turn(
             task=ctx.task, missing=missing, evidence_digest=digest,
             scenario=ctx.scenario, strict=(attempt > 1),
             adjudication_block=_ff_adj, data_checks_block=_ff_dc,
+            scenario_contract_block=render_status_block(
+                getattr(ctx, "scenario_contract", None), st.controller),
         )
         try:
             raw_final = await engine._call_llm(prompt)
@@ -453,6 +463,46 @@ def _has_interpretation(parsed: dict[str, Any]) -> bool:
     if isinstance(evidence, list) and evidence:
         return True
     return isinstance(parsed.get("hypothesis"), dict) and bool(parsed.get("hypothesis"))
+
+
+def _record_scenario_evaluation(st: CycleRuntimeState) -> None:
+    """Freeze the contract-bound evaluation on the artifact state (idempotent).
+
+    The SAME outcome validation bound to is what the artifact records — the
+    target/horizon actually dispatched, the tri-state, the refusal reason,
+    and (when declared) the divergence. Operators never have to reconstruct
+    "which 104.80 was answered" from a capability-log scan.
+    """
+    controller = st.controller
+    contract = getattr(controller, "scenario_contract", None)
+    outcome = None
+    read = getattr(controller, "scenario_outcome", None)
+    if callable(read):
+        try:
+            outcome = read()
+        except Exception:
+            outcome = None
+    if outcome is None and contract is None:
+        return
+    args = (outcome.args
+            if outcome is not None and isinstance(outcome.args, Mapping)
+            else {})
+    try:
+        state = controller.scenario_state().value
+    except Exception:
+        state = None
+    st.deterministic_state["scenario_evaluation"] = {
+        "contract_id": getattr(contract, "contract_id", None),
+        "state": state,
+        "target_price": args.get("target_price"),
+        "horizon": args.get("horizon"),
+        "refused": bool(getattr(outcome, "refused", False)),
+        "refusal_reason": getattr(outcome, "refusal_reason", None),
+    }
+    intent = getattr(controller, "scenario_intent", None)
+    if isinstance(intent, Mapping) and intent.get("mode") == "revision":
+        st.deterministic_state["scenario_divergence"] = dict(intent)
+
 
 def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
     """Merged interpretation view over a cycle's parsed turns (deterministic).
@@ -529,16 +579,49 @@ def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
                 merged[key] = turn[key]
     return merged
 
+def _bound_from_controller(controller: Any, ctx: Any) -> tuple[Any, Any]:
+    """Effective (target, horizon) with legacy fallbacks (pure)."""
+    effective = getattr(controller, "effective_scenario", None)
+    if callable(effective):
+        try:
+            return effective()
+        except Exception:
+            pass
+    if isinstance(ctx.scenario, dict):
+        return ctx.scenario.get("target_price"), ctx.scenario.get("horizon")
+    return None, None
+
+
+def _derive_verdict(
+    payload: Any, st: CycleRuntimeState, det_verdict: Any,
+) -> tuple[str, str]:
+    gate = st.deterministic_state.get("gate") or {}
+    return det_verdict(
+        payload, st.capability_log,
+        str(gate.get("status") or "provisional"),
+        list(gate.get("reasons") or []),
+    )
+
+
 def check_scenario_equality(
     judged: dict[str, Any], st: CycleRuntimeState, ctx: Any,
 ) -> list[str]:
-    """Scenario verdict equality (validation-owned, deterministic).
+    """Scenario contract equality (validation-owned, deterministic).
 
-    The agent's scenario.verdict must equal what the deterministic
-    derivation says: invalidated → not_reachable, validated → reachable,
-    inconclusive → either reachability verdict (the agent weighs the band).
-    Refused tools bypass (unevaluable path owns them). Returns missing[];
-    output keeps the agent's block verbatim and computes nothing.
+    Two planes, ONE oracle:
+
+    * Contract plane (a ScenarioContract and/or a real dispatch outcome
+      exists): the LAST genuine dispatch must carry the EFFECTIVE bound
+      target/horizon. A refusal only answers the asked question when it
+      refuses THAT target — an explicit wrong-target refusal is a finding,
+      not an unevaluable escape. The final block must echo the bound
+      target/horizon; a declared revision must surface its divergence.
+      Verdict derivation reads the SAME outcome payload that was bound.
+    * Legacy plane (no contract/outcome — direct construction/tests): the
+      pre-contract behavior (accumulated payload + log) is preserved so
+      older callers keep working.
+
+    Returns missing[]; output keeps the agent's block verbatim.
     """
     try:
         from ..controller import ScenarioEvalStatus as _SES
@@ -548,23 +631,117 @@ def check_scenario_equality(
     try:
         if ctx.scenario is None:
             return []
-        if st.controller.scenario_state() is _SES.REFUSED:
-            return []
+        controller = st.controller
+        contract = getattr(controller, "scenario_contract", None)
+        outcome = None
+        outcome_read = getattr(controller, "scenario_outcome", None)
+        if callable(outcome_read):
+            try:
+                outcome = outcome_read()
+            except Exception:
+                outcome = None
+        state = controller.scenario_state()
         scen = judged.get("scenario")
+
+        if contract is not None or outcome is not None:
+            eff_t, eff_h = _bound_from_controller(controller, ctx)
+            recorded_args = (outcome is not None
+                             and isinstance(getattr(outcome, "args", None), Mapping)
+                             and bool(outcome.args))
+            if state is _SES.REFUSED:
+                if (recorded_args
+                        and not scenario_args_match(outcome.args, eff_t, eff_h)):
+                    return [
+                        "scenario refused "
+                        f"{getattr(outcome, 'args', None)!r} != bound target "
+                        f"{eff_t!r} @ {eff_h!r} — a refusal answers the asked "
+                        "question only when it refuses the bound target "
+                        "(dispatch the contract target exactly; a declared "
+                        "revision is required to change it)"
+                    ]
+                return []
+            if not isinstance(scen, dict):
+                return []  # the structural check names the missing block
+            if state is _SES.NOT_CALLED:
+                # No dispatch, no data: a verdict (reachable, not_reachable,
+                # OR unevaluable) is fabrication. The structural gate names
+                # the missing block; this names the missing DISPATCH.
+                return [
+                    "scenario never dispatched: call calc.scenario.evaluate "
+                    f"with the bound target {eff_t!r} @ {eff_h!r} before "
+                    "declaring a scenario verdict"
+                ]
+            if (recorded_args
+                    and not scenario_args_match(outcome.args, eff_t, eff_h)):
+                return [
+                    "scenario evaluated "
+                    f"{getattr(outcome, 'args', None)!r} != bound target "
+                    f"{eff_t!r} @ {eff_h!r} — evaluate the bound target "
+                    "(or declare a permitted revision; answering a different "
+                    "question is not a silent option)"
+                ]
+            if (scen.get("target_price") not in (None, "")
+                    and not numbers_equal(scen.get("target_price"), eff_t)):
+                return [
+                    f"scenario.target_price {scen.get('target_price')!r} != "
+                    f"bound target {eff_t!r} — echo the evaluated contract target"
+                ]
+            if (scen.get("horizon") not in (None, "")
+                    and str(scen.get("horizon")).strip() != str(eff_h)):
+                return [
+                    f"scenario.horizon {scen.get('horizon')!r} != bound "
+                    f"horizon {eff_h!r} — echo the contract horizon"
+                ]
+            intent = getattr(controller, "scenario_intent", None)
+            if isinstance(intent, Mapping) and intent.get("mode") == "revision":
+                divergence = scen.get("divergence")
+                if (not isinstance(divergence, dict)
+                        or not str(divergence.get("reason") or "").strip()):
+                    return [
+                        "scenario.divergence {asked_target, reason} required: "
+                        "a declared revision must surface the asked target "
+                        "and why the question changed"
+                    ]
+            verdict = str(scen.get("verdict") or "")
+            if verdict == "unevaluable":
+                return []  # refused-shape verdict with evaluated tooling is
+                # caught by the structural unevaluable rules, not here
+            payload = (outcome.payload if outcome is not None else
+                       (st.accumulated_tool_results or {}).get(
+                           "calc.scenario.evaluate"))
+            derived, reason = _derive_verdict(payload, st, _det_verdict)
+            want = {"invalidated": "not_reachable",
+                    "validated": "reachable"}.get(derived)
+            if want is None:
+                if verdict not in ("reachable", "not_reachable"):
+                    return [
+                        "scenario verdict must be reachable|not_reachable: the "
+                        f"tool evaluated ({reason}) — unevaluable is forbidden "
+                        "with tool data"
+                    ]
+                return []
+            if verdict != want:
+                return [
+                    f"scenario verdict must be {want!r}: deterministic "
+                    f"derivation says {derived} ({reason}) — the agent's "
+                    "block keeps its words, but the verdict obeys the derivation"
+                ]
+            return []
+
+        # --- Legacy plane (no contract, no classified outcome) -------------
+        if state is _SES.REFUSED:
+            return []
         if not isinstance(scen, dict):
-            return []  # the structural check names the missing block
+            return []
         verdict = str(scen.get("verdict") or "")
         if verdict == "unevaluable":
-            return []  # refused-shape verdict with evaluated tooling is
-            # caught by the structural unevaluable rules, not here
-        gate = st.deterministic_state.get("gate") or {}
-        derived, reason = _det_verdict(
+            return []
+        derived, reason = _derive_verdict(
             (st.accumulated_tool_results or {}).get("calc.scenario.evaluate"),
-            st.capability_log,
-            str(gate.get("status") or "provisional"),
-            list(gate.get("reasons") or []),
+            st, _det_verdict,
         )
-        want = {"invalidated": "not_reachable", "validated": "reachable"}.get(derived)
+        want = {"invalidated": "not_reachable",
+                "validated": "reachable"}.get(derived)
         if want is None:
             if verdict not in ("reachable", "not_reachable"):
                 return [
@@ -794,12 +971,20 @@ def validate_final_turn(
                     missing.append(
                         "scenario.verdict required: reachable|not_reachable|unevaluable"
                     )
+                if (scenario_status is ScenarioEvalStatus.NOT_CALLED
+                        and str(scen.get("verdict") or "") == "unevaluable"):
+                    missing.append(
+                        "scenario.verdict 'unevaluable' is forbidden without a "
+                        "deterministic refusal — call calc.scenario.evaluate with "
+                        "the contract target/horizon; a refusal is the ONLY "
+                        "unevaluable path")
                 if normalize_confidence(scen.get("probability")) is None:
                     missing.append(
                         "scenario.probability required: low|medium|high "
                         "(qualitative read of the exceedance + band + tape quality)"
                     )
-                for field in ("required_ofi", "exceedance"):
+                for field in ("target_price", "horizon", "required_ofi",
+                              "exceedance"):
                     if not str(scen.get(field) or "").strip():
                         missing.append(
                             f"scenario.{field} required: echo the calc.scenario.evaluate "

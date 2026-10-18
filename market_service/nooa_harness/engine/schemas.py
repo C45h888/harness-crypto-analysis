@@ -141,6 +141,15 @@ def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     """
     if not isinstance(parsed, dict):
         return None
+    # Scenario declaration (model-authored, engine-disposed). Normalize the
+    # shape only; the controller decides legality (mode/target/reason/basis).
+    intent = parsed.get("scenario_intent")
+    if intent is not None:
+        if not isinstance(intent, dict):
+            parsed["scenario_intent"] = {
+                "mode": "invalid", "raw": str(intent)[:200]}
+        else:
+            intent["mode"] = str(intent.get("mode") or "").strip().lower()
     calls = parsed.get("tool_calls")
     if calls is None:
         return parsed
@@ -167,6 +176,14 @@ def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     hypothesis = parsed.get("hypothesis")
     if hypothesis is not None and not isinstance(hypothesis, dict):
         parsed["hypothesis"] = {"raw": hypothesis}
+    # Structural bound (lean thread): the judged evidence set must not
+    # outrun the repair budget. Cap per-turn entries (temporal primacy —
+    # lead citations first); merge_interpretation still unions across turns
+    # with dedupe. Dropped tail is logged, never silent.
+    evidence = parsed.get("evidence")
+    if isinstance(evidence, list) and len(evidence) > 16:
+        log.warning("capping turn evidence %d → 16 entries", len(evidence))
+        parsed["evidence"] = evidence[:16]
     return parsed
 
 

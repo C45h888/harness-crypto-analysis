@@ -103,6 +103,7 @@ def _derived_hypothesis_id(
     digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
     return f"hyp-{digest}", h0, h1
 from ..llm import call_narration_llm
+from ..scenario_contract import render_status_block
 from market_service.nooa_harness.inference import (
     _normalize_tool_name,
     capability_log_entry,
@@ -558,6 +559,24 @@ class InferenceEngine:
             # IDENTICAL args that already refused this cycle is suppressed
             # structurally (logged, never executed). Reformulated args are
             # new work and flow through (budgets + predicates still gate).
+            # Controller authority: the directive scenario's target/horizon
+            # fill ABSENT scenario args before dispatch (carry_scenario) so
+            # the loop cannot pass validation without evaluating the asked
+            # target. Explicit args always win; the carry is logged as a
+            # finding. Redundancy below sees effective args.
+            args, _carry = st.controller.carry_scenario(canonical, args)
+            if _carry is not None:
+                st.capability_log.append(capability_log_entry(
+                    "engine.scenario.carry",
+                    {"symbol": self.symbol, "venue": self.venue},
+                    "ok",
+                    detail=dict(_carry),
+                ))
+                # Model-visible counterpart: the next prompt renders this
+                # state (the capability_log is operator-plane only). Bounded
+                # list — one carry row per dispatch, last 8 kept.
+                st.scenario_surface.append(dict(_carry))
+                del st.scenario_surface[:-8]
             if st.controller.is_redundant(canonical, args):
                 log.warning(
                     "pass loop: suppressing redundant dispatch of "
@@ -792,6 +811,8 @@ class InferenceEngine:
             round_results=round_results,
             task_reminder=st.task_reminder,
             scenario_reminder=st.scenario_reminder,
+            scenario_contract_block=render_status_block(
+                st.scenario_contract, st.controller),
             phase_guidance=st.phase_guidance,
             next_phase=next_phase,
             chain_block=chain_block,

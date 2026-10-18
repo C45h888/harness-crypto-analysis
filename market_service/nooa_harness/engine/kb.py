@@ -159,8 +159,11 @@ class SystemPromptCache:
 TURN_CONTRACT_LINE = (
     'Return ONE JSON object per turn with keys {phase, summary, evidence, '
     'confidence, limitations, model_separation, hypothesis, scenario, '
-    'forward_scenario, hypothesis_evidence, hypothesis_probabilities, tool_calls} — the tool-name key is '
-    'EXACTLY "name".'
+    'forward_scenario, hypothesis_evidence, hypothesis_probabilities, '
+    'scenario_intent, tool_calls} — the tool-name key is EXACTLY "name".'
+    ' scenario_intent = {target_price, horizon, mode: "as_asked"|"revision"|"refuse", '
+    'reason, basis_path} is the contract declaration (revision only when the '
+    'contract permits divergence).'
 )
 
 # The single citation grammar every prompt uses (L1 unification — one dialect,
@@ -194,8 +197,11 @@ FINAL_SHAPE_BLOCK = (
     '"value": …, "interpretation": "…"}] — ≥2 distinct roots (different tool heads) '
     "including ≥1 fresh tool result and a calc.price.delta → … ΔP path\n"
     '  "confidence": "low|medium|high"\n'
-    '  "scenario": {…} REQUIRED at final when a SCENARIO block was given — or '
-    'verdict="unevaluable" with the refusal cited'
+    '  "scenario": {target_price, horizon, direction, required_ofi, exceedance, '
+    'fit_status, n_windows_usable, probability, verdict, rationale} REQUIRED at '
+    'final when a SCENARIO block was given — the evaluated target/horizon MUST '
+    'equal the contract bound (or a declared revision); or verdict="unevaluable" '
+    'with the refusal cited'
 )
 
 
@@ -681,6 +687,13 @@ def envelope_digest(deterministic_state: dict[str, Any], cap: int = 4_000) -> st
             "task_directive_kind": directive.get("kind"),
             "task_plan_kind": (deterministic_state.get("task_plan") or {}).get("kind"),
             "cadence": (deterministic_state.get("task_plan") or {}).get("cadence"),
+            "scenario_contract": (
+                deterministic_state.get("scenario_contract") or None
+            ),
+            "scenario_digest": (
+                "present" if deterministic_state.get("scenario_digest")
+                else "not_run"
+            ),
         }
         text = json.dumps(digest, default=str)
     except Exception:
@@ -723,12 +736,17 @@ def compose_output_prompt(
     traversal: dict[str, Any],
     chain_line: str,
     collapse_block: str = "",
+    frame_block: str = "",
+    memory_block: str = "",
 ) -> str:
     """Compose the OUTPUT composition pass prompt (non-agentic, tools forbidden).
 
     Single owner for the composition layout (moved from an inline string in
     ``core/output.py``): directive re-anchor, bounded synthesis material,
-    dispatched paths, traversal, and the required-chain line. Pure.
+    dispatched paths, traversal, and the required-chain line. ``frame_block``
+    carries the deterministic frame (the citable fact surface the authored
+    output is built on); ``memory_block`` relays the agent's own memory.*
+    reads (context, never evidence). Pure.
     """
     return (
         "OUTPUT COMPOSITION PASS (no tools available — any tool_calls you "
@@ -752,6 +770,8 @@ def compose_output_prompt(
         "- comparator.* fields are the univariate baseline, top-level fit fields "
         "the multivariate — cite each under its own path, never swap them.\n\n"
         f"{directive_block}"
+        f"{frame_block}"
+        f"{memory_block}"
         f"{collapse_block}"
         "SYNTHESIS MATERIAL:\n"
         f"{json.dumps(synthesis_material, default=str)[:30_000]}\n\n"
@@ -864,6 +884,7 @@ def compose_followup_prompt(
     next_phase: str,
     chain_block: str = "",
     reasoning_entry_block: str = "",
+    scenario_contract_block: str = "",
 ) -> str:
     """Compose the per-pass follow-up prompt.
 
@@ -927,6 +948,7 @@ def compose_followup_prompt(
         f"{chain_block}\n"
         f"{task_reminder}"
         f"{scenario_reminder}"
+        f"{scenario_contract_block}"
         f"PASS RESULTS (pass {passes_spent} of "
         f"{pass_budget} for {loop}. {CITATION_LINE}):\n"
         f"{json.dumps(wrapped_round, default=str)[:40_000]}\n\n"
@@ -951,6 +973,7 @@ def compose_forced_final_prompt(
     strict: bool = False,
     adjudication_block: str = "",
     data_checks_block: str = "",
+    scenario_contract_block: str = "",
 ) -> str:
     """The FORCED FINAL turn — the one that actually produces the artifact JSON.
 
@@ -988,6 +1011,7 @@ def compose_forced_final_prompt(
         f"{strict_block}"
         f"TASK (the question this output answers):\n{(task or '(autonomous microstructure inference)')[:2_000]}\n\n"
         f"{scenario_block}"
+        f"{scenario_contract_block}"
         "WHY THE PREVIOUS FINAL WAS REJECTED — EVERY item below must be fixed:\n"
         + "\n".join(f"- {item}" for item in missing)
         + f"\n\n{adjudication_block}"
@@ -998,6 +1022,47 @@ def compose_forced_final_prompt(
         'Return ONE JSON object with EXACTLY {phase: "P6", summary, evidence, '
         "confidence, limitations, model_separation, hypothesis, scenario, "
         'tool_calls: []}. No prose before or after it.'
+    )
+
+
+def compose_correction_prompt(
+    *,
+    task: str | None,
+    misses: list[str],
+    authored: dict[str, Any] | None = None,
+    frame_block: str = "",
+    memory_block: str = "",
+) -> str:
+    """The OUTPUT correction turn — the agent fixes ITS OWN authored output.
+
+    Sent at most once per cycle (the spare third output pass) when the
+    authored object fails the relaxed hard gate at ASSEMBLE/GROUND. The
+    engine never rewrites the agent's words: it names the misses and the
+    agent re-authors; the corrected turn ships verbatim. Pure.
+    """
+    authored_block = ""
+    if isinstance(authored, dict):
+        authored_block = (
+            "YOUR AUTHORED OUTPUT (correct THIS — keep your wording where it "
+            "already satisfies the misses; never start from scratch):\n"
+            f"{json.dumps(authored, default=str)[:8_000]}\n\n"
+        )
+    return (
+        "CORRECTION TURN — your authored output was checked against the "
+        "deterministic frame and failed the hard gate. Fix EVERY item below, "
+        "then return the complete final JSON again. No tools are available; "
+        "any tool_calls are dropped. This is the LAST chance this cycle: "
+        "whatever you return now ships as the output.\n\n"
+        "WHY THE OUTPUT WAS REJECTED — EVERY item must be fixed:\n"
+        + "\n".join(f"- {item}" for item in misses)
+        + f"\n\n{frame_block}"
+        + f"{memory_block}"
+        + authored_block
+        + f"{FINAL_SHAPE_BLOCK}\n\n"
+        'Return ONE JSON object with EXACTLY {phase: "P6", summary, evidence, '
+        "confidence, limitations, model_separation, hypothesis, "
+        "hypothesis_probabilities, scenario, tool_calls: []}. No prose before "
+        "or after it."
     )
 
 
@@ -1048,6 +1113,7 @@ def compose_repair_prompt(
     next_phase: str,
     adjudication_block: str = "",
     data_checks_block: str = "",
+    scenario_contract_block: str = "",
 ) -> str:
     """Compose the validation-loop repair-turn prompt.
 
@@ -1067,58 +1133,6 @@ def compose_repair_prompt(
     }
     phase_block = build_phase_summary_block(wrapped_accum)
 
-    # F9 steering: echo-type repairs (value mismatches AND missing citations —
-    # same disease: unattributed numbers) lead with correction blocks quoting
-    # each divergent pair, and the accumulated dump shrinks 24k -> 6k so the
-    # correction is not re-buried. Tool-absent repairs keep the full dump.
-    _echo_items = [m for m in missing if "mismatch" in str(m).lower()]
-    _cite_items = [m for m in missing
-                   if "needs path+value" in str(m).lower()
-                   or "needs basis_path" in str(m).lower()]
-    _has_absence = any("mismatch" not in str(m).lower()
-                       and "needs path+value" not in str(m).lower()
-                       and "needs basis_path" not in str(m).lower()
-                       for m in missing)
-    if (_echo_items or _cite_items) and not _has_absence:
-        _blocks: list[str] = []
-        if _echo_items:
-            _corrections = "\n".join(f"- {m}" for m in _echo_items[:3])
-            if len(_echo_items) > 3:
-                _corrections += f"\n- …plus {len(_echo_items) - 3} more mismatch items below"
-            _blocks.append(
-                "COPY CORRECTION — your cited values do not equal tool truth. "
-                "For each line below, replace the cited value with the tool-true "
-                "value verbatim in your next turn (identical `path`, tool-true "
-                "`value`). Do not re-derive, do not round, do not average:\n"
-                f"{_corrections}"
-            )
-        if _cite_items:
-            _cites = "\n".join(f"- {m}" for m in _cite_items[:3])
-            if len(_cite_items) > 3:
-                _cites += f"\n- …plus {len(_cite_items) - 3} more citation items below"
-            _blocks.append(
-                "CITE MISSING — these entries name no tool field. For each line "
-                "below, add the exact tool+field `path` and its exact `value` "
-                "in your next turn. Never invent a value: if no tool produced "
-                "the number, drop the entry instead:\n"
-                f"{_cites}"
-            )
-        _correction_block = "\n\n".join(_blocks) + "\n\n"
-        _dump_cap = 6_000
-        _close = (
-            "Return the next turn now: corrected `evidence[]` entries with "
-            "identical `path`s and tool-true `value`s; `tool_calls=[]` only "
-            "when zero Missing items remain."
-        )
-    else:
-        _correction_block = ""
-        _dump_cap = 24_000
-        _close = (
-            "Return the next turn now: declare \"phase\", include the missing "
-            "tool_calls, and finalize (tool_calls=[]) only when every missing "
-            "item is addressed."
-        )
-
     repair_header = build_loop_state_block(
         controller=controller,
         loop=loop, sub_loop=sub_loop,
@@ -1131,24 +1145,25 @@ def compose_repair_prompt(
         comprehension=None,
     )
     return (
-        f"{_correction_block}"
         f"{repair_header}\n\n"
         f"{TOOL_WINDOWS.get(loop, '')}\n\n"
         f"{task_reminder}"
         f"{scenario_reminder}"
         f"{scenario_steer}"
+        f"{scenario_contract_block}"
         f"{CITATION_LINE}\n"
         f"{adjudication_block}"
         f"{data_checks_block}"
         "FINAL REJECTED — staged inference incomplete. Missing:\n"
         + "\n".join(f"- {item}" for item in missing)
-        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{_bounded_dump(wrapped_accum, _dump_cap)}\n\n"
+        + f"\n\nACCUMULATED TOOL RESULTS (ToolResult envelopes):\n{_bounded_dump(wrapped_accum, 24_000)}\n\n"
         f"{phase_block}"
         f"PHASE COVERAGE: {json.dumps({p: sorted(s) for p, s in controller.phase_coverage.items()})}\n"
         f"{phase_guidance[next_phase]}\n"
         f"{TURN_CONTRACT_LINE}\n"
         f"{FINAL_SHAPE_BLOCK}\n"
-        f"{_close}"
+        "Return the next turn now: declare \"phase\", include the missing tool_calls, "
+        "and finalize (tool_calls=[]) only when every missing item is addressed."
     )
 
 

@@ -48,6 +48,11 @@ from ..kb import (
     seed_evidence_plan,
 )
 from ..loop_states import LoopStep, NestedLoop, SubLoop
+from ..scenario_contract import (
+    build_contract,
+    render_contract_block,
+    render_reminder,
+)
 from .. import receipts
 
 log = logging.getLogger(__name__)
@@ -175,6 +180,13 @@ def run_wake(
     # Canonical injection: the raw CLI prompt normalizes ONCE here into the
     # PromptVariable; every downstream consumer reads its bounded fields.
     prompt = PromptVariable.from_cli(task, scenario)
+    # ONE frozen scenario authority: the asked target/horizon + the
+    # prompt-authored divergence permission. ctx.scenario becomes its
+    # backward-compatible projection; the controller carries the contract
+    # itself (prompt, carry, redundancy, validation all read the same value).
+    scenario_contract = build_contract(scenario, task)
+    if scenario_contract is not None:
+        scenario = scenario_contract.to_scenario_dict()
     generated_at = context._utc_now_iso()
     capability_log: list[dict[str, Any]] = [{
         "capability": "engine.wake",
@@ -203,7 +215,7 @@ def run_wake(
     # (COMPREHENSION / UNDERSTAND_TASK) — the membrane's legality governs
     # every subsequent move.
     controller = (
-        CycleController(scenario)
+        CycleController(scenario, scenario_contract=scenario_contract)
         .with_membrane(GOVERNANCE_MEMBRANE)
         .with_observation(GOVERNANCE_MEMBRANE.initial())
     )
@@ -219,6 +231,7 @@ def run_wake(
     return _CycleContext(
         wake=wake, task=task, scenario=scenario, generated_at=generated_at,
         controller=controller, capability_log=capability_log,
+        scenario_contract=scenario_contract,
         prompt=prompt,
         task_id=_task_segment_id(prompt),
     )
@@ -280,6 +293,7 @@ async def run_comprehension(
     prompt = getattr(ctx, "prompt", None)
     if prompt is None:
         prompt = PromptVariable.from_cli(task, scenario)
+    contract = getattr(ctx, "scenario_contract", None)
     # Named init dict (charter-visible): the comprehension plane OWNS
     # the deterministic keyspace now. capture_status /
     # microstructure_evidence / data_quality are None placeholders
@@ -288,6 +302,7 @@ async def run_comprehension(
     deterministic_state: dict[str, Any] = {
         "task": prompt.raw,
         "scenario": scenario,
+        "scenario_contract": (contract.to_dict() if contract is not None else None),
         "wake": {
             "trigger_source": wake.trigger_source,
             "predicates_fired": wake.predicates_fired,
@@ -342,15 +357,18 @@ async def run_comprehension(
     )
     task_block = prompt.block_4000
     scenario_block = (
-        f"SCENARIO (price-target question — evaluate with the "
-        f"calc.scenario.evaluate tool at the given horizon; cite its "
-        f"→ … paths, never compute the requirement yourself):\n"
-        f"{json.dumps(scenario)}\n\n"
-        if scenario else ""
+        render_contract_block(contract)
+        if contract is not None else
+        (f"SCENARIO (price-target question — evaluate with the "
+         f"calc.scenario.evaluate tool at the given horizon; cite its "
+         f"→ … paths, never compute the requirement yourself):\n"
+         f"{json.dumps(scenario)}\n\n"
+         if scenario else "")
     )
     st.task_reminder = prompt.reminder_500
     st.task_block = task_block
     st.scenario_block = scenario_block
+    st.scenario_contract = contract
     st.wake_block = wake_block
     # CENTRAL LEDGER recall: the engine's own prior conclusions for this task
     # segment are rendered into the prompt block (deterministic, by key and
@@ -361,13 +379,26 @@ async def run_comprehension(
     )
     st.prior_note = ""  # fetch_note removed (R7)
     st.scenario_reminder = (
-        f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
-        f"given horizon; frame H0/H1 as not-reachable/reachable): "
-        f"{json.dumps(scenario)}\n"
-        if scenario else ""
+        render_reminder(contract)
+        if contract is not None else
+        (f"SCENARIO reminder (evaluate with calc.scenario.evaluate at the "
+         f"given horizon; frame H0/H1 as not-reachable/reachable): "
+         f"{json.dumps(scenario)}\n"
+         if scenario else "")
     )
     st.phase_guidance = dict(_PHASE_GUIDANCE)
-    if scenario:
+    if contract is not None:
+        st.phase_guidance["P5"] = (
+            st.phase_guidance["P5"]
+            + f" SCENARIO CONTRACT ({contract.asked_target} @ "
+            f"{contract.asked_horizon}, divergence {contract.divergence}): "
+            "call calc.scenario.evaluate with the bound target/horizon in "
+            "addition to price.delta — the scenario verdict is the primary "
+            "output. Echo target_price + horizon + fit_status + "
+            "n_windows_usable + r2, and name them beside the verdict in the "
+            "rationale (≥80 chars)."
+        )
+    elif scenario:
         st.phase_guidance["P5"] = (
             st.phase_guidance["P5"]
             + f" SCENARIO GIVEN ({json.dumps(scenario)}): call "
@@ -431,6 +462,21 @@ async def run_comprehension(
     st.deterministic_state["task_directive"] = st.task_directive
     st.deterministic_state["task_plan"] = plan
     st.deterministic_state["assessment_note"] = assessment_note
+    # The plan may have bound assessment targets; union them into the
+    # contract's allowed set and rebind the SINGLE authority (controller +
+    # carrier + deterministic state). The prompt block is rebuilt from the
+    # refined contract so the opening loop sees the plan-bound question.
+    if contract is not None:
+        contract = contract.with_allowed_targets(
+            [t.get("value") for t in (plan.get("targets") or [])]
+        )
+        ctx.scenario_contract = contract
+        st.scenario_contract = contract
+        st.controller = st.controller.with_scenario_contract(contract)
+        ctx.controller = st.controller
+        st.deterministic_state["scenario_contract"] = contract.to_dict()
+        st.scenario_block = render_contract_block(contract, plan)
+        st.scenario_reminder = render_reminder(contract)
 
     st.seed_plan = seed_evidence_plan(task, scenario)
     st.deterministic_state["seeded_plan"] = st.seed_plan
@@ -521,6 +567,10 @@ async def run_comprehension(
         "plan_kind": plan["kind"],
         "workflow_kind": st.task_workflow["kind"],
         "assessment": assessment_note or ("silent" if not _assessment_due else "ratified"),
+        "scenario_contract": (
+            st.scenario_contract.to_dict()
+            if getattr(st, "scenario_contract", None) is not None else None
+        ),
         "raw_proposal": raw_proposal,
         "seed_plan": st.seed_plan,
         "comprehension": st.comprehension,

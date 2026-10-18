@@ -89,15 +89,17 @@ class SynthesisWalkTests(unittest.IsolatedAsyncioTestCase):
         ])
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="failed synthesis walk")
-        # The cycle still settles (degraded single-call), but the failure is
-        # FSM-visible for the semantics-review surface — never silent.
+        # The cycle still settles (relaxed-loop degrade), and the failure is
+        # FSM-visible for the semantics-review surface — never silent and
+        # never a false REFUSED receipt on a settled artifact.
         self.assertEqual(meta.get("terminal"), "settled")
         ds = artifact.deterministic_state
         note = ds.get("synthesis_note") or {}
         self.assertEqual(note.get("stage"), "collapse")
-        self.assertEqual(note.get("degraded_to"), "single-call compose")
+        self.assertEqual(note.get("degraded_to"), "derive-without-collapse")
         by_cap = {e.get("capability") for e in artifact.capability_log}
-        self.assertIn("engine.synthesis.failed", by_cap)
+        self.assertIn("engine.synthesis.degraded", by_cap)
+        self.assertNotIn("engine.synthesis.failed", by_cap)
         receipts = (ds.get("loop_receipts") or {}).get("receipts") \
             if isinstance(ds.get("loop_receipts"), dict) else None
         if receipts is None:
@@ -106,7 +108,8 @@ class SynthesisWalkTests(unittest.IsolatedAsyncioTestCase):
                    if isinstance(r, dict)
                    and r.get("sub_loop") == "composition"
                    and r.get("disposition") == "refused"]
-        self.assertTrue(refused)
+        self.assertFalse(refused, "a settled artifact must not carry a "
+                                  "REFUSED composition receipt")
 
 
 if __name__ == "__main__":

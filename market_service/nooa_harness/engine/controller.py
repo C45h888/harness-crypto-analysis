@@ -59,6 +59,14 @@ from market_service.nooa_harness.engine.loop_states import (
     LoopObservation,
     LoopTerminal,
 )
+from market_service.nooa_harness.engine.scenario_contract import (
+    INTENT_MODES,
+    SCENARIO_HORIZONS,
+    args_equivalent,
+    canonical_number,
+    numbers_equal,
+    scenario_args_match,
+)
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +153,13 @@ class CycleController:
     """
 
     scenario: dict[str, Any] | None = None
+    # Scenario contract (ONE frozen authority; see scenario_contract.py).
+    # compare=False keeps legacy value/hash semantics for controllers built
+    # from a bare scenario dict (tests + direct construction).
+    scenario_contract: Any | None = field(default=None, compare=False)
+    scenario_intent: Mapping[str, Any] | None = field(default=None, compare=False)
+    scenario_intent_rejects: tuple[dict[str, Any], ...] = field(
+        default=(), compare=False)
     outcomes: tuple[ToolOutcome, ...] = ()
     loop_visits: tuple[LoopVisit, ...] = ()
     transitions: tuple[GovernanceRecord, ...] = ()
@@ -371,14 +386,114 @@ class CycleController:
             phase_coverage=MappingProxyType(coverage),
         )
 
+    def with_scenario_contract(self, contract: Any) -> "CycleController":
+        """Bind the frozen scenario contract (immutable setter)."""
+        return replace(self, scenario_contract=contract)
+
     def mark_declared(self, parsed: dict[str, Any]) -> "CycleController":
-        """Credit P4/P6 declaration from a parsed turn (declared, not executed)."""
+        """Credit P4/P6 + bind a declared scenario intent (declared, not run).
+
+        The scenario declaration is authored by the model and DISPOSED by
+        the engine (same doctrine as the task assessment): ``as_asked`` is
+        always allowed; ``revision`` needs a permitting contract, a parsed
+        target, a >=20-char reason, and a basis path; ``refuse`` records a
+        deliberate unevaluable declaration. Rejects never bind and are
+        named on ``scenario_intent_rejects`` for the repair surface.
+        """
+        ctrl = self
+        if isinstance(parsed, dict) and parsed.get("scenario_intent") is not None:
+            ctrl = ctrl.with_scenario_intent(parsed.get("scenario_intent"))
         declared = str(parsed.get("phase") or "").strip().upper()
         if declared not in ("P4", "P6"):
-            return self
-        coverage = dict(self.phase_coverage)
+            return ctrl
+        coverage = dict(ctrl.phase_coverage)
         coverage[declared] = coverage.get(declared, frozenset()) | {"declared"}
-        return replace(self, phase_coverage=MappingProxyType(coverage))
+        return replace(ctrl, phase_coverage=MappingProxyType(coverage))
+
+    def with_scenario_intent(self, raw: Any) -> "CycleController":
+        """Dispose one model-declared scenario intent (pure, immutable)."""
+        def _reject(reason: str) -> "CycleController":
+            entry = {
+                "field": "scenario_intent",
+                "value": (str(raw.get("mode")) if isinstance(raw, Mapping)
+                          else type(raw).__name__),
+                "reason": reason,
+            }
+            return replace(
+                self,
+                scenario_intent_rejects=(self.scenario_intent_rejects + (entry,))[-8:],
+            )
+
+        if not isinstance(raw, Mapping):
+            return _reject("scenario_intent must be a JSON object")
+        mode_raw = str(raw.get("mode") or "").strip().lower()
+        mode = {
+            "": "as_asked", "as_asked": "as_asked", "asked": "as_asked",
+            "same": "as_asked", "none": "as_asked",
+            "revision": "revision", "revise": "revision",
+            "changed": "revision", "different": "revision",
+            "refuse": "refuse", "refusal": "refuse",
+            "unevaluable": "refuse",
+        }.get(mode_raw)
+        if mode is None or mode not in INTENT_MODES:
+            return _reject(
+                f"mode {mode_raw!r} not in as_asked|revision|refuse")
+        asked_t, asked_h = self._asked_scenario()
+        target_raw = raw.get("target_price")
+        horizon_raw = raw.get("horizon")
+        target_c = (canonical_number(target_raw)
+                    if target_raw not in (None, "") else None)
+        horizon = (str(horizon_raw).strip()
+                   if isinstance(horizon_raw, str) and horizon_raw.strip()
+                   else None)
+        reason = str(raw.get("reason") or "").strip()
+        basis = str(raw.get("basis_path") or "").strip()
+        if mode == "as_asked":
+            return replace(self, scenario_intent={
+                "mode": "as_asked",
+                "target_price": asked_t,
+                "horizon": horizon or asked_h,
+                "reason": reason[:500] or None,
+            })
+        if mode == "refuse":
+            return replace(self, scenario_intent={
+                "mode": "refuse",
+                "target_price": asked_t,
+                "horizon": horizon or asked_h,
+                "reason": reason[:500] or None,
+            })
+        # mode == revision
+        problems: list[str] = []
+        contract = self.scenario_contract
+        if contract is None:
+            problems.append("no scenario contract to revise")
+        if target_c is None:
+            problems.append("revision target_price unparseable")
+        elif contract is not None and numbers_equal(target_c, contract.asked_target):
+            problems.append("revision target equals asked target; use mode=as_asked")
+        if (contract is not None and contract.divergence == "forbidden"
+                and target_c is not None
+                and target_c not in contract.allowed_targets):
+            problems.append(
+                "contract divergence is forbidden (prompt did not invite it); "
+                f"allowed targets: {list(contract.allowed_targets)}")
+        if horizon is not None and horizon not in SCENARIO_HORIZONS:
+            problems.append(f"horizon {horizon!r} outside {'|'.join(SCENARIO_HORIZONS)}")
+        if len(reason) < 20:
+            problems.append("revision requires a reason (>=20 chars)")
+        if not basis:
+            problems.append("revision requires basis_path")
+        if problems:
+            return _reject("; ".join(problems))
+        return replace(self, scenario_intent={
+            "mode": "revision",
+            "target_price": target_c,
+            "horizon": horizon or asked_h,
+            "reason": reason[:500],
+            "basis_path": basis,
+            "asked_target": asked_t,
+            "asked_horizon": asked_h,
+        })
 
     # ------------------------------------------------------------------
     # Loop-traversal ledger (Track A congruence shape: traversal is
@@ -550,19 +665,122 @@ class CycleController:
     # Redundant-dispatch suppression (refusal is terminal per tool/cycle)
     # ------------------------------------------------------------------
 
+    def _asked_scenario(self) -> tuple[str | None, str | None]:
+        """The contract's asked target/horizon (legacy dict fallback)."""
+        contract = self.scenario_contract
+        if contract is not None:
+            return str(contract.asked_target), str(contract.asked_horizon)
+        if isinstance(self.scenario, dict):
+            target = self.scenario.get("target_price")
+            horizon = self.scenario.get("horizon")
+            return (
+                str(target) if target is not None else None,
+                str(horizon) if horizon is not None else None,
+            )
+        return None, None
+
+    def effective_scenario(self) -> tuple[str | None, str | None]:
+        """The target/horizon this cycle is bound to (declared revision wins)."""
+        asked_t, asked_h = self._asked_scenario()
+        intent = self.scenario_intent
+        if isinstance(intent, Mapping) and intent.get("mode") == "revision":
+            target = intent.get("target_price")
+            horizon = intent.get("horizon")
+            return (
+                str(target) if target else asked_t,
+                str(horizon) if horizon else asked_h,
+            )
+        return asked_t, asked_h
+
+    def scenario_outcome(self) -> "ToolOutcome | None":
+        """The last genuine scenario dispatch (success or refusal), else None.
+
+        This is the OUTCOME validation must bind to — not any row in the
+        capability log. ``None`` means NOT_CALLED (or only denied/errored
+        dispatches, which never attempted the tool).
+        """
+        for outcome in reversed(self.outcomes):
+            if outcome.canonical == SCENARIO_TOOL and outcome.result == "ok":
+                return outcome
+        return None
+
+    def carry_scenario(
+        self, canonical: str, args: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Bind the scenario contract into ABSENT dispatch args (pre-dispatch).
+
+        Target and horizon are filled INDEPENDENTLY (a target-only call must
+        not silently fall back to the tool's default horizon). A valid
+        explicit target executes as given — validation compares it to the
+        bound target. An INVALID explicit target (0, garbage) does not count
+        as "explicit": the bound target is carried and the invalid raw value
+        is named on the finding, so a refusal can never masquerade as the
+        asked question being answered.
+
+        Returns ``(args, finding)``. The finding rides the capability log
+        (operators) AND the model-visible scenario surface (driver).
+        """
+        if canonical != SCENARIO_TOOL:
+            return (dict(args) if isinstance(args, dict) else {}), None
+        asked_t, asked_h = self._asked_scenario()
+        effective_t, effective_h = self.effective_scenario()
+        if effective_t is None and effective_h is None:
+            return (dict(args) if isinstance(args, dict) else {}), None
+        out = dict(args) if isinstance(args, dict) else {}
+        changed = False
+        ignored_invalid: str | None = None
+        raw_target = out.get("target_price")
+        if raw_target is None or (
+                isinstance(raw_target, str) and not raw_target.strip()):
+            if effective_t is not None:
+                out["target_price"] = effective_t
+                changed = True
+        elif canonical_number(raw_target) is None:
+            ignored_invalid = str(raw_target)
+            if effective_t is not None:
+                out["target_price"] = effective_t
+                changed = True
+        raw_horizon = out.get("horizon")
+        if raw_horizon is None or (
+                isinstance(raw_horizon, str) and not raw_horizon.strip()):
+            if effective_h:
+                out["horizon"] = effective_h
+                changed = True
+        if not changed:
+            return out, None
+        intent = (self.scenario_intent
+                  if isinstance(self.scenario_intent, Mapping) else {})
+        finding: dict[str, Any] = {
+            "target_price": out.get("target_price"),
+            "horizon": out.get("horizon"),
+            "source": ("declared_revision" if intent.get("mode") == "revision"
+                       else "directive"),
+            "asked_target": asked_t,
+            "asked_horizon": asked_h,
+            "effective_target": effective_t,
+            "effective_horizon": effective_h,
+        }
+        if self.scenario_contract is not None:
+            finding["contract_id"] = self.scenario_contract.contract_id
+        if ignored_invalid is not None:
+            finding["ignored_invalid_explicit"] = ignored_invalid
+        return out, finding
+
     def is_redundant(self, canonical: str, args: dict[str, Any] | None = None) -> bool:
         """True when this tool already refused this cycle with the same args.
 
-        Suppression is args-aware: a deterministic refusal is terminal only
-        for identical inputs. A re-call with materially different args
-        (window, interval, horizon) is new work the track may attempt —
-        budgets and predicates still gate it. No-args callers match only
-        no-args refusals, preserving the legacy call shape exactly.
+        Suppression is args-aware and NUMERIC for scenario fields: a
+        deterministic refusal is terminal only for equivalent inputs
+        (``104.8`` == ``104.80``). A re-call with materially different args
+        (window, interval, declared revision target) is new work the track
+        may attempt — budgets and predicates still gate it. No-args callers
+        match only no-args refusals, preserving the legacy call shape.
         """
         wanted = dict(args) if isinstance(args, dict) else {}
         return any(
             o.canonical == canonical and o.refused
-            and (dict(o.args) if isinstance(o.args, dict) else {}) == wanted
+            and args_equivalent(
+                o.args if isinstance(o.args, Mapping) else {}, wanted)
             for o in self.outcomes
         )
 
@@ -571,23 +789,43 @@ class CycleController:
     # ------------------------------------------------------------------
 
     def scenario_steer(self) -> str:
-        """Repair steering from the tri-state — correct by construction.
+        """Repair steering bound to the EFFECTIVE contract target.
 
-        NOT_CALLED → CALL steer (the old bug: key-presence-with-None-value
-        silenced this). REFUSED → citation steer, never a re-call demand.
-        EVALUATED → echo demand (current behavior).
+        NOT_CALLED → call steer with the asked tuple. REFUSED → if the
+        refusal was of the asked/declared target, the refusal is terminal
+        and the steer is citation-only; if it refused a DIFFERENT target,
+        the steer names the mismatch and demands the bound target (or a
+        declared revision when the prompt permits one). EVALUATED → a
+        different target is named as a contract violation, never left for
+        the final to discover.
         """
-        state = self.scenario_state()
-        if not self.scenario:
+        asked_t, asked_h = self._asked_scenario()
+        effective_t, effective_h = self.effective_scenario()
+        if asked_t is None and self.scenario_contract is None:
             return ""
+        state = self.scenario_state()
+        outcome = self.scenario_outcome()
         if state is ScenarioEvalStatus.NOT_CALLED:
             return (
                 "SCENARIO UNEVALUATED: call calc.scenario.evaluate with the "
-                f"SCENARIO target_price/horizon ({self._scenario_json()}) "
+                f"contract target/horizon ({effective_t} @ {effective_h}) "
                 "before finalizing — the final is rejected without its "
                 "→ … evidence root.\n"
             )
+        recorded_args = (isinstance(getattr(outcome, "args", None), Mapping)
+                         and bool(outcome.args))
         if state is ScenarioEvalStatus.REFUSED:
+            if outcome is not None and recorded_args and not scenario_args_match(
+                    outcome.args, effective_t, effective_h):
+                return (
+                    "SCENARIO REFUSED A DIFFERENT TARGET/HORIZON: last "
+                    f"dispatch args {getattr(outcome, 'args', None)!r} do not "
+                    f"match the bound target {effective_t} @ {effective_h}. "
+                    "A refusal only answers the asked question when it is a "
+                    "refusal OF that target — dispatch the bound target "
+                    "exactly (a declared revision is required to change it "
+                    "when the contract permits one).\n"
+                )
             reason = self.scenario_refusal_reason() or "deterministic refusal"
             return (
                 "SCENARIO ALREADY DISPATCHED and refused deterministically "
@@ -596,6 +834,16 @@ class CycleController:
                 "`calc.scenario.evaluate → refusal`, set "
                 "scenario.verdict=unevaluable, and name the refusal reason "
                 "in the scenario rationale.\n"
+            )
+        if outcome is not None and recorded_args and not scenario_args_match(
+                outcome.args, effective_t, effective_h):
+            return (
+                "SCENARIO CONTRACT VIOLATION: the evaluated dispatch args "
+                f"{getattr(outcome, 'args', None)!r} are not the bound target "
+                f"{effective_t} @ {effective_h}. Evaluate the bound target; "
+                "if the question must change, declare scenario_intent mode="
+                "revision with reason + basis_path (only when the contract "
+                "permits divergence).\n"
             )
         return ""
 
