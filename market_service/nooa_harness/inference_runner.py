@@ -135,6 +135,9 @@ async def run_inference_once(
             "task": task[:200] if task else None,
             "scenario": scenario,
             "artifact_id": artifact.artifact_id,
+            # C2 (plan §4): the cycle's deliverable — the authored answer,
+            # rendered by the one composer from the run record that ships.
+            "answer": cycle_meta.get("answer"),
             "artifact": artifact.to_dict(),
             "cycle": cycle_meta,
         }

@@ -1459,7 +1459,21 @@
     "limitations": [
      "synthetic window"
     ],
-    "model_separation": "nu*OFI is heteroskedastic; never merged."
+    "model_separation": "nu*OFI is heteroskedastic; never merged.",
+    "hypothesis_probabilities": {
+     "H0": {
+      "probability": "medium",
+      "p": null,
+      "basis_path": "calc.forward.fit \u2192 data.status"
+     },
+     "H1": {
+      "probability": "low",
+      "p": null,
+      "basis_path": "calc.forward.fit \u2192 data.status"
+     },
+     "chosen": "H0",
+     "tiebreak": null
+    }
    },
    "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
    "errors": [],
@@ -1546,6 +1560,7 @@
    "task": "Explain the evidence",
    "scenario": null,
    "terminal": "settled",
+   "answer": null,
    "unexecuted_tool_calls": [
     "calc.price.delta"
    ],
@@ -2859,7 +2874,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -4021,7 +4050,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -5218,7 +5261,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -6763,7 +6820,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -8303,7 +8374,21 @@
     "limitations": [
      "synthetic window"
     ],
-    "model_separation": "nu*OFI is heteroskedastic; never merged."
+    "model_separation": "nu*OFI is heteroskedastic; never merged.",
+    "hypothesis_probabilities": {
+     "H0": {
+      "probability": "medium",
+      "p": null,
+      "basis_path": "calc.forward.fit \u2192 data.status"
+     },
+     "H1": {
+      "probability": "low",
+      "p": null,
+      "basis_path": "calc.forward.fit \u2192 data.status"
+     },
+     "chosen": "H0",
+     "tiebreak": null
+    }
    },
    "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
    "errors": [],
@@ -8390,6 +8475,7 @@
    "task": "Explain the evidence",
    "scenario": null,
    "terminal": "settled",
+   "answer": "ANSWER\n======================================================================\nrun: BTCUSDT spot \u00b7 2026-01-01T00:00:00+00:00\nartifact: 00000000-0000-0000-0000-000000000001\ntask: Explain the evidence\n\n--- summary ---\nOFI tape is usable with 40 exact_feed intervals and no sequence gaps, so the P1 verdict holds. Average depth is stable across the window, giving a clean P2 observation set with beta positive and moderate explanatory power. Market correlation confirms taker flow aligns with the OFI sign, which is why this regime persists now: steady passive depth plus one-sided initiation.\n\n--- evidence ---\ndeterministic_state.microstructure_evidence.price_impact_fit.beta = 0.001\n  positive impact\ncalc.ofi.intervals \u2192 ofi = 12.5\n  sustained one-sided flow\n\n--- scenario rationale ---\nnot applicable (no scenario given)\n\n--- model separation ---\nnu*OFI is heteroskedastic; never merged.\n\n--- limitations ---\n- synthetic window\n\nGATE DATA\n======================================================================\n--- hypothesis ---\nH0: beta > 0 per OFI block (derived empirical model)\nH1: beta <= 0 (flow no longer moves price)\n\n--- adjudication ---\nH0: medium \u00b7 p: null \u00b7 basis: calc.forward.fit \u2192 data.status\nH1: low \u00b7 p: null \u00b7 basis: calc.forward.fit \u2192 data.status\nchosen: H0 \u00b7 tiebreak: none\n\n--- scenario ---\nverdict: not applicable (no scenario given)\n\n--- directive ---\nkind: general \u00b7 horizon: none\ntargets: none\ninvalidations: none\nnote: no directive values extracted\nanswer:\n  not applicable (no targets bound)\n\n--- refusals ---\nnone\n\n--- confidence ---\nmedium\n\nOUTPUT CONFORMANCE\n======================================================================\nhard_misses:\n(none)\nconflicts:\n(none)\nquality_findings:\n(none)\ncorrection_used: false\nterminal: settled",
    "unexecuted_tool_calls": [
     "calc.price.delta"
    ],
@@ -9701,7 +9787,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -10857,7 +10957,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -12048,7 +12162,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],
@@ -13587,7 +13715,21 @@
       "limitations": [
        "synthetic window"
       ],
-      "model_separation": "nu*OFI is heteroskedastic; never merged."
+      "model_separation": "nu*OFI is heteroskedastic; never merged.",
+      "hypothesis_probabilities": {
+       "H0": {
+        "probability": "medium",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "H1": {
+        "probability": "low",
+        "p": null,
+        "basis_path": "calc.forward.fit \u2192 data.status"
+       },
+       "chosen": "H0",
+       "tiebreak": null
+      }
      },
      "session_id": "160cf59b-65ad-53c7-9b64-472306bed5a9",
      "errors": [],

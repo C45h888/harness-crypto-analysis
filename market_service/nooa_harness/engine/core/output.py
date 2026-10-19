@@ -369,6 +369,13 @@ async def run_output(
     # verdict/probability/rationale over the deterministic requirement.
     if scenario is not None and isinstance(parsed_final.get("scenario"), dict):
         interpretation["scenario"] = parsed_final["scenario"]
+    # C2 run-record retention (plan §8 gate 1 — KEEP): the authored
+    # adjudication rides the interpretation so the ``answer`` re-render of a
+    # past run is EXACT. The composer renders what ships; this only keeps
+    # what the agent already wrote in the run record.
+    _adjudication = parsed_final.get("hypothesis_probabilities")
+    if isinstance(_adjudication, dict):
+        interpretation["hypothesis_probabilities"] = _adjudication
     # Pass C: hypothesis formed from the track's own evidence + calc.* tools
     # (memory node pruned from the track — transport retained),
     # final DeltaP is derived diagnostic heteroskedastic ν·OFI.
@@ -521,6 +528,18 @@ async def run_output(
         deterministic_state=dict(deterministic_state),
         errors=tuple(final_errors),
     )
+    # --- C2 ANSWER (docs/CLI_ANSWER_SURFACE_PLAN.md §2/§4, slice S2) ---
+    # The composer renders THE ANSWER from the run record that ships: one
+    # composer, one format — the cycle-close CLI surface and the
+    # ``nooa market inference answer`` re-render of a past run both read
+    # exactly this record. Render-only here (additive); settlement semantics
+    # are untouched until the C2 switch (slice S3).
+    answer_text = None
+    try:
+        from .answer import answer_from_record
+        answer_text = answer_from_record(artifact.to_dict())
+    except Exception:
+        log.exception("answer composition failed; run record unaffected")
     final_persistence = await engine._finalize_persisted(artifact) if durable_ok else persistence
     persistence["final"] = final_persistence
     if durable_ok:
@@ -567,6 +586,7 @@ async def run_output(
         "task": task[:200] if task else None,
         "scenario": scenario,
         "terminal": terminal,
+        "answer": answer_text,
         "unexecuted_tool_calls": unexecuted,
         "llm_calls": llm_calls,
         "passes_per_loop": passes_per_loop,

@@ -72,6 +72,44 @@ def _emit(result: Any) -> None:
     click_echo(json.dumps(result, indent=2, default=str))
 
 
+async def _load_run_record(
+    symbol: str, venue: str, artifact_id: str | None = None,
+    redis_only: bool = False,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Read ONE run record (Postgres-first durable ledger, Redis fallback).
+
+    Returns ``(source, record)``; the record is the run-record dict the
+    stores round-trip (``InferenceArtifact.to_dict()`` shape). The durable
+    ledger is contacted only when DATABASE_URL is set.
+    """
+    settings = _settings()
+    source = None
+    record: dict[str, Any] | None = None
+    if not redis_only:
+        postgres = PostgresRuntimeStore(settings.database_url)
+        try:
+            await postgres.connect()
+            record = await postgres.read_inference_artifact(
+                symbol, artifact_id=artifact_id,
+            )
+            source = "postgres"
+        finally:
+            await postgres.close()
+    if record is None:
+        redis = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            record = await redis.read_latest_inference_artifact(
+                symbol.upper(), venue,
+            )
+            source = "redis"
+        finally:
+            await redis.close()
+    return source, record
+
+
 # --------------------------------------------------------------------------
 # market group
 # --------------------------------------------------------------------------
@@ -612,7 +650,46 @@ def inference_run(symbol: str, venue: str, force: bool, task: str | None,
         return await run_inference_once(symbol, venue=venue, force=force,
                                         task=task, scenario=scenario)
 
-    _emit(asyncio.run(_run()))
+    result = asyncio.run(_run())
+    answer = result.get("answer")
+    if answer:
+        # C2 (plan §4.1): the cycle-close stdout surface IS the answer —
+        # the operator sees it the moment the run settles. The machine
+        # metadata stays beside it as the run-record read-out.
+        click_echo(answer)
+        click_echo("")
+    _emit(result)
+
+
+@inference_group.command("answer")
+@click.argument("symbol", default="BTCUSDT")
+@click.option("--venue", default="spot")
+@click.option("--artifact-id", default=None,
+              help="render the answer of one exact run record")
+def inference_answer(symbol: str, venue: str, artifact_id: str | None) -> None:
+    """Re-render the authored answer of a past cycle from its run record.
+
+    The run record carries the authored interpretation + conformance, so
+    re-rendering is EXACT — the same composer reads the same record the
+    cycle-close surface rendered (parity by construction).
+    """
+    from market_service.nooa_harness.engine.core.answer import answer_from_record
+
+    async def _run() -> tuple[str | None, dict[str, Any] | None]:
+        return await _load_run_record(symbol, venue, artifact_id=artifact_id)
+
+    source, record = asyncio.run(_run())
+    del source  # the answer renders from the record, whatever its source
+    if record is None:
+        raise click.ClickException(
+            f"no run record for {symbol.upper()} {venue}"
+            + (f" / {artifact_id}" if artifact_id else ""))
+    answer_text = answer_from_record(record)
+    if answer_text is None:
+        raise click.ClickException(
+            "run record carries no authored answer (the cycle degraded or "
+            "failed before authoring — `inference read` shows the record)")
+    click_echo(answer_text)
 
 
 @inference_group.command("read")
@@ -624,31 +701,8 @@ def inference_read(symbol: str, venue: str, artifact_id: str | None,
                    redis_only: bool) -> None:
     """Read inference artifacts (Postgres-first durable ledger, Redis fallback)."""
     async def _run() -> dict[str, Any]:
-        settings = _settings()
-        artifact = None
-        source = None
-        if not redis_only:
-            postgres = PostgresRuntimeStore(settings.database_url)
-            try:
-                await postgres.connect()
-                artifact = await postgres.read_inference_artifact(
-                    symbol, artifact_id=artifact_id,
-                )
-                source = "postgres"
-            finally:
-                await postgres.close()
-        if artifact is None:
-            redis = RedisRuntimeStore(
-                settings.redis_url, settings.redis_key_prefix,
-                settings.redis_stream_maxlen,
-            )
-            try:
-                artifact = await redis.read_latest_inference_artifact(
-                    symbol.upper(), venue,
-                )
-                source = "redis"
-            finally:
-                await redis.close()
+        source, artifact = await _load_run_record(
+            symbol, venue, artifact_id=artifact_id, redis_only=redis_only)
         return {"source": source, "artifact": artifact}
 
     _emit(asyncio.run(_run()))
