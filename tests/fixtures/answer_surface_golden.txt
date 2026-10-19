@@ -1,0 +1,69 @@
+ANSWER
+======================================================================
+run: BTCUSDT spot · 2026-01-01T00:00:00+00:00
+artifact: 00000000-0000-0000-0000-000000000001
+task: Explain the evidence
+
+--- summary ---
+Flow is one-sided and depth is stable, so the move persists now.
+
+--- evidence ---
+calc.ofi.intervals → ofi = 12.5
+  sustained one-sided flow
+calc.depth.average → mean_ad = 10.5
+  passive depth holds
+
+--- scenario rationale ---
+The target sits inside the forward band at this horizon.
+
+--- model separation ---
+nu*OFI is heteroskedastic; never merged.
+
+--- limitations ---
+- synthetic window
+
+GATE DATA
+======================================================================
+--- hypothesis ---
+H0: beta > 0 (flow moves price)
+H1: beta <= 0 (flow no longer moves price)
+
+--- adjudication ---
+H0: medium · p: null · basis: calc.forward.fit → data.status
+H1: low · p: null · basis: calc.forward.fit → data.status
+chosen: H0 · tiebreak: none
+
+--- scenario ---
+verdict: reachable
+target: 245.30 · horizon: 1h
+cited: calc.scenario.evaluate → verdict
+
+--- directive ---
+kind: price_target · horizon: 1h (long)
+targets: 245.30
+invalidations: none
+note: targets=[245.30]
+answer:
+  calc.scenario.evaluate → verdict = reachable
+    band says reachable
+
+--- delta (required by directive targets/invalidations) ---
+calc.price.delta → route_a.delta_ticks = +0.53
+  derived move with band
+
+--- refusals ---
+- directive.horizon='5m': unsupported horizon (between native and long)
+
+--- confidence ---
+medium
+
+OUTPUT CONFORMANCE
+======================================================================
+hard_misses:
+(none)
+conflicts:
+(none)
+quality_findings:
+(none)
+correction_used: false
+terminal: settled
