@@ -951,9 +951,17 @@ def compose_followup_prompt(
         f"{scenario_contract_block}"
         f"PASS RESULTS (pass {passes_spent} of "
         f"{pass_budget} for {loop}. {CITATION_LINE}):\n"
-        f"{json.dumps(wrapped_round, default=str)[:40_000]}\n\n"
+        # Prompt-growth bound (live 2026-10-19): late-cycle follow-ups embedded
+    # 40K current-round + 24K history dumps (~90K chars with system prompt)
+    # and DeepSeek's reasoning time scaled past even the 300s bound twice on
+    # the same turn. Fresh-round data keeps its width (the agent acts on it
+    # NOW); history is cut harder — the truncation marker names the cut and
+    # the agent re-pulls via tools, while echo verification reads the
+    # engine-side store (never the prompt text), so cuts cost words, never
+    # truth. Total follow-up ≈ 65K chars → ~160s thinking vs 300s bound.
+    f"{json.dumps(wrapped_round, default=str)[:32_000]}\n\n"
         f"PRIOR PASSES (earlier results, for citation):\n"
-        f"{_bounded_dump(wrapped_accum, 24_000)}\n\n"
+        f"{_bounded_dump(wrapped_accum, 10_000)}\n\n"
         f"{_data_checks}"
         f"{phase_block}"
         f"{TURN_CONTRACT_LINE}\n"

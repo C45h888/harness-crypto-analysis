@@ -22,6 +22,7 @@ This module owns the EVIDENCE and REASONING run_* loop bodies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -144,11 +145,34 @@ async def run_evidence(
         traversal=st.controller.loop_coverage(),
         gate=st.deterministic_state.get("gate"),
     )
+    raw_1: str | None = None
+    first_error = ""
     try:
         raw_1 = await engine._call_llm(user_prompt_1)
         context.record_tier(st)
     except Exception as exc:
         log.exception("narration#1 failed")
+        first_error = f"{type(exc).__name__}: {exc}"
+        # Bounded RETRY for TRANSIENT transport stalls only (timeout-class).
+        # Live 2026-10-19: narration#1 stalled past the 150s bound twice and
+        # the single-shot terminal burned the cycle (provisional artifact,
+        # llm_calls 0, validation never reached). Deterministic failures
+        # (auth, bugs, scripted refusals) keep the instant terminal the
+        # characterization fixtures pin. Same retry plane the validation
+        # repair path uses — substrate dispatches the narration worker,
+        # which re-attempts the call (worker owns the transport). A
+        # recovered turn falls through to the shared downstream path below.
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            st.failure_kind = "narration_failed"
+            st.failure_detail = first_error
+            raw_1 = await context.recover_narration_call(
+                engine, ctx, st, user_prompt_1,
+            )
+            if raw_1 is not None:
+                context.record_tier(st)
+            elif st.failure_kind:
+                return await run_runtime_failure(engine, ctx, st)
+    if raw_1 is None:
         st.controller = st.controller.advance(
             context.failure_event("narration_failed")
         )
@@ -160,7 +184,7 @@ async def run_evidence(
         st.deterministic_state["terminal"] = terminal
         return await engine._degraded_artifact(
             st.deterministic_state, st.capability_log,
-            f"narration_failed: {type(exc).__name__}: {exc}",
+            f"narration_failed: {first_error}",
         ), {"task": (ctx.task or "")[:200] or None,
             "scenario": ctx.scenario,
             "llm_calls": st.llm_calls, "terminal": terminal}

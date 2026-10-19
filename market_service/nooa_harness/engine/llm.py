@@ -32,6 +32,7 @@ the backend behaviour.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Any
@@ -68,6 +69,23 @@ def _note_tier(tier: str, text: str) -> str:
     LAST_EXTRACTION_TIER = tier
     log.info("narration extraction tier=%s chars=%d", tier, len(text or ""))
     return text
+
+
+def _accepts_timeout(fn: Any) -> bool:
+    """Does this LLM client's ``acall`` accept a ``timeout`` kwarg? (pure).
+
+    The NOOA unified client takes ``**kwargs`` (forwarded to litellm as the
+    native total bound); scripted test fakes pin exact signatures. Detect,
+    never assume — an unexpected kwarg would TypeError the call.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "timeout" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in params.values()
+    )
 
 
 async def call_narration_llm(
@@ -119,6 +137,18 @@ async def call_narration_llm(
     # hours inside the transport's inner retry. A timeout is NOT a probe
     # refusal: it propagates with the probe flag untouched.
     timeout_s = narration_timeout_s()
+    # Litellm-native total bound on BOTH attempts: asyncio.wait_for owns the
+    # outer bound, but a provider stall that blocks the loop (sync sleep in
+    # a transport retry path, executor handoff) can delay cancellation
+    # delivery — live 2026-10-19: narration#1 hung 88min against a 150s
+    # wait_for. The native timeout fails the call from INSIDE the transport
+    # so the cycle degrades in minutes, never hours. Passed only when the
+    # client accepts it (the NOOA unified client takes **kwargs; scripted
+    # test fakes pin exact signatures) — capability-detected, never assumed.
+    if _accepts_timeout(llm.acall):
+        _timeout_kw: dict[str, Any] = {"timeout": timeout_s}
+    else:
+        _timeout_kw = {}
     if (NarrationTurn is not None and _STRUCTURED_OK is not False
             and structured_output_enabled()):
         try:
@@ -127,6 +157,7 @@ async def call_narration_llm(
                     messages=messages,
                     output_model=NarrationTurn,
                     max_tokens=narration_max_tokens(),
+                    **_timeout_kw,
                 ),
                 timeout=timeout_s,
             )
@@ -142,6 +173,7 @@ async def call_narration_llm(
             llm.acall(
                 messages=messages,
                 max_tokens=narration_max_tokens(),
+                **_timeout_kw,
             ),
             timeout=timeout_s,
         )
