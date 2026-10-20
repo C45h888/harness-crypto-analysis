@@ -90,7 +90,7 @@ def _conformance(**over):
 
 def _meta(**over):
     base = {"symbol": "BTCUSDT", "venue": "spot",
-            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "run_id": "00000000-0000-0000-0000-000000000001",
             "generated_at": "2026-01-01T00:00:00+00:00",
             "session_id": "sess", "task": "Explain the evidence", "gate": "provisional"}
     base.update(over)
@@ -277,7 +277,7 @@ class FooterHonestyTests(unittest.TestCase):
 class RunRecordParityTests(unittest.TestCase):
     def _record(self, **over):
         record = {
-            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "run_id": "00000000-0000-0000-0000-000000000001",
             "symbol": "BTCUSDT", "venue": "spot",
             "generated_at": "2026-01-01T00:00:00+00:00",
             "session_id": "sess", "status": "provisional",
@@ -403,7 +403,7 @@ _LABEL_WORDS = {
     "horizon", "cited", "kind", "answer", "basis", "chosen", "tiebreak",
     "refusals", "confidence", "hard", "misses", "conflicts", "quality",
     "findings", "correction", "used", "terminal", "delta", "p", "of",
-    "note",
+    "note", "id",
 }
 
 

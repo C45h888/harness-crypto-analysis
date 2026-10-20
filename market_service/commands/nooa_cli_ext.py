@@ -73,14 +73,15 @@ def _emit(result: Any) -> None:
 
 
 async def _load_run_record(
-    symbol: str, venue: str, artifact_id: str | None = None,
+    symbol: str, venue: str, run_id: str | None = None,
     redis_only: bool = False,
 ) -> tuple[str | None, dict[str, Any] | None]:
-    """Read ONE run record (Postgres-first durable ledger, Redis fallback).
+    """Read ONE canonical run record (Postgres-first, Redis projection fallback).
 
-    Returns ``(source, record)``; the record is the run-record dict the
-    stores round-trip (``InferenceArtifact.to_dict()`` shape). The durable
-    ledger is contacted only when DATABASE_URL is set.
+    Returns ``(source, record)``. Pre-canonical cycles fall back to the
+    deprecated ``inference_artifact`` rows, labeled ``legacy_artifact`` —
+    read-only, never written. The durable ledger is contacted only when
+    DATABASE_URL is set.
     """
     settings = _settings()
     source = None
@@ -89,10 +90,17 @@ async def _load_run_record(
         postgres = PostgresRuntimeStore(settings.database_url)
         try:
             await postgres.connect()
-            record = await postgres.read_inference_artifact(
-                symbol, artifact_id=artifact_id,
+            record = await postgres.read_canonical_output(
+                symbol, run_id=run_id,
             )
-            source = "postgres"
+            if record is not None:
+                source = "postgres"
+            else:
+                record = await postgres.read_inference_artifact(
+                    symbol, artifact_id=run_id,
+                )
+                if record is not None:
+                    source = "legacy_artifact"
         finally:
             await postgres.close()
     if record is None:
@@ -101,7 +109,7 @@ async def _load_run_record(
             settings.redis_stream_maxlen,
         )
         try:
-            record = await redis.read_latest_inference_artifact(
+            record = await redis.read_latest_canonical_output(
                 symbol.upper(), venue,
             )
             source = "redis"
@@ -664,27 +672,33 @@ def inference_run(symbol: str, venue: str, force: bool, task: str | None,
 @inference_group.command("answer")
 @click.argument("symbol", default="BTCUSDT")
 @click.option("--venue", default="spot")
-@click.option("--artifact-id", default=None,
+@click.option("--run-id", "run_id", default=None,
               help="render the answer of one exact run record")
-def inference_answer(symbol: str, venue: str, artifact_id: str | None) -> None:
-    """Re-render the authored answer of a past cycle from its run record.
+@click.option("--artifact-id", "legacy_run_id", default=None,
+              help="(deprecated alias) same as --run-id")
+def inference_answer(symbol: str, venue: str, run_id: str | None,
+                     legacy_run_id: str | None) -> None:
+    """Return THE answer of a past cycle — the frozen answer of record.
 
-    The run record carries the authored interpretation + conformance, so
-    re-rendering is EXACT — the same composer reads the same record the
-    cycle-close surface rendered (parity by construction).
+    Canonical rows carry ``answer_text`` exactly as delivered at cycle
+    close (parity by identity). Pre-canonical (deprecated) rows carry no
+    frozen text and re-render through the one composer.
     """
     from market_service.nooa_harness.engine.core.answer import answer_from_record
 
-    async def _run() -> tuple[str | None, dict[str, Any] | None]:
-        return await _load_run_record(symbol, venue, artifact_id=artifact_id)
+    run_id = run_id or legacy_run_id
 
-    source, record = asyncio.run(_run())
-    del source  # the answer renders from the record, whatever its source
+    async def _run() -> dict[str, Any] | None:
+        return (await _load_run_record(symbol, venue, run_id=run_id))[1]
+
+    record = asyncio.run(_run())
     if record is None:
         raise click.ClickException(
             f"no run record for {symbol.upper()} {venue}"
-            + (f" / {artifact_id}" if artifact_id else ""))
-    answer_text = answer_from_record(record)
+            + (f" / {run_id}" if run_id else ""))
+    answer_text = record.get("answer_text")
+    if not answer_text:
+        answer_text = answer_from_record(record)
     if answer_text is None:
         raise click.ClickException(
             "run record carries no authored answer (the cycle degraded or "
@@ -695,15 +709,25 @@ def inference_answer(symbol: str, venue: str, artifact_id: str | None) -> None:
 @inference_group.command("read")
 @click.argument("symbol", default="BTCUSDT")
 @click.option("--venue", default="spot")
-@click.option("--artifact-id", default=None, help="read one exact artifact (durable ledger)")
+@click.option("--run-id", "run_id", default=None,
+              help="read one exact run record")
+@click.option("--artifact-id", "legacy_run_id", default=None,
+              help="(deprecated alias) same as --run-id")
 @click.option("--redis-only", is_flag=True, help="skip Postgres; read the live projection")
-def inference_read(symbol: str, venue: str, artifact_id: str | None,
+def inference_read(symbol: str, venue: str, run_id: str | None,
+                   legacy_run_id: str | None,
                    redis_only: bool) -> None:
-    """Read inference artifacts (Postgres-first durable ledger, Redis fallback)."""
+    """Read canonical run records (Postgres-first, Redis projection fallback).
+
+    Pre-canonical cycles fall back to the deprecated artifact ledger,
+    labeled ``legacy_artifact`` (read-only).
+    """
+    run_id = run_id or legacy_run_id
+
     async def _run() -> dict[str, Any]:
-        source, artifact = await _load_run_record(
-            symbol, venue, artifact_id=artifact_id, redis_only=redis_only)
-        return {"source": source, "artifact": artifact}
+        source, record = await _load_run_record(
+            symbol, venue, run_id=run_id, redis_only=redis_only)
+        return {"source": source, "record": record}
 
     _emit(asyncio.run(_run()))
 
@@ -713,19 +737,75 @@ def inference_read(symbol: str, venue: str, artifact_id: str | None,
 @click.option("--venue", default="spot")
 @click.option("--limit", type=int, default=20)
 def inference_history(symbol: str, venue: str, limit: int) -> None:
-    """Read the inference cycle history (durable ledger, newest first)."""
+    """Read the run history (canonical ledger, newest first)."""
     async def _run() -> dict[str, Any]:
         settings = _settings()
         postgres = PostgresRuntimeStore(settings.database_url)
         try:
             await postgres.connect()
-            history = await postgres.read_inference_history(symbol, limit=limit)
+            history = await postgres.read_canonical_history(symbol, limit=limit)
+            source = "postgres"
+            if not history:
+                history = await postgres.read_inference_history(symbol, limit=limit)
+                source = "legacy_artifact" if history else "postgres"
             return {"symbol": symbol.upper(), "count": len(history),
-                    "history": history}
+                    "source": source, "history": history}
         finally:
             await postgres.close()
 
     _emit(asyncio.run(_run()))
+
+
+# --------------------------------------------------------------------------
+# telemetry — the governed kernel's read-only observation surface
+# --------------------------------------------------------------------------
+TELEMETRY_PLANES = (
+    "ingestion", "capture", "calculation", "analysis", "agentic",
+)
+
+
+@command.group(
+    "telemetry",
+    help="Governed telemetry kernel: sink health and accepted state history "
+         "(read-only; never a control surface).",
+)
+def telemetry_group() -> None:
+    """Operational telemetry reads (PG replay source, Redis projections)."""
+
+
+@telemetry_group.command("status")
+def telemetry_status_cmd() -> None:
+    """Sink health per owner + ledger availability."""
+    from market_service.commands import telemetry as telemetry_cmd
+
+    _emit(asyncio.run(telemetry_cmd.telemetry_status()))
+
+
+@telemetry_group.command("read")
+@click.option("--plane", required=True,
+              type=click.Choice(TELEMETRY_PLANES),
+              help="emission plane (ingestion/capture/calculation/analysis/agentic)")
+@click.option("--owner", required=True,
+              help="declared emitter: poller, capture, cycle_controller, or a worker name")
+@click.option("--subject-type", default="symbol",
+              help="subject identity class (symbol/session/cycle/runtime)")
+@click.option("--subject-id", required=True,
+              help="the subject's identity value (e.g. SOLUSDT, artifact id)")
+@click.option("--limit", type=int, default=50,
+              help="max events (bounded, newest last)")
+@click.option("--rebuild", is_flag=True, default=False,
+              help="rebuild the Redis projection from the durable PG ledger")
+def telemetry_read_cmd(
+    plane: str, owner: str, subject_type: str, subject_id: str,
+    limit: int, rebuild: bool,
+) -> None:
+    """One subject's accepted event history + latest projection."""
+    from market_service.commands import telemetry as telemetry_cmd
+
+    _emit(asyncio.run(telemetry_cmd.telemetry_read(
+        plane=plane, owner=owner, subject_type=subject_type,
+        subject_id=subject_id, limit=limit, rebuild=rebuild,
+    )))
 
 
 __all__ = ["command"]

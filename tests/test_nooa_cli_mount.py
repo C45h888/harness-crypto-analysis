@@ -38,12 +38,13 @@ class NooaCliMountTests(unittest.TestCase):
     def test_market_group_has_harness_subcommands(self):
         # The envelope dataclass read path was retired 2026-08-30 in favour
         # of ``market read`` (runtime.read_paths): the surface is now read /
-        # memory / microstructure / inference.
+        # memory / microstructure / inference, plus the read-only ``telemetry``
+        # observation surface owned by the governed telemetry kernel.
         names = set(_MOUNTED.commands["market"].commands)
         self.assertEqual(
             names,
             {"read", "memory", "microstructure", "inference",
-             "substrate-read", "substrate"},
+             "substrate-read", "substrate", "telemetry"},
         )
 
     def test_mount_does_not_write_into_framework_package(self):

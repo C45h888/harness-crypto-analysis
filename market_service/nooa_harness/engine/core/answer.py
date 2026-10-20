@@ -24,12 +24,17 @@ Doctrine (binding):
 - Null discipline: a null value renders ``null`` — never zero, never a
   placeholder.
 
-Pure: dicts in, string out. No I/O, no engine imports, no clock.
+Pure: dicts in, string out. No I/O, no engine imports, no clock — the
+run-record view resolves through the charter owner
+(``runtime.contracts.run_record_of``), so both record shapes (canonical
+rows + deprecated legacy) read as one.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from market_service.runtime.contracts import run_record_of
 
 __all__ = [
     "MISSING",
@@ -94,8 +99,7 @@ def answer_inputs_from_record(
     record = record if isinstance(record, dict) else {}
     interp = record.get("interpretation")
     interp = interp if isinstance(interp, dict) else {}
-    ds = record.get("deterministic_state")
-    ds = ds if isinstance(ds, dict) else {}
+    ds = run_record_of(record).get("deterministic_state") or {}
     hypothesis = record.get("hypothesis")
     hypothesis = hypothesis if isinstance(hypothesis, dict) else {}
     directive = ds.get("task_directive")
@@ -207,7 +211,7 @@ def answer_inputs_from_record(
     run_meta = {
         "symbol": _text(record.get("symbol")),
         "venue": _text(record.get("venue")),
-        "artifact_id": _text(record.get("artifact_id")),
+        "run_id": _text(record.get("run_id") or record.get("artifact_id")),
         "generated_at": _text(record.get("generated_at")),
         "session_id": _text(record.get("session_id")),
         "task": _text(ds.get("task")),
@@ -224,8 +228,7 @@ def answer_from_record(record: dict[str, Any] | None) -> str | None:
     """
     if not isinstance(record, dict) or record.get("interpretation") is None:
         return None
-    ds = record.get("deterministic_state")
-    ds = ds if isinstance(ds, dict) else {}
+    ds = run_record_of(record).get("deterministic_state") or {}
     conformance = ds.get("conformance")
     conformance = conformance if isinstance(conformance, dict) else {}
     if conformance.get("tier") != "authored":
@@ -428,7 +431,7 @@ def render_answer(structured: dict[str, Any]) -> str:
     lines.append("run: {} {} · {}".format(
         meta.get("symbol") or "?", meta.get("venue") or "?",
         meta.get("generated_at") or "?"))
-    lines.append(f"artifact: {meta.get('artifact_id') or '?'}")
+    lines.append(f"run id: {meta.get('run_id') or '?'}")
     lines.append(f"task: {meta.get('task') or '(none)'}")
     lines.append("")
 

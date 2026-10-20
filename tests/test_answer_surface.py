@@ -91,8 +91,8 @@ class CliCloseSurfaceTests(unittest.TestCase):
         fake = {
             "status": "provisional", "symbol": "BTCUSDT", "venue": "spot",
             "answer": answer,
-            "artifact_id": "00000000-0000-0000-0000-000000000001",
-            "artifact": {}, "cycle": {"terminal": "settled"},
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "record": {}, "cycle": {"terminal": "settled"},
         }
         with patch("market_service.nooa_harness.inference_runner.run_inference_once",
                    new=AsyncMock(return_value=fake)):
@@ -102,11 +102,11 @@ class CliCloseSurfaceTests(unittest.TestCase):
         # the answer is the close surface: it leads stdout...
         self.assertTrue(result.output.startswith(answer))
         # ...and the machine metadata stays beside it
-        self.assertIn('"artifact_id"', result.output)
+        self.assertIn('"run_id"', result.output)
 
     def test_run_without_authored_answer_prints_metadata_only(self):
         fake = {"status": "provisional", "symbol": "BTCUSDT", "venue": "spot",
-                "answer": None, "artifact": {}, "cycle": {}}
+                "answer": None, "record": {}, "cycle": {}}
         with patch("market_service.nooa_harness.inference_runner.run_inference_once",
                    new=AsyncMock(return_value=fake)):
             result = CliRunner().invoke(
@@ -121,7 +121,7 @@ class AnswerSubcommandTests(unittest.TestCase):
         cls._record = _authored_run()["artifact"]
 
     def _invoke(self, args, record, source="postgres"):
-        async def _load(symbol, venue, artifact_id=None, redis_only=False):
+        async def _load(symbol, venue, run_id=None, redis_only=False):
             return source, record
 
         with patch("market_service.commands.nooa_cli_ext._load_run_record",
@@ -145,8 +145,8 @@ class AnswerSubcommandTests(unittest.TestCase):
     def test_exact_run_record_selection(self):
         seen = {}
 
-        async def _load(symbol, venue, artifact_id=None, redis_only=False):
-            seen["artifact_id"] = artifact_id
+        async def _load(symbol, venue, run_id=None, redis_only=False):
+            seen["run_id"] = run_id
             return "postgres", self._record
 
         with patch("market_service.commands.nooa_cli_ext._load_run_record",
@@ -154,9 +154,9 @@ class AnswerSubcommandTests(unittest.TestCase):
             result = CliRunner().invoke(
                 market_group,
                 ["inference", "answer", "BTCUSDT",
-                 "--artifact-id", "00000000-0000-0000-0000-000000000001"])
+                 "--run-id", "00000000-0000-0000-0000-000000000001"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(seen["artifact_id"],
+        self.assertEqual(seen["run_id"],
                          "00000000-0000-0000-0000-000000000001")
 
     def test_missing_run_record_is_an_honest_error(self):
@@ -167,6 +167,7 @@ class AnswerSubcommandTests(unittest.TestCase):
     def test_degraded_run_record_never_authors_an_answer(self):
         record = json.loads(json.dumps(self._record))
         record["interpretation"] = None
+        record["answer_text"] = None
         result = self._invoke(["inference", "answer", "BTCUSDT"], record)
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("no authored answer", result.output)
