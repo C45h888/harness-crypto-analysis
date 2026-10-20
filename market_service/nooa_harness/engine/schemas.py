@@ -128,6 +128,11 @@ def extract_json_object(raw: str) -> dict[str, Any] | None:
 
 
 
+#: Per-turn evidence ceiling. A merge_interpretation union across turns is
+#: bounded separately in config.MAX_MERGED_EVIDENCE.
+EVIDENCE_PER_TURN_CAP = 16
+
+
 def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     """Normalize one narration turn: drop undispatchable tool_calls entries.
 
@@ -150,6 +155,20 @@ def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
                 "mode": "invalid", "raw": str(intent)[:200]}
         else:
             intent["mode"] = str(intent.get("mode") or "").strip().lower()
+    # Structural bound (lean thread): the judged evidence set must not
+    # outrun the repair budget. Cap per-turn entries (temporal primacy —
+    # lead citations first); merge_interpretation still unions across turns
+    # with dedupe. Dropped tail is logged, never silent.
+    #
+    # This MUST run before the tool_calls early-returns below: finalize /
+    # composition turns legitimately carry no `tool_calls` key, and the old
+    # ordering let them through uncapped (live 2026-10-20: a finalize turn
+    # shipped an unbounded evidence dump past the cap).
+    evidence = parsed.get("evidence")
+    if isinstance(evidence, list) and len(evidence) > EVIDENCE_PER_TURN_CAP:
+        log.warning("capping turn evidence %d → %d entries",
+                    len(evidence), EVIDENCE_PER_TURN_CAP)
+        parsed["evidence"] = evidence[:EVIDENCE_PER_TURN_CAP]
     calls = parsed.get("tool_calls")
     if calls is None:
         return parsed
@@ -176,14 +195,6 @@ def coerce_turn(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     hypothesis = parsed.get("hypothesis")
     if hypothesis is not None and not isinstance(hypothesis, dict):
         parsed["hypothesis"] = {"raw": hypothesis}
-    # Structural bound (lean thread): the judged evidence set must not
-    # outrun the repair budget. Cap per-turn entries (temporal primacy —
-    # lead citations first); merge_interpretation still unions across turns
-    # with dedupe. Dropped tail is logged, never silent.
-    evidence = parsed.get("evidence")
-    if isinstance(evidence, list) and len(evidence) > 16:
-        log.warning("capping turn evidence %d → 16 entries", len(evidence))
-        parsed["evidence"] = evidence[:16]
     return parsed
 
 

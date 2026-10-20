@@ -121,6 +121,19 @@ def _recall_int(name: str, default: int, *, lo: int, hi: int) -> int:
 MEMORY_RECALL_LIMIT = _recall_int("NOOA_MEMORY_RECALL_LIMIT", 8, lo=2, hi=32)
 MEMORY_CONTEXT_BUDGET = _recall_int("NOOA_MEMORY_CONTEXT_BUDGET", 4_000, lo=1_000, hi=16_000)
 
+# --- Evidence bounds (gate/assembly authority split) ---
+# Per-TURN cap lives in schemas.coerce_turn (temporal primacy, lead first).
+# A turn cap cannot bound the JUDGED set: merge_interpretation unions across
+# every turn of a cycle (16 x ~15 turns). This is the cycle-level bound the
+# gate actually judges; excess is truncated with a log, never silently.
+MAX_MERGED_EVIDENCE = _recall_int("NOOA_MAX_MERGED_EVIDENCE", 24, lo=8, hi=64)
+# Removal-only salvage at the validation terminal: when the repair budget is
+# spent and EVERY remaining miss is an entry-shape miss (null value on a
+# non-refusal path), the engine may drop those entries deterministically and
+# re-judge once. Bounded so a junk cycle (half the entries unbackable) still
+# terminals instead of being laundered into a settled artifact.
+MAX_SALVAGE_ENTRIES = _recall_int("NOOA_MAX_SALVAGE_ENTRIES", 8, lo=1, hi=32)
+
 # --- Headline bound for the prior-artifact block in the prompt. ---
 _PRIOR_HEADLINE_MAX_CHARS = _recall_int("NOOA_PRIOR_HEADLINE_CHARS", 2_000, lo=500, hi=8_000)
 
@@ -226,6 +239,8 @@ __all__ = [
     "SUMMARY_MIN_CHARS",
     "MEMORY_RECALL_LIMIT",
     "MEMORY_CONTEXT_BUDGET",
+    "MAX_MERGED_EVIDENCE",
+    "MAX_SALVAGE_ENTRIES",
     "_PRIOR_HEADLINE_MAX_CHARS",
     "_STRUCTURED_OK",
     "_TOOL_MANIFEST",

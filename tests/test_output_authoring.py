@@ -279,7 +279,7 @@ class AuthoredShipWalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fv.get("passed"))
         self.assertTrue(any("summary" in m for m in fv.get("missing") or []))
         self.assertTrue(any("evidence" in m for m in fv.get("missing") or []))
-        conf = artifact.deterministic_state.get("conformance") or {}
+        conf = artifact.run_record["deterministic_state"].get("conformance") or {}
         self.assertEqual(conf.get("tier"), "authored")
         self.assertFalse(conf.get("correction_used"))
 
@@ -300,7 +300,7 @@ class AuthoredShipWalkTests(unittest.IsolatedAsyncioTestCase):
         # The corrected citations are frame-backed and kept.
         self.assertGreaterEqual(
             len(artifact.interpretation.get("evidence") or []), 2)
-        conf = artifact.deterministic_state.get("conformance") or {}
+        conf = artifact.run_record["deterministic_state"].get("conformance") or {}
         self.assertTrue(conf.get("correction_used"))
 
 

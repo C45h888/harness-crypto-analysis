@@ -7,7 +7,7 @@ import logging
 from dataclasses import replace
 from typing import Any
 
-from market_service.runtime.contracts import InferenceArtifact
+from market_service.runtime.contracts import CanonicalOutput
 from . import context
 from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
 from ..fsm import GovernanceEvent, GovernanceEventKind
@@ -64,32 +64,50 @@ def build_output_frame(
 
 def _assemble_authored(
     composed: dict[str, Any], frame: dict[str, Any],
+    accumulated: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Deterministic ASSEMBLE over the AUTHORED object (pure).
 
-    Fact-check, never author: evidence entries whose path is not
-    frame-backed (or cites agent memory) are dropped with a record — the one
-    doctrine that lets the engine remove content is "narration carries zero
-    numbers the ledger cannot back". Everything else is the agent's
-    AUTHENTIC output: no substitution, no backfill, no silent relabeling —
-    choice/verdict conflicts surface via ``check_authored_output``, never a
-    rewrite here. Returns (final, dropped_paths).
+    Fact-check, never author words: evidence entries that are unshippable
+    per the shared ``classify_evidence`` authority are dropped with a
+    record — the one doctrine that lets the engine remove content is
+    "narration carries zero numbers the ledger cannot back". Unshippable
+    means: no path, unbacked head (unknown tool / ``memory.*``), or a null
+    value on a non-refusal path (a path-only claim names no number the
+    ledger can back). Empty ``interpretation`` is a quality finding, never
+    a drop. With ``accumulated`` store truth, the completion half applies
+    first (``synthesize.complete_evidence``): null values on resolving
+    paths are FILLED, mismatched values CORRECTED, each with a
+    ``filled:``/``corrected:`` marker on the trail; wording untouched.
+    Everything else is the agent's AUTHENTIC output: no substitution, no
+    backfill, no silent relabeling — choice/verdict conflicts surface via
+    ``check_authored_output``, never a rewrite here. Returns
+    (final, dropped_paths).
     """
-    from .synthesize import path_resolves
+    from .synthesize import (
+        classify_evidence, complete_evidence, EVIDENCE_DROP_CODES,
+    )
     try:
         final = dict(composed)
         dropped: list[str] = []
+        markers: list[str] = []
         ev = final.get("evidence")
         if isinstance(ev, list):
+            work = list(ev)
+            if accumulated is not None:
+                work, filled, corrected, comp_dropped = complete_evidence(
+                    work, accumulated, frame)
+                markers = list(filled) + list(corrected) + list(comp_dropped)
             kept = []
-            for entry in ev:
-                if not isinstance(entry, dict) or not str(entry.get("path") or "").strip():
-                    dropped.append(str((entry or {}).get("path") or "<empty>"))
+            for entry in work:
+                if not isinstance(entry, dict):
+                    dropped.append("<non-object>")
                     continue
-                if not path_resolves(frame, entry.get("path")):
-                    dropped.append(str(entry.get("path")))
+                if classify_evidence(entry, frame) in EVIDENCE_DROP_CODES:
+                    dropped.append(str(entry.get("path") or "<empty>"))
                     continue
                 kept.append(entry)
+            dropped = list(dropped) + list(markers)
             final["evidence"] = kept
         return final, dropped
     except Exception:
@@ -99,7 +117,7 @@ def _assemble_authored(
 
 async def run_output(
     engine: Any, ctx: "_CycleContext", st: Any,
-) -> tuple[InferenceArtifact, dict[str, Any]]:
+) -> tuple[CanonicalOutput, dict[str, Any]]:
     """OUTPUT loop (FINALIZE seam) — synthesize, persist, settle."""
     gathered, reasoned = ctx.gathered, ctx.reasoned
     if gathered is None or reasoned is None:
@@ -238,7 +256,8 @@ async def run_output(
         # ASSEMBLE (deterministic fact-check) + GROUND (relaxed hard gate)
         # on the object that will SHIP — the agent's authentic output.
         from .synthesize import check_authored_output, memory_context_block
-        authored, _dropped = _assemble_authored(authored, frame)
+        authored, _dropped = _assemble_authored(
+            authored, frame, accumulated_tool_results)
         for _d in _dropped:
             log.warning("assembly dropped (not frame-backed): %s", _d[:160])
         _assembly_prev = deterministic_state.get("assembly_dropped") or []
@@ -277,7 +296,8 @@ async def run_output(
                 correction_used = True
                 fixed = coerce_turn(extract_json_object(raw_fix))
                 if isinstance(fixed, dict):
-                    fixed, _fix_dropped = _assemble_authored(fixed, frame)
+                    fixed, _fix_dropped = _assemble_authored(
+                        fixed, frame, accumulated_tool_results)
                     for _d in _fix_dropped:
                         log.warning("correction assembly dropped: %s", _d[:160])
                     _prev_dropped = deterministic_state.get("assembly_dropped") or []
@@ -443,7 +463,7 @@ async def run_output(
         terminal = controller.terminal.value if controller.terminal else "budget_exhausted"
         deterministic_state["terminal"] = terminal
         ctx.controller = controller
-        return await engine._degraded_artifact(
+        return await engine._degraded_output(
             deterministic_state, capability_log,
             "output reached without a validated final",
         ), {"llm_calls": llm_calls, "terminal": terminal}
@@ -455,17 +475,20 @@ async def run_output(
         controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.PLACEMENT
     )
 
-    # Persist a pending artifact first.  The final terminal is written only
-    # after the durable update receipt is known.
+    # --- OUTPUT PLACEMENT (C2 canonical path) ---
+    # The deliverable is THE ANSWER (canonical-output doctrine): compose it
+    # from the record that ships, DELIVER it to its surface (confirmation =
+    # the call returns), then PLACE the canonical output row (bookkeeping).
+    # PLACEMENT = deliver + confirm; SETTLE gates on delivery confirmation +
+    # recorded receipts — never on a store write. Placement failures are
+    # RECORDED as run_record_errors and never block settlement.
     deterministic_state["terminal"] = "pending_settlement"
     deterministic_state["loop_traversal"] = controller.loop_coverage()
     deterministic_state["congruence"] = controller.congruence()
-    pending = InferenceArtifact.create(
+    pending = CanonicalOutput.create(
         symbol=engine.symbol, venue=engine.venue,
         generated_at=generated_at, completed_at=context._utc_now_iso(),
         status=gate_status, window_minutes=30, interval_seconds=10,
-        deterministic_state=dict(deterministic_state),
-        capability_log=capability_log,
         input_hash=str(
             (deterministic_state.get("forecast_result") or {}).get("input_hash")
             or (evidence or {}).get("input_hash")
@@ -476,17 +499,44 @@ async def run_output(
             or "inference-engine-v1"
         ),
         interpretation=interpretation,
-        session_id=engine.session_id,
         hypothesis=hypothesis,
         hypothesis_verdict=hypothesis_verdict,
         verdict_reason=verdict_reason,
         calculations=calculations,
+        conformance=deterministic_state.get("conformance"),
+        run_record={
+            "deterministic_state": dict(deterministic_state),
+            "capability_log": list(capability_log),
+            "errors": [],
+        },
+        task=str(task or "")[:200] or None,
+        terminal="pending_settlement",
+        session_id=engine.session_id,
     )
-    persistence = await engine._persist(pending)
-    durable_ok = bool(
-        persistence.get("postgres") if engine.postgres is not None
-        else persistence.get("redis")
-    )
+
+    # --- DELIVER (the answer reaches its surface; render failure counts) ---
+    answer_text, answer_struct = None, None
+    delivery_error = None
+    try:
+        from .answer import (
+            answer_from_record, answer_inputs_from_record,
+            compose_answer_structured,
+        )
+        answer_text = answer_from_record(pending.to_dict())
+        if answer_text is not None:
+            answer_struct = compose_answer_structured(
+                *answer_inputs_from_record(pending.to_dict()))
+            await engine._deliver_answer(answer_text)
+    except Exception as exc:
+        log.exception("answer delivery failed")
+        delivery_error = f"{type(exc).__name__}: {exc}"
+    delivery_ok = delivery_error is None
+    output = replace(pending, answer_text=answer_text, answer=answer_struct)
+
+    # --- PLACE (the canonical output row: run-record bookkeeping) ---
+    placement = await engine._place_output(output)
+    from .runner import run_record_errors_of
+    run_record_errors = run_record_errors_of(placement)
 
     # --- AGENT MEMORY (the agent owns it) ---
     # The agent writes its own memory through the memory.* tools, in flight, at
@@ -502,70 +552,48 @@ async def run_output(
     receipts.append_receipt(deterministic_state, LoopReceipt(
         loop=NestedLoop.OUTPUT, sub_loop=SubLoop.MEMORY,
         disposition=(ReceiptDisposition.COMPLETED
-                     if durable_ok
+                     if delivery_ok
                      else ReceiptDisposition.REFUSED),
         steps=(LoopStep.ASSEMBLE, LoopStep.GROUND,
                LoopStep.UNDERSTAND_SURFACE, LoopStep.LOCATE_OUTPUT,
                LoopStep.PERSIST, LoopStep.CONFIRM,
                LoopStep.PROPOSE, LoopStep.RESOLVE, LoopStep.SETTLE),
-        payload={"durable_ok": bool(durable_ok)},
-        evidence_refs=(pending.artifact_id,),
+        payload={"delivered": bool(delivery_ok),
+                 "run_record": "errors" if run_record_errors else "recorded"},
+        evidence_refs=(output.run_id,),
     ))
     controller, _ = context._must_govern(
         controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )
 
-    final_terminal = "settled" if durable_ok else "infra_failed"
+    # --- SETTLE (delivery confirmation + receipts recorded) ---
+    final_terminal = "settled" if delivery_ok else "delivery_failed"
     deterministic_state["terminal"] = final_terminal
-    deterministic_state["persistence"] = persistence
+    deterministic_state["persistence"] = placement
     deterministic_state["loop_traversal"] = controller.loop_coverage()
     deterministic_state["congruence"] = controller.congruence()
-    final_errors = list(pending.errors)
-    if not durable_ok:
-        final_errors.append({"source": "persistence", "error": "durable artifact receipt missing"})
-    artifact = replace(
-        pending,
-        deterministic_state=dict(deterministic_state),
-        errors=tuple(final_errors),
+    output = replace(
+        output,
+        terminal=final_terminal,
+        run_record={
+            "deterministic_state": dict(deterministic_state),
+            "capability_log": list(capability_log),
+            "errors": list(run_record_errors),
+        },
     )
-    # --- C2 ANSWER (docs/CLI_ANSWER_SURFACE_PLAN.md §2/§4, slice S2) ---
-    # The composer renders THE ANSWER from the run record that ships: one
-    # composer, one format — the cycle-close CLI surface and the
-    # ``nooa market inference answer`` re-render of a past run both read
-    # exactly this record. Render-only here (additive); settlement semantics
-    # are untouched until the C2 switch (slice S3).
-    answer_text = None
-    try:
-        from .answer import answer_from_record
-        answer_text = answer_from_record(artifact.to_dict())
-    except Exception:
-        log.exception("answer composition failed; run record unaffected")
-    final_persistence = await engine._finalize_persisted(artifact) if durable_ok else persistence
-    persistence["final"] = final_persistence
-    if durable_ok:
-        if final_persistence.get("postgres") is False:
-            final_terminal = "infra_failed"
-            deterministic_state["terminal"] = final_terminal
-            artifact = replace(
-                artifact,
-                deterministic_state=dict(deterministic_state),
-                errors=tuple(list(artifact.errors) + [{
-                    "source": "persistence", "error": "final durable update failed",
-                }]),
-            )
-        elif final_terminal == "settled":
-            # SETTLE is permitted only after the final durable receipt and
-            # only when memory disposition also succeeded.  A durable row is
-            # not enough to hide a failed side effect.
-            controller, _ = context._must_govern(
-                controller, GovernanceEventKind.SETTLE
-            )
+    if delivery_ok:
+        # SETTLE is permitted once the ANSWER is confirmed delivered and the
+        # receipts are recorded. A run-record write is bookkeeping — its
+        # failure never hides a delivered answer nor blocks the settle.
+        controller, _ = context._must_govern(
+            controller, GovernanceEventKind.SETTLE
+        )
     if final_terminal != "settled" and controller.terminal is None:
         controller = controller.advance(
-            context.failure_event("infra_failed")
+            context.failure_event("delivery_failed")
         )
     terminal = controller.terminal.value if controller.terminal else final_terminal
-    # Placement is complete only after the write/receipt path ran.  MEMORY
+    # Placement is complete only after the deliver/confirm path ran.  MEMORY
     # was completed above and cannot be claimed by a planned tuple.
     controller = controller.record_loop_visit(
         "output", passes_per_loop.get("output", 0),
@@ -576,17 +604,34 @@ async def run_output(
     deterministic_state["terminal"] = terminal
     deterministic_state["loop_traversal"] = controller.loop_coverage()
     deterministic_state["governance_trace"] = controller.transition_trace()
-    artifact = replace(artifact, deterministic_state=dict(deterministic_state))
-    # Refresh the durable row once more with the terminal and complete FSM
-    # trace.  The first finalization establishes the terminal; this pass
-    # closes the small metadata gap created by SETTLE itself.
-    if durable_ok:
-        persistence["final_trace"] = await engine._finalize_persisted(artifact)
+    output = replace(
+        output,
+        terminal=terminal,
+        run_record={
+            "deterministic_state": dict(deterministic_state),
+            "capability_log": list(capability_log),
+            "errors": list(run_record_errors),
+        },
+    )
+    # Refresh the canonical row once more with the terminal and complete FSM
+    # trace (best-effort bookkeeping — recorded, never blocking).
+    placement["final_trace"] = await engine._finalize_output(output)
+    run_record_errors = run_record_errors + run_record_errors_of(
+        placement["final_trace"])
+    # Honest reporting: the verdict describes the object that ships — and
+    # whether the deliverable actually reached its surface.
+    if isinstance(final_validation, dict):
+        final_validation = dict(final_validation)
+        final_validation["delivered"] = delivery_ok
+        if delivery_error:
+            final_validation["delivery_error"] = delivery_error
     cycle_meta = {
         "task": task[:200] if task else None,
         "scenario": scenario,
         "terminal": terminal,
         "answer": answer_text,
+        "delivery": {"delivered": delivery_ok, "error": delivery_error},
+        "run_record_errors": run_record_errors,
         "unexecuted_tool_calls": unexecuted,
         "llm_calls": llm_calls,
         "passes_per_loop": passes_per_loop,
@@ -597,8 +642,8 @@ async def run_output(
         "repairs": repairs_sent,
         "phase_coverage": {p: sorted(s) for p, s in phase_coverage.items()},
         "final_validation": final_validation,
-        "persistence": persistence,
+        "persistence": placement,
     }
-    return artifact, cycle_meta
+    return output, cycle_meta
 
 

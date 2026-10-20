@@ -318,5 +318,68 @@ class StatusFamilyTests(unittest.TestCase):
                                  f"status families {a} and {b} share words")
 
 
+class CanonicalOutputCharterTests(unittest.TestCase):
+    """The answer surface is CHARTERED (canonical output plane, C2/C4).
+
+    Owner: ``engine/core/answer.py`` (format) + PLACEMENT (delivery).
+    Contract: ``runtime/contracts.CanonicalOutput``. The composer's read
+    contract is pinned here: state resolves through the charter owner
+    (``run_record_of``) and only declared record fields may influence the
+    answer — nothing bolted-on, no mirrored views.
+    """
+
+    # The composer's DECLARED read set (record fields it may consume).
+    DECLARED_RECORD_FIELDS = frozenset({
+        "run_id", "artifact_id", "symbol", "venue", "generated_at",
+        "session_id", "status", "interpretation", "hypothesis", "run_record",
+    })
+
+    def test_registry_identity(self):
+        self.assertIs(runtime_contracts.CANONICAL_OUTPUT_SCHEMA_VERSION,
+                      runtime_contracts.SCHEMA_VERSION_REGISTRY["canonical_output"])
+
+    def test_composer_resolves_state_through_the_charter_owner(self):
+        from market_service.nooa_harness.engine.core import answer
+
+        src = inspect.getsource(answer)
+        self.assertIn("from market_service.runtime.contracts import run_record_of",
+                      src)
+        self.assertIn("run_record_of(", src)
+
+    def test_composer_read_contract_is_the_declared_field_set(self):
+        from market_service.nooa_harness.engine.core.answer import (
+            answer_inputs_from_record,
+        )
+
+        record = {
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "symbol": "BTCUSDT", "venue": "spot",
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "session_id": "sess", "status": "provisional",
+            "interpretation": {"summary": "s", "confidence": "low"},
+            "hypothesis": {"H0": "h"},
+            "run_record": {"deterministic_state": {"task": "t"}},
+        }
+        base = answer_inputs_from_record(record)
+        # Undeclared extras must never influence the composer's inputs.
+        poisoned = dict(record)
+        poisoned["answer_text"] = "engine-authored leak"
+        poisoned["terminal"] = "flagged"
+        poisoned["run_record"] = dict(record["run_record"],
+                                     errors=[{"source": "poison"}])
+        self.assertEqual(answer_inputs_from_record(poisoned), base)
+        # The declared set is what the composer keys on (allow the legacy
+        # alias only).
+        self.assertLessEqual(
+            {k for k in record if k != "run_record"},
+            self.DECLARED_RECORD_FIELDS)
+
+    def test_run_record_errors_are_never_a_state_root(self):
+        from market_service.nooa_harness.engine.core import context
+
+        self.assertNotIn("run_record_errors", context.DETERMINISTIC_STATE_ROOTS)
+        self.assertNotIn("answer", context.DETERMINISTIC_STATE_ROOTS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -246,6 +246,10 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     # re-ordered cycle roots (comprehension/acquisition plane)
     "data_quality", "seeded_plan", "plan_gate", "persistence",
     "narration_tiers", "base_summary", "assembly_dropped",
+    # removal-only evidence salvage (core/validation.py): the audit record of
+    # null-valued citations dropped at the validation terminal so a cycle
+    # settles instead of failing on entries no ledger can back.
+    "evidence_salvaged",
     # authored-output conformance verdict (core/output.py): the honest
     # tier/drops/conflicts record for the object that SHIPS.
     "conformance",
@@ -662,7 +666,7 @@ async def run_runtime_failure(
     }
     st.deterministic_state["loop_traversal"] = st.controller.loop_coverage()
     st.deterministic_state["governance_trace"] = st.controller.transition_trace()
-    return await engine._degraded_artifact(
+    return await engine._degraded_output(
         st.deterministic_state, st.capability_log,
         f"{kind}: {st.failure_detail or 'runtime failure'}",
     ), {
@@ -724,7 +728,7 @@ async def run_validation_terminal(
     st.deterministic_state["validation_issue"] = validation_issue
     st.deterministic_state["loop_traversal"] = st.controller.loop_coverage()
     st.deterministic_state["congruence"] = st.controller.congruence()
-    return await engine._degraded_artifact(
+    return await engine._degraded_output(
         st.deterministic_state, st.capability_log,
         f"validation_failed: {'; '.join(missing)[:500]}",
     ), {

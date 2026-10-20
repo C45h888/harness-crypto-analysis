@@ -16,15 +16,19 @@ backward-compatible imports.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Mapping
 
 from . import context
+from ..llm import narration_failure_kind
 from ..schemas import coerce_turn, extract_json_object
 from ..controller import next_uncovered_phase
 from ..config import (
     SUMMARY_MIN_CHARS,
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
+    MAX_MERGED_EVIDENCE,
+    MAX_SALVAGE_ENTRIES,
     VALIDATION_RETRY_PASSES,
 )
 from .context import (
@@ -61,6 +65,7 @@ __all__ = [
 
 def _record_verdict_chosen(
     st: CycleRuntimeState, ctx: Any, *, outcome: str,
+    judged: dict[str, Any] | None = None,
 ) -> None:
     """Record the adjudication decision on the central ledger (best-effort).
 
@@ -73,7 +78,11 @@ def _record_verdict_chosen(
     """
     try:
         from .chain import build_hypothesis_frame as _bhf_vc
-        judged = merge_interpretation(st.turn_log)
+        # A salvaged gate judges a REDUCED evidence view; record that same
+        # view so the ledger never claims a settlement the gate did not
+        # actually approve.
+        if judged is None:
+            judged = merge_interpretation(st.turn_log)
         probs = judged.get("hypothesis_probabilities")
         _dir = getattr(st, "task_directive", None)
         frame = _bhf_vc(
@@ -251,8 +260,53 @@ async def run_validation(
     # phase checks pass (refused links stay findings — only never-attempted
     # links and halts block here).
     passed = passed and not st_chain["missing"] and not halted
+    # FORCED FINAL — the missing link (config budget comment promised
+    # "narrate#1 + tool follow-ups + repairs + forced-final" but no such turn
+    # existed). Live probe 2026-09-28: 12 in-loop turns returned tool_calls
+    # only — summary/evidence/hypothesis empty in EVERY turn, while the same
+    # model with a dedicated finalize request returns the complete final
+    # object. So spend one tool-free finalize turn (small context, field
+    # shapes inline) and let this gate judge it. Runs BEFORE salvage and only
+    # on a failed gate: a cycle that passed at the retry ceiling must not
+    # pay an extra turn.
+    if (not passed
+            and st.validation_retries_used >= VALIDATION_RETRY_PASSES
+            and not st.forced_final_sent):
+        st.forced_final_sent = True
+        if await _forced_final_turn(engine, ctx, st, list(missing)) is not None:
+            return await run_validation(engine, ctx, st)
+        # The finalize attempt yielded nothing usable; fall through to
+        # salvage — the pre-existing turn log may still be salvable.
+    # REMOVAL-ONLY SALVAGE (terminal boundary). Doctrine: "narration carries
+    # zero numbers the ledger cannot back" — so a citation with a null value
+    # on a non-refusal path is REMOVABLE, not fatal. The repair budget and the
+    # forced-final turn are spent by now; if every remaining miss is that one
+    # entry-shape class, drop those entries deterministically and re-judge
+    # once. Any other miss (phase/hypothesis/confidence/roots/ΔP/scenario/
+    # directive/chain/halt) vetoes — salvage never papers over a real gap.
+    # The re-judge is the safety net: removing an entry can delete the ΔP
+    # citation or the last distinct root, and then the terminal stands.
+    salvaged: list[dict[str, Any]] = []
+    if (not passed
+            and st.validation_retries_used >= VALIDATION_RETRY_PASSES
+            and st.forced_final_sent):
+        _salvaged_view, _remaining, _dropped = salvage_entry_shape_misses(
+            judged, missing,
+            coverage=st.controller.phase_coverage,
+            scenario=ctx.scenario,
+            scenario_status=st.controller.scenario_state(),
+            scenario_refusal_reason=st.controller.scenario_refusal_reason(),
+            accumulated=st.accumulated_tool_results,
+            task_plan=st.task_plan,
+        )
+        if _salvaged_view is not None:
+            judged, missing, passed = _salvaged_view, _remaining, True
+            salvaged = _dropped
+            _record_evidence_salvage(st, ctx, salvaged)
     if passed:
         st.final_validation = {"passed": True, "missing": []}
+        if salvaged:
+            st.final_validation["salvaged"] = list(salvaged)
         st.finalize_now = True
         _record_scenario_evaluation(st)
         if st.controller.observation is not None and st.controller.observation.sub_loop is not None:
@@ -272,22 +326,13 @@ async def run_validation(
                    LoopStep.CLASSIFY_FINDINGS),
             payload={"retries_used": st.validation_retries_used},
         )
-        _record_verdict_chosen(st, ctx, outcome="settled")
+        _record_verdict_chosen(
+            st, ctx,
+            outcome="settled_salvaged" if salvaged else "settled",
+            judged=judged)
         ctx.controller = st.controller
         ctx.reasoned = st.to_reasoned()
         return None
-    if (st.validation_retries_used >= VALIDATION_RETRY_PASSES
-            and not st.forced_final_sent):
-        # FORCED FINAL — the missing link (config budget comment promised
-        # "narrate#1 + tool follow-ups + repairs + forced-final" but no such
-        # turn existed). Live probe 2026-09-28: 12 in-loop turns returned
-        # tool_calls only — summary/evidence/hypothesis empty in EVERY turn,
-        # while the same model with a dedicated finalize request returns the
-        # complete final object. So spend one tool-free finalize turn (small
-        # context, field shapes inline) and let this gate judge it.
-        st.forced_final_sent = True
-        if await _forced_final_turn(engine, ctx, st, list(missing)) is not None:
-            return await run_validation(engine, ctx, st)
     if st.validation_retries_used >= VALIDATION_RETRY_PASSES:
         _record_verdict_chosen(st, ctx, outcome="validation_failed")
         return await run_validation_terminal(engine, ctx, st, list(missing))
@@ -353,7 +398,10 @@ async def run_validation(
         context.record_tier(st)
     except Exception as exc:
         log.exception("repair turn failed; dispatching to the failure node")
-        st.failure_kind = "narration_failed"
+        # Cause-carrying kinds: Signal B stall verdicts route as their
+        # stall kind (same prompt retry — repair prompts are already
+        # missing-focused with a bounded digest, nothing to shrink).
+        st.failure_kind = narration_failure_kind(exc)
         st.failure_detail = f"{type(exc).__name__}: {exc}"
         # Bounded RETRY: substrate dispatches the narration worker, which
         # re-attempts the repair call (worker owns the transport).
@@ -518,7 +566,12 @@ def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
 
       summary       — longest non-empty across turns (P4 explanation)
       hypothesis    — LAST non-null dict (revision wins)
-      evidence      — union, order-preserving, deduped on (path, value)
+      evidence      — union, order-preserving, deduped BY PATH: a later
+                      non-null value supersedes an earlier null (a repair
+                      can finally fix an entry); distinct non-null values
+                      stay visible as contradictions. Bounded by
+                      MAX_MERGED_EVIDENCE (a per-turn cap cannot bound a
+                      union across turns)
       confidence    — LAST non-null (revision wins)
       limitations   — union of strings
       model_separation — LAST non-null (revision wins)
@@ -541,7 +594,7 @@ def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
         "hypothesis_evidence": None,
         "hypothesis_probabilities": None,
     }
-    seen_evidence: set[tuple[str, str]] = set()
+    seen_evidence: dict[str, int] = {}
     seen_limits: set[str] = set()
     for turn in turns or []:
         if not isinstance(turn, dict):
@@ -557,11 +610,35 @@ def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
             for entry in evidence:
                 if not isinstance(entry, dict):
                     continue
-                key = (str(entry.get("path") or ""), str(entry.get("value") or ""))
-                if key in seen_evidence:
+                path_key = str(entry.get("path") or "").strip()
+                if not path_key:
+                    # Pathless entries are gate material (they fail shape);
+                    # never let them collide with one another.
+                    merged["evidence"].append(entry)
                     continue
-                seen_evidence.add(key)
-                merged["evidence"].append(entry)
+                idx = seen_evidence.get(path_key)
+                if idx is None:
+                    seen_evidence[path_key] = len(merged["evidence"])
+                    merged["evidence"].append(entry)
+                    continue
+                prev = merged["evidence"][idx]
+                prev_value, new_value = prev.get("value"), entry.get("value")
+                if prev_value is None and new_value is not None:
+                    # null -> value: a later turn REFINED the citation.
+                    # Replace in place so a repair can actually fix an entry.
+                    # The old (path, value) key appended a corrected twin and
+                    # left the broken one unremovable, so the gate re-refused
+                    # the same index on every pass (live 2026-10-20: 2 repairs
+                    # could not clear 4 null-valued citations).
+                    merged["evidence"][idx] = entry
+                elif str(prev_value) == str(new_value):
+                    # Same claim: a later reading wins when it has one.
+                    if str(entry.get("interpretation") or "").strip():
+                        merged["evidence"][idx] = entry
+                else:
+                    # Two DIFFERENT non-null values for one path is a real
+                    # contradiction: keep both so the echo gate still sees it.
+                    merged["evidence"].append(entry)
         if turn.get("confidence") is not None:
             merged["confidence"] = turn.get("confidence")
         limitations = turn.get("limitations")
@@ -577,6 +654,10 @@ def merge_interpretation(turns: list[dict[str, Any] | None]) -> dict[str, Any]:
                     "hypothesis_probabilities"):
             if turn.get(key) is not None:
                 merged[key] = turn[key]
+    if len(merged["evidence"]) > MAX_MERGED_EVIDENCE:
+        log.warning("capping merged evidence %d → %d entries",
+                    len(merged["evidence"]), MAX_MERGED_EVIDENCE)
+        merged["evidence"] = merged["evidence"][:MAX_MERGED_EVIDENCE]
     return merged
 
 def _bound_from_controller(controller: Any, ctx: Any) -> tuple[Any, Any]:
@@ -778,6 +859,111 @@ def has_directive_verdict(parsed: dict[str, Any] | None) -> bool:
             return True
     return False
 
+
+#: The ONLY miss class salvage may consume: a citation that names no number
+#: (path present, value null, non-refusal). Any other string vetoes.
+_ENTRY_SHAPE_MISS = re.compile(r"^evidence\[(\d+)\] needs path\+value\b")
+
+
+def salvage_entry_shape_misses(
+    judged: dict[str, Any],
+    missing: list[str],
+    *,
+    coverage: dict[str, set[str]],
+    scenario: dict[str, Any] | None,
+    scenario_status: Any,
+    scenario_refusal_reason: str | None,
+    accumulated: dict[str, Any] | None,
+    task_plan: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, list[str], list[dict[str, Any]]]:
+    """Complete-then-drop rescue at the validation terminal (pure).
+
+    Fires ONLY when EVERY miss is an entry-shape miss — the cycle is
+    complete in every structural, contract, scenario, chain and verdict
+    sense and only unattributed citations block it. Integral entries (paths
+    resolving to store truth) are COMPLETED first (nulls filled, mismatches
+    corrected via ``synthesize.complete_evidence`` — engine completes,
+    never kills, model-derived state); only unbacked entries are dropped.
+    Then re-judges ONCE.
+
+    Returns ``(reduced_view, remaining_missing, records)`` where records
+    carry ``filled:``/``corrected:`` markers and dropped index/path rows
+    for the audit trail. ``reduced_view`` is None when salvage is not
+    permitted or the re-judge fails — the caller then keeps the terminal
+    with the ORIGINAL missing list. Nothing worded is rewritten.
+    """
+    from .synthesize import complete_evidence
+    indices: list[int] = []
+    for item in missing:
+        hit = _ENTRY_SHAPE_MISS.match(str(item))
+        if hit is None:
+            return None, list(missing), []
+        indices.append(int(hit.group(1)))
+    if not indices or len(indices) > MAX_SALVAGE_ENTRIES:
+        return None, list(missing), []
+    evidence = judged.get("evidence")
+    if not isinstance(evidence, list) or any(i >= len(evidence) for i in indices):
+        return None, list(missing), []
+    completed, filled, corrected, comp_dropped = complete_evidence(
+        evidence, accumulated)
+    records: list[dict[str, Any]] = (
+        [{"action": "filled", "path": str(m).split("filled:", 1)[-1]}
+         for m in filled]
+        + [{"action": "corrected", "path": str(m).split("corrected:", 1)[-1]}
+           for m in corrected]
+    )
+    for index in indices:
+        entry = evidence[index]
+        records.append({
+            "index": index,
+            "path": (str(entry.get("path") or "")
+                     if isinstance(entry, dict) else "<non-object>"),
+        })
+    reduced = {**judged, "evidence": completed}
+    # Task-conformance lives OUTSIDE validate_final_turn, so the re-judge
+    # cannot see it: veto if the dropped entries were carrying the directive
+    # verdict (a null-valued citation still counts for has_directive_verdict).
+    if (task_plan is not None
+            and (task_plan.get("targets") or task_plan.get("invalidations"))
+            and has_directive_verdict(judged)
+            and not has_directive_verdict(reduced)):
+        return None, list(missing), []
+    _findings: list[str] = []
+    passed, _remaining = validate_final_turn(
+        reduced, coverage, scenario=scenario,
+        scenario_status=scenario_status,
+        scenario_refusal_reason=scenario_refusal_reason,
+        accumulated=accumulated, findings=_findings)
+    if not passed:
+        # Dropping the entry broke another citation contract (ΔP, distinct
+        # roots, directive, …): do not ship a half-salvaged view.
+        return None, list(missing), []
+    return reduced, [], dropped
+
+
+def _record_evidence_salvage(
+    st: CycleRuntimeState, ctx: Any, dropped: list[dict[str, Any]],
+) -> None:
+    """Audit-trail the removal-only rescue (ledger OBSERVATION + state).
+
+    Best-effort, like every ledger writer on this path: a record failure must
+    never convert a settled cycle back into a terminal.
+    """
+    try:
+        st.deterministic_state["evidence_salvaged"] = list(dropped)
+        segment = getattr(ctx, "task_id", None)
+        wake_id = getattr(getattr(ctx, "wake", None), "wake_id", "") or ""
+        entry = record_entry(
+            st.deterministic_state, LedgerKind.OBSERVATION,
+            {"stage": "evidence-salvage",
+             "reason": "null value on non-refusal path; removal-only rescue",
+             "dropped": list(dropped)},
+            evidence_refs=(wake_id,), segment=segment)
+        st.ledger_stage_ids.append(f"evidence-salvage#{entry.seq}")
+    except Exception:
+        log.exception("evidence salvage record failed; continuing")
+
+
 def validate_final_turn(
     parsed: dict[str, Any],
     coverage: dict[str, set[str]],
@@ -853,6 +1039,15 @@ def validate_final_turn(
         )
     roots: set[str] = set()
     evidence = parsed.get("evidence")
+    # ONE shape authority, shared with the shipping filter
+    # (output._assemble_authored → synthesize.classify_evidence). The gate
+    # judges shape only (no frame); backing is assembly's fact-check.
+    from .synthesize import (
+        EVIDENCE_NO_PATH,
+        EVIDENCE_NO_READING,
+        EVIDENCE_NULL_VALUE,
+        classify_evidence,
+    )
     if isinstance(evidence, list):
         for idx, entry in enumerate(evidence):
             if not isinstance(entry, dict):
@@ -865,16 +1060,14 @@ def validate_final_turn(
             # discipline. The echo check below judges path-correct +
             # value-wrong. Interpretation stays required (the reading is
             # what keeps prose grounded to the cited field).
-            _path_raw = str(entry.get("path") or "")
-            if not _path_raw.strip() or (
-                entry.get("value") is None and "refusal" not in _path_raw
-            ):
+            _shape = classify_evidence(entry)
+            if _shape in (EVIDENCE_NO_PATH, EVIDENCE_NULL_VALUE):
                 missing.append(
                     f"evidence[{idx}] needs path+value — cite the tool+field "
                     "you read (unattributed numbers never reach the artifact)"
                 )
                 continue
-            if not str(entry.get("interpretation") or "").strip():
+            if _shape == EVIDENCE_NO_READING:
                 missing.append(
                     f"evidence[{idx}] missing interpretation: say what "
                     f"{entry.get('path')!r} shows (paths+values cited, readings empty is a violation)"

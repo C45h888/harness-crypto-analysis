@@ -66,9 +66,9 @@ class SynthesisWalkTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="synthesis walk")
         self.assertEqual(meta.get("terminal"), "settled")
-        ds = artifact.deterministic_state
+        ds = artifact.run_record["deterministic_state"]
         self.assertNotIn("synthesis_note", ds)
-        by_cap = {e.get("capability") for e in artifact.capability_log}
+        by_cap = {e.get("capability") for e in artifact.run_record["capability_log"]}
         self.assertNotIn("engine.synthesis.failed", by_cap)
         # Both synthesis passes spent output budget.
         traversal = ds.get("loop_traversal") or {}
@@ -93,11 +93,11 @@ class SynthesisWalkTests(unittest.IsolatedAsyncioTestCase):
         # FSM-visible for the semantics-review surface — never silent and
         # never a false REFUSED receipt on a settled artifact.
         self.assertEqual(meta.get("terminal"), "settled")
-        ds = artifact.deterministic_state
+        ds = artifact.run_record["deterministic_state"]
         note = ds.get("synthesis_note") or {}
         self.assertEqual(note.get("stage"), "collapse")
         self.assertEqual(note.get("degraded_to"), "derive-without-collapse")
-        by_cap = {e.get("capability") for e in artifact.capability_log}
+        by_cap = {e.get("capability") for e in artifact.run_record["capability_log"]}
         self.assertIn("engine.synthesis.degraded", by_cap)
         self.assertNotIn("engine.synthesis.failed", by_cap)
         receipts = (ds.get("loop_receipts") or {}).get("receipts") \

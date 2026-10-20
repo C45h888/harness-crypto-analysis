@@ -16,8 +16,11 @@ killed by its synthesis. No REFUSED composition receipt on a settling
 cycle: a refusal record on a settled artifact is a false failure signal.
 
 The object that ships is the agent's AUTHORED output — the engine
-fact-checks it (``path_resolves`` / ``_assemble_authored``) and compels the
-gate data (``check_authored_output``), but never rewrites the agent's words.
+fact-checks it (``path_resolves`` / ``_assemble_authored``), completes
+integral values from store truth (``complete_evidence`` — fill nulls,
+correct mismatches, never touch wording), and compels the
+gate data (``check_authored_output``). Values ride the ledger; words stay
+the agent's.
 """
 
 from __future__ import annotations
@@ -67,6 +70,50 @@ def path_resolves(frame: Any, path: Any) -> bool:
             or head in set(frame.get("state_keys") or ()))
 
 
+# Evidence shape codes — ONE authority shared by the strict gate
+# (``validation.validate_final_turn``) and the shipping filter
+# (``output._assemble_authored``). The two used to disagree: assembly dropped
+# empty/unbacked paths but never checked ``value``; the gate demanded
+# path+value but never checked backing. Entries with a good path and a null
+# value sailed through assembly and died at the gate — before assembly could
+# run. One classifier, two actions (block vs drop+record).
+EVIDENCE_OK = "ok"
+EVIDENCE_NO_PATH = "no_path"
+EVIDENCE_NULL_VALUE = "null_value"
+EVIDENCE_UNBACKED = "unbacked"
+EVIDENCE_NO_READING = "no_reading"
+
+#: Codes that make an entry UNSHIPPABLE (removal-only doctrine).
+EVIDENCE_DROP_CODES = frozenset(
+    {EVIDENCE_NO_PATH, EVIDENCE_NULL_VALUE, EVIDENCE_UNBACKED})
+#: Codes that make the strict VALIDATION gate refuse the cycle.
+EVIDENCE_BLOCK_CODES = frozenset(
+    {EVIDENCE_NO_PATH, EVIDENCE_NULL_VALUE, EVIDENCE_NO_READING})
+
+
+def classify_evidence(entry: Any, frame: Any = None) -> str:
+    """Classify one evidence entry against the doctrine (pure).
+
+    ``frame=None`` is the gate's view: it judges shape only (path + value +
+    reading), because backing is assembly's fact-check and the gate has no
+    frame. With a frame, unbacked heads (unknown tools, ``memory.*``) are
+    classified too. Refusal findings (``→ refusal``) legally carry a null
+    value under null discipline.
+    """
+    if not isinstance(entry, dict):
+        return EVIDENCE_NO_PATH
+    path = str(entry.get("path") or "").strip()
+    if not path:
+        return EVIDENCE_NO_PATH
+    if entry.get("value") is None and "refusal" not in path:
+        return EVIDENCE_NULL_VALUE
+    if frame is not None and not path_resolves(frame, path):
+        return EVIDENCE_UNBACKED
+    if not str(entry.get("interpretation") or "").strip():
+        return EVIDENCE_NO_READING
+    return EVIDENCE_OK
+
+
 def _frame_value_is_null(frame: Any, path: Any) -> bool:
     """Does the frame report the cited field as null? (null discipline)."""
     if not isinstance(frame, dict):
@@ -74,6 +121,89 @@ def _frame_value_is_null(frame: Any, path: Any) -> bool:
     text = str(path or "").strip()
     known = set(frame.get("known_nulls") or ())
     return text in known or text.split("→")[0].strip() in known
+
+
+def _decimal_norm(value: Any) -> str | None:
+    """Canonical compare key: Decimal text when numeric, stripped text else."""
+    if value is None:
+        return None
+    try:
+        from decimal import Decimal
+        return str(Decimal(str(value)))
+    except Exception:
+        text = str(value).strip()
+        return text or None
+
+
+def complete_evidence(
+    evidence: Any,
+    accumulated: dict[str, Any] | None,
+    frame: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
+    """Deterministic completion over one evidence list (pure).
+
+    The completion half of the locked doctrine (engine completes, never
+    kills, model-derived state): integral entries — paths resolving via
+    ``resolve_basis_path`` to an accumulated tool field — have null values
+    FILLED and mismatched values CORRECTED from store truth (wording
+    untouched); non-integral entries (empty/unresolvable paths, non-dicts)
+    are DROPPED with record. Refusal findings pass through (null
+    discipline). Entries missing only their interpretation are KEPT —
+    readings are the agent's to write; repair owns them, completion never
+    invents them. Returns ``(entries, filled, corrected, dropped)`` with
+    ``filled:<path>`` / ``corrected:<path>`` markers for the audit trail.
+    """
+    from .chain import resolve_basis_path
+    kept: list[dict[str, Any]] = []
+    filled: list[str] = []
+    corrected: list[str] = []
+    dropped: list[str] = []
+    if not isinstance(evidence, list):
+        return kept, filled, corrected, dropped
+    acc = accumulated if isinstance(accumulated, dict) else {}
+    has_truth = bool(acc)
+    for entry in evidence:
+        if not isinstance(entry, dict):
+            dropped.append("<non-object>")
+            continue
+        path = str(entry.get("path") or "").strip()
+        if not path:
+            dropped.append("<empty>")
+            continue
+        if "refusal" in path:
+            kept.append(dict(entry))
+            continue
+        if not has_truth:
+            # No store to complete from (frame-only callers, tests): keep
+            # frame-backed entries exactly as today's assembly does; the
+            # gate judges values downstream.
+            if frame is not None and not path_resolves(frame, path):
+                dropped.append(path)
+                continue
+            kept.append(dict(entry))
+            continue
+        head, _field, truth = resolve_basis_path(path, acc)
+        if _field is None or truth is None:
+            # Unresolvable against the store: the echo check skips these
+            # too, so completion cannot judge them. Keep valued entries
+            # (preserve model-derived state — never kill what the gate
+            # would pass); drop only valueless ones the gate would
+            # refuse as unattributed.
+            if entry.get("value") is None:
+                dropped.append(path)
+            else:
+                kept.append(dict(entry))
+            continue
+        out = dict(entry)
+        cited = entry.get("value")
+        if cited is None:
+            out["value"] = truth
+            filled.append(f"filled:{path}")
+        elif _decimal_norm(cited) != _decimal_norm(truth):
+            out["value"] = truth
+            corrected.append(f"corrected:{path}")
+        kept.append(out)
+    return kept, filled, corrected, dropped
 
 
 def memory_context_block(accumulated: Any) -> str:
