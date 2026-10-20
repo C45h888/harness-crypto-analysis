@@ -47,7 +47,12 @@ def _build_llm() -> Any | None:
 
 
 def _build_memory(settings: Settings):
-    """Build the engine's episodic MemoryNode (Postgres required)."""
+    """Build the AGENT's episodic MemoryNode store (Postgres required).
+
+    The engine constructs and injects this node, but it is the AGENT's memory:
+    only ``memory.*`` tool calls and the operator CLI write rows. Engine
+    memory is the central ledger (``engine/ledger.py``).
+    """
     if not settings.database_url:
         return None
     try:
