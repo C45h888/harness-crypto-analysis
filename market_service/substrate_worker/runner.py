@@ -32,6 +32,7 @@ from typing import Any
 from market_service.config import default_depth_levels
 from market_service.runtime.redis_store import RedisRuntimeStore
 from market_service.substrate_worker import WORKER_REGISTRY, SubstrateWorkerCore
+from market_service.telemetry_kernel import kernel_for_runtime
 from market_service.substrate_worker.core.base import SUPERVISOR_MS
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ def build_workers(
     pg_store: Any | None = None,
     pg_strict: bool = True,
     governor: Any | None = None,
+    telemetry: Any | None = None,
 ) -> list[SubstrateWorkerCore]:
     """Instantiate the enabled workers (registry-driven, env-tunable)."""
     selected = names or _split_env("SUBSTRATE_WORKERS", "all")
@@ -95,6 +97,7 @@ def build_workers(
                 pg_store=pg_store,
                 pg_strict=pg_strict,
                 governor=governor,
+                telemetry=telemetry,
             ))
     return workers
 
@@ -149,9 +152,12 @@ async def run_forever() -> int:
         os.getenv("REDIS_KEY_PREFIX") or "marketflow",
         int(os.getenv("REDIS_STREAM_MAXLEN") or 10_000),
     )
-    workers = build_workers(store, symbols=_symbols(),
-                            pg_store=(pg := _pg_store()), pg_strict=_pg_strict(),
-                            governor=governance_from_env(store, pg))
+    workers = build_workers(
+        store, symbols=_symbols(),
+        pg_store=(pg := _pg_store()), pg_strict=_pg_strict(),
+        governor=governance_from_env(store, pg),
+        telemetry=kernel_for_runtime(store, pg),
+    )
     if not workers:
         log.error("no substrate workers selected — nothing to run")
         return 1

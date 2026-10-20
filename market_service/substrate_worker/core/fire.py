@@ -543,10 +543,22 @@ class FireMixin(SubstrateBase):
                     log.warning("substrate %s PG insert failed (lax: continuing): %s",
                                 self.SUBSTRATE_NAME, exc)
                     self._last_error = f"pg (lax, continuing): {exc}"
-            await self._publish_own_state(payload.to_dict())
+            stream_id = await self._publish_own_state(payload.to_dict())
+            await self._emit_telemetry_state(
+                "state_adjudicated", payload.to_dict(),
+                source_sequence=int(payload.computed_at_ms),
+                occurred_at_ms=int(payload.computed_at_ms),
+                source_ref=str(stream_id),
+            )
         except Exception as exc:
             log.exception("substrate %s fire failed", self.SUBSTRATE_NAME)
             self._last_error = f"fire: {exc}"
+            await self._emit_telemetry_state(
+                "worker_state",
+                {"status": "failed", "failure_code": type(exc).__name__},
+                source_sequence=max(0, int(now_ms)),
+                occurred_at_ms=max(0, int(now_ms)),
+            )
 
     async def _govern(
         self, gate: str, payload: dict[str, Any] | None = None,
@@ -585,6 +597,26 @@ class FireMixin(SubstrateBase):
                         symbol=self.symbol,
                         observation=observation,
                         verdict=verdict,
+                    )
+                    decision_ms = int(
+                        (payload or {}).get("computed_at_ms")
+                        or self._last_fire_ms or time.time() * 1000
+                    )
+                    await self._emit_telemetry_state(
+                        "governance_decision",
+                        {
+                            "gate": gate,
+                            "allowed": bool(verdict.allowed),
+                            "rule": verdict.rule,
+                            "reason": verdict.reason[:500],
+                            "status": getattr(observation, "status", None),
+                            "schema_version": getattr(observation, "schema_version", None),
+                        },
+                        source_sequence=max(0, decision_ms),
+                        occurred_at_ms=max(0, decision_ms),
+                        source_ref=(
+                            f"{self.SUBSTRATE_NAME}:{self.symbol}:{gate}:{decision_ms}"
+                        ),
                     )
             else:
                 method = getattr(self.governor, f"authorize_{gate}", None)

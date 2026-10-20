@@ -26,6 +26,7 @@ from typing import Any
 
 from market_service.analysis_worker import ANALYSIS_WORKER_REGISTRY
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.telemetry_kernel import kernel_for_runtime
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def build_workers(
     pg_store: Any | None = None,
     pg_strict: bool = True,
     governor: Any | None = None,
+    telemetry: Any | None = None,
 ) -> list[Any]:
     """Instantiate the enabled analysis workers (registry-driven)."""
     selected = names or _split_env("ANALYSIS_WORKERS", "all")
@@ -77,6 +79,7 @@ def build_workers(
                 pg_store=pg_store,
                 pg_strict=pg_strict,
                 governor=governor,
+                telemetry=telemetry,
             ))
     return workers
 
@@ -113,6 +116,7 @@ async def run_forever() -> int:
         store, symbols=_symbols(),
         pg_store=pg, pg_strict=pg_strict_from_env(),
         governor=governance_from_env(store, pg),
+        telemetry=kernel_for_runtime(store, pg),
     )
     if not workers:
         log.error("no analysis workers selected — nothing to run")

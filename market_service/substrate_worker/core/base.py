@@ -100,6 +100,7 @@ class SubstrateBase:
         governor: Any | None = None,
         pg_store: Any | None = None,
         pg_strict: bool = True,
+        telemetry: Any | None = None,
     ) -> None:
         if not self.SUBSTRATE_NAME:
             raise ValueError(
@@ -143,6 +144,8 @@ class SubstrateBase:
         self.governor = governor
         self.pg_store = pg_store
         self.pg_strict = pg_strict
+        # Observational mirror only: the plane FSM remains the legality owner.
+        self.telemetry = telemetry
 
         self._stream = self._resolve_input_stream(store)
         self._group = (
@@ -236,6 +239,29 @@ class SubstrateBase:
                 self.SUBSTRATE_NAME, self.symbol, payload)
         return await self.store.publish_substrate_state(
             self.SUBSTRATE_NAME, self.symbol, payload)
+
+    async def _emit_telemetry_state(
+        self, event_type: str, state: dict[str, Any], *,
+        source_sequence: int, occurred_at_ms: int, source_ref: str | None = None,
+    ) -> None:
+        """Mirror a governed state outcome without changing worker behavior."""
+        if self.telemetry is None:
+            return
+        try:
+            await self.telemetry.emit_state(
+                plane="analysis" if self._plane == "analysis" else "calculation",
+                owner=self.SUBSTRATE_NAME,
+                subject_type="symbol",
+                subject_id=self.symbol,
+                event_type=event_type,
+                source_sequence=max(0, int(source_sequence)),
+                occurred_at_ms=max(0, int(occurred_at_ms)),
+                state=state,
+                source_ref=source_ref,
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never gates a fire
+            log.warning("telemetry emit failed for %s/%s: %s",
+                        self.SUBSTRATE_NAME, self.symbol, exc)
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,

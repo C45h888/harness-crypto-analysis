@@ -53,7 +53,9 @@ async def read_state(
     }
 
 
-async def invoke_one(store: Any, symbol: str, analysis: str) -> dict[str, Any]:
+async def invoke_one(
+    store: Any, symbol: str, analysis: str, *, telemetry: Any | None = None,
+) -> dict[str, Any]:
     """One bounded fire-tick for one (analysis, symbol) — in-process."""
     from market_service.substrate_worker.core import SubstrateWorkerCore
 
@@ -61,7 +63,7 @@ async def invoke_one(store: Any, symbol: str, analysis: str) -> dict[str, Any]:
     worker_cls = ANALYSIS_WORKER_REGISTRY.get(name)
     if worker_cls is None:
         raise ValueError(f"unknown analysis worker {name!r}")
-    worker = worker_cls(store, symbol=symbol.upper())
+    worker = worker_cls(store, symbol=symbol.upper(), telemetry=telemetry)
     from market_service.substrate_worker.core.base import _now_ms
 
     await worker.start()
@@ -84,6 +86,8 @@ async def invoke_many(
     store: Any,
     symbol: str,
     analyses: list[str] | tuple[str, ...] | None = None,
+    *,
+    telemetry: Any | None = None,
 ) -> dict[str, Any]:
     """One bounded fire-tick per named analysis worker (or all).
 
@@ -102,7 +106,7 @@ async def invoke_many(
         if key not in ANALYSIS_WORKER_REGISTRY:
             return name, {"error": "unknown analysis worker"}
         async with sem:
-            return key, await invoke_one(store, symbol, name)
+            return key, await invoke_one(store, symbol, name, telemetry=telemetry)
 
     for key, result in await _asyncio.gather(*(_one(n) for n in names)):
         out[key] = result

@@ -22,6 +22,7 @@ from aiohttp import web
 
 from market_service.analysis_worker import ANALYSIS_WORKER_REGISTRY
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.telemetry_kernel import kernel_for_runtime
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ async def build_workers(store: RedisRuntimeStore) -> list[Any]:
         store, symbols=_symbols(),
         pg_store=pg, pg_strict=pg_strict_from_env(),
         governor=governance_from_env(store, pg),
+        telemetry=kernel_for_runtime(store, pg),
     )
 
 
@@ -71,9 +73,11 @@ class AnalysisHttpApp:
     def __init__(self, store: RedisRuntimeStore, workers: list[Any]) -> None:
         self.store = store
         self.workers = workers
+        self.telemetry = workers[0].telemetry if workers else None
         self.app = web.Application()
         self.app.router.add_get("/health", self._health)
         self.app.router.add_get("/status", self._status)
+        self.app.router.add_get("/telemetry", self._telemetry_status)
         self.app.router.add_get("/governance", self._governance)
         self.app.router.add_post("/invoke", self._invoke)
         self.app.router.add_post("/dispatch-ticket", self._dispatch_ticket)
@@ -141,15 +145,24 @@ class AnalysisHttpApp:
              "governance": {
                  "plane": "analysis",
                  "alive": await self.store.governance_alive("analysis", symbol),
-             }},
+             },
+             "telemetry": self.telemetry.health() if self.telemetry else {
+                 "status": "unavailable"}},
             status=200 if ok else 503,
         )
 
     async def _status(self, _request: web.Request) -> web.Response:
         from market_service.analysis_worker.tools import read_state
 
-        return web.json_response(await read_state(
-            self.store, _request.query.get("symbol", "SOLUSDT")))
+        return web.json_response({
+            **await read_state(self.store, _request.query.get("symbol", "SOLUSDT")),
+            "telemetry": self.telemetry.health() if self.telemetry else {
+                "status": "unavailable"},
+        })
+
+    async def _telemetry_status(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            self.telemetry.health() if self.telemetry else {"status": "unavailable"})
 
     async def _invoke(self, request: web.Request) -> web.Response:
         """Request one bounded fire-tick per named analysis worker.
@@ -185,7 +198,8 @@ class AnalysisHttpApp:
         except Exception as exc:  # noqa: BLE001 — guard never bricks invokes
             log.warning("analysis dispatch guard unavailable (%s); failing open", exc)
             from market_service.analysis_worker.tools import invoke_many
-            result = await invoke_many(self.store, symbol, analyses or None)
+            result = await invoke_many(
+                self.store, symbol, analyses or None, telemetry=self.telemetry)
             result["dispatch_ticket"] = {
                 "plane": "analysis", "symbol": symbol,
                 "rule": "dispatch-observation-unavailable",
@@ -198,7 +212,8 @@ class AnalysisHttpApp:
             })
         try:
             from market_service.analysis_worker.tools import invoke_many
-            result = await invoke_many(self.store, symbol, list(ticket.allowed))
+            result = await invoke_many(
+                self.store, symbol, list(ticket.allowed), telemetry=self.telemetry)
         finally:
             try:
                 await governor.release_dispatch_lease(symbol=symbol)

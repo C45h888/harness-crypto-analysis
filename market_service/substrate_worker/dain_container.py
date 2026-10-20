@@ -49,6 +49,7 @@ from typing import Any
 from aiohttp import web
 
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.telemetry_kernel import kernel_for_runtime
 from market_service.substrate_worker import WORKER_REGISTRY
 from market_service.substrate_worker import tools as substrate_tools
 
@@ -79,6 +80,7 @@ async def build_workers(store: RedisRuntimeStore) -> list[Any]:
         store, symbols=_symbols(),
         pg_store=pg, pg_strict=pg_strict_from_env(),
         governor=governance_from_env(store, pg),
+        telemetry=kernel_for_runtime(store, pg),
     )
 
 
@@ -101,9 +103,11 @@ class CalcHttpApp:
         self.workers = workers
         self.pg_store = pg_store
         self.pg_strict = pg_strict
+        self.telemetry = workers[0].telemetry if workers else None
         self.app = web.Application()
         self.app.router.add_get("/health", self._health)
         self.app.router.add_get("/status", self._status)
+        self.app.router.add_get("/telemetry", self._telemetry_status)
         self.app.router.add_get("/governance", self._governance)
         self.app.router.add_post("/invoke", self._invoke)
         self.app.router.add_post("/dispatch-ticket", self._dispatch_ticket)
@@ -142,7 +146,9 @@ class CalcHttpApp:
              "governance": {
                  "plane": "calculation",
                  "alive": await self.store.governance_alive("calculation", symbol),
-             }},
+             },
+             "telemetry": self.telemetry.health() if self.telemetry else {
+                 "status": "unavailable"}},
             status=200 if ok else 503,
         )
 
@@ -152,7 +158,13 @@ class CalcHttpApp:
             **await substrate_tools.read_state(
                 self.store, _request.query.get("symbol", "SOLUSDT")),
             "starved": await check_starvation(self.store, self.workers),
+            "telemetry": self.telemetry.health() if self.telemetry else {
+                "status": "unavailable"},
         })
+
+    async def _telemetry_status(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            self.telemetry.health() if self.telemetry else {"status": "unavailable"})
 
     async def _dispatch_ticket(self, request: web.Request) -> web.Response:
         """Dry-run the dispatch guard: due-check + batch plan, no compute."""
@@ -242,7 +254,8 @@ class CalcHttpApp:
             log.warning("dispatch guard unavailable (%s); failing open", exc)
             result = await substrate_tools.invoke_many(
                 self.store, symbol, substrates or None,
-                pg_store=self.pg_store, pg_strict=self.pg_strict)
+                pg_store=self.pg_store, pg_strict=self.pg_strict,
+                telemetry=self.telemetry)
             result["dispatch_ticket"] = {
                 "plane": "calculation", "symbol": symbol,
                 "rule": "dispatch-observation-unavailable",
@@ -256,7 +269,8 @@ class CalcHttpApp:
         try:
             result = await substrate_tools.invoke_many(
                 self.store, symbol, list(ticket.allowed),
-                pg_store=self.pg_store, pg_strict=self.pg_strict)
+                pg_store=self.pg_store, pg_strict=self.pg_strict,
+                telemetry=self.telemetry)
         finally:
             try:
                 await governor.release_dispatch_lease(symbol=symbol)

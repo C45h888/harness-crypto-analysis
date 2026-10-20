@@ -47,6 +47,7 @@ async def invoke(
     depth: int | None = None,
     pg_store: Any | None = None,
     pg_strict: bool = True,
+    telemetry: Any | None = None,
 ) -> dict[str, Any]:
     """Invoke ONE worker for one bounded fire-tick; return its report.
 
@@ -64,6 +65,7 @@ async def invoke(
     worker = worker_cls(
         store, symbol=symbol.upper(), window_minutes=window_minutes,
         depth=depth, pg_store=pg_store, pg_strict=pg_strict,
+        telemetry=telemetry,
     )
     fired_before = worker.fired_count
     await worker.start()
