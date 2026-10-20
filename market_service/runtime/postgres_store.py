@@ -12,6 +12,7 @@ import asyncpg
 
 from .contracts import (
     AgentMemory,
+    CanonicalOutput,
     InferenceArtifact,
     _json_safe,
 )
@@ -749,6 +750,12 @@ class PostgresRuntimeStore:
     async def insert_inference_artifact(self, artifact: InferenceArtifact) -> bool:
         """Durable, idempotent write of one ``InferenceArtifact``.
 
+        .. deprecated:: canonical-output plane
+           **Deprecated writer (legacy).** New cycles place
+           ``CanonicalOutput`` rows (``insert_canonical_output``); this
+           method remains only for legacy tooling and is not called by the
+           engine anymore.
+
         Primary key is ``artifact_id``: each engine cycle produces exactly
         one immutable row. The interpretation column is NULL whenever the
         hard status gate refused the LLM call — that is the durable record
@@ -934,6 +941,207 @@ class PostgresRuntimeStore:
                 symbol.upper(), limit,
             )
         return [self._parse_artifact_row(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Canonical output ledger (postgres-first durable layer) — THE
+    # deliverable plane: one row per cycle = the frozen answer of record
+    # (answer_text) + its run record (bookkeeping). The inference_artifact
+    # ledger above is deprecated read-only legacy (pre-canonical cycles).
+    # ------------------------------------------------------------------
+
+    async def insert_canonical_output(self, output: CanonicalOutput) -> bool:
+        """Durable, idempotent write of one ``CanonicalOutput`` row.
+
+        Primary key is ``run_id``: each cycle produces exactly one immutable
+        answer of record. A NULL ``answer_text`` means no authored ship
+        (degraded or gate-failed cycle) — the durable record of that, never
+        a missing value.
+        """
+        output.validate()
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO canonical_output
+               (run_id, symbol, venue, generated_at, completed_at,
+                schema_version, status, terminal, window_minutes,
+                interval_seconds, input_hash, model_version, task, session_id,
+                answer_text, answer, interpretation, hypothesis,
+                hypothesis_verdict, verdict_reason, calculations, conformance,
+                run_record)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+               ON CONFLICT (run_id) DO NOTHING
+               RETURNING run_id""",
+            uuid.UUID(output.run_id),
+            output.symbol,
+            output.venue,
+            datetime.fromisoformat(output.generated_at.replace("Z", "+00:00")),
+            datetime.fromisoformat(output.completed_at.replace("Z", "+00:00")),
+            output.schema_version,
+            output.status,
+            output.terminal,
+            output.window_minutes,
+            output.interval_seconds,
+            output.input_hash,
+            output.model_version,
+            output.task,
+            uuid.UUID(output.session_id) if output.session_id else None,
+            output.answer_text,
+            json.dumps(output.answer, default=str) if output.answer is not None else None,
+            json.dumps(output.interpretation, default=str)
+            if output.interpretation is not None else None,
+            json.dumps(output.hypothesis, default=str)
+            if output.hypothesis is not None else None,
+            output.hypothesis_verdict,
+            output.verdict_reason,
+            json.dumps(output.calculations, default=str)
+            if output.calculations is not None else None,
+            json.dumps(output.conformance, default=str)
+            if output.conformance is not None else None,
+            json.dumps(output.run_record, default=str),
+        )
+        return row is not None
+
+    async def update_canonical_output(self, output: CanonicalOutput) -> bool:
+        """Refresh an existing canonical row in place (terminal + trace).
+
+        Same immutable-by-id row: the terminal/state written after SETTLE
+        closes the metadata gap the settle itself creates. Never blocks
+        settlement — callers record failures as run_record_errors.
+        """
+        output.validate()
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        status = await self.pool.execute(
+            """UPDATE canonical_output SET
+                completed_at=$2, status=$3, terminal=$4, answer_text=$5,
+                answer=$6, interpretation=$7, hypothesis=$8,
+                hypothesis_verdict=$9, verdict_reason=$10, calculations=$11,
+                conformance=$12, run_record=$13
+               WHERE run_id=$1""",
+            uuid.UUID(output.run_id),
+            datetime.fromisoformat(output.completed_at.replace("Z", "+00:00")),
+            output.status,
+            output.terminal,
+            output.answer_text,
+            json.dumps(output.answer, default=str) if output.answer is not None else None,
+            json.dumps(output.interpretation, default=str)
+            if output.interpretation is not None else None,
+            json.dumps(output.hypothesis, default=str)
+            if output.hypothesis is not None else None,
+            output.hypothesis_verdict,
+            output.verdict_reason,
+            json.dumps(output.calculations, default=str)
+            if output.calculations is not None else None,
+            json.dumps(output.conformance, default=str)
+            if output.conformance is not None else None,
+            json.dumps(output.run_record, default=str),
+        )
+        return status.endswith("1")
+
+    async def read_canonical_output(
+        self, symbol: str | None = None, run_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Durable read: one exact ``run_id``, or the latest for a symbol."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        columns = (
+            "run_id, symbol, venue, generated_at, completed_at, status, terminal,"
+            " window_minutes, interval_seconds, input_hash, model_version, task,"
+            " session_id, answer_text, answer, interpretation, hypothesis,"
+            " hypothesis_verdict, verdict_reason, calculations, conformance,"
+            " run_record, schema_version"
+        )
+        if run_id:
+            row = await self.pool.fetchrow(
+                f"SELECT {columns} FROM canonical_output WHERE run_id = $1",
+                uuid.UUID(run_id),
+            )
+        elif symbol:
+            row = await self.pool.fetchrow(
+                f"SELECT {columns} FROM canonical_output WHERE symbol = $1"
+                " ORDER BY generated_at DESC LIMIT 1",
+                symbol.upper(),
+            )
+        else:
+            return None
+        if row is None:
+            return None
+        return self._parse_canonical_row(row)
+
+    async def read_recent_canonical_outputs(
+        self, symbol: str, *, venue: str | None = None, limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Durable read: recent FULL canonical rows (with run record), newest first.
+
+        Deterministic consumers (prior fits, cross-cycle recall) reuse these;
+        empty list on no rows.
+        """
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        columns = (
+            "run_id, symbol, venue, generated_at, completed_at, status, terminal,"
+            " window_minutes, interval_seconds, input_hash, model_version, task,"
+            " session_id, answer_text, answer, interpretation, hypothesis,"
+            " hypothesis_verdict, verdict_reason, calculations, conformance,"
+            " run_record, schema_version"
+        )
+        if venue is not None:
+            rows = await self.pool.fetch(
+                f"SELECT {columns} FROM canonical_output"
+                " WHERE symbol = $1 AND venue = $2"
+                " ORDER BY generated_at DESC LIMIT $3",
+                symbol.upper(), venue, limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                f"SELECT {columns} FROM canonical_output WHERE symbol = $1"
+                " ORDER BY generated_at DESC LIMIT $2",
+                symbol.upper(), limit,
+            )
+        return [self._parse_canonical_row(row) for row in rows]
+
+    async def read_canonical_history(
+        self, symbol: str, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Durable read: canonical-run headlines for one symbol, newest first."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            "SELECT run_id, symbol, venue, generated_at, status, terminal,"
+            " window_minutes, interval_seconds, input_hash, model_version"
+            " FROM canonical_output WHERE symbol = $1"
+            " ORDER BY generated_at DESC LIMIT $2",
+            symbol.upper(), limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            if hasattr(entry.get("generated_at"), "isoformat"):
+                entry["generated_at"] = entry["generated_at"].isoformat()
+            out.append(entry)
+        return out
+
+    @staticmethod
+    def _parse_canonical_row(row: Any) -> dict[str, Any]:
+        """Parse one canonical_output row into a JSON-safe dict (pure)."""
+        result = dict(row)
+        for col in ("answer", "interpretation", "hypothesis", "calculations",
+                    "conformance", "run_record"):
+            value = result.get(col)
+            if isinstance(value, str):
+                try:
+                    result[col] = json.loads(value)
+                except (ValueError, json.JSONDecodeError):
+                    result[col] = {} if col == "run_record" else None
+        for col in ("generated_at", "completed_at"):
+            if hasattr(result.get(col), "isoformat"):
+                result[col] = result[col].isoformat()
+        return result
 
     # ------------------------------------------------------------------
     # Horizon spans — durable fallback for per-horizon blocks.
@@ -1232,5 +1440,65 @@ class PostgresRuntimeStore:
             if hasattr(result.get("decided_at"), "isoformat"):
                 result["decided_at"] = result["decided_at"].isoformat()
             result["ledger_id"] = result.pop("id")
+            out.append(result)
+        return out
+
+    # ------------------------------------------------------------------
+    # Out-of-band telemetry ledger. This table is separate from canonical
+    # market, worker, governance, and inference state; Redis is its projection.
+    # ------------------------------------------------------------------
+
+    async def record_telemetry_event(self, event: dict[str, Any]) -> bool:
+        """Append one idempotent, state-only telemetry event."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        row = await self.pool.fetchrow(
+            """INSERT INTO runtime_telemetry_event
+               (event_id, schema_version, plane, owner, subject_type,
+                subject_id, event_type, source_sequence, occurred_at_ms,
+                source_ref, correlation_id, parent_event_id, state)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+               ON CONFLICT (event_id) DO NOTHING
+               RETURNING event_id""",
+            str(event["event_id"]), int(event["schema_version"]),
+            str(event["plane"]), str(event["owner"]),
+            str(event["subject_type"]), str(event["subject_id"]),
+            str(event["event_type"]), int(event["source_sequence"]),
+            int(event["occurred_at_ms"]), event.get("source_ref"),
+            event.get("correlation_id"), event.get("parent_event_id"),
+            json.dumps(_json_safe(event.get("state") or {}), separators=(",", ":")),
+        )
+        return row is not None
+
+    async def read_telemetry_events(
+        self, *, plane: str, owner: str, subject_type: str,
+        subject_id: str, limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        """Read one owner's durable event history in deterministic order."""
+        if self.pool is None:
+            await self.connect()
+        assert self.pool is not None
+        rows = await self.pool.fetch(
+            """SELECT event_id, schema_version, plane, owner, subject_type,
+                      subject_id, event_type, source_sequence, occurred_at_ms,
+                      source_ref, correlation_id, parent_event_id, state
+               FROM runtime_telemetry_event
+               WHERE plane = $1 AND owner = $2 AND subject_type = $3
+                 AND subject_id = $4
+               ORDER BY occurred_at_ms, source_sequence, event_id
+               LIMIT $5""",
+            plane.lower(), owner.lower(), subject_type.lower(),
+            subject_id, max(1, int(limit)),
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            result = dict(row)
+            state = result.get("state")
+            if isinstance(state, str):
+                try:
+                    result["state"] = json.loads(state)
+                except (ValueError, json.JSONDecodeError):
+                    result["state"] = {}
             out.append(result)
         return out

@@ -195,6 +195,50 @@ CREATE INDEX IF NOT EXISTS inference_artifact_symbol_generated_idx
 CREATE INDEX IF NOT EXISTS inference_artifact_session_idx
     ON inference_artifact (session_id);
 
+-- Canonical output plane (docs/CLI_ANSWER_SURFACE_PLAN.md → canonical
+-- path): ONE row per engine cycle = THE deliverable — the frozen ANSWER
+-- text of record (``answer_text``, exactly what shipped to the CLI
+-- surface), its structured variant (``answer``), and the RUN RECORD
+-- (``run_record``: deterministic state, capability log, errors) which is
+-- engine bookkeeping, never the consumable output. The inference_artifact
+-- table above is DEPRECATED (read-only legacy rows, pre-canonical cycles).
+-- Null discipline: a NULL answer means no authored ship (degraded or
+-- gate-failed cycle) — never "nothing to say".
+CREATE TABLE IF NOT EXISTS canonical_output (
+    run_id UUID PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    status TEXT NOT NULL CHECK (status IN ('validated', 'provisional', 'insufficient')),
+    terminal TEXT,
+    window_minutes INTEGER NOT NULL,
+    interval_seconds INTEGER NOT NULL,
+    input_hash TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    task TEXT,
+    session_id UUID,
+    answer_text TEXT,
+    answer JSONB,
+    interpretation JSONB,
+    hypothesis JSONB,
+    hypothesis_verdict TEXT CHECK (
+        hypothesis_verdict IS NULL
+        OR hypothesis_verdict IN ('validated', 'invalidated', 'inconclusive')),
+    verdict_reason TEXT,
+    calculations JSONB,
+    conformance JSONB,
+    run_record JSONB NOT NULL DEFAULT '{}'::jsonb,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS canonical_output_symbol_time_idx
+    ON canonical_output (symbol, venue, completed_at DESC);
+
+CREATE INDEX IF NOT EXISTS canonical_output_symbol_idx
+    ON canonical_output (symbol, completed_at DESC);
+
 -- Durable record for validated AnalystBriefing artifacts produced by the
 -- NOOA analyst suite. Primary key is (session_id, run_id) so the same
 -- analyst session over the same canonical envelope updates in place;
@@ -334,3 +378,31 @@ CREATE INDEX IF NOT EXISTS ix_governance_ledger_lookup
 CREATE INDEX IF NOT EXISTS ix_governance_ledger_denials
     ON governance_ledger (plane, symbol, decided_at DESC)
     WHERE allowed = FALSE;
+
+-- Out-of-band, pure-state telemetry history. This ledger is not canonical
+-- market/worker/governance/inference state; Redis holds its live projections.
+CREATE TABLE IF NOT EXISTS runtime_telemetry_event (
+    event_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    plane TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    source_sequence BIGINT NOT NULL CHECK (source_sequence >= 0),
+    occurred_at_ms BIGINT NOT NULL CHECK (occurred_at_ms >= 0),
+    source_ref TEXT,
+    correlation_id TEXT,
+    parent_event_id TEXT,
+    state JSONB NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS runtime_telemetry_subject_order_idx
+    ON runtime_telemetry_event
+       (plane, owner, subject_type, subject_id,
+        occurred_at_ms, source_sequence, event_id);
+
+CREATE INDEX IF NOT EXISTS runtime_telemetry_trace_idx
+    ON runtime_telemetry_event (correlation_id, occurred_at_ms DESC)
+    WHERE correlation_id IS NOT NULL;

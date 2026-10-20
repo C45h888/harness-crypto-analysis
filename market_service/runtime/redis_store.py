@@ -11,7 +11,8 @@ from typing import Any
 from redis.asyncio import Redis
 
 from .contracts import (
-    AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, InferenceArtifact,
+    AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, CanonicalOutput,
+    InferenceArtifact,
     MarketStateEnvelope,
 )
 
@@ -881,7 +882,12 @@ class RedisRuntimeStore:
     async def publish_inference_artifact(
         self, artifact: InferenceArtifact, *, stream_maxlen: int | None = None,
     ) -> str:
-        """Publish one inference artifact: latest-key projection + stream entry."""
+        """Publish one inference artifact: latest-key projection + stream entry.
+
+        .. deprecated:: canonical-output plane
+           **Deprecated writer (legacy).** New cycles publish
+           ``CanonicalOutput`` rows (``publish_canonical_output``).
+        """
         artifact.validate()
         body = artifact.to_json()
         await self.redis.set(self.inference_latest_key(artifact.symbol, artifact.venue), body)
@@ -903,6 +909,32 @@ class RedisRuntimeStore:
         except (ValueError, json.JSONDecodeError):
             return None
         return decoded if isinstance(decoded, dict) else None
+
+    async def publish_canonical_output(
+        self, output: CanonicalOutput, *, stream_maxlen: int | None = None,
+    ) -> str:
+        """Publish one canonical output: latest-key projection + stream entry.
+
+        Same nervous-system role as the legacy artifact projection (the
+        live latest read surface, never the historical authority): the key
+        and stream carry the canonical row now.
+        """
+        output.validate()
+        body = output.to_json()
+        await self.redis.set(
+            self.inference_latest_key(output.symbol, output.venue), body)
+        return str(await self.redis.xadd(
+            self.inference_stream(output.symbol, output.venue),
+            {"payload": body, "run_id": output.run_id,
+             "status": output.status},
+            maxlen=stream_maxlen or self.stream_maxlen, approximate=True,
+        ))
+
+    async def read_latest_canonical_output(
+        self, symbol: str, venue: str = "spot",
+    ) -> dict[str, Any] | None:
+        """Latest canonical output projection (same read path as legacy)."""
+        return await self.read_latest_inference_artifact(symbol, venue)
 
     # ------------------------------------------------------------------
     # Poller control plane — dynamic symbol selection
@@ -1059,6 +1091,8 @@ class RedisRuntimeStore:
             self.substrate_stream(substrate, symbol),
             body, substrate.lower(), symbol.upper(), ts, maxlen,
         ))
+
+
 
     async def read_substrate_latest(
         self, substrate: str, symbol: str,

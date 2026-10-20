@@ -23,6 +23,10 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     "specialist_report": 2,
     "agent_memory": 1,
     "inference_artifact": 1,
+    # Canonical output (docs/CLI_ANSWER_SURFACE_PLAN.md → canonical path):
+    # ONE row per cycle = the answer (frozen text + structured) + its run
+    # record. THE deliverable plane; inference_artifact is deprecated legacy.
+    "canonical_output": 1,
     "wake_envelope": 1,
     "substrate_state": 2,
     "microstructure": 1,
@@ -38,13 +42,18 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     # the worker-plane FSMs' durable verdict surface. One registry entry,
     # identity-resolved by the declaring module per the charter.
     "governance_ledger": 1,
+    # Operational telemetry state mirror. This is deliberately separate from
+    # market/worker/governance ledgers; Redis is only its live projection.
+    "telemetry_event": 1,
 }
 MARKET_STATE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_state"]
 MARKET_RUN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_run"]
 SPECIALIST_REPORT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["specialist_report"]
 AGENT_MEMORY_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["agent_memory"]
 INFERENCE_ARTIFACT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["inference_artifact"]
+CANONICAL_OUTPUT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["canonical_output"]
 WAKE_ENVELOPE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["wake_envelope"]
+TELEMETRY_EVENT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["telemetry_event"]
 # Agent-artifact kinds the memory node can persist — the AGENT's own
 # observation kinds plus 'fact' (deterministic paper truth, seed-only). The
 # engine's loop carries (understanding/plan/handoff) are NOT here: they live on
@@ -95,6 +104,132 @@ def normalize_confidence(value: Any) -> str | None:
     if mapped is not None and mapped in ValidConfidence:
         return mapped
     return None
+
+
+# ---------------------------------------------------------------------------
+# The authored adjudication (interpretation.hypothesis_probabilities) —
+# REGISTERED field (canonical output doctrine). The agent's weighed choice:
+# H0/H1 probability bands + basis paths, the chosen hypothesis, the tiebreak.
+# Read side is lenient (legacy rows may lack it); write side is strict — a
+# malformed adjudication fails validation, it is never silently coerced into
+# meaning (state doctrine).
+# ---------------------------------------------------------------------------
+
+ValidAdjudicationChoice: tuple[str, ...] = ("H0", "H1")
+
+
+def normalize_adjudication(value: Any) -> dict[str, Any] | None:
+    """Coerce an adjudication block to its canonical shape (pure, lenient).
+
+    Returns ``{"H0": {...}, "H1": {...}, "chosen": ..., "tiebreak": ...}``
+    or ``None`` when the value is unmappable. Never raises — legacy rows and
+    model drift read as None, never as invented meaning.
+    """
+    if not isinstance(value, dict):
+        return None
+    chosen = str(value.get("chosen") or "").strip().upper()
+    if chosen not in ValidAdjudicationChoice:
+        chosen = None
+    out: dict[str, Any] = {}
+    for side in ValidAdjudicationChoice:
+        row = value.get(side)
+        if not isinstance(row, dict):
+            out[side] = {"probability": None, "p": None, "basis_path": None}
+            continue
+        probability = row.get("probability")
+        out[side] = {
+            "probability": (normalize_confidence(probability)
+                            if probability is not None else None),
+            "p": row.get("p"),
+            "basis_path": (str(row["basis_path"])
+                           if row.get("basis_path") is not None else None),
+        }
+    out["chosen"] = chosen
+    out["tiebreak"] = value.get("tiebreak")
+    return out
+
+
+def validate_adjudication(value: Any) -> None:
+    """Strict write-side validation of one adjudication block (raises).
+
+    Shape: ``{H0: {probability, p, basis_path}, H1: {...}, chosen, tiebreak}``
+    with ``chosen`` in {H0, H1} and band vocabulary the contract enum.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("interpretation.hypothesis_probabilities must be a JSON object")
+    chosen = str(value.get("chosen") or "").strip().upper()
+    if chosen not in ValidAdjudicationChoice:
+        raise ValueError(
+            "interpretation.hypothesis_probabilities.chosen must be H0 or H1, "
+            f"got {value.get('chosen')!r}")
+    for side in ValidAdjudicationChoice:
+        row = value.get(side)
+        if row is not None and not isinstance(row, dict):
+            raise ValueError(
+                f"interpretation.hypothesis_probabilities.{side} must be a JSON object")
+        if isinstance(row, dict):
+            probability = row.get("probability")
+            if probability is not None and normalize_confidence(probability) is None:
+                raise ValueError(
+                    f"interpretation.hypothesis_probabilities.{side}.probability "
+                    f"must be one of {ValidConfidence!r}, got {probability!r}")
+            basis = row.get("basis_path")
+            if basis is not None and not isinstance(basis, str):
+                raise ValueError(
+                    f"interpretation.hypothesis_probabilities.{side}.basis_path "
+                    "must be a string or null")
+
+
+def validate_interpretation(interpretation: dict[str, Any] | None) -> None:
+    """Strict write-side validation of the LLM-authored interpretation (raises).
+
+    Shared by every output contract: confidence is the contract enum, every
+    evidence entry carries a path + interpretation, and the REGISTERED
+    adjudication field (hypothesis_probabilities) validates its shape.
+    """
+    if interpretation is None:
+        return
+    # Validator hardening (2026-09-10): interpretation confidence must be
+    # the contract enum (aliases coerce, blends go conservative). Past
+    # rows with "low-medium" read back as "low" via normalize.
+    conf = interpretation.get("confidence")
+    if conf is not None and normalize_confidence(conf) is None:
+        raise ValueError(
+            f"interpretation.confidence must be one of {ValidConfidence!r}, got {conf!r}"
+        )
+    evidence = interpretation.get("evidence")
+    if isinstance(evidence, list):
+        for i, entry in enumerate(evidence):
+            if not isinstance(entry, dict):
+                raise ValueError(f"interpretation.evidence[{i}] must be an object")
+            if not str(entry.get("path") or "").strip():
+                raise ValueError(f"interpretation.evidence[{i}] missing required field: path")
+            if not str(entry.get("interpretation") or "").strip():
+                raise ValueError(
+                    f"interpretation.evidence[{i}] missing required field: interpretation"
+                )
+    adjudication = interpretation.get("hypothesis_probabilities")
+    if adjudication is not None:
+        validate_adjudication(adjudication)
+
+
+def run_record_of(record: dict[str, Any] | None) -> dict[str, Any]:
+    """The run-record bookkeeping of EITHER record shape (pure).
+
+    Canonical rows nest it under ``run_record``; deprecated legacy artifact
+    rows carry the keys at top level (read-only compatibility). Readers use
+    this helper so both shapes resolve to one view.
+    """
+    if not isinstance(record, dict):
+        return {"deterministic_state": {}, "capability_log": [], "errors": []}
+    run_record = record.get("run_record")
+    if isinstance(run_record, dict):
+        return run_record
+    return {
+        "deterministic_state": record.get("deterministic_state") or {},
+        "capability_log": record.get("capability_log") or [],
+        "errors": record.get("errors") or [],
+    }
 # Inference-artifact status trichotomy (Pass-3 discipline, generalized):
 # validated  — deterministic inputs passed every quality gate; narration may cite values
 # provisional — fitted but diagnostics incomplete; narration must caveat, never signal
@@ -709,6 +844,13 @@ class AgentMemory:
 class InferenceArtifact:
     """Immutable output of one inference-engine cycle.
 
+    .. deprecated:: canonical-output plane
+       **DEPRECATED as an output contract (read-only legacy).** Pre-canonical
+       rows stay readable through this type; new cycles produce
+       ``CanonicalOutput`` (one row = the answer + its run record). Nothing
+       writes ``inference_artifact`` rows anymore — the run record is
+       bookkeeping, the ANSWER is the deliverable.
+
     The inference engine is an orchestrator object with AUTHORITY over the
     deterministic supporting modules: it reads price/microstructure data from
     Redis, validates the request via the bounded capability registry, triggers
@@ -868,23 +1010,9 @@ class InferenceArtifact:
         # Validator hardening (2026-09-10): interpretation confidence must be
         # the contract enum (aliases coerce, blends go conservative). Past
         # rows with "low-medium" read back as "low" via normalize.
-        if self.interpretation is not None:
-            conf = self.interpretation.get("confidence")
-            if conf is not None and normalize_confidence(conf) is None:
-                raise ValueError(
-                    f"interpretation.confidence must be one of {ValidConfidence!r}, got {conf!r}"
-                )
-            evidence = self.interpretation.get("evidence")
-            if isinstance(evidence, list):
-                for i, entry in enumerate(evidence):
-                    if not isinstance(entry, dict):
-                        raise ValueError(f"interpretation.evidence[{i}] must be an object")
-                    if not str(entry.get("path") or "").strip():
-                        raise ValueError(f"interpretation.evidence[{i}] missing required field: path")
-                    if not str(entry.get("interpretation") or "").strip():
-                        raise ValueError(
-                            f"interpretation.evidence[{i}] missing required field: interpretation"
-                        )
+        # Registered adjudication field (hypothesis_probabilities) validates
+        # through the same shared write-side contract.
+        validate_interpretation(self.interpretation)
         # Combined formula is derived hypothesis only — never a shortcut stored as deterministic prediction.
         if self.calculations and self.calculations.get("combined_prediction") is not None:
             raise ValueError("calculations.combined_prediction must not be stored as deterministic prediction; use derived_diagnostic")
@@ -911,6 +1039,218 @@ class InferenceArtifact:
             "hypothesis_verdict": self.hypothesis_verdict,
             "verdict_reason": self.verdict_reason,
             "calculations": self.calculations,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class CanonicalOutput:
+    """THE canonical output of one engine cycle — the answer + its run record.
+
+    The deliverable plane (canonical output doctrine): ONE immutable row per
+    cycle in Postgres. ``answer_text`` is the frozen render of the answer —
+    the answer OF RECORD, exactly what shipped to the CLI surface — and
+    ``answer`` is the structured variant (audit / machine read). Everything
+    else is RUN RECORD: engine-internal bookkeeping, never the consumable
+    output (docs/CLI_ANSWER_SURFACE_PLAN.md §3, C2).
+
+    State doctrine: symbol-specific, time-bounded, schema-versioned,
+    source-attributed (input_hash / model_version), explicit about missing
+    values. Null discipline: ``status == "insufficient"`` carries NULL
+    interpretation AND NULL answer — no LLM narration over gate-failed data.
+    """
+
+    run_id: str
+    symbol: str
+    venue: str
+    generated_at: str
+    completed_at: str
+    status: InferenceStatus
+    window_minutes: int
+    interval_seconds: int
+    input_hash: str
+    model_version: str
+    # --- the deliverable (frozen + structured) ---
+    answer_text: str | None = None
+    answer: dict[str, Any] | None = None
+    # --- run record (bookkeeping) ---
+    interpretation: dict[str, Any] | None = None
+    hypothesis: dict[str, Any] | None = None
+    hypothesis_verdict: str | None = None  # validated|invalidated|inconclusive
+    verdict_reason: str | None = None
+    calculations: dict[str, Any] | None = None
+    conformance: dict[str, Any] | None = None
+    run_record: dict[str, Any] = field(default_factory=dict)
+    task: str | None = None
+    terminal: str | None = None
+    session_id: str | None = None
+    schema_version: int = CANONICAL_OUTPUT_SCHEMA_VERSION
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        symbol: str,
+        venue: str,
+        generated_at: str,
+        completed_at: str,
+        status: InferenceStatus,
+        window_minutes: int,
+        interval_seconds: int,
+        input_hash: str,
+        model_version: str,
+        run_record: dict[str, Any] | None = None,
+        answer_text: str | None = None,
+        answer: dict[str, Any] | None = None,
+        interpretation: dict[str, Any] | None = None,
+        hypothesis: dict[str, Any] | None = None,
+        hypothesis_verdict: str | None = None,
+        verdict_reason: str | None = None,
+        calculations: dict[str, Any] | None = None,
+        conformance: dict[str, Any] | None = None,
+        task: str | None = None,
+        terminal: str | None = None,
+        session_id: str | None = None,
+    ) -> "CanonicalOutput":
+        created = cls(
+            run_id=str(uuid.uuid4()),
+            symbol=symbol.upper(),
+            venue=venue,
+            generated_at=generated_at,
+            completed_at=completed_at,
+            status=status,
+            window_minutes=window_minutes,
+            interval_seconds=interval_seconds,
+            input_hash=input_hash,
+            model_version=model_version,
+            answer_text=answer_text,
+            answer=answer,
+            interpretation=interpretation,
+            hypothesis=hypothesis,
+            hypothesis_verdict=hypothesis_verdict,
+            verdict_reason=verdict_reason,
+            calculations=calculations,
+            conformance=conformance,
+            run_record=dict(run_record or {}),
+            task=task,
+            terminal=terminal,
+            session_id=session_id,
+        )
+        created.validate()
+        return created
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "CanonicalOutput":
+        output = cls(
+            run_id=str(value["run_id"]),
+            symbol=str(value["symbol"]).upper(),
+            venue=str(value["venue"]),
+            generated_at=str(value["generated_at"]),
+            completed_at=str(value["completed_at"]),
+            status=value["status"],
+            window_minutes=int(value["window_minutes"]),
+            interval_seconds=int(value["interval_seconds"]),
+            input_hash=str(value.get("input_hash") or ""),
+            model_version=str(value.get("model_version") or ""),
+            answer_text=(
+                str(value["answer_text"])
+                if value.get("answer_text") is not None else None
+            ),
+            answer=(dict(value["answer"])
+                    if value.get("answer") is not None else None),
+            interpretation=(dict(value["interpretation"])
+                            if value.get("interpretation") is not None else None),
+            hypothesis=(dict(value["hypothesis"])
+                        if value.get("hypothesis") is not None else None),
+            hypothesis_verdict=value.get("hypothesis_verdict"),
+            verdict_reason=value.get("verdict_reason"),
+            calculations=(dict(value["calculations"])
+                          if value.get("calculations") is not None else None),
+            conformance=(dict(value["conformance"])
+                         if value.get("conformance") is not None else None),
+            run_record=dict(value.get("run_record") or {}),
+            task=value.get("task"),
+            terminal=value.get("terminal"),
+            session_id=(str(value["session_id"])
+                        if value.get("session_id") is not None else None),
+            schema_version=int(
+                value.get("schema_version", CANONICAL_OUTPUT_SCHEMA_VERSION)
+            ),
+        )
+        output.validate()
+        return output
+
+    def validate(self) -> None:
+        if self.schema_version != CANONICAL_OUTPUT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported canonical output schema version: {self.schema_version}"
+            )
+        if not self.run_id or not self.symbol or not self.venue:
+            raise ValueError("run_id, symbol, and venue are required")
+        if self.status not in ValidInferenceStatus:
+            raise ValueError(f"invalid inference status: {self.status}")
+        if self.window_minutes <= 0 or self.interval_seconds <= 0:
+            raise ValueError("window_minutes and interval_seconds must be positive")
+        if self.interpretation is not None and self.status == "insufficient":
+            raise ValueError(
+                "an insufficient output must carry a NULL interpretation "
+                "(hard gate: no LLM narration over gate-failed data)"
+            )
+        if (self.answer_text is not None or self.answer is not None) \
+                and self.status == "insufficient":
+            raise ValueError(
+                "an insufficient output must carry a NULL answer "
+                "(null discipline: nothing authored over gate-failed data)"
+            )
+        if self.hypothesis_verdict is not None and self.hypothesis_verdict not in (
+                "validated", "invalidated", "inconclusive"):
+            raise ValueError(f"invalid hypothesis_verdict: {self.hypothesis_verdict}")
+        if self.answer_text is not None and not isinstance(self.answer_text, str):
+            raise ValueError("answer_text must be a string or NULL")
+        if self.answer is not None and not isinstance(self.answer, dict):
+            raise ValueError("answer must be a JSON object or NULL")
+        if not isinstance(self.run_record, dict):
+            raise ValueError("run_record must be a JSON object")
+        state = self.run_record.get("deterministic_state")
+        if state is not None and not isinstance(state, dict):
+            raise ValueError("run_record.deterministic_state must be a JSON object")
+        # Registered adjudication field + interpretation shape (shared).
+        validate_interpretation(self.interpretation)
+        # Combined formula is derived hypothesis only — never a shortcut
+        # stored as deterministic prediction.
+        if self.calculations and self.calculations.get("combined_prediction") is not None:
+            raise ValueError(
+                "calculations.combined_prediction must not be stored as "
+                "deterministic prediction; use derived_diagnostic"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "symbol": self.symbol,
+            "venue": self.venue,
+            "generated_at": self.generated_at,
+            "completed_at": self.completed_at,
+            "status": self.status,
+            "window_minutes": self.window_minutes,
+            "interval_seconds": self.interval_seconds,
+            "input_hash": self.input_hash,
+            "model_version": self.model_version,
+            "answer_text": self.answer_text,
+            "answer": self.answer,
+            "interpretation": self.interpretation,
+            "hypothesis": self.hypothesis,
+            "hypothesis_verdict": self.hypothesis_verdict,
+            "verdict_reason": self.verdict_reason,
+            "calculations": self.calculations,
+            "conformance": self.conformance,
+            "run_record": self.run_record,
+            "task": self.task,
+            "terminal": self.terminal,
+            "session_id": self.session_id,
         }
 
     def to_json(self) -> str:
