@@ -34,7 +34,9 @@ INFERENCE PLANE — the OO agent, LLM narration over injected state:
 - ``inference_runner``           — task-directed one-shot cycle (manual +
                                    ``task`` / direct envelope / no-wake; the
                                    interaction plane's only seam)
-- ``memory.MemoryNode``          — the engine's episodic memory
+- ``memory.MemoryNode``          — the AGENT's own episodic memory store
+                                   (reached in-flight via the ``memory.*``
+                                   tools; the engine's memory is the ledger)
 - ``backends.ModelBackendConfig``— narration LLM client config
 
 Boundary rule: the inference plane imports ``composition`` /

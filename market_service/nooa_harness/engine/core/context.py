@@ -12,6 +12,7 @@ from market_service.nooa_harness.inference import execute_tool  # noqa: F401  (r
 from ..controller import CycleController
 from ..fsm import GovernanceEvent, GovernanceEventKind, MembraneVerdict
 from ..llm import last_tier as _last_tier
+from ..ledger import record_finding
 from ..loop_states import NestedLoop, SubLoop, TaskIntent
 from .chain import (
     POSITION_ORDER,
@@ -228,14 +229,10 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     "forecast_result", "forward_scenario", "forward_scenario_note",
     "forward_gate", "gate",
     # pass/loop-carried verdict roots
-    "assessment_note", "chain_gaps", "chain_halt", "comprehension",
-    "congruence", "failure", "failure_report", "terminal",
-    "loop_traversal", "validation_issue", "understanding_receipt",
-    "statistical_chain", "governance_trace",
-    # canonical loop-receipt vector (engine/receipts.py; the canonical half of
-    # the receipt/note partition — see docs/NESTED_LOOP_SPEC §8)
-    "loop_receipts",
-    # central engine ledger (engine/ledger.py) — the ONE deterministic home
+    "chain_halt", "comprehension",
+    "failure", "terminal",
+    "understanding_receipt",
+    "statistical_chain",     # central engine ledger (engine/ledger.py) — the ONE deterministic home
     # for engine-authored memory, sectioned by LedgerKind
     "ledger",
     # scenario contract (interaction plane → runtime): ONE frozen question,
@@ -245,21 +242,8 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     "scenario_digest",
     # re-ordered cycle roots (comprehension/acquisition plane)
     "data_quality", "seeded_plan", "plan_gate", "persistence",
-    "narration_tiers", "base_summary", "assembly_dropped",
-    # removal-only evidence salvage (core/validation.py): the audit record of
-    # null-valued citations dropped at the validation terminal so a cycle
-    # settles instead of failing on entries no ledger can back.
-    "evidence_salvaged",
-    # authored-output conformance verdict (core/output.py): the honest
-    # tier/drops/conflicts record for the object that SHIPS.
-    "conformance",
-    # agentic synthesis (core/synthesize.py): FSM-visible failure note for
+    "narration_tiers", "base_summary",     # agentic synthesis (core/synthesize.py): FSM-visible failure note for
     # the semantics-review surface; the cycle degrades, never dies on it
-    "synthesis_note",
-    # relaxed-loop authored output (core/output.py): the conformance record
-    # of the object that SHIPS — dropped citations, hard misses, carried-
-    # semantics conflicts, quality findings, correction usage
-    "conformance",
 })
 
 
@@ -283,13 +267,9 @@ class CycleRuntimeState:
     repairs_sent: int = 0
     validation_retries_used: int = 0
     validation_entered: bool = False
+    # The FRAMING gate verdict, recorded once at comprehension close.
+    framing_verdict: Any | None = None
     opened_subs: set[str] = field(default_factory=set)
-    # Loop receipts (canonical, engine-authored): one close record per
-    # loop/sub-loop, mirrored into the chartered
-    # ``deterministic_state["loop_receipts"]`` root by
-    # ``engine.receipts.emit_receipt``. Receipts are authoritative structural
-    # facts and carry no model prose (the agent's memory node is separate).
-    loop_receipts: list[Any] = field(default_factory=list)
     passes_per_loop: dict[str, int] = field(default_factory=lambda: {
         "comprehension": 0, "evidence": 0, "reasoning": 0,
         "validation": 0, "output": 0,
@@ -438,7 +418,13 @@ def freeze_chain(
         # Slice D: base pointer — the halt/retry reader gets base + position
         # in one snapshot instead of joining two roots.
         "base_summary": dict(getattr(st, "base_summary", {}) or {}),
-        "stage_ids": list(getattr(st, "ledger_stage_ids", []) or []),
+        # Observation stage pointers only: gate verdicts and audit rows share
+        # the ledger now, but they are not chain readings.
+        "stage_ids": [
+            pointer for pointer in (getattr(st, "ledger_stage_ids", []) or [])
+            if not str(pointer).startswith(
+                ("verdict:", "verdict-chosen#", "evidence-salvage#"))
+        ],
     }
 
 
@@ -543,7 +529,12 @@ async def dispatch_failure(
     outcome = await failure_substrate_for(st).dispatch(
         verdict, task=task, transport=transport,
     )
-    st.deterministic_state["failure_report"] = outcome.failure_report.to_dict()
+    record_finding(
+        st.deterministic_state, "failure_report",
+        "failure remediated: " + str(kind),
+        detail=outcome.failure_report.to_dict(),
+        segment=getattr(ctx, "task_id", None),
+    )
     st.deterministic_state["failure"] = st.deterministic_state.get("failure", {}) | {
         "kind": kind,
         "detail": detail,
@@ -664,11 +655,10 @@ async def run_runtime_failure(
     st.deterministic_state["failure"] = {
         "kind": kind, "detail": st.failure_detail,
     }
-    st.deterministic_state["loop_traversal"] = st.controller.loop_coverage()
-    st.deterministic_state["governance_trace"] = st.controller.transition_trace()
     return await engine._degraded_output(
         st.deterministic_state, st.capability_log,
         f"{kind}: {st.failure_detail or 'runtime failure'}",
+        controller=st.controller,
     ), {
         "llm_calls": st.llm_calls,
         "terminal": terminal,
@@ -725,12 +715,16 @@ async def run_validation_terminal(
     )
     ctx.controller = st.controller
     st.deterministic_state["terminal"] = terminal
-    st.deterministic_state["validation_issue"] = validation_issue
-    st.deterministic_state["loop_traversal"] = st.controller.loop_coverage()
-    st.deterministic_state["congruence"] = st.controller.congruence()
+    record_finding(
+        st.deterministic_state, "validation_issue",
+        "validation terminal: " + "; ".join(str(m) for m in missing[:3]),
+        detail=validation_issue,
+        segment=getattr(ctx, "task_id", None),
+    )
     return await engine._degraded_output(
         st.deterministic_state, st.capability_log,
         f"validation_failed: {'; '.join(missing)[:500]}",
+        controller=st.controller,
     ), {
         "llm_calls": st.llm_calls,
         "terminal": terminal,

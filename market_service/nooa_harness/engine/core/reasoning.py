@@ -43,7 +43,7 @@ from .context import (
 from ..llm import NarrationStalledError, narration_failure_kind
 from ..fsm import GovernanceEventKind
 from .. import kb
-from .. import receipts
+from .. import gates
 from ..ledger import LedgerKind, ledger_rows, record_entry, render_ledger
 from .chain import (
     POSITION_ORDER,
@@ -284,13 +284,14 @@ async def run_evidence(
     )
     # Canonical receipt: the evidence half of CONTEXT closed. Only sub-loops
     # that actually opened are claimed (no invented work).
-    receipts.emit_receipt(
+    gates.close_loop(
         st, loop=NestedLoop.CONTEXT, sub_loop=SubLoop.VERIFICATION,
         steps=(LoopStep.PLAN_READS, LoopStep.SELECT_TOOLS, LoopStep.READ,
                LoopStep.CALCULATE, LoopStep.OBSERVE, LoopStep.ASSESS,
                LoopStep.STORE_HANDOFF),
         payload={"passes": st.passes_per_loop.get("evidence", 0)},
-        evidence_refs=(getattr(ctx.wake, "wake_id", "") or "",),
+        refs=(getattr(ctx.wake, "wake_id", "") or "",),
+        segment=getattr(ctx, "task_id", None),
     )
     return None
 
@@ -489,11 +490,12 @@ async def run_reasoning(
         completed=True,
     )
     # Canonical receipt: the REASONING loop closed its full track.
-    receipts.emit_receipt(
+    gates.close_loop(
         st, loop=NestedLoop.REASONING, sub_loop=SubLoop.SYNTHESIS,
         steps=(LoopStep.FRAME, LoopStep.STATE_PRIOR, LoopStep.TEST,
                LoopStep.COMPARE, LoopStep.INTERPRET, LoopStep.RECONCILE),
         payload={"reason_position": st.reason_position},
+        segment=getattr(ctx, "task_id", None),
     )
     # Adjudication spine (spec §3): verdict-basis ledger record at reasoning
     # close — frame + primary truth + stage ids — so validation weighs

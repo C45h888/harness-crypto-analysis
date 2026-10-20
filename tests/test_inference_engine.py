@@ -5,7 +5,7 @@ Covers the three mechanical foundations of the agent role shift
 
 1. ``InferenceArtifact`` contract — round-trip, validation, and the hard
    rule that an insufficient artifact can never carry an interpretation.
-2. ``resolve_inference_status`` — the deterministic trichotomy: identical
+2. (retired) the status trichotomy moved out of the agentic path
    inputs always yield identical status + reasons.
 3. Capability registry — bounded scope denial and pure dispatch paths
    (fitting.replay / fitting.assemble_evidence over synthetic fixtures,
@@ -24,8 +24,6 @@ from market_service.nooa_harness.inference import (
     CapabilityDenied,
     dispatch_assemble_evidence,
     dispatch_replay,
-    gate_interpretation,
-    resolve_inference_status,
 )
 from market_service.runtime.contracts import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,
@@ -105,75 +103,7 @@ class InferenceArtifactContractTests(unittest.TestCase):
             ).validate()
 
 
-class ResolveInferenceStatusTests(unittest.TestCase):
-    def test_validated_when_all_gates_pass(self):
-        status, reasons = resolve_inference_status(
-            n_observations=80, min_observations=30, fit_status="validated",
-            capture_state="running", events_in_window=500,
-        )
-        self.assertEqual(status, "validated")
-        self.assertEqual(reasons, ())
 
-    def test_insufficient_when_below_minimum_observations(self):
-        status, reasons = resolve_inference_status(
-            n_observations=10, min_observations=30, fit_status="validated",
-            capture_state="running", events_in_window=100,
-        )
-        self.assertEqual(status, "insufficient")
-        self.assertTrue(any("minimum" in r for r in reasons))
-
-    def test_insufficient_when_capture_never_established(self):
-        status, _ = resolve_inference_status(
-            n_observations=80, min_observations=30, fit_status="validated",
-            capture_state="starting", events_in_window=100,
-        )
-        self.assertEqual(status, "insufficient")
-
-    def test_insufficient_when_fit_insufficient(self):
-        status, _ = resolve_inference_status(
-            n_observations=80, min_observations=30, fit_status="insufficient",
-            capture_state="running", events_in_window=100,
-        )
-        self.assertEqual(status, "insufficient")
-
-    def test_provisional_when_fit_provisional(self):
-        status, reasons = resolve_inference_status(
-            n_observations=80, min_observations=30, fit_status="provisional",
-            capture_state="running", events_in_window=500,
-        )
-        self.assertEqual(status, "provisional")
-        self.assertTrue(any("provisional" in r for r in reasons))
-
-    def test_provisional_when_degraded_spans(self):
-        status, _ = resolve_inference_status(
-            n_observations=80, min_observations=30, fit_status="validated",
-            capture_state="running", events_in_window=500, degraded_spans_in_window=2,
-        )
-        self.assertEqual(status, "provisional")
-
-    def test_determinism_identical_inputs_identical_outputs(self):
-        kwargs = {
-            "n_observations": 45, "min_observations": 30,
-            "fit_status": "validated", "capture_state": "running",
-            "events_in_window": 120,
-        }
-        self.assertEqual(resolve_inference_status(**kwargs),
-                         resolve_inference_status(**kwargs))
-
-
-class GateInterpretationTests(unittest.TestCase):
-    def test_insufficient_neutralizes_interpretation(self):
-        self.assertIsNone(
-            gate_interpretation("insufficient", {"summary": "should not survive"})
-        )
-
-    def test_validated_passes_interpretation_through(self):
-        interp = {"summary": "fine"}
-        self.assertEqual(gate_interpretation("validated", interp), interp)
-
-    def test_provisional_passes_interpretation_through(self):
-        interp = {"summary": "caveated"}
-        self.assertEqual(gate_interpretation("provisional", interp), interp)
 
 
 def _synthetic_event_payload(k: int, contribution: str, ts: int) -> dict:

@@ -345,55 +345,9 @@ class LoopObservation:
 # canonical and carry no model prose; the agent's own memory node is a separate
 # surface the agent calls and writes.
 #
-# Emission mechanics live in ``engine/receipts.py``; this module owns only the
+# Emission mechanics live in ``engine/gates.py`` (CLOSE verdicts); this module owns only the
 # VOCABULARY (matching the loop_states/fsm authority split: vocabulary here,
 # legality in fsm, semantics in controller).
-
-
-class ReceiptDisposition(str, Enum):
-    """How a loop/sub-loop actually closed — the honest disposition set.
-
-    ``NOT_APPLICABLE`` and ``SKIPPED`` exist so an inapplicable or unentered
-    step is disposed *explicitly* rather than fabricated (NESTED_LOOP_SPEC
-    §8.4: no invented work, no no-op event parade).
-    """
-
-    COMPLETED = "completed"          # the sub-loop's work ran and satisfied its exit
-    NOT_APPLICABLE = "not_applicable"  # the sub-loop does not apply to this cycle
-    REFUSED = "refused"              # a deterministic verdict refused the work
-    DENIED = "denied"                # the membrane denied the transition
-    SKIPPED = "skipped"              # not entered (budget/early exit) — recorded, not claimed
-
-
-@dataclass(frozen=True)
-class LoopReceipt:
-    """One engine-authored, JSON-serializable record of a loop/sub-loop close.
-
-    It answers *what happened* (structural facts + provenance). Receipts are
-    frozen so a cycle's traversal is replayable and auditable from the
-    artifact.
-
-    ``payload``       — bounded, JSON-safe STRUCTURAL facts only (never narration).
-    ``evidence_refs`` — provenance ancestors (wake_id / artifact_id / tool paths).
-    """
-
-    loop: NestedLoop
-    sub_loop: SubLoop
-    disposition: ReceiptDisposition = ReceiptDisposition.COMPLETED
-    steps: tuple[LoopStep, ...] = ()
-    payload: Mapping[str, Any] | None = None
-    evidence_refs: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-safe projection (stable key order for fixtures/artifacts)."""
-        return {
-            "loop": self.loop.value,
-            "sub_loop": self.sub_loop.value,
-            "disposition": self.disposition.value,
-            "steps": [step.value for step in self.steps],
-            "payload": dict(self.payload) if self.payload else {},
-            "evidence_refs": list(self.evidence_refs),
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -904,8 +858,6 @@ __all__ = [
     # observation
     "LoopObservation",
     # receipt (canonical half of the receipt/note partition)
-    "LoopReceipt",
-    "ReceiptDisposition",
     # terminal sets
     "SUCCESS_TERMINALS",
     "FAILURE_TERMINALS",

@@ -173,11 +173,16 @@ def test_salvage_records_ledger_and_state():
     st = _St()
     _record_evidence_salvage(
         st, _Ctx(), [{"index": 3, "path": "micro.fit_beta → data.beta"}])
-    assert st.deterministic_state["evidence_salvaged"] == [
-        {"index": 3, "path": "micro.fit_beta → data.beta"}]
+    # No competing state root: the salvage is a FINDING row (projected to
+    # evidence_salvaged on the artifact).
     rows = st.deterministic_state["ledger"]
-    assert rows[-1]["payload"]["stage"] == "evidence-salvage"
-    assert rows[-1]["payload"]["dropped"][0]["index"] == 3
+    _salvage_rows = [r for r in rows
+                     if r["payload"].get("stage") == "evidence-salvage"]
+    assert len(_salvage_rows) == 1
+    assert _salvage_rows[0]["payload"]["dropped"][0]["index"] == 3
+    _finding_rows = [r for r in rows
+                     if r["payload"].get("finding_kind") == "evidence_salvaged"]
+    assert _finding_rows[0]["payload"]["detail"]["dropped"][0]["index"] == 3
     assert st.ledger_stage_ids[-1].startswith("evidence-salvage#")
 
 

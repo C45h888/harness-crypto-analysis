@@ -1059,8 +1059,12 @@ class P3PromptContractTests(unittest.TestCase):
 
     def test_system_prompt_frames_invoke_as_a_request(self):
         """A granted tool call is not a guaranteed fresh compute."""
-        from market_service.nooa_harness.engine import _SYSTEM_PROMPT_TEMPLATE
-        self.assertIn("calculation plane", _SYSTEM_PROMPT_TEMPLATE.lower())
+        # Load doctrine (Signal B): the invoke-as-request rule lives in the
+        # per-loop tool window the model sees on tool loops, not in the
+        # 350-word system charter.
+        from market_service.nooa_harness.engine.kb import tool_window_for
+        self.assertIn("calculation plane", tool_window_for("context").lower())
+        self.assertIn("age_ms", tool_window_for("context").lower())
 
     def test_output_format_names_substrate_primary(self):
         from market_service.nooa_harness.engine import InferenceEngine
@@ -1069,6 +1073,53 @@ class P3PromptContractTests(unittest.TestCase):
         self.assertIn("TWO-BEAT", fmt)
         self.assertIn("substrate.invoke", fmt)
         self.assertIn("age_ms", fmt)
+
+    def test_loop_windows_name_no_phantom_memory_surface(self):
+        """Loop prompts must name only memory surfaces that exist.
+
+        Two real, distinct surfaces: the central engine ledger
+        (engine/ledger.py — agent reads, engine writes) and the agent's own
+        memory node (memory.* tools — agent writes and reads). The reasoning
+        window once said a base observation "is stored to task memory", a
+        surface that has never existed; the write actually lands on the
+        ledger (core/reasoning.py::record_inter_stage). A prompt that names
+        a third surface sends the agent looking for memory it cannot reach.
+        """
+        from market_service.nooa_harness.engine.kb import (
+            TOOL_WINDOWS, tool_window_for,
+        )
+        windows = {loop: text for loop, text in TOOL_WINDOWS.items()
+                   if isinstance(text, str)}
+        for loop in ("context", "reasoning", "validation", "output"):
+            windows.setdefault(loop, tool_window_for(loop))
+        for loop, text in windows.items():
+            lowered = text.lower()
+            self.assertNotIn("task memory", lowered,
+                             f"{loop} window names a phantom memory surface")
+            self.assertNotIn("episodic memory node", lowered,
+                             f"{loop} window names the store, not the agent "
+                             "surface the agent actually calls")
+
+    def test_agent_memory_is_the_only_agent_writable_surface(self):
+        """memory.* is the sole persistence write in the tool registry."""
+        from market_service.nooa_harness.inference.tooling.registry import (
+            TOOL_NAMES, tool_homes,
+        )
+        from market_service.nooa_harness.engine import gates, ledger
+        # Every loop names the agent's own memory as reachable in flight.
+        for tool in ("memory.remember", "memory.recall",
+                     "memory.forget", "memory.stats"):
+            self.assertIn(tool, TOOL_NAMES)
+            homes = tool_homes(tool)
+            self.assertTrue(homes, f"{tool} has no authorized home")
+            self.assertGreater(
+                len(homes), 1,
+                f"{tool} must be reachable from more than one loop")
+        # The engine's own memory is not the agent's memory: the ledger is
+        # engine-authored and the agent never writes it.
+        self.assertIn("the agent never writes it", ledger.__doc__)
+        # A loop close is a gate verdict, never a second record type.
+        self.assertIn("A loop close is a gate too", gates.__doc__)
 
 
 class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):

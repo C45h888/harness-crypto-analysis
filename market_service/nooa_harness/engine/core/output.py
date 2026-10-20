@@ -13,15 +13,9 @@ from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..kb import build_task_workflow, chain_status
 from ..schemas import coerce_turn, extract_json_object
-from ..ledger import LedgerKind, ledger_rows
-from ..loop_states import (
-    LoopReceipt,
-    LoopStep,
-    NestedLoop,
-    ReceiptDisposition,
-    SubLoop,
-)
-from .. import receipts
+from ..ledger import LedgerKind, ledger_rows, record_finding
+from ..loop_states import LoopStep, NestedLoop, SubLoop
+from .. import gates
 
 log = logging.getLogger(__name__)
 
@@ -260,8 +254,10 @@ async def run_output(
             authored, frame, accumulated_tool_results)
         for _d in _dropped:
             log.warning("assembly dropped (not frame-backed): %s", _d[:160])
-        _assembly_prev = deterministic_state.get("assembly_dropped") or []
-        deterministic_state["assembly_dropped"] = list(_assembly_prev) + _dropped[:8]
+            record_finding(
+                deterministic_state, "assembly_dropped", str(_d),
+                detail={"reason": "not frame-backed"},
+                segment=getattr(st, "session_id", None))
         memory_block = memory_context_block(
             getattr(st, "accumulated_tool_results", None) or accumulated_tool_results)
         scenario_refused = False
@@ -300,9 +296,6 @@ async def run_output(
                         fixed, frame, accumulated_tool_results)
                     for _d in _fix_dropped:
                         log.warning("correction assembly dropped: %s", _d[:160])
-                    _prev_dropped = deterministic_state.get("assembly_dropped") or []
-                    deterministic_state["assembly_dropped"] = (
-                        list(_prev_dropped) + _fix_dropped[:8])
                     hard, findings, conflicts = check_authored_output(
                         fixed, frame, scenario=scenario,
                         scenario_refused=scenario_refused, final_pass=True)
@@ -324,14 +317,22 @@ async def run_output(
             "tier": "authored",
             "correction_used": correction_used,
         }
-        deterministic_state["conformance"] = {
-            "tier": "authored",
-            "dropped": list(deterministic_state.get("assembly_dropped") or [])[-8:],
-            "hard_misses": list(hard)[:8],
-            "conflicts": list(conflicts)[:8],
-            "quality_findings": list(findings)[:8],
-            "correction_used": correction_used,
-        }
+        _dropped_now = [
+            str((row.get("payload") or {}).get("message"))
+            for row in (deterministic_state.get("ledger") or [])
+            if row.get("kind") == LedgerKind.FINDING.value
+            and (row.get("payload") or {}).get("finding_kind") == "assembly_dropped"
+        ]
+        record_finding(
+            deterministic_state, "conformance", "authored ship conformance",
+            detail={
+                "tier": "authored",
+                "dropped": _dropped_now[-8:],
+                "hard_misses": list(hard)[:8],
+                "conflicts": list(conflicts)[:8],
+                "quality_findings": list(findings)[:8],
+                "correction_used": correction_used,
+            })
     # Sync the handoff counters with what synthesis spent (tiers accrued on
     # st via record_tier; narration_tiers freezes the full cycle sequence).
     llm_calls = st.llm_calls
@@ -480,11 +481,11 @@ async def run_output(
     # from the record that ships, DELIVER it to its surface (confirmation =
     # the call returns), then PLACE the canonical output row (bookkeeping).
     # PLACEMENT = deliver + confirm; SETTLE gates on delivery confirmation +
-    # recorded receipts — never on a store write. Placement failures are
+    # recorded verdicts — never on a store write. Placement failures are
     # RECORDED as run_record_errors and never block settlement.
     deterministic_state["terminal"] = "pending_settlement"
-    deterministic_state["loop_traversal"] = controller.loop_coverage()
-    deterministic_state["congruence"] = controller.congruence()
+    from ..projections import build_artifact_state as _project
+    deterministic_state.update(_project(deterministic_state, controller))
     pending = CanonicalOutput.create(
         symbol=engine.symbol, venue=engine.venue,
         generated_at=generated_at, completed_at=context._utc_now_iso(),
@@ -549,29 +550,33 @@ async def run_output(
     # Canonical receipt: the OUTPUT loop's four sub-loops closed. The final
     # terminal is recorded separately (deterministic_state["terminal"] +
     # loop_traversal); this receipt records the WORK, not the SETTLE transition.
-    receipts.append_receipt(deterministic_state, LoopReceipt(
-        loop=NestedLoop.OUTPUT, sub_loop=SubLoop.MEMORY,
-        disposition=(ReceiptDisposition.COMPLETED
+    gates.close_loop(
+        deterministic_state, loop=NestedLoop.OUTPUT, sub_loop=SubLoop.MEMORY,
+        disposition=(gates.GateDisposition.COMPLETED
                      if delivery_ok
-                     else ReceiptDisposition.REFUSED),
+                     else gates.GateDisposition.REFUSED),
         steps=(LoopStep.ASSEMBLE, LoopStep.GROUND,
                LoopStep.UNDERSTAND_SURFACE, LoopStep.LOCATE_OUTPUT,
                LoopStep.PERSIST, LoopStep.CONFIRM,
                LoopStep.PROPOSE, LoopStep.RESOLVE, LoopStep.SETTLE),
         payload={"delivered": bool(delivery_ok),
                  "run_record": "errors" if run_record_errors else "recorded"},
-        evidence_refs=(output.run_id,),
-    ))
+        refs=(output.run_id,),
+        segment=getattr(output, "run_id", None),
+    )
     controller, _ = context._must_govern(
         controller, GovernanceEventKind.COMPLETE_SUBLOOP
     )
 
-    # --- SETTLE (delivery confirmation + receipts recorded) ---
+    # --- SETTLE (delivery confirmation + projections recorded) ---
+    # Receipts/findings are no longer state: derive the permanent artifact
+    # projections from the ledger rows written this cycle.
+    from ..projections import build_artifact_state
+    deterministic_state.update(build_artifact_state(deterministic_state, controller))
     final_terminal = "settled" if delivery_ok else "delivery_failed"
     deterministic_state["terminal"] = final_terminal
     deterministic_state["persistence"] = placement
-    deterministic_state["loop_traversal"] = controller.loop_coverage()
-    deterministic_state["congruence"] = controller.congruence()
+    deterministic_state.update(build_artifact_state(deterministic_state, controller))
     output = replace(
         output,
         terminal=final_terminal,
@@ -583,7 +588,7 @@ async def run_output(
     )
     if delivery_ok:
         # SETTLE is permitted once the ANSWER is confirmed delivered and the
-        # receipts are recorded. A run-record write is bookkeeping — its
+        # verdicts are recorded. A run-record write is bookkeeping — its
         # failure never hides a delivered answer nor blocks the settle.
         controller, _ = context._must_govern(
             controller, GovernanceEventKind.SETTLE
@@ -602,8 +607,7 @@ async def run_output(
     )
     ctx.controller = controller
     deterministic_state["terminal"] = terminal
-    deterministic_state["loop_traversal"] = controller.loop_coverage()
-    deterministic_state["governance_trace"] = controller.transition_trace()
+    deterministic_state.update(build_artifact_state(deterministic_state, controller))
     output = replace(
         output,
         terminal=terminal,

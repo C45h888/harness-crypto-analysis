@@ -30,9 +30,10 @@ import logging
 from typing import Any
 
 from . import context
-from .. import kb, receipts
+from .. import kb
+from ..ledger import record_finding
 from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
-from ..loop_states import LoopStep, NestedLoop, SubLoop, ReceiptDisposition
+from ..loop_states import LoopStep, NestedLoop, SubLoop
 
 log = logging.getLogger(__name__)
 
@@ -504,16 +505,12 @@ def _note_synthesis_failure(
         })
     except Exception:
         pass
-    try:
-        # First failure wins the note (root cause for the review surface).
-        if "synthesis_note" not in st.deterministic_state:
-            st.deterministic_state["synthesis_note"] = {
-                "stage": stage, "reason": str(reason)[:500],
-                "degraded_to": degraded_to,
-                "disposition": "degraded",
-            }
-    except Exception:
-        pass
+    # One writer: the FINDING row. The artifact projection reconstructs
+    # synthesis_note from it at settle.
+    record_finding(
+        st.deterministic_state, "synthesis",
+        "synthesis degraded: " + str(reason)[:500],
+        detail={"stage": stage, "degraded_to": degraded_to})
 
 
 async def _one_call(

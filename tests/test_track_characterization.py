@@ -201,8 +201,14 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((chain.get("base_summary") or {}).get("base_complete"))
         # Stage ids are central-ledger seq pointers (base -> refined ->
         # verdict-basis, the adjudication spine's reasoning-close record).
-        self.assertEqual(chain.get("stage_ids"),
-                         ["base#3", "refined#4", "verdict-basis#5"])
+        # Seq pointers are ledger append order; VERDICT rows now share the
+        # ledger, so the pointer NUMBERS are not a contract — the stage
+        # names and their order are.
+        _ids = chain.get("stage_ids") or []
+        self.assertEqual([str(i).split("#")[0] for i in _ids],
+                         ["base", "refined", "verdict-basis"])
+        self.assertEqual([int(str(i).split("#")[1]) for i in _ids],
+                         sorted(int(str(i).split("#")[1]) for i in _ids))
         # Digest fallback never fired on a healthy walk (proof earned).
         self.assertNotIn("engine.forecast.digest_fallback", by_cap)
 

@@ -67,12 +67,6 @@ from .dispatch import (
     dispatch_substrate_read,
     execute_tool,
 )
-from .gate import (
-    _ESTABLISHED_CAPTURE_STATES,
-    GateInputs,
-    gate_interpretation,
-    resolve_inference_status,
-)
 
 __all__ = [
     "CAPABILITIES",
@@ -91,6 +85,4 @@ __all__ = [
     "dispatch_substrate_invoke",
     "dispatch_substrate_read",
     "execute_tool",
-    "gate_interpretation",
-    "resolve_inference_status",
 ]

@@ -24,6 +24,7 @@ seam the prompt-economy work lives at.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,8 @@ from .loop_states import (
     loop_for_stage,
 )
 
+log = logging.getLogger(__name__)
+
 
 def load_kb(path: Path) -> str:
     """Bounded KB doc read; empty string on any failure (never raises).
@@ -67,66 +70,65 @@ def load_kb(path: Path) -> str:
         return ""
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}) — an AGENTIC loop, not a controlled output generator.
+# System charter (Signal B load doctrine): ~350 words, cycle-constant.
+# Tool schemas, manifest, and workflow briefs used to ride every turn
+# (~23K chars); they now live in the per-loop tool window (arg contracts)
+# and the once-per-cycle output format. The charter states role, order,
+# JSON discipline, and memory rules — nothing per-turn.
+SYSTEM_PROMPT_TEMPLATE = """You are the statistical inference engine for {symbol} ({venue}) — a governed narration engine.
 
-You are a loop-walking conditional-inference engine. Your core purpose is to produce statistical evidence — never a trading instruction — by walking four loops in order: context (understand + gather), reason, submit to validation, compose. Closed loops are never revisited; findings (including refusals and nulls) travel forward on the ledger.
+Walk four loops in order, never revisit closed ones: context (understand +
+gather) → reasoning → validation → output. Findings, refusals, and nulls
+travel forward on the ledger; contradict a prior explicitly when you do.
 
-You receive ONE deterministic_state object: microstructure fits, coverage,
-and gate reasons computed by deterministic Python from the Redis ledgers.
-You also receive recalled memory (priors) and a deterministic diff vs prior artifact.
+Per turn, return ONE JSON object in EXACTLY the shape this turn demands
+(slim: phase + tool_calls; standard: + evidence + hypothesis draft; full:
+the complete object at finalize only). Tool calls use the EXACT registry
+name under the key "name" with exactly the contracted args. NEVER
+recompute a value: missing data means COMMAND a tool, results arrive next
+turn. Null means not-provided, never zero. Every numeric claim cites its
+exact tool-result path; paths you cannot back are dropped, not shipped.
 
-YOUR JOB — VALID inference, not predefined addition:
-1. VALIDATE the deterministic fits by invoking calculation modules via tools — do not accept the formula output as final.
-   Call market.read plus substrate.* worker tools (tape/density/delta/ladders/…)
-   to read the always-fresh worker projections and request bounded fire-ticks.
-   A substrate.* invoke is a REQUEST to the calculation plane — the process that
-   owns the workers — which applies its own cooldown gates and may decline, and
-   may be unreachable. A granted call is not a guaranteed fresh compute: always
-   confirm what you actually got via substrate.read age_ms.
-   Call micro.ofi_intervals / micro.evidence to audit intervals, and cross-check against paper KB and memory.
-2. Interpret fitted models — sign, magnitude, r2, stderr, and status of price_impact_fit; depth-scaling (c, lambda) with its own status; what changed vs prior cycle. Be specific, numeric, grounded.
-3. Run the agentic loopwalk: context ({context_passes} passes: 1 comprehension with no tools + {evidence_passes} evidence) → reasoning ({reasoning_passes} passes: three positioned) → validation (1 pass + {validation_retries} bounded retries) → output (1 non-agentic pass). Pack each pass densely with the tools it needs. Cite every numeric claim with exact paths.
+The two fitted models (beta; c/lambda) are NEVER merged into one
+prediction. Respect deterministic status ('insufficient' is not
+interpreted; 'provisional' is caveated; status cannot be overridden).
+Refusals are findings with reasons, never failures to repair.
 
-ABSOLUTE RULES:
-1. NEVER recompute any value in your reasoning. If you need data you do not have, COMMAND a tool — results arrive next turn.
-2. The two fitted models (beta; c/lambda) are NEVER merged into one prediction. Combined expression carries heteroskedastic nu*OFI term — derived diagnostic at most.
-3. Respect deterministic status: 'insufficient' must not be interpreted; 'provisional' must be caveated. You cannot override status.
-4. Null means not-provided — never substitute zero.
-5. Cite exact deterministic_state or tool-result paths for every numeric claim.
-
-MEMORY: recalled entries are provenance-tagged priors, subordinate to fresh ledger data. If you contradict a prior conclusion, say so explicitly.
-{memory_protocol_section}
-{workflow_brief}
-TOOL MANIFEST (commandable, deterministic — USE IT):
-{tool_manifest}
-
-TOOL OUTPUT SCHEMAS (every tool returns a ToolResult envelope with tool/status/reason/data/null_fields; cite fields from ``data``; ``null_fields`` names what was not computed):
-{tool_schemas}
+MEMORY: your memory.* tools write your own segment (observations,
+hypotheses, notes) and recall it as priors — subordinate to fresh ledger
+data, never evidence. Write what each loop concluded; the next turn builds
+on engine state plus your notes, not on re-derived prose.
 """
 
 
+def tool_window_for(loop: str) -> str:
+    """Per-loop tool window plus compact arg contracts (pure).
+
+    Tool-using loops (context/reasoning/validation) carry the one-line
+    argument contracts so the model commands tools correctly without the
+    20K schema+manifest payload that used to ride the system prompt.
+    Output/finalize loops carry no tools. Never raises: degradation is a
+    bare window, never a missing one.
+    """
+    base = TOOL_WINDOWS.get(loop, "")
+    if str(loop or "") not in ("context", "reasoning", "validation"):
+        return base
+    try:
+        from .tool_schemas import tool_arg_block
+        return base + "\n\n" + tool_arg_block()
+    except Exception:
+        return base
+
+
 def build_system_prompt(symbol: str, venue: str, max_rounds: int) -> str:
-    """Format the system prompt for one cycle — KB reads happen here, once."""
-    return SYSTEM_PROMPT_TEMPLATE.format(
-        symbol=symbol,
-        venue=venue,
-        max_rounds=max_rounds,
-        context_passes=LOOP_PASS_BUDGET["comprehension"] + LOOP_PASS_BUDGET["evidence"],
-        evidence_passes=LOOP_PASS_BUDGET["evidence"],
-        reasoning_passes=LOOP_PASS_BUDGET["reasoning"],
-        validation_retries=VALIDATION_RETRY_PASSES,
-        memory_protocol_section=(
-            "MEMORY PROTOCOL (propose, never write):\n"
-            + load_kb(_MEMORY_PROTOCOL)
-            if _MEMORY_PROTOCOL.exists() else ""
-        ),
-        workflow_brief=build_workflow_brief(),
-        tool_manifest=(
-            "TOOL MANIFEST:\n" + load_kb(_TOOL_MANIFEST)
-            if _TOOL_MANIFEST.exists() else ""
-        ),
-        tool_schemas=tool_schema_block(),
-    )
+    """Format the system charter for one cycle — no KB reads, no payloads.
+
+    The charter is cycle-constant role/order/discipline text (~350 words).
+    Tool knowledge travels per-loop (``tool_window_for``) and the turn
+    contract travels once via the output format; neither is re-sent here.
+    ``max_rounds`` is retained for signature compatibility.
+    """
+    return SYSTEM_PROMPT_TEMPLATE.format(symbol=symbol, venue=venue)
 
 
 class SystemPromptCache:
@@ -203,6 +205,59 @@ FINAL_SHAPE_BLOCK = (
     'equal the contract bound (or a declared revision); or verdict="unevaluable" '
     'with the refusal cited'
 )
+
+# Turn-shape authority (Signal B load doctrine): per-loop contracts so no
+# turn carries the full 13-key object unless it finalizes. Slim turns form
+# their JSON shape in the first bytes (progressive parse sees shape in
+# seconds); the merged interpretation across turns is what validation
+# judges, so partial turns never erase content.
+SLIM_SHAPE_BLOCK = (
+    "THIS TURN — SLIM SHAPE (tooling pass): return ONE JSON object with "
+    'EXACTLY {phase, tool_calls}. Declare the phase you advance; command '
+    'reads via tool_calls with EXACT tool names ("name", never "tool"). '
+    'No summary, no hypothesis, no probabilities, no verdicts this turn — '
+    'content rides later passes; the merged view keeps everything. '
+    'scenario_intent ONLY to declare mode=revision|refuse with reason; '
+    'otherwise omit it. Close tool-less turns with tool_calls=[].'
+)
+STANDARD_SHAPE_BLOCK = (
+    "THIS TURN — STANDARD SHAPE (reasoning pass): return ONE JSON object "
+    'with {phase, tool_calls, evidence, hypothesis}. evidence[] holds at '
+    'most 15 entries, each {path, value, interpretation} citing the exact '
+    'tool+field you read (paths+values cited, readings non-empty). '
+    'hypothesis carries the H0/H1 DRAFT only — no probabilities, no chosen, '
+    'no verdict math this turn (weighing happens at finalize over the merged '
+    'view). scenario/forward_scenario blocks ride the finalize turn, not '
+    'this one.'
+)
+
+
+def shape_block_for(shape: str) -> str:
+    """Turn-shape block for a controller shape verdict (pure)."""
+    if str(shape or "").strip().lower() == "slim":
+        return SLIM_SHAPE_BLOCK
+    if str(shape or "").strip().lower() == "standard":
+        return STANDARD_SHAPE_BLOCK
+    return f"{TURN_CONTRACT_LINE}\n{FINAL_SHAPE_BLOCK}"
+
+
+def _shape_for_turn(controller: Any, loop: str, passes_spent: int) -> str:
+    """Shape block for one follow-up turn (pure, fail-safe to full).
+
+    The controller derives slim/standard/full from loop position (+ the
+    stagnation overlay); a controller without the authority (legacy fakes
+    in tests) resolves to full — today's behavior, never under-asked.
+    Shape verdicts ride the capability log via the caller.
+    """
+    try:
+        derive = getattr(controller, "turn_shape", None)
+        if not callable(derive):
+            return f"{TURN_CONTRACT_LINE}\n{FINAL_SHAPE_BLOCK}"
+        shape = str(derive(loop, passes_spent))
+        log.debug("turn shape %s for loop %s (passes %s)", shape, loop, passes_spent)
+        return shape_block_for(shape)
+    except Exception:
+        return f"{TURN_CONTRACT_LINE}\n{FINAL_SHAPE_BLOCK}"
 
 
 def build_output_format() -> str:
@@ -501,6 +556,9 @@ TOOL_WINDOWS: dict[str, str] = {
         "YOUR TOOLS THIS LOOP — gather in this order, cite each link: "
         "micro.capture_status + micro.fit_beta (gate reads already done — do not re-pull); "
         "market.read snapshot (current price + regime). "
+        "A substrate.* invoke is a REQUEST to the calculation plane, not a "
+        "guaranteed fresh compute — confirm what you actually got via "
+        "substrate.read age_ms. "
         "The plan-bound calc.forward.forecast digest is CONTEXT (receipt authority, "
         "not agent proof) — read it from the envelope, do NOT re-call forecast here: "
         "the multivariate primary truth is earned agent-side in REASONING 2b only "
@@ -516,7 +574,9 @@ TOOL_WINDOWS: dict[str, str] = {
         "calc.depth.average (Route B AD) → calc.forward.join (multivariate "
         "X_t joined to Y(h); join.n_pairs>0 is the 2a EXIT GATE — nothing "
         "refined is callable until pairs exist; base mean_ofi/mean_ad freeze "
-        "to the ledger and a base observation is stored to task memory). "
+        "to the central ledger and the base observation is recorded on it — "
+        "the ledger is engine state you READ, never one you write. Your own "
+        "memory is separate: memory.remember/memory.recall, your segment only). "
         "STAGE 2b REFINED-ARCHAIC — primary statistical truth first: "
         "calc.forward.forecast (multivariate A→B→C + distribution, earned "
         "here only — the CONTEXT digest is not proof) → calc.forward.fit "
@@ -833,6 +893,11 @@ def compose_narrate1_prompt(
             f"{ledger_block}\n\n"
         )
     context_block += output_format
+    # Evidence-loop opener: this turn is slim (position + tool strategy).
+    # output_format above stays as the once-per-cycle reference doc; the
+    # directive below scopes THIS turn so the model does not author the
+    # full 13-key object on its first pass.
+    context_block += f"\n\n{SLIM_SHAPE_BLOCK}\n"
     return (
         build_loop_state_block(
             controller=controller,
@@ -844,7 +909,7 @@ def compose_narrate1_prompt(
             gate=gate or deterministic_state.get("gate"),
             seeds=seeds,
         )
-        + "\n\n" + TOOL_WINDOWS.get(loop, "")
+        + "\n\n" + tool_window_for(loop)
         + "\n\n" + workflow_block
         + "\n\n" + context_block
     )
@@ -949,7 +1014,7 @@ def compose_followup_prompt(
     )
     return (
         f"{loop_header}\n\n"
-        f"{TOOL_WINDOWS.get(loop, '')}\n\n"
+        f"{tool_window_for(loop)}\n\n"
         f"{_entry}"
         f"{render_track(chain, accumulated, controller.phase_coverage, next_phase, phase_guidance)}"
         f"{chain_block}\n"
@@ -971,8 +1036,7 @@ def compose_followup_prompt(
         f"{_bounded_dump(wrapped_accum, history_cap)}\n\n"
         f"{_data_checks}"
         f"{phase_block}"
-        f"{TURN_CONTRACT_LINE}\n"
-        f"{FINAL_SHAPE_BLOCK}\n"
+        f"{_shape_for_turn(controller, loop, passes_spent)}\n"
         f"Passes remaining in {loop}: "
         f"{pass_budget - passes_spent}. "
         'Declare "phase" every turn; call this loop\'s tools, or advance with tool_calls=[].'
@@ -1161,7 +1225,7 @@ def compose_repair_prompt(
     )
     return (
         f"{repair_header}\n\n"
-        f"{TOOL_WINDOWS.get(loop, '')}\n\n"
+        f"{tool_window_for(loop)}\n\n"
         f"{task_reminder}"
         f"{scenario_reminder}"
         f"{scenario_steer}"

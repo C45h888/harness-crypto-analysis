@@ -4,7 +4,7 @@ The runner is the OUTER loop; the nested loops are derived within it via
 ``OUTER_SEQUENCE``. It owns the stage order and nothing else:
 
   - stage order — DERIVED from ``OUTER_SEQUENCE`` (Phase S-1,
-    docs/STATE_CHARTER_SPEC.md): the receipts enumerate the real chain
+    docs/STATE_CHARTER_SPEC.md): the stage table enumerates the real chain
     (wake → comprehension → plan-bound acquisition → evidence → reasoning
     → validation → output) and narrate_cycle iterates the table through
     _STAGE_RUNNERS;
@@ -41,6 +41,7 @@ from . import wake as wake_mod
 from ..ledger import LedgerKind, record_entry
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..loop_states import NestedLoop
+from .. import gates
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ log = logging.getLogger(__name__)
 # the reasoning+output owners — every stage wrapper calls through the module
 # attribute at call time, so the seams survive.
 #
-# Stage receipts are the honest grain: the FSM's CONTEXT loop covers the
+# Stage boundaries are the honest grain: the FSM's CONTEXT loop covers the
 # pre-reasoning stages (wake is pre-FSM; the merged CONTEXT loop hosts
 # comprehension → plan-bound acquisition → evidence).
 # ---------------------------------------------------------------------------
@@ -97,11 +98,24 @@ async def _stage_comprehension(engine, ctx, st, wake, wake_meta, task, scenario)
     if st is None:
         raise context.GovernanceDenied(
             "comprehension closed without a runtime state")
-    # Receipt gate: the runner refuses to advance on a missing
-    # understanding — a loop never starts on an un-understood prompt.
-    if not wake_mod.is_framing_complete(st):
-        raise context.GovernanceDenied(
-            "comprehension closed without understanding receipt")
+    # FRAMING gate: a loop never starts on an un-understood prompt. The
+    # refusal is a GATE refusal (route_refusal), not infrastructure.
+    framing = getattr(st, "framing_verdict", None) or wake_mod.framing_verdict(st)
+    if not framing.passed:
+        route = gates.route_refusal(framing) or "gate_refused"
+        st.controller = st.controller.advance(context.failure_event(route))
+        st.deterministic_state["terminal"] = (
+            st.controller.terminal.value if st.controller.terminal else route)
+        ctx.controller = st.controller
+        return st, ctx, (
+            await engine._degraded_output(
+                st.deterministic_state, st.capability_log,
+                "framing_refused: " + "; ".join(framing.reasons),
+                controller=st.controller,
+            ),
+            {"llm_calls": st.llm_calls, "terminal": st.deterministic_state["terminal"],
+             "framing": framing.to_dict()},
+        )
     await _place_understanding(engine, ctx, st)
     return st, ctx, None
 
@@ -218,9 +232,9 @@ async def narrate_cycle(
         terminal = ctx.controller.terminal.value if ctx.controller.terminal else "infra_failed"
         state["terminal"] = terminal
         state["governance_denial"] = str(exc)
-        state["governance_trace"] = ctx.controller.transition_trace()
         artifact = await degraded_artifact(
             engine, state, ctx.capability_log, f"governance_denied: {exc}",
+            controller=ctx.controller,
         )
         return await _mirror_cycle(engine, ctx, (artifact, {
             "task": task[:200] if task else None,
@@ -279,12 +293,16 @@ async def degraded_output(
     deterministic_state: dict[str, Any],
     capability_log: list[dict[str, Any]],
     error: str,
+    *,
+    controller: Any | None = None,
 ) -> CanonicalOutput:
     """Narration-failure record: deterministic state preserved, no answer.
 
     Null discipline: no authored ship means a NULL ``answer_text`` /
     ``interpretation`` — the durable record of the failure, never filler.
     """
+    from ..projections import build_artifact_state
+    deterministic_state = build_artifact_state(deterministic_state, controller)
     output = CanonicalOutput.create(
         symbol=engine.symbol, venue=engine.venue,
         generated_at=context._utc_now_iso(), completed_at=context._utc_now_iso(),

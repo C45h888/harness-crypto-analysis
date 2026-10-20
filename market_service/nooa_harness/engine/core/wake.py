@@ -41,7 +41,8 @@ from ..schemas import coerce_turn, extract_json_object
 from ..kb import PHASE_GUIDANCE as _PHASE_GUIDANCE
 from ..controller import CycleController
 from ..fsm import GOVERNANCE_MEMBRANE, GovernanceEvent, GovernanceEventKind
-from ..gates import evaluate_plan_gate
+from .. import gates
+from ..ledger import record_finding
 from ..kb import (
     build_task_workflow,
     default_comprehension,
@@ -53,7 +54,6 @@ from ..scenario_contract import (
     render_contract_block,
     render_reminder,
 )
-from .. import receipts
 
 log = logging.getLogger(__name__)
 
@@ -264,17 +264,23 @@ def is_interpretation_complete(st: CycleRuntimeState) -> bool:
     return True
 
 
-def is_framing_complete(st: CycleRuntimeState) -> bool:
-    """FRAMING complete iff seed plan + workflow + receipt persisted."""
+def framing_verdict(st: CycleRuntimeState):
+    """Evaluate the FRAMING gate over the carrier (single snapshot builder)."""
     ds = st.deterministic_state or {}
-    return bool(
-        st.seed_plan is not None
-        and st.task_workflow is not None
-        and ds.get("seeded_plan") is not None
-        and ds.get("task_workflow") is not None
-        and ds.get("comprehension") is not None
-        and ds.get("understanding_receipt") is not None
-    )
+    return gates.evaluate(gates.GateKind.FRAMING, {
+        "seed_plan": st.seed_plan,
+        "task_workflow": st.task_workflow,
+        "seeded_plan_state": ds.get("seeded_plan"),
+        "task_workflow_state": ds.get("task_workflow"),
+        "comprehension": ds.get("comprehension"),
+        "understanding": ds.get("understanding_receipt"),
+        "refs": (),
+    })
+
+
+def is_framing_complete(st: CycleRuntimeState) -> bool:
+    """FRAMING complete iff the FRAMING gate verdict passes."""
+    return framing_verdict(st).passed
 
 
 async def run_comprehension(
@@ -461,7 +467,9 @@ async def run_comprehension(
     st.task_plan = plan
     st.deterministic_state["task_directive"] = st.task_directive
     st.deterministic_state["task_plan"] = plan
-    st.deterministic_state["assessment_note"] = assessment_note
+    if assessment_note:
+        record_finding(st.deterministic_state, "assessment", str(assessment_note),
+                       segment=getattr(ctx, "task_id", None))
     # The plan may have bound assessment targets; union them into the
     # contract's allowed set and rebind the SINGLE authority (controller +
     # carrier + deterministic state). The prompt block is rebuilt from the
@@ -581,18 +589,24 @@ async def run_comprehension(
     })
     # Track actually-opened CONTEXT sub-loops for the honest visit at close.
     st.opened_subs.update(("intake", "interpretation", "framing"))
+    # FRAMING verdict is recorded once, here — the gate that lets the cycle
+    # advance is auditable, never a bare boolean.
+    st.framing_verdict = framing_verdict(st)
+    gates.record_verdict(st.framing_verdict, st,
+                         segment=getattr(ctx, "task_id", None))
     # GATE_PLAN (post-framing): the deterministic plan-adequacy guard.
     # Forward-only — a refused plan routes to the canonical gate terminal;
     # the verdict is the frozen data contract, never inline judgement.
-    plan_gate = evaluate_plan_gate(st.task_plan)
+    plan_gate = gates.evaluate(gates.GateKind.PLAN, st.task_plan)
+    gates.record_verdict(plan_gate, st, segment=getattr(ctx, "task_id", None))
     st.deterministic_state["plan_gate"] = plan_gate.to_dict()
     if plan_gate.refused:
-        st.controller = st.controller.advance(
-            context.failure_event("gate_refused")
-        )
+        # ONE refusal router: the gate kind decides the terminal.
+        _route = gates.route_refusal(plan_gate) or "gate_refused"
+        st.controller = st.controller.advance(context.failure_event(_route))
         terminal = (
             st.controller.terminal.value if st.controller.terminal
-            else "gate_refused"
+            else _route
         )
         st.deterministic_state["terminal"] = terminal
         ctx.controller = st.controller
@@ -600,13 +614,14 @@ async def run_comprehension(
             await engine._degraded_output(
                 st.deterministic_state, st.capability_log,
                 "plan_gate_refused: " + "; ".join(plan_gate.reasons),
+                controller=st.controller,
             ),
             {"llm_calls": st.llm_calls, "terminal": terminal,
              "plan_gate": plan_gate.to_dict()},
         )
     # Canonical receipt: FRAMING closed (the comprehension half of CONTEXT).
     # Structural facts only — no model prose enters the receipt.
-    receipts.emit_receipt(
+    gates.close_loop(
         st, loop=NestedLoop.CONTEXT, sub_loop=SubLoop.FRAMING,
         steps=(LoopStep.RECEIVE, LoopStep.DECODE, LoopStep.NORMALIZE,
                LoopStep.CLASSIFY_INTENT, LoopStep.EXTRACT_CONSTRAINTS,
@@ -617,7 +632,8 @@ async def run_comprehension(
             "workflow_kind": (st.task_workflow or {}).get("kind"),
             "cadence": (st.task_plan or {}).get("cadence"),
         },
-        evidence_refs=(getattr(ctx.wake, "wake_id", "") or "",),
+        refs=(getattr(ctx.wake, "wake_id", "") or "",),
+        segment=getattr(ctx, "task_id", None),
     )
     # The CONTEXT loop visit is recorded once at its true close (end of
     # verification in run_evidence), covering all six sub-loops.

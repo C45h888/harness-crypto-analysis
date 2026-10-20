@@ -307,7 +307,11 @@ class TestSignalAndRouteFailure(unittest.IsolatedAsyncioTestCase):
         result = await signal_and_route_failure(engine, ctx, st)
         assert result is None, "transient with budget should continue loop"
         assert st.failure_kind is None
-        assert "failure_report" in st.deterministic_state
+        _report_rows = [
+            r for r in st.deterministic_state["ledger"]
+            if r["payload"].get("finding_kind") == "failure_report"
+        ]
+        assert _report_rows, "failure report must be a FINDING row"
 
     async def test_permanent_returns_terminal(self):
         engine, store, _, memory, ctx, st = _build_failure_context()
@@ -349,7 +353,11 @@ class TestSignalAndRouteFailure(unittest.IsolatedAsyncioTestCase):
         assert failure["class"] == "narration"
         assert failure["severity"] == "transient"
         assert failure["worker"] == "narration"
-        assert "failure_report" in st.deterministic_state
+        _report_rows = [
+            r for r in st.deterministic_state["ledger"]
+            if r["payload"].get("finding_kind") == "failure_report"
+        ]
+        assert _report_rows, "failure report must be a FINDING row"
 
 
 # ========================================================================

@@ -855,6 +855,23 @@ class CycleController:
     # Loop-exit decision (semantics only — the FSM owns transition legality)
     # ------------------------------------------------------------------
 
+    def scenario_dispatch_due(self) -> bool:
+        """True when a contract scenario exists but was never dispatched.
+
+        Pure systemic guard: a price-target question the cycle never
+        attempted (tri-state ``NOT_CALLED``) cannot be answered — any
+        verdict without a dispatch is fabrication, and the validation home
+        cannot dispatch it (loop-work boundary). The reasoning exit uses
+        this to force one bounded dispatch pass instead of closing blind.
+        """
+        if self.scenario_contract is None and not isinstance(
+                self.scenario, dict):
+            return False
+        try:
+            return self.scenario_state() is ScenarioEvalStatus.NOT_CALLED
+        except Exception:
+            return False
+
     def next_action(self, parsed_turn: dict[str, Any]) -> str:
         """Classify the loop's next action from the current parsed turn.
 
@@ -867,6 +884,42 @@ class CycleController:
         if isinstance(tool_calls, list) and tool_calls:
             return "dispatch"
         return "validate"
+
+    # ------------------------------------------------------------------
+    # Turn-shape authority (Signal B load doctrine: slim/standard/full)
+    # ------------------------------------------------------------------
+
+    def turn_shape(self, loop: str, passes_spent: int = 0) -> str:
+        """Required turn shape for the next narration turn (pure).
+
+        The per-pass load contract: evidence passes carry position +
+        tool strategy only (slim); reasoning passes add citations and a
+        hypothesis draft (standard); validation recovery, output, and
+        finalize turns carry the full object (full). Static base map from
+        loop position plus ONE stagnation overlay: an evidence loop that
+        has spent 2+ passes without advancing escalates to standard and
+        must cite instead of dispatching blindly again. Unknown loops
+        resolve to full (never under-ask where position is unclear).
+        Shape changes are recorded by callers on the capability log /
+        ledger, so every escalation is auditable without touching the
+        frozen membrane: the observation (governed) feeds this derivation
+        (semantic), the composer renders it. Returns
+        one of ``slim`` | ``standard`` | ``full``.
+        """
+        name = str(loop or "").strip().lower()
+        try:
+            spent = int(passes_spent)
+        except (TypeError, ValueError):
+            spent = 0
+        if name in ("validation", "output"):
+            return "full"
+        if name == "reasoning":
+            return "standard"
+        if name in ("evidence", "context"):
+            if spent >= 2:
+                return "standard"
+            return "slim"
+        return "full"
 
 
 __all__ = [

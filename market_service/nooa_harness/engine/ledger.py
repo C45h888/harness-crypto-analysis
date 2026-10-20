@@ -46,15 +46,22 @@ class LedgerKind(str, Enum):
     PLAN = "plan"                    # what will be done (disposed plan)
     HANDOFF = "handoff"              # what was gathered (coverage + gaps)
     OBSERVATION = "observation"      # what was derived (base/refined readings)
+    VERDICT = "verdict"              # gate outcome (guard or loop close)
+    FINDING = "finding"              # advisory/finding rows (never gate authority)
+    SCENARIO = "scenario"            # frozen scenario contract facts
 
 
-# The canonical section order (append + render).
+# The canonical section order (append + render). VERDICT/FINDING/SCENARIO are
+# audit rows: they are never rendered into the narration prompt.
 LEDGER_ORDER: tuple[LedgerKind, ...] = (
     LedgerKind.UNDERSTANDING,
     LedgerKind.PLAN,
     LedgerKind.HANDOFF,
     LedgerKind.OBSERVATION,
 )
+
+#: The only kinds that may enter narration context (prompt isolation).
+CONTEXT_KINDS: tuple[LedgerKind, ...] = LEDGER_ORDER
 
 
 @dataclass(frozen=True)
@@ -154,16 +161,20 @@ def render_ledger(
     rows = ledger_rows(deterministic_state, kinds, segment=segment, stage=stage)
     if not rows:
         return ""
-    lines = ["## Engine ledger (central, deterministic — context, never evidence)"]
+    sections: list[str] = []
     order = kinds or LEDGER_ORDER
     for kind in order:
         section = [r for r in rows if r.get("kind") == kind.value]
         if not section:
             continue
-        lines.append(f"[{kind.value}]")
+        sections.append(f"[{kind.value}]")
         for row in section:
             rendered = json.dumps(row.get("payload") or {}, default=str)
-            lines.append(f"  - {rendered}")
+            sections.append(f"  - {rendered}")
+    if not sections:
+        return ""
+    lines = ["## Engine ledger (central, deterministic — context, never evidence)"]
+    lines.extend(sections)
     text = "\n".join(lines)
     if len(text) > budget:
         text = text[:budget].rstrip() + "\n…"
@@ -183,12 +194,41 @@ def _bounded(payload: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return dict(payload)
 
 
+def record_finding(
+    deterministic_state: dict[str, Any],
+    finding_kind: str,
+    message: str,
+    *,
+    detail: Mapping[str, Any] | None = None,
+    evidence_refs: Sequence[str] = (),
+    segment: str | None = None,
+) -> LedgerEntry:
+    """Append one FINDING row — the ONE home for every advisory finding.
+
+    Findings never grant coverage and never block a gate; they ride the
+    artifact (and the projections built from them).
+    """
+    payload: dict[str, Any] = {
+        "stage": "finding",
+        "finding_kind": str(finding_kind),
+        "message": str(message)[:1_000],
+    }
+    if detail:
+        payload["detail"] = dict(detail)
+    return record_entry(
+        deterministic_state, LedgerKind.FINDING, payload,
+        evidence_refs=evidence_refs, segment=segment,
+    )
+
+
 __all__ = [
+    "CONTEXT_KINDS",
     "LEDGER_ORDER",
     "LEDGER_ROOT",
     "LedgerEntry",
     "LedgerKind",
     "ledger_rows",
     "record_entry",
+    "record_finding",
     "render_ledger",
 ]

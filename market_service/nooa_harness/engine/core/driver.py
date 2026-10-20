@@ -60,9 +60,9 @@ from .chain import (
     position_steer,
 )
 from ..principles import evaluate_principles, render_findings
-from ..gates import evaluate_budget_gate
+from .. import gates
 from ..cadence import INTERVAL_SECONDS, WINDOW_MINUTES
-from ..ledger import ledger_rows, render_ledger
+from ..ledger import CONTEXT_KINDS, ledger_rows, render_ledger
 
 
 def _cadence_arg_refusals(canonical: str, args: dict[str, Any]) -> list[str]:
@@ -272,7 +272,9 @@ class InferenceEngine:
                 ds = getattr(prior, "deterministic_state", None)
         if not isinstance(ds, Mapping):
             return [], ""
-        rows = ledger_rows(ds, segment=segment)
+        # Prompt isolation: only the context kinds enter narration. VERDICT /
+        # FINDING / SCENARIO rows are audit data and never prompt material.
+        rows = ledger_rows(ds, CONTEXT_KINDS, segment=segment)
         if not rows:
             return [], ""
         return rows, render_ledger(
@@ -383,13 +385,16 @@ class InferenceEngine:
         # numbers), never decided inline. A refused gate is a finding that
         # names what will not run: everything pending moves to unexecuted
         # and the round ends — the loop continues its closing semantics.
-        _budget = evaluate_budget_gate(
-            tool_rounds_used=st.tool_rounds_used,
-            dispatched_in_pass=st.dispatched_in_pass,
-            max_tool_rounds=AGENTIC_MAX_TOOL_ROUNDS,
-            max_dispatches_per_pass=MAX_DISPATCHES_PER_PASS,
-        )
+        _budget = gates.evaluate(gates.GateKind.BUDGET, {
+            "tool_rounds_used": st.tool_rounds_used,
+            "dispatched_in_pass": st.dispatched_in_pass,
+            "max_tool_rounds": AGENTIC_MAX_TOOL_ROUNDS,
+            "max_dispatches_per_pass": MAX_DISPATCHES_PER_PASS,
+        })
         if _budget.refused:
+            # Refusals are audit-worthy; a passing round is derivable from the
+            # controller and would otherwise add one row per dispatch round.
+            gates.record_verdict(_budget, st)
             for reason in _budget.reasons:
                 log.warning("budget gate refused: %s", reason)
             for call in dict_calls:
@@ -859,6 +864,36 @@ class InferenceEngine:
         )
 
         user_prompt_next = _compose_followup()
+        # Sticky scenario directive (systemic guard): while a contract
+        # scenario is undispatched, every reasoning followup carries the
+        # dispatch imperative — the validation home cannot dispatch it
+        # (loop-work boundary), so an uninstructed close guarantees a
+        # fabrication terminal. Scoped to the reasoning loop (the scenario
+        # tool's home — elsewhere it would be denied as wrong-loop work).
+        # One capability-log entry per cycle; the prompt text repeats until
+        # the dispatch executes and flips the tri-state. No extra rounds,
+        # no budget spent beyond the scheduled passes.
+        if (st.loop_tag == "reasoning"
+                and st.controller.scenario_dispatch_due()):
+            _vt, _vh = st.controller.effective_scenario()
+            user_prompt_next += (
+                "\n\nSTRUCTURAL DIRECTIVE (engine-issued, non-optional): "
+                f"the contract scenario ({_vt} @ {_vh}) has NEVER been "
+                "dispatched this cycle. This pass MUST call "
+                "calc.scenario.evaluate with exactly that target/horizon "
+                "FIRST — a refusal is a legitimate finding with its reason, "
+                "but declaring any scenario verdict without dispatching "
+                "fails validation and ends the cycle. Do not close with "
+                "tool_calls=[] until the dispatch has executed."
+            )
+            if not getattr(st, "_scenario_directive_logged", False):
+                st._scenario_directive_logged = True  # type: ignore[attr-defined]
+                st.capability_log.append({
+                    "capability": "engine.scenario.dispatch_directive",
+                    "scope": {"symbol": self.symbol, "venue": self.venue},
+                    "result": "ok",
+                    "detail": {"bound_target": _vt, "bound_horizon": _vh},
+                })
         try:
             raw_next = await self._call_llm(user_prompt_next)
             context.record_tier(st)
@@ -951,10 +986,13 @@ class InferenceEngine:
         deterministic_state: dict[str, Any],
         capability_log: list[dict[str, Any]],
         error: str,
+        *,
+        controller: Any | None = None,
     ) -> CanonicalOutput:
         """Pure forward — implementation lives in ``core.runner``."""
         return await runner.degraded_output(
-            self, deterministic_state, capability_log, error)
+            self, deterministic_state, capability_log, error,
+            controller=controller)
 
     async def _degraded_artifact(
         self,
