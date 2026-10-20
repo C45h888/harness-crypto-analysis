@@ -1,5 +1,9 @@
 # B3 — NOOA Agent host vectors (assessment, not implemented)
 
+> **RETIRED (2026-10-20).** `memory_skill.py` is deleted. Agent memory has one
+> home: `memory.MemoryNode` with its `AgentMemorySurface` facade. The NOOA
+> skill attachment described below is obsolete.
+
 Status: **recorded for decision.** B1 (`memory.*` tools) and B2
 (`nooa_harness/memory_skill.py`) are the implemented memory surface. B3 is the
 question of whether the harness should adopt a real **NOOA Agent host** so a

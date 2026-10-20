@@ -379,16 +379,16 @@ def _single_report(report: dict[str, Any], target: str) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # memory.* — the AGENT's OWN segmented episodic memory (B1 surface for the B2
-# ``MemorySkill``). The agent writes and reads its own observations in flight;
+# ``AgentMemorySurface``). The agent writes and reads its own observations in flight;
 # the engine does NOT dispose these writes — only structural hygiene (kind /
 # size / pinned segment) applies, and it lives in the skill.
 # ---------------------------------------------------------------------------
 
 
-def _agent_memory_skill(memory: Any, session_id: Any, segment: Any):
-    """Build the B2 skill bound to this cycle's session + task segment."""
-    from market_service.nooa_harness.memory_skill import MemorySkill
-    return MemorySkill(
+def _agent_memory(memory: Any, session_id: Any, segment: Any):
+    """Bind the agent memory home to this cycle's session + task segment."""
+    from market_service.nooa_harness.memory import AgentMemorySurface
+    return AgentMemorySurface(
         memory=memory,
         session_id=str(session_id),
         segment=(str(segment) if segment else None),
@@ -413,8 +413,8 @@ async def dispatch_memory_remember(
         result = {"stored": False, "reason": "memory_node_not_configured"}
         return result, capability_log_entry(cap.name, scope, "error", detail=result)
     try:
-        skill = _agent_memory_skill(memory, session_id, segment)
-        result = await skill.remember(
+        agent = _agent_memory(memory, session_id, segment)
+        result = await agent.remember(
             str(args.get("kind") or "observation"),
             str(args.get("content") or ""),
             importance=args.get("importance", 5.0),
@@ -447,8 +447,8 @@ async def dispatch_memory_recall(
         return [], capability_log_entry(
             cap.name, scope, "ok", detail={"rows": 0, "reason": "memory_node_not_configured"})
     try:
-        skill = _agent_memory_skill(memory, session_id, segment)
-        rows = await skill.recall(
+        agent = _agent_memory(memory, session_id, segment)
+        rows = await agent.recall(
             kind=(str(args["kind"]) if args.get("kind") else None),
             query=(str(args["query"]) if args.get("query") else None),
             limit=args.get("limit", 8),
@@ -478,8 +478,8 @@ async def dispatch_memory_forget(
         result = {"forgotten": False, "reason": "memory_node_not_configured"}
         return result, capability_log_entry(cap.name, scope, "ok", detail=result)
     try:
-        skill = _agent_memory_skill(memory, session_id, segment)
-        result = await skill.forget(str(args.get("memory_id") or ""))
+        agent = _agent_memory(memory, session_id, segment)
+        result = await agent.forget(str(args.get("memory_id") or ""))
         return result, capability_log_entry(cap.name, scope, "ok", detail=result)
     except Exception as exc:  # noqa: BLE001
         return {"forgotten": False}, capability_log_entry(
@@ -502,8 +502,8 @@ async def dispatch_memory_stats(
         return {"configured": False, "counts": {}}, capability_log_entry(
             cap.name, scope, "ok", detail={"configured": False})
     try:
-        skill = _agent_memory_skill(memory, session_id, segment)
-        result = await skill.stats()
+        agent = _agent_memory(memory, session_id, segment)
+        result = await agent.stats()
         return result, capability_log_entry(cap.name, scope, "ok", detail=result)
     except Exception as exc:  # noqa: BLE001
         return {}, capability_log_entry(

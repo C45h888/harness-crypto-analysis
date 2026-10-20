@@ -1,8 +1,8 @@
-"""Agent memory surface — B1 tools + B2 ``MemorySkill``.
+"""Agent memory surface — B1 tools + ``AgentMemorySurface`` (in memory.py).
 
 Pins the partition:
 
-  - ``MemorySkill`` is the AGENT's memory: kind hygiene, segment pinning,
+  - ``AgentMemorySurface`` is the AGENT's memory: kind hygiene, segment pinning,
     bounded content, and explicit empty results when no store is configured.
     There is NO engine disposition — the agent's write lands as-is.
   - The ``memory.*`` tools are registered, phase-less (a memory write is never
@@ -17,7 +17,7 @@ import unittest
 from types import SimpleNamespace
 
 from market_service.nooa_harness.engine.fsm import GOVERNANCE_MEMBRANE
-from market_service.nooa_harness.memory_skill import MemorySkill
+from market_service.nooa_harness.memory import AgentMemorySurface
 from market_service.nooa_harness.inference import (
     TOOL_NAMES,
     TOOL_PHASE,
@@ -46,10 +46,10 @@ class _FakeMemory:
         return {"observation": 1}
 
 
-class MemorySkillTests(unittest.TestCase):
+class AgentMemoryTests(unittest.TestCase):
     def test_write_pins_the_segment(self):
         memory = _FakeMemory()
-        skill = MemorySkill(memory=memory, session_id="sess", segment="task:abc")
+        skill = AgentMemorySurface(memory=memory, session_id="sess", segment="task:abc")
         out = asyncio.run(skill.remember("observation", "beta flipped", tags=["beta"]))
         self.assertTrue(out["stored"])
         session_id, kind, _content, kwargs = memory.rows[0]
@@ -58,25 +58,25 @@ class MemorySkillTests(unittest.TestCase):
         self.assertEqual(kwargs["segment"], "task:abc")
 
     def test_reserved_kinds_are_refused(self):
-        skill = MemorySkill(memory=_FakeMemory(), session_id="s", segment="task:abc")
+        skill = AgentMemorySurface(memory=_FakeMemory(), session_id="s", segment="task:abc")
         for kind in ("fact", "understanding", "plan", "handoff"):
             out = asyncio.run(skill.remember(kind, "x"))
             self.assertFalse(out["stored"], kind)
 
     def test_content_is_bounded_not_dropped(self):
         memory = _FakeMemory()
-        skill = MemorySkill(memory=memory, session_id="s")
+        skill = AgentMemorySurface(memory=memory, session_id="s")
         asyncio.run(skill.remember("note", "x" * 10_000))
         self.assertEqual(len(memory.rows[0][2]), 4000)
 
     def test_no_store_is_explicit_never_fabricated(self):
-        skill = MemorySkill(memory=None, session_id="s")
+        skill = AgentMemorySurface(memory=None, session_id="s")
         self.assertFalse(asyncio.run(skill.remember("note", "x"))["stored"])
         self.assertEqual(asyncio.run(skill.recall()), [])
         self.assertFalse(asyncio.run(skill.stats())["configured"])
 
     def test_render_is_labelled_advisory(self):
-        skill = MemorySkill(memory=_FakeMemory(), session_id="s", segment="t")
+        skill = AgentMemorySurface(memory=_FakeMemory(), session_id="s", segment="t")
         block = skill.render(asyncio.run(skill.recall()))
         self.assertIn("never evidence", block)
         self.assertIn("[observation#", block)
