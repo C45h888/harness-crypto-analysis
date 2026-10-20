@@ -129,6 +129,10 @@ class MicrostructureInterpretationAgent:
             candidate = envelope.get(key)
             if isinstance(candidate, dict):
                 return candidate
+        _acq = envelope.get("acquisition")
+        if isinstance(_acq, dict) and isinstance(
+                _acq.get("microstructure_evidence"), dict):
+            return _acq["microstructure_evidence"]
         canonical = envelope.get("canonical_state")
         if isinstance(canonical, dict):
             for key in ("microstructure", "microstructure_evidence"):

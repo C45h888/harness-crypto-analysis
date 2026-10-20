@@ -75,6 +75,75 @@ def build_artifact_state(
             out[projected] = dict(payload.get("detail") or {})
             break
 
+    # The canonical answer turn rides the conformance view (ledger truth —
+    # recorded by output.run_output after the verbalization): the composer
+    # renders answer_fallback beside the engine verdict line.
+    for payload in _findings(state, "answer"):
+        detail = payload.get("detail") or {}
+        if "answer_fallback" in detail and isinstance(out.get("conformance"), dict):
+            out["conformance"] = {
+                **out["conformance"],
+                "answer_fallback": detail["answer_fallback"],
+            }
+        break
+
+    _plan = state.get("plan")
+    if isinstance(_plan, dict):
+        out["task_directive"] = _plan.get("directive")
+        out["task_plan"] = _plan.get("task_plan")
+        out["task_workflow"] = _plan.get("workflow")
+        out["seeded_plan"] = _plan.get("seeded")
+
+    _acq = state.get("acquisition")
+    if isinstance(_acq, dict):
+        out["wake"] = _acq.get("wake")
+        out["capture_status"] = _acq.get("capture_status")
+        out["microstructure_evidence"] = _acq.get("microstructure_evidence")
+        out["data_quality"] = _acq.get("data_quality")
+
+    _sf = state.get("scenario_facts")
+    if isinstance(_sf, dict):
+        out["scenario_contract"] = _sf.get("contract")
+        out["scenario_evaluation"] = _sf.get("evaluation")
+        out["scenario_divergence"] = _sf.get("divergence")
+        out["scenario_digest"] = _sf.get("digest")
+
+    _acq2 = state.get("acquisition")
+    if isinstance(_acq2, dict):
+        out["forecast_result"] = _acq2.get("forecast_result")
+        out["forward_scenario"] = _acq2.get("forward_scenario")
+        out["forward_scenario_note"] = _acq2.get("forward_scenario_note")
+        out["forward_gate"] = _acq2.get("forward_gate")
+
+    _u = state.get("understanding")
+    if isinstance(_u, dict):
+        out["comprehension"] = _u.get("comprehension")
+        out["understanding_receipt"] = _u.get("receipt")
+
+    _data = gates.latest_verdict(state, gates.GateKind.DATA)
+    if _data:
+        _facts = _data.get("facts") or {}
+        out["gate"] = {"status": _facts.get("status"),
+                       "reasons": _facts.get("reasons") or []}
+    _plan_gate = gates.latest_verdict(state, gates.GateKind.PLAN)
+    if _plan_gate:
+        out["plan_gate"] = {k: v for k, v in _plan_gate.items()
+                            if k in ("gate", "status", "passed", "disposition",
+                                     "reasons", "facts")}
+
+    for row in _rows(state):
+        payload = row.get("payload") or {}
+        if (row.get("kind") == LedgerKind.OBSERVATION.value
+                and payload.get("stage") == "narration_tiers"):
+            out["narration_tiers"] = list(payload.get("tiers") or ())
+            break
+
+    chain = out.get("statistical_chain")
+    if isinstance(chain, dict) and "chain_halt" in chain:
+        out["chain_halt"] = chain.get("chain_halt")
+    if isinstance(chain, dict) and "base_summary" in chain:
+        out["base_summary"] = chain.get("base_summary")
+
     out["loop_receipts"] = gates.project_closes(state)
     if controller is not None:
         # Traversal is FSM/telemetry-owned: the artifact view is derived at

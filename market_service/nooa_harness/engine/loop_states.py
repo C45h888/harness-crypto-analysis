@@ -592,15 +592,18 @@ SUBLOOP_SPECS: dict[SubLoop, SubLoopSpec] = {
             "never re-decide."
         ),
         exit_condition="synthesis converges (valid collapse + derived final) "
-            "or the output pass budget is spent (degrades to single-call compose)",
+            "or the output pass budget is spent (degrades to the staged final)",
     ),
     SubLoop.ARCHITECTURE: SubLoopSpec(
         steps=(LoopStep.UNDERSTAND_SURFACE, LoopStep.LOCATE_OUTPUT),
         iterates=False,
         purpose=(
-            "Ordered governance handoff between composition and placement on "
-            "the output surface; no handler work runs here (the placement "
-            "rule lives in composition). Claimed as cursor, never as work."
+            "The surface understands itself: the canonical answer turn runs "
+            "here, inside the architecture observation — the agent speaks "
+            "finally FROM the gated foundation (reword, never re-decide; "
+            "prose fields only, gate data frozen). Ordered governance "
+            "handoff between composition and placement; the placement rule "
+            "lives in composition."
         ),
     ),
     SubLoop.PLACEMENT: SubLoopSpec(

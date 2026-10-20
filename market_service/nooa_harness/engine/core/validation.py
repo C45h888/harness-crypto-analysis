@@ -255,7 +255,7 @@ async def run_validation(
     # for the FSM retry decision. The halt never clears itself here — the
     # missing entry below forces the validation_failed terminal with the
     # halt preserved on the artifact; only an FSM retry grant resumes it.
-    halt = st.chain_halt or st.deterministic_state.get("chain_halt")
+    halt = st.chain_halt
     halted = isinstance(halt, dict) and bool(halt.get("tool"))
     if halted:
         missing.append(
@@ -558,7 +558,7 @@ def _record_scenario_evaluation(st: CycleRuntimeState) -> None:
         state = controller.scenario_state().value
     except Exception:
         state = None
-    st.deterministic_state["scenario_evaluation"] = {
+    st.deterministic_state.setdefault("scenario_facts", {})["evaluation"] = {
         "contract_id": getattr(contract, "contract_id", None),
         "state": state,
         "target_price": args.get("target_price"),
@@ -568,7 +568,8 @@ def _record_scenario_evaluation(st: CycleRuntimeState) -> None:
     }
     intent = getattr(controller, "scenario_intent", None)
     if isinstance(intent, Mapping) and intent.get("mode") == "revision":
-        st.deterministic_state["scenario_divergence"] = dict(intent)
+        st.deterministic_state.setdefault("scenario_facts", {})[
+            "divergence"] = dict(intent)
 
 
 

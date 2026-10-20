@@ -77,12 +77,12 @@ AGENTIC_PER_ROUND_CALL_CAP = 3
 # Phase R7 (fetch semantic removed): the fetch pass budget is gone with
 # the fetch turn. Comprehension is the first agentic pass (its bounded
 # assessment turn rides its budget); acquisition is plan-bound (0 LLM);
-# evidence/reasoning/validation/output unchanged.
-# 1 + 3 + 6 + 1(+2 retries) + 1 = 12 planned, inside the backstop.
+# evidence/reasoning/validation/output accounting.
+# 1 + 3 + 6 + 1(+2 retries) + 1 + 1 = 13 planned, inside the backstop.
 # Headroom (16): +1 comprehension assessment + reflection/refusal reserves.
-# Synthesis doctrine: output spends COLLAPSE + DERIVE (+ legacy single-call
-# fallback when synthesis fails FSM-visibly) — bounded, tool-free, inside
-# the backstop.
+# Synthesis doctrine: output spends COLLAPSE + DERIVE + the answer
+# verbalization turn (+ the one correction turn when the hard gate misses)
+# — bounded, tool-free, inside the backstop.
 LOOP_PASS_BUDGET: dict[str, int] = {
     "comprehension": 1,
     "evidence": 3,
@@ -93,7 +93,10 @@ LOOP_PASS_BUDGET: dict[str, int] = {
     # the steady statistical track spends, not a suggestion.
     "reasoning": 8,
     "validation": 1,
-    "output": 3,
+    # The fourth output pass is the canonical answer verbalization: the
+    # agent speaks finally FROM the gated foundation (verdict + assembled
+    # values + memory), after the one correction turn has had its chance.
+    "output": 4,
 }
 # Bounded internal retry inside VALIDATION (diagnose -> steered repair ->
 # revalidate). Persistent failure emits a structured issue to the FSM

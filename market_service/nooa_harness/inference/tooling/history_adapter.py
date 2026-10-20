@@ -108,7 +108,8 @@ async def _load_prior_block_fits(
     for row in rows or []:
         from market_service.runtime.contracts import run_record_of
         state = run_record_of(row).get("deterministic_state") or {}
-        micro = state.get("microstructure_evidence") or {}
+        micro = ((state.get("acquisition") or {}).get("microstructure_evidence")
+             or state.get("microstructure_evidence") or {})
         fit_dict = micro.get("price_impact_fit")
         if not isinstance(fit_dict, dict):
             continue

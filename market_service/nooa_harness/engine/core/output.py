@@ -13,7 +13,7 @@ from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
 from ..fsm import GovernanceEvent, GovernanceEventKind
 from ..kb import build_task_workflow, chain_status
 from ..schemas import coerce_turn, extract_json_object
-from ..ledger import LedgerKind, ledger_rows, record_finding
+from ..ledger import LedgerKind, ledger_rows, record_entry, record_finding
 from ..loop_states import LoopStep, NestedLoop, SubLoop
 from .. import gates
 
@@ -131,7 +131,7 @@ async def run_output(
     passes_per_loop = dict(reasoned.passes_per_loop or {})
     comprehension = reasoned.comprehension
 
-    # --- OUTPUT COMPOSITION PASS (LOOP_PASS_BUDGET["output"] = 1, non-agentic) ---
+    # --- OUTPUT COMPOSITION PASSES (bounded output budget, non-agentic) ---
     # One LLM call, tools forbidden: compose the final artifact JSON
     # strictly from this run's material. Any tool_calls returned are
     # dropped and logged. Parse failure keeps the staged final.
@@ -142,7 +142,8 @@ async def run_output(
         controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.COMPOSITION
     )
     staged_final = parsed_final
-    task_workflow = (deterministic_state.get("task_workflow")
+    task_workflow = ((deterministic_state.get("plan") or {}).get("workflow")
+                     or deterministic_state.get("task_workflow")
                      or build_task_workflow(task, scenario))
     # Re-anchor the composition to the question asked: the task and the
     # bound directive (with its parse refusals) ride the synthesis material
@@ -156,18 +157,18 @@ async def run_output(
             "paths; preserve refusals as findings, never paraphrased numbers):\n"
             f"{json.dumps(deterministic_state.get('task_directive'), default=str)[:6_000]}\n\n"
         )
-    if (deterministic_state.get("scenario_contract")
-            or deterministic_state.get("scenario_evaluation")):
+    _sf = deterministic_state.get("scenario_facts") or deterministic_state
+    if (_sf.get("contract") or _sf.get("evaluation")):
         directive_block += (
             "SCENARIO CONTRACT + EVALUATION (the exact question and the exact "
             "dispatched answer — echo these; never re-scope in composition):\n"
             "contract: "
             f"{json.dumps(deterministic_state.get('scenario_contract'), default=str)[:2_000]}\n"
             "evaluation: "
-            f"{json.dumps(deterministic_state.get('scenario_evaluation'), default=str)[:2_000]}\n"
+            f"{json.dumps(_sf.get('evaluation'), default=str)[:2_000]}\n"
             + ("divergence: "
                f"{json.dumps(deterministic_state.get('scenario_divergence'), default=str)[:1_000]}\n"
-               if deterministic_state.get("scenario_divergence") else "")
+               if _sf.get("divergence") else "")
             + "\n"
         )
     # Loop-surface completion (verdict recall): the adjudication decision
@@ -338,7 +339,10 @@ async def run_output(
     llm_calls = st.llm_calls
     passes_per_loop = dict(reasoned.passes_per_loop or {})
     passes_per_loop["output"] = st.passes_per_loop.get("output", 0)
-    deterministic_state["narration_tiers"] = list(st.llm_tiers)
+    record_entry(
+        deterministic_state, LedgerKind.OBSERVATION,
+        {"stage": "narration_tiers", "tiers": list(st.llm_tiers)},
+        segment=getattr(ctx, "task_id", None))
     # Composition completed; architecture is a real governed sub-loop.  The
     # placement and memory sub-loops are opened below only when their actual
     # handlers run, so the trace cannot claim work that was merely planned.
@@ -397,6 +401,15 @@ async def run_output(
     _adjudication = parsed_final.get("hypothesis_probabilities")
     if isinstance(_adjudication, dict):
         interpretation["hypothesis_probabilities"] = _adjudication
+    # Judged-but-unrendered persistence (no migration — JSON keys only): the
+    # judged forward_scenario / hypothesis_evidence ride the interpretation
+    # so the canonical answer turn speaks from the FULL judged view, not the
+    # render allowlist. Canonical numeric truth still lives in calculations;
+    # these are the agent's judged readings, kept verbatim.
+    for _judged_key in ("forward_scenario", "hypothesis_evidence"):
+        _judged_val = parsed_final.get(_judged_key)
+        if _judged_val is not None:
+            interpretation[_judged_key] = _judged_val
     # Pass C: hypothesis formed from the track's own evidence + calc.* tools
     # (memory node pruned from the track — transport retained),
     # final DeltaP is derived diagnostic heteroskedastic ν·OFI.
@@ -462,14 +475,122 @@ async def run_output(
             context.failure_event("budget_exhausted")
         )
         terminal = controller.terminal.value if controller.terminal else "budget_exhausted"
-        deterministic_state["terminal"] = terminal
+        context.set_terminal(deterministic_state, terminal)
         ctx.controller = controller
         return await engine._degraded_output(
             deterministic_state, capability_log,
             "output reached without a validated final",
         ), {"llm_calls": llm_calls, "terminal": terminal}
 
-    # The composition call above opened ARCHITECTURE.  Opening the next
+    # --- ANSWER VERBALIZATION (canonical completion) ---
+    # The loop completes with the ANSWER, built ON the deterministic
+    # foundation above: the agent verbalizes its prose in light of the gate
+    # verdict it can now see. Reword, never re-decide — only prose fields
+    # are accepted (summary, scenario_rationale, model_separation,
+    # limitations, confidence); every gate-data side stays frozen as
+    # founded. Empty prose keeps the foundation's words (field-level keep,
+    # never a fill); transport/parse failure falls back to the foundation
+    # render, flagged in conformance. Governed inside the ARCHITECTURE pass
+    # accounting (no new sub-loop); the fourth output pass funds this turn.
+    answer_fallback: str | None = None
+    if authored_shipped:
+        from .answer import answer_material_from_skeleton
+        from .synthesize import _one_call
+        from ..kb import compose_answer_prompt
+        _skeleton = {
+            "task": task,
+            "gate": {"status": gate_status,
+                     "reasons": list(gate_reasons or [])},
+            "hypothesis_verdict": hypothesis_verdict,
+            "verdict_reason": verdict_reason,
+            "interpretation": interpretation,
+            "hypothesis": hypothesis,
+            "calculations": calculations,
+            "dropped": list(_dropped),
+            "conformance": {
+                "hard_misses": list(hard)[:8],
+                "conflicts": list(conflicts)[:8],
+                "quality_findings": list(findings)[:8],
+                "correction_used": correction_used,
+            },
+        }
+        _material = None
+        try:
+            _material = answer_material_from_skeleton(_skeleton)
+        except Exception:
+            log.exception("answer material build failed; foundation render ships")
+        if _material is None:
+            answer_fallback = "no answer material (no authored ship)"
+        else:
+            raw_answer = await _one_call(
+                engine, st,
+                compose_answer_prompt(
+                    material=_material, frame_block=frame_block,
+                    memory_block=memory_block,
+                ),
+            )
+            if raw_answer is None:
+                answer_fallback = (
+                    "answer turn unrun (pass budget spent or transport failure)")
+            else:
+                try:
+                    verbal = coerce_turn(extract_json_object(raw_answer))
+                except Exception:
+                    verbal = None
+                if not isinstance(verbal, dict):
+                    answer_fallback = "unparseable answer turn"
+                else:
+                    if verbal.pop("tool_calls", None):
+                        log.warning(
+                            "answer turn: tool_calls dropped (non-agentic)")
+                    _new_summary = verbal.get("summary")
+                    if (isinstance(_new_summary, str)
+                            and _new_summary.strip()):
+                        interpretation["summary"] = _new_summary
+                    if (scenario is not None and isinstance(
+                            interpretation.get("scenario"), dict)):
+                        _new_rationale = verbal.get("scenario_rationale")
+                        if (isinstance(_new_rationale, str)
+                                and _new_rationale.strip()):
+                            interpretation["scenario"]["rationale"] = (
+                                _new_rationale)
+                    _new_separation = verbal.get("model_separation")
+                    if (isinstance(_new_separation, str)
+                            and _new_separation.strip()):
+                        interpretation["model_separation"] = _new_separation
+                    _new_limitations = verbal.get("limitations")
+                    if isinstance(_new_limitations, list):
+                        _kept_limits = [str(item) for item in _new_limitations
+                                        if str(item).strip()]
+                        if _kept_limits:
+                            interpretation["limitations"] = _kept_limits
+                    try:
+                        from market_service.runtime.contracts import (
+                            normalize_confidence as _norm_conf3)
+                        _new_conf = _norm_conf3(verbal.get("confidence"))
+                    except Exception:
+                        _new_conf = None
+                    if _new_conf is not None:
+                        interpretation["confidence"] = _new_conf
+    # The verbalization spent the fourth output pass: re-sync the handoff
+    # counters so the cycle meta reports what the loop actually spent.
+    llm_calls = st.llm_calls
+    passes_per_loop["output"] = st.passes_per_loop.get("output", 0)
+    if authored_shipped:
+        # The answer turn (or its fallback) is ledger truth: the artifact
+        # projections overlay it onto the conformance view, so every
+        # re-projection (settle, final trace) keeps it and the composer
+        # renders answer_fallback beside the verdict line.
+        record_finding(
+            deterministic_state, "answer",
+            "verbalized" if answer_fallback is None
+            else f"fallback: {answer_fallback}",
+            detail={"answer_fallback": answer_fallback,
+                    "verbalized": answer_fallback is None},
+            segment=getattr(ctx, "task_id", None))
+
+    # The composition call above opened ARCHITECTURE, inside whose
+    # observation the canonical answer turn just ran. Opening the next
     # sibling is the membrane's ordered handoff; do not close first because
     # the current observation carries the sibling cursor.
     controller, _ = context._must_govern(
@@ -483,7 +604,7 @@ async def run_output(
     # PLACEMENT = deliver + confirm; SETTLE gates on delivery confirmation +
     # recorded verdicts — never on a store write. Placement failures are
     # RECORDED as run_record_errors and never block settlement.
-    deterministic_state["terminal"] = "pending_settlement"
+    context.set_terminal(deterministic_state, "pending_settlement")
     from ..projections import build_artifact_state as _project
     deterministic_state.update(_project(deterministic_state, controller))
     pending = CanonicalOutput.create(
@@ -491,12 +612,14 @@ async def run_output(
         generated_at=generated_at, completed_at=context._utc_now_iso(),
         status=gate_status, window_minutes=30, interval_seconds=10,
         input_hash=str(
-            (deterministic_state.get("forecast_result") or {}).get("input_hash")
+            ((deterministic_state.get("acquisition") or {})
+             .get("forecast_result") or {}).get("input_hash")
             or (evidence or {}).get("input_hash")
             or "no-evidence"
         ),
         model_version=str(
-            (deterministic_state.get("forecast_result") or {}).get("model_version")
+            ((deterministic_state.get("acquisition") or {})
+             .get("forecast_result") or {}).get("model_version")
             or "inference-engine-v1"
         ),
         interpretation=interpretation,
@@ -574,7 +697,7 @@ async def run_output(
     from ..projections import build_artifact_state
     deterministic_state.update(build_artifact_state(deterministic_state, controller))
     final_terminal = "settled" if delivery_ok else "delivery_failed"
-    deterministic_state["terminal"] = final_terminal
+    context.set_terminal(deterministic_state, final_terminal)
     deterministic_state["persistence"] = placement
     deterministic_state.update(build_artifact_state(deterministic_state, controller))
     output = replace(
@@ -606,7 +729,7 @@ async def run_output(
         completed=terminal == "settled",
     )
     ctx.controller = controller
-    deterministic_state["terminal"] = terminal
+    context.set_terminal(deterministic_state, terminal)
     deterministic_state.update(build_artifact_state(deterministic_state, controller))
     output = replace(
         output,
@@ -627,6 +750,10 @@ async def run_output(
     if isinstance(final_validation, dict):
         final_validation = dict(final_validation)
         final_validation["delivered"] = delivery_ok
+        if authored_shipped:
+            final_validation["answer_turn"] = (
+                "verbalized" if answer_fallback is None
+                else f"fallback: {answer_fallback}")
         if delivery_error:
             final_validation["delivery_error"] = delivery_error
     cycle_meta = {

@@ -75,15 +75,20 @@ class PurityTests(unittest.TestCase):
         self.assertTrue(verdict.refused)
         self.assertIn("gate_worker_error:RuntimeError", verdict.reasons[0])
 
-    def test_no_module_level_core_imports(self):
-        # Workers take snapshots. The only core imports are two lazy, pure
-        # leaf helpers inside the content worker (documented exception).
+    def test_no_core_imports_at_all(self):
+        # Workers take snapshots; pure helpers live in engine/predicates.py.
+        # gates.py must not import a loop module, eagerly or lazily.
         src = pathlib.Path(gates.__file__).read_text()
         tree = ast.parse(src)
-        for node in tree.body:
+        for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 self.assertFalse(node.module.startswith("core"),
-                                 f"top-level core import: {node.module}")
+                                 f"core import: {node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(alias.name.startswith(
+                        "market_service.nooa_harness.engine.core"),
+                        f"core import: {alias.name}")
 
 
 class FramingTests(unittest.TestCase):

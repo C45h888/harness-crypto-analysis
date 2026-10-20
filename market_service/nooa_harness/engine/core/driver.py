@@ -688,7 +688,7 @@ class InferenceEngine:
                     pass
                 if _failed:
                     try:
-                        _digest = (st.deterministic_state.get("forecast_result")
+                        _digest = ((st.deterministic_state.get("acquisition") or {}).get("forecast_result")
                                  if isinstance(st.deterministic_state, dict) else None)
                         if isinstance(_digest, dict):
                             _ft = _digest.get("forward_target") or {}

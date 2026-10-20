@@ -722,11 +722,20 @@ def envelope_digest(deterministic_state: dict[str, Any], cap: int = 4_000) -> st
     the agent pulls it instead of guessing. Pure: no state, no I/O.
     """
     try:
-        gate = deterministic_state.get("gate") or {}
-        dq = deterministic_state.get("data_quality") or {}
-        forecast = deterministic_state.get("forecast_result")
-        fwd_scen = deterministic_state.get("forward_scenario")
-        directive = deterministic_state.get("task_directive") or {}
+        from . import gates as _gates
+        gate = _gates.gate_facts(deterministic_state, _gates.GateKind.DATA)
+        if not gate:
+            gate = deterministic_state.get("gate") or {}
+        _acq = deterministic_state.get("acquisition") or {}
+        _plan = deterministic_state.get("plan") or {}
+        dq = (_acq.get("data_quality")
+              or deterministic_state.get("data_quality") or {})
+        _acq = deterministic_state.get("acquisition") or deterministic_state
+        _sf = deterministic_state.get("scenario_facts") or deterministic_state
+        forecast = _acq.get("forecast_result")
+        fwd_scen = _acq.get("forward_scenario")
+        directive = (_plan.get("directive")
+                     or deterministic_state.get("task_directive") or {})
         digest = {
             "gate": gate,
             "data_quality": {
@@ -745,13 +754,15 @@ def envelope_digest(deterministic_state: dict[str, Any], cap: int = 4_000) -> st
                 "present" if fwd_scen else "not_run"
             ),
             "task_directive_kind": directive.get("kind"),
-            "task_plan_kind": (deterministic_state.get("task_plan") or {}).get("kind"),
-            "cadence": (deterministic_state.get("task_plan") or {}).get("cadence"),
+            "task_plan_kind": (_plan.get("task_plan")
+                               or deterministic_state.get("task_plan") or {}).get("kind"),
+            "cadence": (_plan.get("task_plan")
+                        or deterministic_state.get("task_plan") or {}).get("cadence"),
             "scenario_contract": (
-                deterministic_state.get("scenario_contract") or None
+                _sf.get("contract") or deterministic_state.get("scenario_contract") or None
             ),
             "scenario_digest": (
-                "present" if deterministic_state.get("scenario_digest")
+                "present" if _sf.get("digest")
                 else "not_run"
             ),
         }
@@ -1142,6 +1153,45 @@ def compose_correction_prompt(
         "confidence, limitations, model_separation, hypothesis, "
         "hypothesis_probabilities, scenario, tool_calls: []}. No prose before "
         "or after it."
+    )
+
+
+def compose_answer_prompt(
+    *,
+    material: dict[str, Any],
+    frame_block: str = "",
+    memory_block: str = "",
+) -> str:
+    """The canonical ANSWER verbalization turn — the agent speaks finally.
+
+    Sent once per authored cycle, AFTER the deterministic foundation is
+    complete (validation verdict derived, evidence assembled + corrected,
+    output gate ruled, correction spent). The agent verbalizes its prose IN
+    LIGHT OF the gate verdict it can now see — reword, never re-decide:
+    only prose fields are accepted downstream (summary, scenario_rationale,
+    model_separation, limitations, confidence); every gate-data side
+    (choice, verdicts, citations, values) stays frozen as founded. The
+    engine never rewrites words: a transport/parse failure falls back to
+    the foundation render, flagged. Pure.
+    """
+    return (
+        "ANSWER TURN — the deterministic foundation below is complete and "
+        "FROZEN: the gate has ruled (the engine verdict names its reading "
+        "of this cycle), the evidence values are store-corrected, the "
+        "adjudicated choice is carried. Speak your answer FROM it: reword "
+        "your prose so it reads honestly beside the verdict — never re-decide "
+        "the choice, never restate the verdict as your own, never move a "
+        "number. An omission ships as omission; do not fill what you did "
+        "not author. No tools are available; any tool_calls are dropped.\n\n"
+        "GATED FOUNDATION (read-only — verbalize from this, never against it):\n"
+        f"{json.dumps(material, default=str)[:12_000]}\n\n"
+        f"{frame_block}"
+        f"{memory_block}"
+        "Return ONE JSON object with EXACTLY {phase: \"P6\", summary, "
+        "scenario_rationale, model_separation, limitations, confidence, "
+        "tool_calls: []} — summary >=80 chars saying what the fits show AND "
+        "why it is happening now, in light of the verdict; confidence one "
+        "of low|medium|high. No prose before or after it."
     )
 
 

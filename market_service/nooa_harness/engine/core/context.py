@@ -221,29 +221,15 @@ class _CycleContext:
 # undeclared write fails the charter at commit time.
 # ---------------------------------------------------------------------------
 DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
-    # task-directive roots (gather init + inference_runner persist)
-    "task", "scenario", "task_directive", "task_plan", "task_workflow",
-    # wake + acquisition surface roots (Phase R7: data_gate /
-    # bootstrap_basis / fetch_note retired with the fetch semantic)
-    "wake", "capture_status", "microstructure_evidence",
-    "forecast_result", "forward_scenario", "forward_scenario_note",
-    "forward_gate", "gate",
-    # pass/loop-carried verdict roots
-    "chain_halt", "comprehension",
-    "failure", "terminal",
-    "understanding_receipt",
-    "statistical_chain",     # central engine ledger (engine/ledger.py) — the ONE deterministic home
-    # for engine-authored memory, sectioned by LedgerKind
+    # inputs (single writer, needed mid-cycle)
+    "task", "scenario", "plan", "acquisition", "scenario_facts",
+    "understanding",
+    # lifecycle
+    "failure", "terminal", "persistence",
+    # chain snapshot (statistical_chain carries chain_halt + base_summary)
+    "statistical_chain",
+    # engine bedrock: the ONE deterministic home for engine-authored memory
     "ledger",
-    # scenario contract (interaction plane → runtime): ONE frozen question,
-    # the plan-bound evaluation, the declared divergence, and the plan-bound
-    # digest (pre-acquisition, never agent-visible accumulated state).
-    "scenario_contract", "scenario_evaluation", "scenario_divergence",
-    "scenario_digest",
-    # re-ordered cycle roots (comprehension/acquisition plane)
-    "data_quality", "seeded_plan", "plan_gate", "persistence",
-    "narration_tiers", "base_summary",     # agentic synthesis (core/synthesize.py): FSM-visible failure note for
-    # the semantics-review surface; the cycle degrades, never dies on it
 })
 
 
@@ -428,6 +414,27 @@ def freeze_chain(
     }
 
 
+def set_terminal(
+    deterministic_state: dict[str, Any], terminal: str, *,
+    failure: Mapping[str, Any] | None = None,
+) -> str:
+    """The ONE terminal writer: outcome + optional failure facts together."""
+    deterministic_state["terminal"] = terminal
+    if failure is not None:
+        deterministic_state["failure"] = (
+            (deterministic_state.get("failure") or {}) | dict(failure))
+    return terminal
+
+
+def merge_failure(
+    deterministic_state: dict[str, Any], **fields: Any,
+) -> dict[str, Any]:
+    """The ONE failure-field writer (incremental remediation facts)."""
+    deterministic_state["failure"] = (
+        (deterministic_state.get("failure") or {}) | dict(fields))
+    return deterministic_state["failure"]
+
+
 def failure_event(kind: str | None) -> GovernanceEvent:
     """The main FSM's ONE failure edge: the CYCLE_FAILED intake.
 
@@ -547,11 +554,12 @@ async def dispatch_failure(
     }
     status = outcome.status
     if status is not None:
-        st.deterministic_state["failure"]["worker_outcome"] = status.outcome
+        _extra: dict[str, Any] = {"worker_outcome": status.outcome}
         if status.mirrored:
-            st.deterministic_state["failure"]["mirrored"] = list(status.mirrored)
+            _extra["mirrored"] = list(status.mirrored)
         if status.findings:
-            st.deterministic_state["failure"]["findings"] = list(status.findings)
+            _extra["findings"] = list(status.findings)
+        merge_failure(st.deterministic_state, **_extra)
     return outcome
 
 
@@ -574,7 +582,7 @@ async def signal_and_route_failure(
     if outcome.continue_cycle:
         st.failure_kind = None
         st.failure_detail = None
-        st.deterministic_state["failure"]["resolved"] = outcome.resolved
+        merge_failure(st.deterministic_state, resolved=outcome.resolved)
         return None
     return await run_runtime_failure(engine, ctx, st)
 
@@ -634,7 +642,7 @@ async def recover_tool_failure(
         st.failure_kind = None
         st.failure_detail = None
         st.tool_intent = None                  # type: ignore[attr-defined]
-        st.deterministic_state["failure"]["resolved"] = outcome.resolved
+        merge_failure(st.deterministic_state, resolved=outcome.resolved)
         return None
     return outcome
 
@@ -651,10 +659,8 @@ async def run_runtime_failure(
     kind = st.failure_kind or "infra_failed"
     st.controller = st.controller.advance(failure_event(kind))
     terminal = st.controller.terminal.value if st.controller.terminal else kind
-    st.deterministic_state["terminal"] = terminal
-    st.deterministic_state["failure"] = {
-        "kind": kind, "detail": st.failure_detail,
-    }
+    set_terminal(st.deterministic_state, terminal,
+                 failure={"kind": kind, "detail": st.failure_detail})
     return await engine._degraded_output(
         st.deterministic_state, st.capability_log,
         f"{kind}: {st.failure_detail or 'runtime failure'}",
@@ -690,7 +696,7 @@ async def run_validation_terminal(
             and "context" not in _covered):
         st.controller = st.controller.record_loop_visit(
             "context",
-            st.passes_per_loop.get("comprehension", 0)
+            st.passes_per_loop.get(0)
             + st.passes_per_loop.get("evidence", 0),
             ("intake", "interpretation", "framing", "sourcing",
              "acquisition", "verification"),
@@ -704,7 +710,7 @@ async def run_validation_terminal(
         )
     st.controller = st.controller.record_loop_visit(
         "validation", st.passes_per_loop.get("validation", 0),
-        ("gate", "recovery"), completed=False,
+        ("recovery"), completed=False,
     )
     st.controller = st.controller.advance(
         failure_event("validation_failed")
@@ -714,7 +720,7 @@ async def run_validation_terminal(
         else "validation_failed"
     )
     ctx.controller = st.controller
-    st.deterministic_state["terminal"] = terminal
+    set_terminal(st.deterministic_state, terminal)
     record_finding(
         st.deterministic_state, "validation_issue",
         "validation terminal: " + "; ".join(str(m) for m in missing[:3]),

@@ -353,7 +353,7 @@ def test_evaluation_root_records_the_bound_dispatch():
     controller = _evaluated(_controller(contract))
     st = _state(controller)
     _record_scenario_evaluation(st)
-    evaluation = st.deterministic_state["scenario_evaluation"]
+    evaluation = st.deterministic_state["scenario_facts"]["evaluation"]
     assert evaluation["contract_id"] == contract.contract_id
     assert evaluation["target_price"] == TARGET
     assert evaluation["horizon"] == HORIZON
@@ -491,7 +491,7 @@ def test_opening_loop_binds_contract_and_renders_block():
     assert st.scenario_contract.asked_target == TARGET
     assert "SCENARIO CONTRACT" in st.scenario_block
     assert TARGET in st.scenario_block
-    assert st.deterministic_state["scenario_contract"]["asked_target"] == TARGET
+    assert st.deterministic_state["scenario_facts"]["contract"]["asked_target"] == TARGET
     assert st.controller.scenario_contract is st.scenario_contract
 
 

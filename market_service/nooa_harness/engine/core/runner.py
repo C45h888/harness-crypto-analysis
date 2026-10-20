@@ -104,7 +104,8 @@ async def _stage_comprehension(engine, ctx, st, wake, wake_meta, task, scenario)
     if not framing.passed:
         route = gates.route_refusal(framing) or "gate_refused"
         st.controller = st.controller.advance(context.failure_event(route))
-        st.deterministic_state["terminal"] = (
+        context.set_terminal(
+            st.deterministic_state,
             st.controller.terminal.value if st.controller.terminal else route)
         ctx.controller = st.controller
         return st, ctx, (
@@ -273,7 +274,8 @@ async def _place_understanding(engine: Any, ctx: Any, st: Any) -> None:
     deterministic engine state — never the episodic memory node — and the LLM
     reads it as context. Pure state mutation, so it cannot fail the cycle.
     """
-    receipt = (st.deterministic_state or {}).get("understanding_receipt") or {}
+    receipt = (((st.deterministic_state or {}).get("understanding") or {})
+               .get("receipt") or {})
     wake_id = getattr(getattr(ctx, "wake", None), "wake_id", "") or ""
     segment = getattr(ctx, "task_id", None)
     record_entry(
@@ -309,11 +311,13 @@ async def degraded_output(
         status="provisional", window_minutes=30, interval_seconds=10,
         input_hash=str(
             (deterministic_state.get("forecast_result") or {}).get("input_hash")
-            or (deterministic_state.get("microstructure_evidence") or {}).get("input_hash")
+            or ((deterministic_state.get("acquisition") or {})
+                .get("microstructure_evidence") or {}).get("input_hash")
             or "narration-failed"
         ),
         model_version=str(
-            (deterministic_state.get("forecast_result") or {}).get("model_version")
+            ((deterministic_state.get("acquisition") or {})
+             .get("forecast_result") or {}).get("model_version")
             or "inference-engine-v1"
         ),
         run_record={

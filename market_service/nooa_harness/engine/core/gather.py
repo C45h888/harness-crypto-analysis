@@ -24,6 +24,7 @@ from ..fsm import GovernanceEventKind
 from ..loop_states import NestedLoop
 from market_service.runtime.contracts import InferenceArtifact  # noqa: F401 (compat type)
 from . import context
+from .. import gates
 from .context import _CycleContext, _GatheredEvidence
 
 log = logging.getLogger(__name__)
@@ -125,6 +126,13 @@ async def run_plan_bound_acquisition(
         ctx.gathered.gate_status if ctx.gathered is not None else "provisional"
     )
     gate_reasons = list(ctx.gathered.gate_reasons) if ctx.gathered is not None else []
+    # DATA gate: the status is adjudicated by the gate registry, not written
+    # inline. Policy is unchanged (provisional unless insufficient).
+    _data_verdict = gates.evaluate(gates.GateKind.DATA, {
+        "status": gate_status, "reasons": list(gate_reasons)})
+    gates.record_verdict(_data_verdict, st,
+                         segment=getattr(ctx, "task_id", None))
+    gate_status = str(_data_verdict.facts_dict().get("status") or gate_status)
     if gate_status == "validated" and forward_status != "validated":
         gate_status = "provisional"
         gate_reasons = list(gate_reasons) + [
@@ -214,14 +222,15 @@ async def run_plan_bound_acquisition(
                 })
 
     # In-place merge (key order preserved — placeholders set by bootstrap).
-    deterministic_state["forecast_result"] = forecast_result
-    deterministic_state["forward_scenario"] = forward_scenario_result
-    deterministic_state["scenario_digest"] = scenario_digest
-    deterministic_state["forward_scenario_note"] = (
+    _acq = deterministic_state.setdefault("acquisition", {})
+    _acq["forecast_result"] = forecast_result
+    _acq["forward_scenario"] = forward_scenario_result
+    _sfacts = deterministic_state.setdefault("scenario_facts", {})
+    _sfacts["digest"] = scenario_digest
+    _acq["forward_scenario_note"] = (
         (forward_scenario_log or {}).get("detail")
         if isinstance(forward_scenario_log, dict) else "not_run")
-    deterministic_state["gate"] = {"status": gate_status, "reasons": list(gate_reasons)}
-    deterministic_state["forward_gate"] = {
+    _acq["forward_gate"] = {
         "status": ((forecast_result or {}).get("validation_state")
                    if isinstance(forecast_result, dict) else "unavailable"),
         "probability_status": (((forecast_result or {}).get("multivariate") or {}).get("probability_status")

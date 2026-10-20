@@ -48,6 +48,14 @@ from typing import Any, Mapping
 
 from .config import MAX_MERGED_EVIDENCE, SUMMARY_MIN_CHARS
 from .ledger import LedgerKind, record_entry
+from .predicates import (
+    EVIDENCE_NO_PATH,
+    EVIDENCE_NO_READING,
+    EVIDENCE_NULL_VALUE,
+    classify_evidence,
+    path_resolves,
+    resolve_basis_path,
+)
 from .scenario_contract import (
     numbers_equal,
     render_status_block,
@@ -422,7 +430,8 @@ def _bound_from_controller(controller: Any, ctx: Any) -> tuple[Any, Any]:
 def _derive_verdict(
     payload: Any, st: CycleRuntimeState, det_verdict: Any,
 ) -> tuple[str, str]:
-    gate = st.deterministic_state.get("gate") or {}
+    gate = (gate_facts(st.deterministic_state, GateKind.DATA)
+            or st.deterministic_state.get("gate") or {})
     return det_verdict(
         payload, st.capability_log,
         str(gate.get("status") or "provisional"),
@@ -683,14 +692,8 @@ def validate_final_turn(
     roots: set[str] = set()
     evidence = parsed.get("evidence")
     # ONE shape authority, shared with the shipping filter
-    # (output._assemble_authored → synthesize.classify_evidence). The gate
+    # (output._assemble_authored → predicates.classify_evidence). The gate
     # judges shape only (no frame); backing is assembly's fact-check.
-    from .core.synthesize import (
-        EVIDENCE_NO_PATH,
-        EVIDENCE_NO_READING,
-        EVIDENCE_NULL_VALUE,
-        classify_evidence,
-    )
     if isinstance(evidence, list):
         for idx, entry in enumerate(evidence):
             if not isinstance(entry, dict):
@@ -861,11 +864,11 @@ def validate_final_turn(
                 "and H1 (target reachable), both non-empty"
             )
     # Slice E — value-echo verify (path-correct + value-wrong = missing).
-    # Resolves through chain.resolve_basis_path (the shared citation resolver):
+    # Resolves through predicates.resolve_basis_path (the shared citation resolver):
     # field-segmented, comparator-disjoint, skip-when-unresolvable. See that
     # function for the run-6 lesson.
     try:
-        from .core.chain import resolve_basis_path as _resolve
+        _resolve = resolve_basis_path
 
         def _norm(_v: Any) -> str | None:
             if _v is None:
@@ -922,7 +925,7 @@ def validate_final_turn(
                 "probabilities inform, never execute"
             )
         elif isinstance(_probs, dict) and _needs_weigh:
-            from .core.chain import resolve_basis_path as _resolve_basis
+            _resolve = resolve_basis_path
             _RANK = {"low": 0, "medium": 1, "high": 2}
 
             def _acc_data(_v: Any) -> Any:
@@ -938,7 +941,7 @@ def validate_final_turn(
             def _basis_truth(_path: str) -> tuple[str | None, Any]:
                 # Shared citation resolver (chain-owned): adjudication can
                 # never disagree with echo on what a path means.
-                _head, _field, _truth = _resolve_basis(_path, _a)
+                _head, _field, _truth = _resolve(_path, _a)
                 if _field is None:
                     return None, None
                 return _field, _truth
@@ -1147,7 +1150,8 @@ class _DataWorker(GateWorker):
                     else GateStatus.PASSED),
             reasons=(() if status != "insufficient"
                      else ("data insufficient",)),
-            facts=(("status", status),),
+            facts=(("status", status),
+                   ("reasons", list(snapshot.get("reasons") or ()))),
             disposition=(GateDisposition.REFUSED if status == "insufficient"
                          else GateDisposition.COMPLETED),
         )
@@ -1327,9 +1331,32 @@ def close_loop(
 __all__ += [
     "GateDisposition", "GateWorker", "GATE_WORKERS", "REFUSAL_TERMINALS",
     "evaluate", "require", "route_refusal", "record_verdict", "close_loop",
+    "latest_verdict", "gate_facts",
     "merge_interpretation", "check_scenario_equality",
     "has_directive_verdict", "validate_final_turn",
 ]
+
+
+def latest_verdict(
+    state: Mapping[str, Any], kind: "GateKind",
+) -> dict[str, Any] | None:
+    """The most recent recorded verdict payload for one gate kind."""
+    rows = state.get("ledger") if isinstance(state, Mapping) else None
+    for row in reversed(rows if isinstance(rows, list) else []):
+        if row.get("kind") != LedgerKind.VERDICT.value:
+            continue
+        payload = row.get("payload") or {}
+        if payload.get("gate") == kind.value:
+            return payload
+    return None
+
+
+def gate_facts(
+    state: Mapping[str, Any], kind: "GateKind",
+) -> dict[str, Any]:
+    """Facts of the latest verdict (empty when the gate never ran)."""
+    payload = latest_verdict(state, kind)
+    return dict((payload or {}).get("facts") or {})
 
 
 def project_closes(state: Mapping[str, Any]) -> list[dict[str, Any]]:

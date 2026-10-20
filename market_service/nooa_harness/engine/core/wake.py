@@ -270,10 +270,10 @@ def framing_verdict(st: CycleRuntimeState):
     return gates.evaluate(gates.GateKind.FRAMING, {
         "seed_plan": st.seed_plan,
         "task_workflow": st.task_workflow,
-        "seeded_plan_state": ds.get("seeded_plan"),
-        "task_workflow_state": ds.get("task_workflow"),
-        "comprehension": ds.get("comprehension"),
-        "understanding": ds.get("understanding_receipt"),
+        "seeded_plan_state": (ds.get("plan") or {}).get("seeded"),
+        "task_workflow_state": (ds.get("plan") or {}).get("workflow"),
+        "comprehension": (ds.get("understanding") or {}).get("comprehension"),
+        "understanding": (ds.get("understanding") or {}).get("receipt"),
         "refs": (),
     })
 
@@ -308,23 +308,20 @@ async def run_comprehension(
     deterministic_state: dict[str, Any] = {
         "task": prompt.raw,
         "scenario": scenario,
-        "scenario_contract": (contract.to_dict() if contract is not None else None),
-        "wake": {
-            "trigger_source": wake.trigger_source,
-            "predicates_fired": wake.predicates_fired,
+        # One acquisition root (legacy keys are artifact projections).
+        "acquisition": {
+            "wake": {
+                "trigger_source": wake.trigger_source,
+                "predicates_fired": wake.predicates_fired,
+            },
+            "capture_status": None,
+            "microstructure_evidence": None,
+            "data_quality": None,
         },
-        "capture_status": None,
-        "microstructure_evidence": None,
-        "data_quality": None,
-        # Plan-bound acquisition merges these in place after the
-        # receipt (placeholders preserve the charter key order).
-        "forecast_result": None,
-        "forward_scenario": None,
-        "forward_scenario_note": "not_run",
-        "gate": {"status": "provisional", "reasons": []},
-        "forward_gate": {"status": "unavailable",
-                         "probability_status": "unavailable",
-                         "reason": "not_run"},
+        # Grouped derived planes (legacy keys are artifact projections).
+        "scenario_facts": {
+            "contract": (contract.to_dict() if contract is not None else None)},
+        "understanding": {},
     }
     st = CycleRuntimeState(
         controller=ctx.controller,
@@ -465,8 +462,8 @@ async def run_comprehension(
             assessment_note = f"assessment_unavailable: {type(exc).__name__}"
     st.task_directive = directive.to_dict()
     st.task_plan = plan
-    st.deterministic_state["task_directive"] = st.task_directive
-    st.deterministic_state["task_plan"] = plan
+    st.deterministic_state["plan"] = {
+        "directive": st.task_directive, "task_plan": plan}
     if assessment_note:
         record_finding(st.deterministic_state, "assessment", str(assessment_note),
                        segment=getattr(ctx, "task_id", None))
@@ -482,15 +479,16 @@ async def run_comprehension(
         st.scenario_contract = contract
         st.controller = st.controller.with_scenario_contract(contract)
         ctx.controller = st.controller
-        st.deterministic_state["scenario_contract"] = contract.to_dict()
+        st.deterministic_state.setdefault("scenario_facts", {})[
+            "contract"] = contract.to_dict()
         st.scenario_block = render_contract_block(contract, plan)
         st.scenario_reminder = render_reminder(contract)
 
     st.seed_plan = seed_evidence_plan(task, scenario)
-    st.deterministic_state["seeded_plan"] = st.seed_plan
     st.task_workflow = build_task_workflow(task, scenario,
                                             kind_override=plan["kind"])
-    st.deterministic_state["task_workflow"] = st.task_workflow
+    st.deterministic_state.setdefault("plan", {}).update({
+        "seeded": st.seed_plan, "workflow": st.task_workflow})
     workflow_block = (
         f"REQUIRED WORKFLOW FOR THIS TASK (kind: {st.task_workflow['kind']} — "
         "walk it in order; this is the shape a complete answer takes):\n"
@@ -555,7 +553,9 @@ async def run_comprehension(
     st.comprehension = default_comprehension(
         task, scenario, st.seed_plan, "deterministic",
     )
-    st.deterministic_state["comprehension"] = st.comprehension
+    # One understanding root (legacy comprehension/receipt are projections).
+    st.deterministic_state.setdefault("understanding", {})[
+        "comprehension"] = st.comprehension
     st.controller, _ = context._must_govern(
         st.controller, GovernanceEventKind.OPEN_SUBLOOP, SubLoop.FRAMING
     )
@@ -569,7 +569,7 @@ async def run_comprehension(
     # (preview), what was understood (directive/plan), the answer shape
     # (workflow kind), the disposal outcome, and the agent's raw proposal.
     import copy as _copy
-    st.deterministic_state["understanding_receipt"] = _copy.deepcopy({
+    st.deterministic_state.setdefault("understanding", {})["receipt"] = _copy.deepcopy({
         "prompt_preview": prompt.preview_200,
         "directive": st.task_directive,
         "plan_kind": plan["kind"],
@@ -599,7 +599,6 @@ async def run_comprehension(
     # the verdict is the frozen data contract, never inline judgement.
     plan_gate = gates.evaluate(gates.GateKind.PLAN, st.task_plan)
     gates.record_verdict(plan_gate, st, segment=getattr(ctx, "task_id", None))
-    st.deterministic_state["plan_gate"] = plan_gate.to_dict()
     if plan_gate.refused:
         # ONE refusal router: the gate kind decides the terminal.
         _route = gates.route_refusal(plan_gate) or "gate_refused"
@@ -608,7 +607,7 @@ async def run_comprehension(
             st.controller.terminal.value if st.controller.terminal
             else _route
         )
-        st.deterministic_state["terminal"] = terminal
+        context.set_terminal(st.deterministic_state, terminal)
         ctx.controller = st.controller
         return None, (
             await engine._degraded_output(

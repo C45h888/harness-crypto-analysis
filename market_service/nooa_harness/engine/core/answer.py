@@ -26,12 +26,14 @@ Doctrine (binding):
 
 Pure: dicts in, string out. No I/O, no engine imports, no clock — the
 run-record view resolves through the charter owner
-(``runtime.contracts.run_record_of``), so both record shapes (canonical
-rows + deprecated legacy) read as one.
+(``runtime.contracts.run_record_of``), so every canonical row reads as one.
+The same purity holds for the answer-turn material builder below: the
+foundation skeleton in, the prompt material out.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from market_service.runtime.contracts import run_record_of
@@ -39,6 +41,7 @@ from market_service.runtime.contracts import run_record_of
 __all__ = [
     "MISSING",
     "NOT_APPLICABLE",
+    "answer_material_from_skeleton",
     "compose_answer",
     "compose_answer_structured",
     "answer_inputs_from_record",
@@ -92,7 +95,7 @@ def answer_inputs_from_record(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Build ``(authored, gate_data, conformance, run_meta)`` from a run record.
 
-    The record is the ``InferenceArtifact.to_dict()`` shape (the run record
+    The record is the ``CanonicalOutput.to_dict()`` shape (the run record
     written to PG/Redis). Everything read here is engine-recorded state —
     nothing is derived from outside the record.
     """
@@ -102,7 +105,8 @@ def answer_inputs_from_record(
     ds = run_record_of(record).get("deterministic_state") or {}
     hypothesis = record.get("hypothesis")
     hypothesis = hypothesis if isinstance(hypothesis, dict) else {}
-    directive = ds.get("task_directive")
+    directive = ((ds.get("plan") or {}).get("directive")
+                 or ds.get("task_directive"))
     directive = directive if isinstance(directive, dict) else {}
     conformance_record = ds.get("conformance")
     conformance_record = conformance_record if isinstance(conformance_record, dict) else {}
@@ -114,7 +118,8 @@ def answer_inputs_from_record(
 
     scenario_cfg = ds.get("scenario")
     scenario_cfg = scenario_cfg if isinstance(scenario_cfg, dict) else {}
-    scenario_contract = ds.get("scenario_contract")
+    scenario_contract = ((ds.get("scenario_facts") or {}).get("contract")
+                         or ds.get("scenario_contract"))
     scenario_contract = scenario_contract if isinstance(scenario_contract, dict) else {}
     scenario_applicable = bool(scenario_cfg or scenario_contract or scenario_block)
 
@@ -169,6 +174,14 @@ def answer_inputs_from_record(
         "hypothesis": {"H0": _text(hypothesis.get("H0")),
                        "H1": _text(hypothesis.get("H1"))},
         "adjudication": adjudication,
+        # The engine verdict rides beside the agent's adjudication (never
+        # merged into it): the record's gate reading of this cycle. Rows
+        # frozen before the verdict line carry neither key and render
+        # explicit missing lines for both.
+        "verdict": {
+            "engine": _text(record.get("hypothesis_verdict")),
+            "reason": _text(record.get("verdict_reason")),
+        },
         "scenario": {
             "applicable": scenario_applicable,
             "verdict": _text(scenario_block.get("verdict")),
@@ -207,6 +220,7 @@ def answer_inputs_from_record(
         "quality_findings": [str(f) for f in
                              (conformance_record.get("quality_findings") or [])],
         "correction_used": bool(conformance_record.get("correction_used")),
+        "answer_fallback": _text(conformance_record.get("answer_fallback")),
     }
     run_meta = {
         "symbol": _text(record.get("symbol")),
@@ -218,6 +232,80 @@ def answer_inputs_from_record(
         "gate": _text(record.get("status")),
     }
     return authored, gate_data, conformance, run_meta
+
+
+def answer_material_from_skeleton(
+    skeleton: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build the ANSWER-turn prompt material from the gated foundation (pure).
+
+    The skeleton is the deterministic foundation ``output.run_output``
+    completes before the canonical verbalization: the assembled
+    interpretation, the frozen hypothesis + adjudication, the engine
+    verdict + reason, the calculations, the gate conformance, and the
+    assembly trail (dropped paths, filled/corrected markers). Returns the
+    bounded read-only material the agent verbalizes FROM — reword, never
+    re-decide — or ``None`` when the skeleton carries no authored ship.
+    """
+    if not isinstance(skeleton, dict):
+        return None
+    interp = skeleton.get("interpretation")
+    interp = interp if isinstance(interp, dict) else {}
+    if _text(interp.get("summary")) is None and not interp.get("evidence"):
+        return None
+    adjudication = interp.get("hypothesis_probabilities")
+    adjudication = adjudication if isinstance(adjudication, dict) else {}
+    scenario_block = interp.get("scenario")
+    scenario_block = scenario_block if isinstance(scenario_block, dict) else {}
+    evidence = interp.get("evidence")
+    evidence = evidence if isinstance(evidence, list) else []
+    conformance = skeleton.get("conformance")
+    conformance = conformance if isinstance(conformance, dict) else {}
+    gate = skeleton.get("gate")
+    gate = gate if isinstance(gate, dict) else {}
+
+    def _bounded(value: Any, cap: int) -> Any:
+        try:
+            dumped = json.dumps(value, default=str)
+        except Exception:
+            return "<unserializable>"
+        if len(dumped) <= cap:
+            return value
+        return dumped[:cap] + "… [truncated]"
+
+    return {
+        "task": _text(skeleton.get("task")),
+        "engine_verdict": _text(skeleton.get("hypothesis_verdict")),
+        "verdict_reason": _text(skeleton.get("verdict_reason")),
+        "gate_status": _text(gate.get("status")),
+        "gate_reasons": [str(r) for r in (gate.get("reasons") or [])][:8],
+        "summary": _text(interp.get("summary")),
+        "evidence": [
+            {"path": _text(e.get("path")), "value": e.get("value"),
+             "interpretation": _text(e.get("interpretation"))}
+            for e in evidence[:24] if isinstance(e, dict)
+        ],
+        "hypothesis": skeleton.get("hypothesis"),
+        "adjudication": {
+            "chosen": _text(adjudication.get("chosen")),
+            "H0": adjudication.get("H0"), "H1": adjudication.get("H1"),
+        },
+        "scenario": _bounded(scenario_block, 2_000),
+        "forward_scenario": _bounded(interp.get("forward_scenario"), 2_000),
+        "hypothesis_evidence": _bounded(interp.get("hypothesis_evidence"), 2_000),
+        "confidence": _text(interp.get("confidence")),
+        "limitations": ([str(item) for item in interp["limitations"]][:12]
+                          if isinstance(interp.get("limitations"), list) else []),
+        "model_separation": _text(interp.get("model_separation")),
+        "calculations": _bounded(skeleton.get("calculations"), 4_000),
+        "assembly_trail": [str(d) for d in (skeleton.get("dropped") or [])][:12],
+        "conformance": {
+            "hard_misses": [str(m) for m in (conformance.get("hard_misses") or [])][:8],
+            "conflicts": [str(c) for c in (conformance.get("conflicts") or [])][:8],
+            "quality_findings": [str(f) for f in (conformance.get("quality_findings") or [])][:8],
+            "correction_used": bool(conformance.get("correction_used")),
+        },
+    }
 
 
 def answer_from_record(record: dict[str, Any] | None) -> str | None:
@@ -255,10 +343,12 @@ def compose_answer_structured(
 ) -> dict[str, Any]:
     """Structured variant of the answer (pure) — same content, machine shape.
 
-    ``conformance["missing_blocks"]`` names every block the agent left empty
-    and ``conformance["terminal"]`` is the honest ship state (``flagged``
-    whenever the gate flagged, a conflict was carried, or a block is
-    missing).
+    ``conformance["missing_blocks"]`` names every block the agent left empty,
+    ``conformance["answer_fallback"]`` names why the canonical verbalization
+    did not ship (None when the answer turn spoke finally), and
+    ``conformance["terminal"]`` is the honest ship state (``flagged``
+    whenever the gate flagged, a conflict was carried, a block is
+    missing, or the answer fell back to the foundation render).
     """
     authored = dict(authored_interpretation or {})
     gate = dict(gate_data or {})
@@ -312,6 +402,18 @@ def compose_answer_structured(
         adjudication_out = {"H0": {}, "H1": {}, "chosen": None, "tiebreak": None}
         adjudication_out["chosen"] = _missing(missing_blocks, "adjudication")
 
+    # The engine verdict beside the agent's adjudication: the record's gate
+    # reading of this cycle. Rendered, never merged into the choice — the
+    # split stays visible instead of hidden.
+    verdict_in = gate.get("verdict") if isinstance(gate.get("verdict"), dict) else {}
+    engine_verdict = _text(verdict_in.get("engine"))
+    if engine_verdict is None:
+        engine_verdict = _missing(missing_blocks, "verdict")
+    verdict_reason = _text(verdict_in.get("reason"))
+    if verdict_reason is None:
+        verdict_reason = _missing(missing_blocks, "verdict reason")
+    verdict_out = {"engine": engine_verdict, "reason": verdict_reason}
+
     if scenario.get("applicable"):
         scenario_out = {
             "verdict": _text(scenario.get("verdict"))
@@ -360,7 +462,9 @@ def compose_answer_structured(
     conflicts = [str(c) for c in (conf.get("conflicts") or [])]
     quality_findings = [str(f) for f in (conf.get("quality_findings") or [])]
     correction_used = bool(conf.get("correction_used"))
-    terminal = ("flagged" if (hard_misses or conflicts or missing_blocks)
+    answer_fallback = _text(conf.get("answer_fallback"))
+    terminal = ("flagged" if (hard_misses or conflicts or missing_blocks
+                               or answer_fallback)
                 else "settled")
 
     return {
@@ -376,6 +480,7 @@ def compose_answer_structured(
         "gate_data": {
             "hypothesis": {"H0": h0, "H1": h1},
             "adjudication": adjudication_out,
+            "verdict": verdict_out,
             "scenario": scenario_out,
             "directive": {
                 "kind": directive.get("kind") or "general",
@@ -397,6 +502,7 @@ def compose_answer_structured(
             "conflicts": conflicts,
             "quality_findings": quality_findings,
             "correction_used": correction_used,
+            "answer_fallback": answer_fallback,
             "missing_blocks": missing_blocks,
             "terminal": terminal,
         },
@@ -474,6 +580,9 @@ def render_answer(structured: dict[str, Any]) -> str:
     tiebreak = adjudication.get("tiebreak")
     lines.append(f"chosen: {adjudication.get('chosen') or MISSING}"
                  f" · tiebreak: {'none' if tiebreak is None else tiebreak}")
+    verdict = gate["verdict"]
+    lines.append(f"engine verdict: {verdict['engine']}")
+    lines.append(f"verdict reason: {verdict['reason']}")
     lines.append("")
     scenario = gate["scenario"]
     lines.append("--- scenario ---")
@@ -531,6 +640,8 @@ def render_answer(structured: dict[str, Any]) -> str:
             lines.append("(none)")
     lines.append(f"correction_used: "
                  f"{'true' if conf.get('correction_used') else 'false'}")
+    if conf.get("answer_fallback") is not None:
+        lines.append(f"answer_fallback: {conf['answer_fallback']}")
     lines.append(f"terminal: {conf.get('terminal')}")
     return "\n".join(lines)
 

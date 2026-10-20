@@ -35,6 +35,18 @@ from ..ledger import record_finding
 from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
 from ..loop_states import LoopStep, NestedLoop, SubLoop
 
+from ..predicates import (
+    EVIDENCE_BLOCK_CODES,
+    EVIDENCE_DROP_CODES,
+    EVIDENCE_NO_PATH,
+    EVIDENCE_NO_READING,
+    EVIDENCE_NULL_VALUE,
+    EVIDENCE_OK,
+    EVIDENCE_UNBACKED,
+    classify_evidence,
+    path_resolves,
+)
+
 log = logging.getLogger(__name__)
 
 COLLAPSE_VECTORS: tuple[str, ...] = (
@@ -46,73 +58,10 @@ COLLAPSE_VECTORS: tuple[str, ...] = (
 OUTPUT_SUMMARY_FLOOR = 80
 
 
-def path_resolves(frame: Any, path: Any) -> bool:
-    """Does a cited path resolve against the deterministic frame? (pure)
-
-    Head-level authority: a real tool home from THIS run, a
-    ``deterministic_state`` key, or the ledger/digest namespaces. Agent
-    memory heads NEVER resolve — memory is context, never evidence.
-    """
-    head = str(path or "").split("→")[0].strip()
-    if not head:
-        return False
-    if head.startswith("memory."):
-        return False
-    # Refusal findings are citable under null discipline — they carry a
-    # reason string, never a number, and the strict gate already demands
-    # they be recorded (a refusal is a finding, never a failure to repair).
-    if "refusal" in str(path or ""):
-        return True
-    if head.split(".")[0] in ("deterministic_state", "ledger", "digest"):
-        return True
-    if not isinstance(frame, dict):
-        return False
-    return (head in set(frame.get("citable_heads") or ())
-            or head in set(frame.get("state_keys") or ()))
 
 
-# Evidence shape codes — ONE authority shared by the strict gate
-# (``validation.validate_final_turn``) and the shipping filter
-# (``output._assemble_authored``). The two used to disagree: assembly dropped
-# empty/unbacked paths but never checked ``value``; the gate demanded
-# path+value but never checked backing. Entries with a good path and a null
-# value sailed through assembly and died at the gate — before assembly could
-# run. One classifier, two actions (block vs drop+record).
-EVIDENCE_OK = "ok"
-EVIDENCE_NO_PATH = "no_path"
-EVIDENCE_NULL_VALUE = "null_value"
-EVIDENCE_UNBACKED = "unbacked"
-EVIDENCE_NO_READING = "no_reading"
-
-#: Codes that make an entry UNSHIPPABLE (removal-only doctrine).
-EVIDENCE_DROP_CODES = frozenset(
-    {EVIDENCE_NO_PATH, EVIDENCE_NULL_VALUE, EVIDENCE_UNBACKED})
-#: Codes that make the strict VALIDATION gate refuse the cycle.
-EVIDENCE_BLOCK_CODES = frozenset(
-    {EVIDENCE_NO_PATH, EVIDENCE_NULL_VALUE, EVIDENCE_NO_READING})
 
 
-def classify_evidence(entry: Any, frame: Any = None) -> str:
-    """Classify one evidence entry against the doctrine (pure).
-
-    ``frame=None`` is the gate's view: it judges shape only (path + value +
-    reading), because backing is assembly's fact-check and the gate has no
-    frame. With a frame, unbacked heads (unknown tools, ``memory.*``) are
-    classified too. Refusal findings (``→ refusal``) legally carry a null
-    value under null discipline.
-    """
-    if not isinstance(entry, dict):
-        return EVIDENCE_NO_PATH
-    path = str(entry.get("path") or "").strip()
-    if not path:
-        return EVIDENCE_NO_PATH
-    if entry.get("value") is None and "refusal" not in path:
-        return EVIDENCE_NULL_VALUE
-    if frame is not None and not path_resolves(frame, path):
-        return EVIDENCE_UNBACKED
-    if not str(entry.get("interpretation") or "").strip():
-        return EVIDENCE_NO_READING
-    return EVIDENCE_OK
 
 
 def _frame_value_is_null(frame: Any, path: Any) -> bool:
@@ -519,8 +468,9 @@ async def _one_call(
     """One tool-free synthesis LLM call with pass accounting (never raises).
 
     Budget-honest: at most ``LOOP_PASS_BUDGET["output"]`` synthesis passes
-    per cycle (collapse + derive + the one correction turn) — beyond that
-    the caller degrades/flags without spending another turn.
+    per cycle (collapse + derive + the one correction turn + the canonical
+    answer verbalization) — beyond that the caller degrades/flags without
+    spending another turn.
     """
     try:
         if st.passes_per_loop.get("output", 0) >= LOOP_PASS_BUDGET["output"]:

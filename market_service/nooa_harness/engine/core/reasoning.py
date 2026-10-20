@@ -144,7 +144,8 @@ async def run_evidence(
         output_format=engine._output_format(),
         workflow_block=st.workflow_block,
         traversal=st.controller.loop_coverage(),
-        gate=st.deterministic_state.get("gate"),
+        gate=(gates.gate_facts(st.deterministic_state, gates.GateKind.DATA)
+              or st.deterministic_state.get("gate")),
     )
     raw_1: str | None = None
     first_error = ""
@@ -189,7 +190,7 @@ async def run_evidence(
             else terminal_kind
         )
         ctx.controller = st.controller
-        st.deterministic_state["terminal"] = terminal
+        context.set_terminal(st.deterministic_state, terminal)
         return await engine._degraded_artifact(
             st.deterministic_state, st.capability_log,
             f"{terminal_kind}: {first_error}",
@@ -209,7 +210,7 @@ async def run_evidence(
             else "parse_failed"
         )
         ctx.controller = st.controller
-        st.deterministic_state["terminal"] = terminal
+        context.set_terminal(st.deterministic_state, terminal)
         return await engine._degraded_artifact(
             st.deterministic_state, st.capability_log,
             "narration_parse_failed: no JSON object in output",
@@ -388,7 +389,6 @@ async def run_reasoning(
                 task=ctx.task, scenario=ctx.scenario)
             if halt is not None and st.chain_halt is None:
                 st.chain_halt = halt
-                st.deterministic_state["chain_halt"] = dict(halt)
                 freeze_chain(st, ctx.task, ctx.scenario)
                 # Bounded reformulation offer: one followup turn where ONLY
                 # a materially-different re-call of the halted tool can move
@@ -409,7 +409,6 @@ async def run_reasoning(
                         task=ctx.task, scenario=ctx.scenario,
                     ) is None:
                         st.chain_halt = None
-                        st.deterministic_state["chain_halt"] = None
                         freeze_chain(st, ctx.task, ctx.scenario)
                         continue  # halt cleared by re-evaluation; resume track
                 engine._name_pending(st)
@@ -441,8 +440,6 @@ async def run_reasoning(
                     try:
                         st.base_summary = dict(
                             _base_summary(st.accumulated_tool_results))
-                        st.deterministic_state["base_summary"] = dict(
-                            st.base_summary)
                     except Exception:
                         log.exception("base_summary freeze failed")
                     await _store_stage_observation(
