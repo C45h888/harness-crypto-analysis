@@ -27,6 +27,8 @@ from market_service.clients.binance import Binance, normalize_fut_trade, normali
 from market_service.config import Settings
 from market_service.rate_limit import IpBanError, RateLimitError
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.runtime.postgres_store import PostgresRuntimeStore
+from market_service.telemetry_kernel import kernel_for_runtime
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +196,9 @@ async def poll_symbol(
     redis: RedisRuntimeStore,
     settings: Settings,
     symbol: str,
+    *,
+    telemetry: Any | None = None,
+    telemetry_states: dict[str, tuple[Any, ...]] | None = None,
 ) -> None:
     """Fetch evidence for one symbol and append to the raw stream."""
     evidence = await fetch_binance_evidence(
@@ -203,6 +208,29 @@ async def poll_symbol(
         flow_window_seconds=settings.flow_window_seconds,
     )
     stream_id = await redis.publish_raw_evidence(symbol, evidence)
+    endpoint_errors = tuple(sorted(
+        str(item.get("endpoint") or "unknown")
+        for item in evidence.get("errors", ()) if isinstance(item, dict)
+    ))
+    status = "degraded" if endpoint_errors else "healthy"
+    signature = (status, endpoint_errors)
+    if telemetry is not None and (
+        telemetry_states is None or telemetry_states.get(symbol.upper()) != signature
+    ):
+        await telemetry.emit_state(
+            plane="ingestion", owner="poller", subject_type="symbol",
+            subject_id=symbol.upper(), event_type="poller_status",
+            source_sequence=int(evidence["observed_at_ms"]),
+            occurred_at_ms=int(evidence["observed_at_ms"]),
+            source_ref=str(stream_id) if stream_id is not None else None,
+            state={
+                "status": status,
+                "endpoint_errors": list(endpoint_errors),
+                "snapshot_published": stream_id is not None,
+            },
+        )
+    if telemetry_states is not None:
+        telemetry_states[symbol.upper()] = signature
     if stream_id is None:
         log.debug("poller %s: duplicate snapshot skipped", symbol)
         return
@@ -218,6 +246,9 @@ async def _safe_poll_symbol(
     redis: RedisRuntimeStore,
     settings: Settings,
     symbol: str,
+    *,
+    telemetry: Any | None = None,
+    telemetry_states: dict[str, tuple[Any, ...]] | None = None,
 ) -> None:
     """Guarded wrapper so one symbol's failure never cancels the others.
 
@@ -227,11 +258,26 @@ async def _safe_poll_symbol(
     worse).
     """
     try:
-        await poll_symbol(client, redis, settings, symbol)
+        await poll_symbol(
+            client, redis, settings, symbol, telemetry=telemetry,
+            telemetry_states=telemetry_states,
+        )
     except _RATE_ERRORS:
         raise
     except Exception as exc:
         log.warning("poller cycle failed for %s: %s", symbol, exc)
+        if telemetry is not None:
+            source_sequence = _now_ms()
+            signature = ("degraded", (type(exc).__name__,))
+            if telemetry_states is None or telemetry_states.get(symbol.upper()) != signature:
+                await telemetry.emit_state(
+                    plane="ingestion", owner="poller", subject_type="symbol",
+                    subject_id=symbol.upper(), event_type="poller_status",
+                    source_sequence=source_sequence, occurred_at_ms=source_sequence,
+                    state={"status": "degraded", "failure_code": type(exc).__name__},
+                )
+            if telemetry_states is not None:
+                telemetry_states[symbol.upper()] = signature
 
 
 async def resolve_active_symbols(
@@ -324,6 +370,18 @@ async def main() -> int:
         raw_retention_ms=settings.redis_raw_retention_ms,
         raw_guardrail_maxlen=settings.redis_raw_guardrail_maxlen,
     )
+    telemetry_pg = (
+        PostgresRuntimeStore(settings.database_url)
+        if settings.database_url else None
+    )
+    telemetry = kernel_for_runtime(redis, telemetry_pg)
+    if telemetry is not None:
+        # Local, non-recursive lifecycle receipt (health, never an event).
+        await telemetry.record_lifecycle(
+            "started", process="poller",
+            durable=telemetry_pg is not None,
+        )
+    telemetry_states: dict[str, tuple[Any, ...]] = {}
     try:
         if not await redis.ping_with_retry():
             log.error("redis ping failed; aborting poller")
@@ -354,6 +412,7 @@ async def main() -> int:
             # Backoff ladder state: 0 = healthy; escalates on rate errors,
             # resets to 0 on a clean cycle.
             current_backoff_s = 0.0
+            rate_limit_state: tuple[Any, ...] | None = None
             while True:
                 started = time.monotonic()
                 # Per-cycle symbol resolution: a Redis control key written
@@ -369,7 +428,10 @@ async def main() -> int:
                 # iteration multiplied cycle time by len(symbols).
                 results = await asyncio.gather(
                     *[
-                        _safe_poll_symbol(client, redis, settings, symbol)
+                        _safe_poll_symbol(
+                            client, redis, settings, symbol, telemetry=telemetry,
+                            telemetry_states=telemetry_states,
+                        )
                         for symbol in active_symbols
                     ],
                     return_exceptions=True,
@@ -409,10 +471,34 @@ async def main() -> int:
                         "rate_limited": True,
                         "rate_backoff_s": backoff_s,
                     })
+                    state = ("rate_limited", int(backoff_s * 1000), kind)
+                    if telemetry is not None and state != rate_limit_state:
+                        event_ms = _now_ms()
+                        await telemetry.emit_state(
+                            plane="ingestion", owner="poller",
+                            subject_type="runtime", subject_id="binance",
+                            event_type="poller_status", source_sequence=event_ms,
+                            occurred_at_ms=event_ms,
+                            state={"status": "rate_limited", "error_code": kind,
+                                   "rate_backoff_ms": int(backoff_s * 1000),
+                                   "active_symbols": list(active_symbols)},
+                        )
+                    rate_limit_state = state
                     await asyncio.sleep(backoff_s)
                     continue
                 # Clean cycle: reset the backoff ladder.
                 current_backoff_s = 0.0
+                if telemetry is not None and rate_limit_state is not None:
+                    event_ms = _now_ms()
+                    await telemetry.emit_state(
+                        plane="ingestion", owner="poller",
+                        subject_type="runtime", subject_id="binance",
+                        event_type="poller_status", source_sequence=event_ms,
+                        occurred_at_ms=event_ms,
+                        state={"status": "running", "recovered": True,
+                               "active_symbols": list(active_symbols)},
+                    )
+                rate_limit_state = None
                 if elapsed > settings.poll_seconds:
                     log.warning("poller overrun: cycle took %.2fs > poll=%ss",
                                 elapsed, settings.poll_seconds)

@@ -34,6 +34,7 @@ from market_service.microstructure.ofi import OFIAggregator
 from market_service.microstructure.orderbook import BookGapError, OrderBookReconstructor
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.telemetry_kernel import kernel_for_runtime
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +164,12 @@ class BinanceSpotDepthCapture:
         self._book: OrderBookReconstructor | None = None
         self._aggregator = OFIAggregator(settings.interval_seconds * 1_000)
         self._last_written_status_state: str | None = None
+        # Observational mirror only: the capture state machine above remains
+        # the sole owner of capture liveness. Built lazily so a capture
+        # process with no DATABASE_URL never opens a PG pool it cannot use.
+        self.telemetry: Any | None = None
+        self._telemetry_pg: PostgresRuntimeStore | None = None
+        self._telemetry_transition_seq = 0
         # Gap-adaptive backoff state (Fix A(iii)). Starts at the floor;
         # doubles per gap, halves per success batch.
         self._backoff_ms = self._BACKOFF_MIN_MS
@@ -170,9 +177,60 @@ class BinanceSpotDepthCapture:
 
     async def close(self) -> None:
         await self.store.close()
+        if self._telemetry_pg is not None:
+            await self._telemetry_pg.close()
+            self._telemetry_pg = None
         if self._tape is not None:
             await self._tape.close()
             self._tape = None
+
+    def _telemetry_kernel(self) -> Any | None:
+        """The capture process's telemetry emitter (built once, lazily)."""
+        if self.telemetry is None:
+            database_url = os.getenv("DATABASE_URL", "").strip()
+            if database_url:
+                self._telemetry_pg = PostgresRuntimeStore(database_url)
+            self.telemetry = kernel_for_runtime(self.store, self._telemetry_pg)
+        return self.telemetry
+
+    async def _emit_status_transition(
+        self, payload: dict[str, Any], prior: str | None, state: str,
+        transition_id: str | None,
+    ) -> None:
+        """Mirror one capture transition AFTER the state machine wrote it.
+
+        State transition only — never a per-frame or per-read emission — and
+        bounded diagnostics only: the error string is a code-shaped prefix,
+        never unbounded exception text.
+        """
+        telemetry = self._telemetry_kernel()
+        if telemetry is None:
+            return
+        self._telemetry_transition_seq += 1
+        occurred_at_ms = max(0, int(payload.get("updated_at_ms") or 0))
+        error = payload.get("error")
+        try:
+            await telemetry.emit_state(
+                plane="capture", owner="capture", subject_type="symbol",
+                subject_id=str(self.settings.symbol).upper(),
+                event_type="capture_status",
+                source_sequence=int(payload.get("updated_at_ms") or self._telemetry_transition_seq),
+                occurred_at_ms=occurred_at_ms,
+                source_ref=transition_id,
+                state={
+                    "schema_version": payload.get("schema_version"),
+                    "venue": payload.get("venue"),
+                    "from_state": prior,
+                    "to_state": state,
+                    "sequence_gaps": payload.get("sequence_gaps"),
+                    "reconnects": payload.get("reconnects"),
+                    "messages": payload.get("messages"),
+                    "tape_errors": payload.get("tape_errors"),
+                    "error_code": (str(error)[:200] if error else None),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never gates capture
+            log.warning("capture telemetry emit failed: %s", exc)
 
     async def _durable_tape(self) -> PostgresRuntimeStore | None:
         """Lazily connect the durable tape writer (None when disabled/failed)."""
@@ -232,6 +290,13 @@ class BinanceSpotDepthCapture:
         return self._backoff_ms
 
     async def run_forever(self) -> None:
+        telemetry = self._telemetry_kernel()
+        if telemetry is not None:
+            # Local, non-recursive lifecycle receipt (health, never an event).
+            await telemetry.record_lifecycle(
+                "started", process="capture",
+                durable=self._telemetry_pg is not None,
+            )
         await self._status("starting")
         try:
             async with aiohttp.ClientSession() as session:
@@ -501,16 +566,23 @@ class BinanceSpotDepthCapture:
             transition_payload = dict(payload)
             transition_payload["from_state"] = prior
             transition_payload["to_state"] = state
+            transition_id: str | None = None
             try:
-                await self.store.publish_microstructure_status_transition(
+                stream_id = await self.store.publish_microstructure_status_transition(
                     self.settings.venue, self.settings.symbol, transition_payload,
                     maxlen=self.settings.stream_maxlen,
                 )
+                transition_id = str(stream_id) if stream_id is not None else None
             except Exception:
                 # A failed transition append must NEVER break the capture
                 # loop or its status bookkeeping. The latest-key status is
                 # already written; the transition ledger is best-effort.
                 pass
+            # The transition above is the CAPTURE state machine's decision;
+            # telemetry mirrors it afterwards and cannot undo it.
+            await self._emit_status_transition(
+                payload, prior, state, transition_id,
+            )
 
 
 async def main_async(symbol: str, venue: str | None = None) -> int:
