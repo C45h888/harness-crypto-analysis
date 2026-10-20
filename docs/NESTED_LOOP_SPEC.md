@@ -1,5 +1,11 @@
 # Nested Loop Spec — the in-depth workflow inside each loop state
 
+> **SUPERSEDED (2026-10-20).** Loop receipts are retired: a loop close is now
+> a `GateKind.CLOSE` verdict recorded on the engine ledger
+> (`engine/gates.py`, `close_loop`). `receipts.py`, `LoopReceipt`, and
+> `ReceiptDisposition` no longer exist; `loop_receipts` is an artifact
+> projection. References below are historical.
+
 Status: **vocabulary, governance membrane, and runtime alignment
 implemented; governance-boundary pass (R + G) landed and green.**
 Vocabulary lives in `engine/loop_states.py`, legality in `engine/fsm.py`,

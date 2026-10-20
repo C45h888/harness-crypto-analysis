@@ -192,3 +192,29 @@ plan_bound_acquisition → evidence → reasoning → validation → output) —
 no stage runs on another stage's promise, and no pre-INTAKE acquisition
 exists anywhere (the fetch semantic and DATA gate are dissolved; run_wake
 owns INTAKE deterministically).
+
+## Gate substrate and the record plane (2026-10-20 consolidation)
+
+One deterministic home for every guard and every loop close:
+
+- `engine/gates.py` owns the gate vocabulary (`GateKind`, `GateStatus`,
+  `GateDisposition`, `GateVerdict`), the worker registry (`GATE_WORKERS`,
+  `evaluate`, `require`), the single refusal router (`route_refusal`), and
+  verdict recording (`record_verdict`, `close_loop`). Workers take a frozen
+  snapshot and return a verdict; they perform no I/O and never mutate state.
+- **A loop close is a gate** (`GateKind.CLOSE`). `receipts.py`,
+  `LoopReceipt`, and `ReceiptDisposition` are retired; the ledger `VERDICT`
+  row is the canonical record of what ran and how it closed.
+- `engine/ledger.py` is the engine bedrock: `UNDERSTANDING`, `PLAN`,
+  `HANDOFF`, `OBSERVATION`, plus audit kinds `VERDICT`, `FINDING`,
+  `SCENARIO`. Only the four context kinds may enter narration prompts.
+- `engine/projections.py` derives the permanent artifact keys
+  (`loop_receipts`, `validation_findings`, `chain_gaps`, `synthesis_note`,
+  `assessment_note`, `assembly_dropped`, `evidence_salvaged`, …) from ledger
+  rows at artifact write. Projections are not live authorities.
+- `inference/gate.py` (the validated/provisional/insufficient trichotomy) is
+  retired; data sufficiency is adjudicated by per-tool deterministic
+  refusals plus the CONTENT gate.
+- Agent memory has one home: `memory.MemoryNode` plus its
+  `AgentMemorySurface` facade. `memory_skill.py` is deleted; the engine never
+  reads agent memory.
