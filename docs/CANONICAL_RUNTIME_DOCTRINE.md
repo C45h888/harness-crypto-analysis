@@ -47,6 +47,16 @@ compare conditions, produce scenarios, and identify missing evidence. It may
 not access Docker directly, bypass the runtime, redefine thresholds, turn
 missing data into neutral data, or execute trades.
 
+### Canonical output
+
+The cycle's deliverable is **the answer**: the agent's authored prose with its
+gate data, composed by the chartered answer owner
+(`nooa_harness/engine/core/answer.py`) and delivered to the operator through
+the CLI surface. The canonical output row (`canonical_output` /
+`runtime/contracts.CanonicalOutput`) is the answer OF RECORD — frozen at
+delivery — plus its run record. The run record is engine bookkeeping and is
+never the consumable output.
+
 ### Trader
 
 The trader retains final decision authority. No model output is an instruction
@@ -141,7 +151,9 @@ deterministic_state keyspace → `engine/core/context.py` roots registry;
 schema versions → `runtime/contracts.py` registry; status families → their
 per-plane owners, pairwise disjoint; **read/calc cadence →
 `engine/cadence.py`** — `INTERVAL_SECONDS` {10,15,30} × `WINDOW_MINUTES`
-{15,30,60}, bound by the plan, adopted by the controller). Planes consume
+{15,30,60}, bound by the plan, adopted by the controller; **the answer
+(canonical output) → `engine/core/answer.py` format + PLACEMENT delivery,
+contract `runtime/contracts.CanonicalOutput`**). Planes consume
 owners by IMPORT, never by mirrored constants; silent defaults that map
 unknown state identities to authorized behavior are governance errors.
 Enforcement lives in `tests/test_state_charter.py` +

@@ -1,6 +1,21 @@
 # CLI Answer Surface (C2) — integration plan
 
-Status: **plan — decisions locked, implementation not started.**
+Status: **LANDED (S1–S4 + the canonical-output pivot).** The answer is
+composed by the pure composer, delivered at PLACEMENT (deliver + confirm),
+and kept as the frozen answer of record in the `canonical_output` row
+(contract `runtime/contracts.CanonicalOutput`, migration 0017). The old
+`inference_artifact` **as-output** logic is deprecated: writes stopped,
+legacy rows read-only, every engine reader migrated.
+
+> **SUPERSEDING DECISION (canonical output plane).** Decision 1 evolved:
+> the answer does not ship as a file produced FOR the consumer, but it IS
+> persisted as the **canonical output of record** in Postgres (frozen text +
+> structured variant) and given to the CLI surface — the deliverable is
+> still the answer inside the CLI; the row is its immutable record. §8
+> gates resolved: (1) run-record retention — KEEP (frozen text + structured);
+> (2) delivery channel — CLI stdout at close; (3) `delivery_failed` —
+> added as `FailureKind.DELIVERY_FAILED` + `LoopTerminal.DELIVERY_FAILED`
+> (INFRA/PERMANENT → TERMINATE), flagged to the failure-FSM owner.
 Builds on the relaxed OUTPUT loop (frame / authored gate / correction turn)
 that landed green (full suite 1355 passed). Companion to
 `NESTED_LOOP_SPEC.md` §2 (OUTPUT loop) and the authored-output seam in

@@ -109,12 +109,20 @@ the loop + intent + sub-loop, never the internal step.
 - **RECOVERY** *(iterates)* — `DIAGNOSE → STEER → REVALIDATE`. Exit: the
   final passes or the repair budget is spent.
 
-### OUTPUT (FINALIZE) — place the output
+### OUTPUT (FINALIZE) — deliver the answer
 - **COMPOSITION** — `ASSEMBLE → GROUND`.
 - **ARCHITECTURE** — `UNDERSTAND_SURFACE → LOCATE_OUTPUT`. **The agent must
   understand the agentic surface plane architecture and locate where its
-  output belongs inside it.**
-- **PLACEMENT** — `PERSIST → CONFIRM`. Place the output.
+  output belongs inside it.** The surface resolved here is the CLI /
+  interaction plane the answer is delivered to — not Postgres/Redis
+  destinations.
+- **PLACEMENT** — `PERSIST → CONFIRM`. **Deliver the answer and confirm
+  (canonical-output doctrine).** The deliverable is THE ANSWER (the frozen
+  answer of record, composed by `engine/core/answer.py`); PLACEMENT =
+  deliver + confirm, and the canonical output row (`canonical_output`,
+  contract `runtime/contracts.CanonicalOutput`) is its record of placement.
+  The step names keep their vocabulary (renaming is vocabulary-owner
+  territory); what they record is DELIVERY, not persistence.
 - **MEMORY** *(iterates)* — `PROPOSE → RESOLVE → SETTLE`. Exit: every
   proposal resolved and the cycle settled.
 
@@ -125,11 +133,20 @@ drift vector; the `ARCHITECTURE` sub-loop is structural, not advisory.
 
 ## 3. Why the final loop is OUTPUT, not PERSISTENCE
 
-The final state for the agent is to **place the output where it understands
-the architecture of the current agentic surface plane**. Persistence alone
-would place bytes without grounding them in the surface. `OUTPUT` composes,
-understands, places, and remembers — and `ARCHITECTURE` is where the agent
-builds the understanding the placement depends on.
+The final state for the agent is to **deliver the answer where it
+understands the architecture of the current agentic surface plane**.
+Persistence alone would place bytes without grounding them in the surface —
+and the bytes were never the product: the ANSWER is. `OUTPUT` composes,
+understands, delivers, and remembers — and `ARCHITECTURE` is where the agent
+builds the understanding the delivery depends on.
+
+The C2 doctrine (docs/CLI_ANSWER_SURFACE_PLAN.md §3) settles the mechanics:
+PLACEMENT = deliver + confirm; SETTLE gates on the answer reaching its
+surface + the receipts being recorded. The canonical output row is RUN
+RECORD — engine bookkeeping, never the consumable output — and its write
+failures are recorded as `run_record_errors`, never blocking settlement.
+A delivery failure (composer render or sink) is its own honest terminal:
+`delivery_failed`.
 
 ---
 

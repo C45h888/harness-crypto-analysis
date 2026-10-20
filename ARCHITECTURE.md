@@ -227,6 +227,49 @@ longer participates in the read path.
   counts so derivative series horizons (N × 5 min) are explicit regardless
   of the requested 15m/1h/4h window.
 
+## Governed telemetry kernel
+
+The runtime mirror lives in `market_service/telemetry_kernel/` and records what
+an owning FSM has ALREADY decided. It is an observation surface, never a
+control bus:
+
+```text
+owning component produces typed state intent
+  -> existing domain FSM / governance boundary adjudicates it
+  -> kernel receives the adjudication receipt
+  -> idempotent PostgreSQL ledger (runtime_telemetry_event)
+  -> bounded Redis streams + latest projections
+  -> read-only operational/trace views
+```
+
+Boundaries that hold by construction:
+
+- **The FSM decides.** Telemetry records adjudicated state and cannot mutate
+  canonical state, advance the agentic board, or resolve/override cadence.
+- **Pure state only.** State facts, verdict references, provenance, and bounded
+  diagnostic codes. No raw evidence, prompts, model prose, or credentials —
+  `contracts._validate_state` refuses them at admission.
+- **Declared provenance.** `contracts._EVENT_OWNERS` is the owner-to-event
+  admission matrix (poller, capture, the 12 calculation workers, the 6 analysis
+  workers, cycle_controller). Undeclared owners and cross-plane emissions are
+  refused.
+- **Isolated storage.** Redis keys live under `marketflow:telemetry:*`
+  (`events:` / `latest:` / `health:` / `cursor:`); the durable ledger is the
+  separate `runtime_telemetry_event` table. Nothing writes
+  `marketflow:latest:substrate:*`, `analysis:*`, `governance:*`,
+  `market_run`, or `inference_artifact`.
+- **Failure is surfaced, never fatal.** A sink failure is retried, counted, and
+  written to `telemetry:health:<owner>`; it never reverses a transition the
+  owning FSM already returned as governed.
+- **Deterministic replay.** `event_id` is a hash of owner + subject +
+  sequence + time + state, so retries collapse to one row. Projections are
+  pure reducers over ordered events and rebuild from PostgreSQL.
+
+Operator reads: `nooa market telemetry status` and
+`nooa market telemetry read --plane <plane> --owner <owner> --subject-id <id>`
+(add `--rebuild` to restore a Redis projection from the durable ledger). The
+agent plane gets no arbitrary telemetry access.
+
 ## Deferred (next phases)
 
 - Add Redis node instance/session keyspaces for future model reads.

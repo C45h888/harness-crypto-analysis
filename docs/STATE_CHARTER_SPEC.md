@@ -466,3 +466,27 @@ auto-defaulting, inline budget decisions) were governance errors under
 default" rule to the registry layer. Payload shapes and persistence keys
 are unchanged (§8 scope holds) except the deleted fetch-plane roots,
 which were chartered state, not payloads.
+
+### 9.5 Canonical output plane (C2/C4 — the answer is chartered)
+
+* **Role change (not keyspace change):** the per-cycle row is RUN RECORD —
+  engine bookkeeping (deterministic state, capability log, errors) and never
+  the consumable output. The deliverable is THE ANSWER: the frozen answer of
+  record (`answer_text`) + its structured variant (`answer`), composed by the
+  chartered owner `engine/core/answer.py` and delivered at PLACEMENT
+  (deliver + confirm; SETTLE gates on delivery + receipts).
+* **Contract + registry:** `runtime/contracts.CanonicalOutput`, registry
+  entry `SCHEMA_VERSION_REGISTRY["canonical_output"] = 1`, table
+  `canonical_output` (migration `0017_canonical_output`). `InferenceArtifact`
+  is deprecated read-only legacy (pre-canonical rows); its writers are gone.
+* **Registered interpretation field:** `interpretation.hypothesis_probabilities`
+  (the authored adjudication) — strict write-side shape
+  (`validate_adjudication`), lenient read-side (`normalize_adjudication`);
+  shared interpretation validation for every output contract.
+* **keyspace holds:** `DETERMINISTIC_STATE_ROOTS` is unchanged —
+  `run_record_errors` and the answer live in cycle meta / the row, never in
+  deterministic_state (charter-tested in `CanonicalOutputCharterTests`).
+* **Read contract:** the composer consumes exactly {run_id, symbol, venue,
+  generated_at, session_id, status, interpretation, hypothesis, run_record}
+  and resolves state through `contracts.run_record_of` (canonical nesting +
+  deprecated legacy shape read as one view) — pinned by charter test.
