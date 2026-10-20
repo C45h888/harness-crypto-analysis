@@ -35,6 +35,8 @@ import asyncio
 import inspect
 import json
 import logging
+import time
+import uuid
 from typing import Any
 
 from .config import (
@@ -214,6 +216,254 @@ async def call_narration_llm(
     return _note_tier("str_fallback", str(raw))
 
 
+# ---------------------------------------------------------------------------
+# Signal B — cadence-aware narration supervision (streaming)
+# ---------------------------------------------------------------------------
+# The fixed wall-clock ticker cannot tell "slow but thinking" from
+# "dangling". The supervision loop below consumes the SSE stream, emits
+# throttled heartbeats to the telemetry projection plane, and judges
+# cadence from bytes + progressive shape — the deterministic checker the
+# failure FSM consumes as cause-carrying kinds.
+
+_STREAMING_ENV = "NOOA_STREAMING"
+# Deadline model: base + rate x prompt size, clamped. Calibrated live
+# 2026-10-19 — a 35K-char narrate#1 needs ~78s of DeepSeek reasoning
+# (~2.2s/Kchar); the rate carries ~2x headroom over measured pace.
+_CADENCE_BASE_S = 60.0
+_CADENCE_RATE_S_PER_KCHAR = 4.0
+_CADENCE_MIN_S = 90.0
+# Liveness: no chunk for this long means the provider dangled (mirrors the
+# httpx read-gap philosophy — gaps, not totals, catch frozen streams).
+_CADENCE_BYTE_GAP_S = 60.0
+# Heartbeat throttle: a milestone every N bytes or M seconds, plus always
+# the terminal heartbeat. Keeps the projection plane bounded.
+_HEARTBEAT_BYTES = 4_096
+_HEARTBEAT_S = 5.0
+
+
+class NarrationStalledError(Exception):
+    """A supervised narration stream stalled with its cadence evidence.
+
+    ``verdict`` is one of ``stalled_no_bytes`` (dangle — kill fast),
+    ``stalled_thinking`` (bytes without shape past deadline), or
+    ``timeout`` (absolute backstop). Callers map verdicts to the
+    cause-carrying ``FailureKind`` values; the stats ride the ledger so
+    every stall trip teaches the retry what happened.
+    """
+
+    def __init__(
+        self, verdict: str, *, attempt_id: str, turn_ref: str,
+        prompt_chars: int, deadline_ms: int, bytes_in: int, elapsed_ms: int,
+    ) -> None:
+        super().__init__(
+            f"narration {verdict}: attempt {attempt_id} "
+            f"({bytes_in} bytes in {elapsed_ms}ms, "
+            f"prompt {prompt_chars} chars, deadline {deadline_ms}ms)"
+        )
+        self.verdict = verdict
+        self.attempt_id = attempt_id
+        self.turn_ref = turn_ref
+        self.prompt_chars = prompt_chars
+        self.deadline_ms = deadline_ms
+        self.bytes_in = bytes_in
+        self.elapsed_ms = elapsed_ms
+
+
+def streaming_enabled() -> bool:
+    """Whether the SSE supervision path may be attempted at all."""
+    import os as _os
+    return _os.getenv(_STREAMING_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def narration_deadline_s(prompt_chars: int, *, cap: float | None = None) -> float:
+    """Model-aware deadline for one narration turn (pure, deterministic).
+
+    ``base + rate x prompt_size``, floored at ``_CADENCE_MIN_S`` and capped
+    at the absolute narration bound (the backstop, never the decision).
+    Small prompts clear fast; the 90K-char late-cycle follow-ups that died
+    under the flat 150s ticker get proportional room.
+    """
+    absolute = float(cap if cap is not None else narration_timeout_s())
+    proportional = _CADENCE_BASE_S + _CADENCE_RATE_S_PER_KCHAR * (max(0, int(prompt_chars)) / 1000.0)
+    return max(_CADENCE_MIN_S, min(proportional, absolute))
+
+
+def judge_cadence(
+    *, bytes_in: int, shape_formed: bool, stream_done: bool,
+) -> str:
+    """Deadline-moment cadence verdict (pure — no I/O, no clock).
+
+    ``complete`` (stream finished), ``stalled_no_bytes`` (nothing arrived),
+    ``stalled_thinking`` (bytes but no JSON shape formed), or
+    ``progressing`` (bytes + shape — bounded patience applies). Mid-stream
+    byte gaps are enforced by the supervision loop's per-chunk bound, not
+    here: this judges what the deadline found.
+    """
+    if stream_done:
+        return "complete"
+    if bytes_in <= 0:
+        return "stalled_no_bytes"
+    if not shape_formed:
+        return "stalled_thinking"
+    return "progressing"
+
+
+def narration_failure_kind(exc: BaseException) -> str:
+    """Map a narration error to its cause-carrying ``FailureKind`` (pure).
+
+    ``NarrationStalledError`` verdicts become the Signal B stall kinds the
+    failure FSM classifies (transient narration, retry policy); the
+    absolute-cap ``timeout`` verdict and every other error keep the legacy
+    ``narration_failed`` kind so existing terminals and fixtures hold.
+    """
+    from .failure_fsm import FailureKind
+    if isinstance(exc, NarrationStalledError):
+        if exc.verdict == "stalled_no_bytes":
+            return FailureKind.NARRATION_STALLED_NO_BYTES.value
+        if exc.verdict == "stalled_thinking":
+            return FailureKind.NARRATION_STALLED_THINKING.value
+    return FailureKind.NARRATION_FAILED.value
+
+
+async def call_narration_llm_streaming(
+    llm: Any,
+    user_prompt: str,
+    *,
+    system_prompt: str | None = None,
+    engine: Any | None = None,
+    turn_ref: str = "narration",
+    correlation_id: str | None = None,
+) -> str:
+    """One supervised narration turn over SSE (Signal B transport).
+
+    Streams text deltas, emits throttled ``agent_narration_cadence``
+    heartbeats (best-effort; ``engine=None`` disables emission for tests),
+    and judges cadence from bytes + progressive JSON shape. Returns the
+    assembled text (callers parse as usual). Raises ``RuntimeError`` when
+    streaming is unavailable (caller falls back to buffered ``acall``) and
+    ``NarrationStalledError`` with cadence evidence on stall/timeout.
+    """
+    from .narration_stream import stream_deltas
+    from .schemas import extract_json_object
+    from .telemetry import emit_narration_heartbeat
+
+    # Capability detection (never assume): SSE needs the real NOOA client
+    # surface — a routing ``model`` plus ``config``. Scripted test fakes and
+    # minimal clients expose only ``acall()``; attempting SSE against them
+    # raised AttributeError inside the stream, which the supervision loop
+    # reported as a NarrationStalledError (0 bytes) instead of falling back.
+    # RuntimeError is the documented "streaming unavailable" signal and the
+    # driver's caller falls back to buffered narration.
+    if not getattr(llm, "model", None):
+        raise RuntimeError(
+            "streaming unavailable: client exposes no routing model")
+
+    if system_prompt is None:
+        from .kb import build_system_prompt
+        system_prompt = build_system_prompt("BTCUSDT", "spot",
+                                            AGENTIC_MAX_TOOL_ROUNDS)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    prompt_chars = len(system_prompt or "") + len(user_prompt or "")
+    absolute_cap = float(narration_timeout_s())
+    deadline = narration_deadline_s(prompt_chars, cap=absolute_cap)
+    deadline_ms = int(deadline * 1000)
+    attempt_id = uuid.uuid4().hex[:12]
+    session = getattr(engine, "session_id", None) if engine is not None else None
+    corr = correlation_id or (str(session) if session else None)
+    t0 = time.monotonic()
+    seq = 0
+
+    async def _beat(outcome: str, bytes_in: int, cause: str | None = None) -> None:
+        nonlocal seq
+        if engine is None:
+            return
+        try:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            await emit_narration_heartbeat(
+                engine, attempt_id=attempt_id, turn_ref=str(turn_ref),
+                prompt_chars=int(prompt_chars), deadline_ms=deadline_ms,
+                bytes_in=int(bytes_in), elapsed_ms=elapsed_ms,
+                outcome=outcome, cause=cause, source_sequence=seq,
+                correlation_id=corr,
+            )
+        except Exception:
+            log.debug("heartbeat %s failed silently", outcome, exc_info=True)
+        seq += 1
+
+    def _stalled(verdict: str, bytes_in: int) -> NarrationStalledError:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return NarrationStalledError(
+            verdict, attempt_id=attempt_id, turn_ref=str(turn_ref),
+            prompt_chars=int(prompt_chars), deadline_ms=deadline_ms,
+            bytes_in=int(bytes_in), elapsed_ms=elapsed_ms,
+        )
+
+    await _beat("started", 0)
+    text_parts: list[str] = []
+    bytes_in = 0
+    shape_formed = False
+    last_beat_at = time.monotonic()
+    last_beat_bytes = 0
+    try:
+        stream = stream_deltas(
+            llm, messages=messages,
+            max_tokens=narration_max_tokens(), timeout=absolute_cap,
+        )
+        while True:
+            try:
+                delta = await asyncio.wait_for(
+                    stream.__anext__(), timeout=_CADENCE_BYTE_GAP_S,
+                )
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                await _beat("stalled_no_bytes", bytes_in,
+                            cause=f"no chunk for {_CADENCE_BYTE_GAP_S:.0f}s")
+                raise _stalled("stalled_no_bytes", bytes_in) from None
+            text_parts.append(delta.text or "")
+            bytes_in += len(delta.text or "") + len(delta.thinking or "")
+            now = time.monotonic()
+            if (bytes_in - last_beat_bytes >= _HEARTBEAT_BYTES
+                    or now - last_beat_at >= _HEARTBEAT_S):
+                if not shape_formed:
+                    try:
+                        shape_formed = extract_json_object("".join(text_parts)) is not None
+                    except Exception:
+                        shape_formed = False
+                await _beat("chunk", bytes_in)
+                last_beat_at, last_beat_bytes = now, bytes_in
+            elapsed = now - t0
+            if elapsed >= deadline and not shape_formed:
+                await _beat("stalled_thinking", bytes_in,
+                            cause=f"{bytes_in} bytes, no JSON shape in {elapsed:.0f}s")
+                raise _stalled("stalled_thinking", bytes_in)
+            if elapsed >= absolute_cap:
+                await _beat("timeout", bytes_in,
+                            cause=f"absolute cap {absolute_cap:.0f}s")
+                raise _stalled("timeout", bytes_in)
+    except NarrationStalledError:
+        raise
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Transport error mid-stream: the heartbeat stream ends without a
+        # terminal heartbeat; the caller's failure receipt records the
+        # error kind. Never synthesize content from a broken stream.
+        raise NarrationStalledError(
+            "timeout", attempt_id=attempt_id, turn_ref=str(turn_ref),
+            prompt_chars=int(prompt_chars), deadline_ms=deadline_ms,
+            bytes_in=int(bytes_in),
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        ) from exc
+    text = "".join(text_parts)
+    await _beat("complete", bytes_in)
+    return _note_tier("streamed", text)
+
+
 def bounded_envelope_view(
     payload: dict[str, Any] | None,
     roof: int = 180_000,
@@ -283,6 +533,11 @@ def response_text(resp: Any) -> str:
 
 __all__ = [
     "call_narration_llm",
+    "call_narration_llm_streaming",
+    "judge_cadence",
+    "NarrationStalledError",
+    "narration_deadline_s",
+    "narration_failure_kind",
     "bounded_envelope_view",
     "response_text",
 ]
