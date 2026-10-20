@@ -277,14 +277,16 @@ async def run_validation(
             return await run_validation(engine, ctx, st)
         # The finalize attempt yielded nothing usable; fall through to
         # salvage — the pre-existing turn log may still be salvable.
-    # REMOVAL-ONLY SALVAGE (terminal boundary). Doctrine: "narration carries
-    # zero numbers the ledger cannot back" — so a citation with a null value
-    # on a non-refusal path is REMOVABLE, not fatal. The repair budget and the
-    # forced-final turn are spent by now; if every remaining miss is that one
-    # entry-shape class, drop those entries deterministically and re-judge
-    # once. Any other miss (phase/hypothesis/confidence/roots/ΔP/scenario/
+    # COMPLETE-THEN-DROP SALVAGE (terminal boundary). Doctrine: engine
+    # completes, never kills, model-derived state — integral citations
+    # (paths resolving to store truth) have nulls filled and mismatches
+    # corrected; only unbacked entries are REMOVABLE, never fatal. The
+    # repair budget and the forced-final turn are spent by now; if every
+    # remaining miss is that one entry-shape class, complete those entries
+    # deterministically and re-judge once. Any other miss
+    # (phase/hypothesis/confidence/roots/ΔP/scenario/
     # directive/chain/halt) vetoes — salvage never papers over a real gap.
-    # The re-judge is the safety net: removing an entry can delete the ΔP
+    # The re-judge is the safety net: completion can delete the ΔP
     # citation or the last distinct root, and then the terminal stands.
     salvaged: list[dict[str, Any]] = []
     if (not passed
@@ -921,8 +923,8 @@ def salvage_entry_shape_misses(
         })
     reduced = {**judged, "evidence": completed}
     # Task-conformance lives OUTSIDE validate_final_turn, so the re-judge
-    # cannot see it: veto if the dropped entries were carrying the directive
-    # verdict (a null-valued citation still counts for has_directive_verdict).
+    # cannot see it: veto if the completion removed the directive verdict
+    # (a null-valued citation still counts for has_directive_verdict).
     if (task_plan is not None
             and (task_plan.get("targets") or task_plan.get("invalidations"))
             and has_directive_verdict(judged)
@@ -935,17 +937,19 @@ def salvage_entry_shape_misses(
         scenario_refusal_reason=scenario_refusal_reason,
         accumulated=accumulated, findings=_findings)
     if not passed:
-        # Dropping the entry broke another citation contract (ΔP, distinct
+        # Completion broke another citation contract (ΔP, distinct
         # roots, directive, …): do not ship a half-salvaged view.
         return None, list(missing), []
-    return reduced, [], dropped
+    return reduced, [], records
 
 
 def _record_evidence_salvage(
     st: CycleRuntimeState, ctx: Any, dropped: list[dict[str, Any]],
 ) -> None:
-    """Audit-trail the removal-only rescue (ledger OBSERVATION + state).
+    """Audit-trail the complete-then-drop rescue (ledger OBSERVATION + state).
 
+    Records carry ``filled:``/``corrected:`` markers and dropped index/path
+    rows — what the engine completed vs removed, never model wording.
     Best-effort, like every ledger writer on this path: a record failure must
     never convert a settled cycle back into a terminal.
     """
@@ -956,7 +960,8 @@ def _record_evidence_salvage(
         entry = record_entry(
             st.deterministic_state, LedgerKind.OBSERVATION,
             {"stage": "evidence-salvage",
-             "reason": "null value on non-refusal path; removal-only rescue",
+             "reason": ("entry-shape rescue: integral values completed "
+                          "from store truth, unbacked entries removed"),
              "dropped": list(dropped)},
             evidence_refs=(wake_id,), segment=segment)
         st.ledger_stage_ids.append(f"evidence-salvage#{entry.seq}")
