@@ -78,10 +78,9 @@ async def _load_run_record(
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Read ONE canonical run record (Postgres-first, Redis projection fallback).
 
-    Returns ``(source, record)``. Pre-canonical cycles fall back to the
-    deprecated ``inference_artifact`` rows, labeled ``legacy_artifact`` —
-    read-only, never written. The durable ledger is contacted only when
-    DATABASE_URL is set.
+    Returns ``(source, record)``. Canonical rows only — the pre-canonical
+    artifact ledger is retired; rows that predate it are no longer readable.
+    The durable ledger is contacted only when DATABASE_URL is set.
     """
     settings = _settings()
     source = None
@@ -95,12 +94,6 @@ async def _load_run_record(
             )
             if record is not None:
                 source = "postgres"
-            else:
-                record = await postgres.read_inference_artifact(
-                    symbol, artifact_id=run_id,
-                )
-                if record is not None:
-                    source = "legacy_artifact"
         finally:
             await postgres.close()
     if record is None:
@@ -674,19 +667,14 @@ def inference_run(symbol: str, venue: str, force: bool, task: str | None,
 @click.option("--venue", default="spot")
 @click.option("--run-id", "run_id", default=None,
               help="render the answer of one exact run record")
-@click.option("--artifact-id", "legacy_run_id", default=None,
-              help="(deprecated alias) same as --run-id")
-def inference_answer(symbol: str, venue: str, run_id: str | None,
-                     legacy_run_id: str | None) -> None:
-    """Return THE answer of a past cycle — the frozen answer of record.
+def inference_answer(symbol: str, venue: str, run_id: str | None) -> None:
+    """Return THE answer of a past cycle — the authoritative deliverable.
 
-    Canonical rows carry ``answer_text`` exactly as delivered at cycle
-    close (parity by identity). Pre-canonical (deprecated) rows carry no
-    frozen text and re-render through the one composer.
+    The frozen ``answer_text`` exactly as delivered at cycle close (parity
+    by identity). For the diagnostic record behind it (raw run JSON),
+    use ``inference read``.
     """
     from market_service.nooa_harness.engine.core.answer import answer_from_record
-
-    run_id = run_id or legacy_run_id
 
     async def _run() -> dict[str, Any] | None:
         return (await _load_run_record(symbol, venue, run_id=run_id))[1]
@@ -711,19 +699,14 @@ def inference_answer(symbol: str, venue: str, run_id: str | None,
 @click.option("--venue", default="spot")
 @click.option("--run-id", "run_id", default=None,
               help="read one exact run record")
-@click.option("--artifact-id", "legacy_run_id", default=None,
-              help="(deprecated alias) same as --run-id")
 @click.option("--redis-only", is_flag=True, help="skip Postgres; read the live projection")
 def inference_read(symbol: str, venue: str, run_id: str | None,
-                   legacy_run_id: str | None,
                    redis_only: bool) -> None:
-    """Read canonical run records (Postgres-first, Redis projection fallback).
+    """Read the diagnostic record of a past cycle (raw run JSON).
 
-    Pre-canonical cycles fall back to the deprecated artifact ledger,
-    labeled ``legacy_artifact`` (read-only).
+    Postgres-first, Redis projection fallback. For the authoritative
+    deliverable (the frozen answer prose), use ``inference answer``.
     """
-    run_id = run_id or legacy_run_id
-
     async def _run() -> dict[str, Any]:
         source, record = await _load_run_record(
             symbol, venue, run_id=run_id, redis_only=redis_only)
@@ -737,19 +720,15 @@ def inference_read(symbol: str, venue: str, run_id: str | None,
 @click.option("--venue", default="spot")
 @click.option("--limit", type=int, default=20)
 def inference_history(symbol: str, venue: str, limit: int) -> None:
-    """Read the run history (canonical ledger, newest first)."""
+    """Read the diagnostic run history (canonical ledger, newest first)."""
     async def _run() -> dict[str, Any]:
         settings = _settings()
         postgres = PostgresRuntimeStore(settings.database_url)
         try:
             await postgres.connect()
             history = await postgres.read_canonical_history(symbol, limit=limit)
-            source = "postgres"
-            if not history:
-                history = await postgres.read_inference_history(symbol, limit=limit)
-                source = "legacy_artifact" if history else "postgres"
             return {"symbol": symbol.upper(), "count": len(history),
-                    "source": source, "history": history}
+                    "source": "postgres", "history": history}
         finally:
             await postgres.close()
 

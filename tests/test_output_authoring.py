@@ -304,5 +304,93 @@ class AuthoredShipWalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(conf.get("correction_used"))
 
 
+_ANSWER_TURN = json.dumps({
+    "phase": "P6",
+    "summary": ("Flow stays one-sided into the close and depth absorbs the "
+                "aggression, so the distribution keeps pointing up — held as "
+                "the gate's inconclusive diagnostic, never a shortcut."),
+    "scenario_rationale": "no scenario was bound this cycle",
+    "model_separation": "nu*OFI stays heteroskedastic; never merged.",
+    "limitations": ["synthetic window", "single-venue read"],
+    "confidence": "high",
+    "tool_calls": [{"name": "calc.ofi.intervals", "args": {}}],
+})
+
+
+class AnswerVerbalizationWalkTests(unittest.IsolatedAsyncioTestCase):
+    async def _walk(self, *extra_responses):
+        engine, _s, _p, _m = _engine(llm_responses=[
+            *_evidence_prefix(), *_walk_tail(),
+            _collapse_turn(),
+            _staged_narration("P6", final=True),
+            *extra_responses,
+        ])
+        return await engine.narrate_cycle(
+            _wake(), {"decision": "fire"}, task="answer turn walk")
+
+    async def test_answer_turn_speaks_finally_from_the_foundation(self):
+        artifact, meta = await self._walk(_ANSWER_TURN)
+        self.assertEqual(meta.get("terminal"), "settled")
+        # prose verbalized in light of the gate …
+        self.assertIn("keeps pointing up",
+                      artifact.interpretation.get("summary"))
+        self.assertIn("single-venue read",
+                      artifact.interpretation.get("limitations"))
+        self.assertEqual(artifact.interpretation.get("confidence"), "high")
+        # … gate data frozen as founded (choice never re-decided, tool
+        # calls from the turn dropped, numbers untouched).
+        probs = artifact.interpretation.get("hypothesis_probabilities") or {}
+        self.assertEqual(probs.get("chosen"), "H0")
+        fv = meta.get("final_validation") or {}
+        self.assertEqual(fv.get("answer_turn"), "verbalized")
+        conf = artifact.run_record["deterministic_state"].get("conformance") or {}
+        self.assertIsNone(conf.get("answer_fallback"))
+        self.assertIn("keeps pointing up", meta.get("answer"))
+        self.assertIn("engine verdict:", meta.get("answer"))
+
+    async def test_unparseable_answer_turn_falls_back_flagged(self):
+        artifact, meta = await self._walk("not json at all {{{")
+        # delivery still settles; the ANSWER is honest about the fallback.
+        self.assertEqual(meta.get("terminal"), "settled")
+        self.assertIn("terminal: flagged", meta.get("answer"))
+        # foundation words ship; the fallback is on the record + footer.
+        self.assertEqual(artifact.interpretation.get("summary"), _STAGED_SUMMARY)
+        fv = meta.get("final_validation") or {}
+        self.assertTrue(str(fv.get("answer_turn", "")).startswith("fallback:"))
+        conf = artifact.run_record["deterministic_state"].get("conformance") or {}
+        self.assertIn("unparseable", conf.get("answer_fallback"))
+        self.assertIn("answer_fallback: unparseable", meta.get("answer"))
+
+    async def test_empty_prose_keeps_foundation_words(self):
+        keep_turn = json.dumps({
+            "phase": "P6", "summary": "  ", "limitations": [],
+            "confidence": "bogus", "tool_calls": [],
+        })
+        artifact, meta = await self._walk(keep_turn)
+        # field-level keep: foundation prose survives, turn still counts.
+        self.assertEqual(artifact.interpretation.get("summary"), _STAGED_SUMMARY)
+        self.assertNotEqual(artifact.interpretation.get("limitations"), [])
+        fv = meta.get("final_validation") or {}
+        self.assertEqual(fv.get("answer_turn"), "verbalized")
+        conf = artifact.run_record["deterministic_state"].get("conformance") or {}
+        self.assertIsNone(conf.get("answer_fallback"))
+
+    async def test_judged_fields_persist_through_interpretation(self):
+        staged = json.loads(_staged_narration("P6", final=True))
+        staged["forward_scenario"] = {"note": "judged forward read"}
+        staged["hypothesis_evidence"] = {"note": "judged support"}
+        engine, _s, _p, _m = _engine(llm_responses=[
+            *_evidence_prefix(), *_walk_tail(),
+            _collapse_turn(), json.dumps(staged),
+            # answer turn unscripted → foundation render ships
+        ])
+        artifact, meta = await engine.narrate_cycle(
+            _wake(), {"decision": "fire"}, task="judged persistence walk")
+        self.assertEqual(artifact.interpretation.get("forward_scenario"),
+                         {"note": "judged forward read"})
+        self.assertEqual(artifact.interpretation.get("hypothesis_evidence"),
+                         {"note": "judged support"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -172,6 +172,29 @@ class AnswerSubcommandTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("no authored answer", result.output)
 
+    def test_retired_artifact_alias_is_rejected(self):
+        # Pre-canonical read paths are removed: --artifact-id is no option.
+        result = self._invoke(
+            ["inference", "answer", "BTCUSDT", "--artifact-id", "x"],
+            self._record)
+        self.assertNotEqual(result.exit_code, 0)
+        result = self._invoke(
+            ["inference", "read", "BTCUSDT", "--artifact-id", "x"],
+            self._record)
+        self.assertNotEqual(result.exit_code, 0)
+
+    def test_help_blesses_answer_vs_record_contract(self):
+        def _flat(result):
+            return " ".join(result.output.split())
+        answer_help = CliRunner().invoke(
+            market_group, ["inference", "answer", "--help"])
+        self.assertIn("authoritative deliverable", _flat(answer_help))
+        self.assertIn("inference read", _flat(answer_help))
+        read_help = CliRunner().invoke(
+            market_group, ["inference", "read", "--help"])
+        self.assertIn("diagnostic record", _flat(read_help))
+        self.assertIn("inference answer", _flat(read_help))
+
 
 class RunRecordRoundTripTests(unittest.TestCase):
     def test_stores_round_trip_the_answer_exactly(self):

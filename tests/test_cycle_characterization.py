@@ -17,6 +17,22 @@ from market_service.nooa_harness.engine import core
 
 FIXTURE = Path(__file__).with_name("fixtures") / "cycle_characterization.json"
 
+#: The canonical answer-turn response pinned by the fixture: the agent
+#: speaks finally FROM the gated foundation (reword, never re-decide).
+#: Cases that ship an authored output script it as their last turn; the
+#: fallback path is pinned separately by the output-authoring suite.
+_ANSWER_PIN = json.dumps({
+    "phase": "P6",
+    "summary": ("OFI tape stays one-sided into the close and depth absorbs "
+                "the aggression, so the distribution keeps pointing up — "
+                "held as the gate's diagnostic reading, never a shortcut."),
+    "scenario_rationale": "no scenario was bound this cycle",
+    "model_separation": "nu*OFI stays heteroskedastic; never merged.",
+    "limitations": ["synthetic window"],
+    "confidence": "medium",
+    "tool_calls": [],
+})
+
 
 async def capture(case, stage_trace=None):
     # Phase R7 (fetch semantic removed): narrate#1 IS the P1 evidence read
@@ -71,6 +87,15 @@ async def capture(case, stage_trace=None):
         turns = [_staged_narration("P6", final=True)] * 12
     else:
         turns = success_turns
+    if case in ("success", "repair", "authored"):
+        # Canonical completion: the answer turn speaks finally from the
+        # gated foundation (unused script is harmless — llm() pops on call).
+        # Success walks one turn deeper before output (validation recovery
+        # consumes the spare final), so it scripts its own derive spare.
+        turns = list(turns)
+        if case == "success":
+            turns.append(_staged_narration("P6", final=True))
+        turns.append(_ANSWER_PIN)
     engine, store, postgres, memory = _engine(llm_responses=turns)
     effects = []
 

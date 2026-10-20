@@ -24,6 +24,7 @@ from market_service.nooa_harness.engine.core.answer import (
     NOT_APPLICABLE,
     answer_from_record,
     answer_inputs_from_record,
+    answer_material_from_skeleton,
     compose_answer,
     compose_answer_structured,
 )
@@ -57,6 +58,8 @@ def _gate(**over):
                    "basis_path": "calc.forward.fit → data.status"},
             "chosen": "H0", "tiebreak": None,
         },
+        "verdict": {"engine": "validated",
+                    "reason": "Deterministic fits validated; hypothesis confirmed"},
         "scenario": {"applicable": True, "verdict": "reachable",
                      "target": "245.30", "horizon": "1h",
                      "cited": [{"path": "calc.scenario.evaluate → verdict",
@@ -320,6 +323,8 @@ class RunRecordParityTests(unittest.TestCase):
                     "chosen": "H0", "tiebreak": None},
             },
             "hypothesis": {"H0": "beta > 0", "H1": "beta <= 0"},
+            "hypothesis_verdict": "validated",
+            "verdict_reason": "Deterministic fits validated; hypothesis confirmed",
         }
         record.update(over)
         return record
@@ -392,6 +397,99 @@ def _words(text: str) -> set[str]:
     return {t for t in tokens if any(c.isalpha() for c in t)}
 
 
+class EngineVerdictLineTests(unittest.TestCase):
+    def test_engine_verdict_renders_beside_the_choice(self):
+        out = _render()
+        self.assertIn("engine verdict: validated", out)
+        self.assertIn("verdict reason: Deterministic fits validated", out)
+        # the agent's weighed choice is untouched — the split is visible
+        self.assertIn("chosen: H0", out)
+
+    def test_inconclusive_verdict_with_refusal_reason(self):
+        gate = _gate(verdict={
+            "engine": "inconclusive",
+            "reason": ("Gate provisional (adjudication open); hypothesis held "
+                         "as derived diagnostic ; scenario unevaluated (refusal)")})
+        out = _render(gate=gate)
+        self.assertIn("engine verdict: inconclusive", out)
+        self.assertIn("scenario unevaluated (refusal)", out)
+
+    def test_absent_verdict_is_missing_never_silent(self):
+        gate = _gate()
+        gate.pop("verdict")
+        structured = compose_answer_structured(
+            _authored(), gate, _conformance(), _meta())
+        self.assertIn("verdict", structured["conformance"]["missing_blocks"])
+        self.assertIn("verdict reason",
+                      structured["conformance"]["missing_blocks"])
+        self.assertEqual(structured["conformance"]["terminal"], "flagged")
+        out = _render(gate=gate)
+        self.assertIn("engine verdict: missing (flagged)", out)
+
+    def test_record_verdict_flows_into_gate_data(self):
+        record = RunRecordParityTests()._record()
+        _, gate_data, _, _ = answer_inputs_from_record(record)
+        self.assertEqual(gate_data["verdict"]["engine"], "validated")
+        self.assertIn("confirmed", gate_data["verdict"]["reason"])
+
+
+class AnswerFallbackTests(unittest.TestCase):
+    def test_fallback_rides_the_footer_and_flags(self):
+        out = _render(conformance=_conformance(
+            answer_fallback="answer turn unrun (pass budget spent)"))
+        self.assertIn("answer_fallback: answer turn unrun", out)
+        self.assertIn("terminal: flagged", out)
+
+    def test_no_fallback_renders_no_line_and_settles(self):
+        structured = compose_answer_structured(
+            _authored(), _gate(), _conformance(), _meta())
+        self.assertIsNone(structured["conformance"]["answer_fallback"])
+        out = _render()
+        self.assertNotIn("answer_fallback", out)
+        self.assertIn("terminal: settled", out)
+
+
+class AnswerMaterialTests(unittest.TestCase):
+    def _skeleton(self, **over):
+        base = {
+            "task": "can price hit 245.30?",
+            "gate": {"status": "provisional", "reasons": ["adjudication open"]},
+            "hypothesis_verdict": "inconclusive",
+            "verdict_reason": "Gate provisional (adjudication open)",
+            "interpretation": dict(_authored()),
+            "hypothesis": {"H0": "beta > 0", "H1": "beta <= 0"},
+            "calculations": {"calc.ofi.intervals": {"ofi": "12.5"}},
+            "dropped": ["bogus.tool → x"],
+            "conformance": dict(_conformance()),
+        }
+        base.update(over)
+        return base
+
+    def test_material_carries_the_gated_foundation(self):
+        material = answer_material_from_skeleton(self._skeleton())
+        self.assertIsNotNone(material)
+        self.assertEqual(material["engine_verdict"], "inconclusive")
+        self.assertIn("adjudication open", material["verdict_reason"])
+        self.assertEqual(material["gate_status"], "provisional")
+        self.assertEqual(material["assembly_trail"], ["bogus.tool → x"])
+        self.assertTrue(material["evidence"])
+
+    def test_no_ship_means_no_material(self):
+        self.assertIsNone(answer_material_from_skeleton(None))
+        self.assertIsNone(answer_material_from_skeleton({"interpretation": {}}))
+        self.assertIsNone(answer_material_from_skeleton(
+            {"interpretation": {"summary": None}}))
+
+    def test_material_is_pure_and_bounded(self):
+        skeleton = self._skeleton()
+        before = dict(skeleton["interpretation"])
+        material = answer_material_from_skeleton(skeleton)
+        self.assertEqual(skeleton["interpretation"], before)
+        material["evidence"].append({"path": "mutated"})
+        fresh = answer_material_from_skeleton(skeleton)
+        self.assertNotIn({"path": "mutated"}, fresh["evidence"])
+
+
 #: The ONLY words the renderer may contribute beyond the input payloads.
 _LABEL_WORDS = {
     "ANSWER", "GATE", "DATA", "OUTPUT", "CONFORMANCE", "H0", "H1",
@@ -403,7 +501,7 @@ _LABEL_WORDS = {
     "horizon", "cited", "kind", "answer", "basis", "chosen", "tiebreak",
     "refusals", "confidence", "hard", "misses", "conflicts", "quality",
     "findings", "correction", "used", "terminal", "delta", "p", "of",
-    "note", "id",
+    "note", "id", "engine", "reason", "fallback",
 }
 
 

@@ -32,6 +32,8 @@ H1: beta <= 0 (flow no longer moves price)
 H0: medium · p: null · basis: calc.forward.fit → data.status
 H1: low · p: null · basis: calc.forward.fit → data.status
 chosen: H0 · tiebreak: none
+engine verdict: validated
+verdict reason: Deterministic fits validated; hypothesis confirmed
 
 --- scenario ---
 verdict: reachable
