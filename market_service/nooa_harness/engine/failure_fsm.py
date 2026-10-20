@@ -96,10 +96,20 @@ class FailureKind(str, Enum):
     # --- terminal-bearing kinds (dedicated LoopTerminal) ---
     GATE_REFUSED = "gate_refused"
     NARRATION_FAILED = "narration_failed"
+    # Signal B (cadence-aware narration supervision): stall verdicts with
+    # cadence evidence. Both route to the NARRATION_FAILED terminal — the
+    # endpoint is shared, the KIND stays distinct so classification, policy,
+    # and the substrate's retry shape key off cause, not just outcome.
+    NARRATION_STALLED_NO_BYTES = "narration_stalled_no_bytes"
+    NARRATION_STALLED_THINKING = "narration_stalled_thinking"
     PARSE_FAILED = "parse_failed"
     VALIDATION_FAILED = "validation_failed"
     BUDGET_EXHAUSTED = "budget_exhausted"
     INFRA_FAILED = "infra_failed"
+    # Canonical-output plane (C2): the ANSWER could not be delivered (the
+    # composer render or the sink raised). Honest and distinct from
+    # persistence/infra failures — the run record still lands.
+    DELIVERY_FAILED = "delivery_failed"
     # --- substrate-routed kinds (default terminal INFRA_FAILED) ---
     TOOL_DENIED = "tool_denied"
     TOOL_ERROR = "tool_error"
@@ -125,10 +135,13 @@ class FailureKind(str, Enum):
 FAILURE_TERMINAL: dict[str, LoopTerminal] = {
     FailureKind.GATE_REFUSED.value: LoopTerminal.GATE_REFUSED,
     FailureKind.NARRATION_FAILED.value: LoopTerminal.NARRATION_FAILED,
+    FailureKind.NARRATION_STALLED_NO_BYTES.value: LoopTerminal.NARRATION_FAILED,
+    FailureKind.NARRATION_STALLED_THINKING.value: LoopTerminal.NARRATION_FAILED,
     FailureKind.PARSE_FAILED.value: LoopTerminal.PARSE_FAILED,
     FailureKind.VALIDATION_FAILED.value: LoopTerminal.VALIDATION_FAILED,
     FailureKind.BUDGET_EXHAUSTED.value: LoopTerminal.BUDGET_EXHAUSTED,
     FailureKind.INFRA_FAILED.value: LoopTerminal.INFRA_FAILED,
+    FailureKind.DELIVERY_FAILED.value: LoopTerminal.DELIVERY_FAILED,
 }
 
 #: The classification of every failure kind: (class, severity). Worker
@@ -136,6 +149,11 @@ FAILURE_TERMINAL: dict[str, LoopTerminal] = {
 FAILURE_CLASSIFICATION: dict[str, tuple[FailureClass, FailureSeverity]] = {
     # narration (LLM transport / parse)
     FailureKind.NARRATION_FAILED.value: (FailureClass.NARRATION, FailureSeverity.TRANSIENT),
+    # Signal B stalls: transient narration with cadence evidence. Policy is
+    # RETRY for both; the KIND selects the mechanical retry shape in the
+    # substrate (identical re-attempt vs shrink-prompt re-attempt).
+    FailureKind.NARRATION_STALLED_NO_BYTES.value: (FailureClass.NARRATION, FailureSeverity.TRANSIENT),
+    FailureKind.NARRATION_STALLED_THINKING.value: (FailureClass.NARRATION, FailureSeverity.TRANSIENT),
     FailureKind.PARSE_FAILED.value: (FailureClass.NARRATION, FailureSeverity.PERMANENT),
     # tool
     FailureKind.TOOL_DENIED.value: (FailureClass.TOOL, FailureSeverity.PERMANENT),
@@ -161,6 +179,8 @@ FAILURE_CLASSIFICATION: dict[str, tuple[FailureClass, FailureSeverity]] = {
     FailureKind.GATE_TIMEOUT.value: (FailureClass.GATE, FailureSeverity.TRANSIENT),
     # infrastructure (catch-all)
     FailureKind.INFRA_FAILED.value: (FailureClass.INFRA, FailureSeverity.TRANSIENT),
+    # canonical-output delivery (the answer could not reach its surface)
+    FailureKind.DELIVERY_FAILED.value: (FailureClass.INFRA, FailureSeverity.PERMANENT),
 }
 
 #: Unknown kinds classify as infra/transient — the honest fallback.

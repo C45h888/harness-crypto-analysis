@@ -597,7 +597,7 @@ async def run_comprehension(
         st.deterministic_state["terminal"] = terminal
         ctx.controller = st.controller
         return None, (
-            await engine._degraded_artifact(
+            await engine._degraded_output(
                 st.deterministic_state, st.capability_log,
                 "plan_gate_refused: " + "; ".join(plan_gate.reasons),
             ),

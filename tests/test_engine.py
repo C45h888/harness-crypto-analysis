@@ -90,20 +90,42 @@ class _FakeStore:
     async def read_latest_inference_artifact(self, symbol, venue):
         return None
 
+    async def read_latest_canonical_output(self, symbol, venue):
+        return None
+
     async def publish_inference_artifact(self, artifact):
         self.published.append(artifact)
+        return "stream-id"
+
+    async def publish_canonical_output(self, output):
+        self.published.append(output)
         return "stream-id"
 
 
 class _FakePostgres:
     def __init__(self):
         self.inserted: list[Any] = []
+        self.updated: list[Any] = []
 
-    async def read_inference_artifact(self, symbol):
+    async def read_inference_artifact(self, symbol, artifact_id=None):
         return None
 
     async def insert_inference_artifact(self, artifact):
         self.inserted.append(artifact)
+        return True
+
+    async def read_canonical_output(self, symbol=None, run_id=None):
+        return None
+
+    async def read_recent_canonical_outputs(self, symbol, *, venue=None, limit=8):
+        return []
+
+    async def insert_canonical_output(self, output):
+        self.inserted.append(output)
+        return True
+
+    async def update_canonical_output(self, output):
+        self.updated.append(output)
         return True
 
     async def close(self):
@@ -345,15 +367,16 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(artifact.interpretation)
         self.assertIn("beta", artifact.interpretation["summary"].lower() or "x")
         # capability_log: wake + capture + fit + tool round
-        capabilities = [entry["capability"] for entry in artifact.capability_log]
+        capabilities = [entry["capability"] for entry in artifact.run_record["capability_log"]]
         self.assertIn("engine.wake", capabilities)
         self.assertIn("redis.read_capture_status", capabilities)
         self.assertIn("fitting.assemble_evidence", capabilities)
-        # PG-first pending write, final durable update, and final-trace
-        # projection are all visible; Redis is never published before PG.
+        # Canonical placement: durable insert + live projection, then the
+        # post-SETTLE row refresh + its projection; Redis is never published
+        # before the durable insert.
         self.assertEqual(len(postgres.inserted), 1)
-        self.assertEqual(len(store.published), 3)
-        assert store.published[0].deterministic_state["terminal"] == "pending_settlement"
+        self.assertEqual(len(store.published), 2)
+        assert store.published[0].run_record["deterministic_state"]["terminal"] == "pending_settlement"
         # Memory proposal accepted and written
         # Retirement: the ENGINE no longer disposes memory. An observation
         # only lands if the agent called the memory.remember tool — which this
@@ -377,7 +400,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(artifact.interpretation)
         # The gate key stays but carries no refusal — the deterministic
         # plane owns tape quality via per-tool refusals now.
-        self.assertEqual((artifact.deterministic_state.get("gate") or {}).get("status"),
+        self.assertEqual((artifact.run_record["deterministic_state"].get("gate") or {}).get("status"),
                          "provisional")
 
     async def test_task_directive_persists_on_narration_failed_cycle(self):
@@ -391,8 +414,8 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _wake(), {"decision": "fire"}, task=task)
         self.assertEqual(meta["llm_calls"], 0)
         self.assertEqual(meta["terminal"], "narration_failed")
-        self.assertEqual(artifact.deterministic_state.get("task"), task)
-        wake_detail = artifact.capability_log[0]["detail"]
+        self.assertEqual(artifact.run_record["deterministic_state"].get("task"), task)
+        wake_detail = artifact.run_record["capability_log"][0]["detail"]
         self.assertEqual(wake_detail["task"], task[:200])
         # Manual wake carries the task preview on its predicates.
         wake, _ = await engine.acquire_manual_wake(task=task)
@@ -409,12 +432,12 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             scenario=scenario)
         self.assertEqual(meta["llm_calls"], 0)
         self.assertEqual(meta["scenario"], scenario)
-        self.assertEqual(artifact.deterministic_state.get("scenario"), scenario)
+        self.assertEqual(artifact.run_record["deterministic_state"].get("scenario"), scenario)
         self.assertEqual(
-            artifact.capability_log[0]["detail"]["scenario"], scenario)
+            artifact.run_record["capability_log"][0]["detail"]["scenario"], scenario)
         plain_engine, _s2, _p2, _m2 = _engine(llm_responses=[])
         plain, _ = await plain_engine.narrate_cycle(_wake(), {"decision": "fire"})
-        self.assertIsNone(plain.deterministic_state.get("scenario"))
+        self.assertIsNone(plain.run_record["deterministic_state"].get("scenario"))
 
     async def test_thin_final_triggers_repair_then_finalizes(self):
         # narrate#1 finalizes with zero validation → the hard track still
@@ -516,12 +539,12 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["llm_calls"], 0)
         self.assertIsNone(artifact.interpretation)
         self.assertTrue(any(
-            e.get("source") == "narration" for e in artifact.errors
+            e.get("source") == "narration" for e in artifact.run_record["errors"]
         ))
         # Phase R7: the comprehension plane owns the deterministic state —
         # the receipt survives the narration failure.
-        self.assertIsNotNone(artifact.deterministic_state.get("understanding_receipt"))
-        self.assertIsNotNone(artifact.deterministic_state.get("task_directive"))
+        self.assertIsNotNone(artifact.run_record["deterministic_state"].get("understanding_receipt"))
+        self.assertIsNotNone(artifact.run_record["deterministic_state"].get("task_directive"))
         self.assertEqual(len(postgres.inserted), 1)
 
     async def test_unparseable_narration_is_degraded_not_fatal(self):
@@ -531,7 +554,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(artifact.interpretation)
         self.assertTrue(any(
             "narration_parse_failed" in (e.get("error") or "")
-            for e in artifact.errors
+            for e in artifact.run_record["errors"]
         ))
         self.assertEqual(len(postgres.inserted), 1)
 
@@ -571,7 +594,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # tool round contributes capture_status + intervals + evidence (the
         # 4th requested call, micro.events, must be dropped by the cap).
         tool_round_entries = [
-            e for e in _artifact.capability_log
+            e for e in _artifact.run_record["capability_log"]
             if e["capability"] in ("redis.read_capture_status",
                                    "redis.read_intervals", "redis.read_evidence",
                                    "redis.read_events")
@@ -906,7 +929,7 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
         self.assertTrue(any(
             str(e.get("capability", "")).startswith("tool.error:")
-            for e in artifact.capability_log
+            for e in artifact.run_record["capability_log"]
         ))
         self.assertIsNotNone(artifact.interpretation)
 
@@ -994,7 +1017,7 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(meta["final_validation"]["passed"],
                         meta["final_validation"])
         self.assertNotIn("tool.unknown",
-                         [str(e.get("capability")) for e in artifact.capability_log])
+                         [str(e.get("capability")) for e in artifact.run_record["capability_log"]])
 
 
 class P3PromptContractTests(unittest.TestCase):
@@ -1294,7 +1317,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["repairs"], 1)
         # Exactly ONE scenario.evaluate dispatch; no suppression needed.
         scen_entries = [
-            e for e in artifact.capability_log
+            e for e in artifact.run_record["capability_log"]
             if e.get("capability") == "calc.scenario.evaluate"
         ]
         self.assertEqual(len(scen_entries), 1)
@@ -1302,11 +1325,11 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unevaluated", artifact.verdict_reason)
         # Contract plane: the frozen question + the evaluated (refused)
         # dispatch are on the artifact — not reconstructed from a log scan.
-        contract = artifact.deterministic_state["scenario_contract"]
+        contract = artifact.run_record["deterministic_state"]["scenario_contract"]
         self.assertEqual(contract["asked_target"], "100.50")
         self.assertEqual(contract["asked_horizon"], "15m")
         self.assertEqual(contract["divergence"], "forbidden")
-        evaluation = artifact.deterministic_state["scenario_evaluation"]
+        evaluation = artifact.run_record["deterministic_state"]["scenario_evaluation"]
         self.assertEqual(evaluation["state"], "refused")
         self.assertEqual(evaluation["target_price"], "100.50")
         self.assertEqual(evaluation["horizon"], "15m")
@@ -1372,9 +1395,9 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
                         meta["final_validation"])
         self.assertEqual(meta["repairs"], 1)
         # ONE real dispatch + ONE suppressed entry — never two dispatches.
-        real = [e for e in artifact.capability_log
+        real = [e for e in artifact.run_record["capability_log"]
                 if e.get("capability") == "calc.scenario.evaluate"]
-        suppressed = [e for e in artifact.capability_log
+        suppressed = [e for e in artifact.run_record["capability_log"]
                       if str(e.get("capability", "")).startswith("tool.suppressed")]
         self.assertEqual(len(real), 1)
         self.assertEqual(len(suppressed), 1)

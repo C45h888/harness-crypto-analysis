@@ -885,6 +885,13 @@ def compose_followup_prompt(
     chain_block: str = "",
     reasoning_entry_block: str = "",
     scenario_contract_block: str = "",
+    # Signal B shrink-retry: the substrate re-attempts a stalled_thinking
+    # turn against a recomposed prompt with halved history. Defaults carry
+    # the retuned production widths (round 32K, history 10K); the shrink
+    # path passes smaller values. Echo verification reads the engine-side
+    # store, never the prompt text, so cuts cost words, never truth.
+    round_cap: int = 32_000,
+    history_cap: int = 10_000,
 ) -> str:
     """Compose the per-pass follow-up prompt.
 
@@ -959,9 +966,9 @@ def compose_followup_prompt(
     # the agent re-pulls via tools, while echo verification reads the
     # engine-side store (never the prompt text), so cuts cost words, never
     # truth. Total follow-up ≈ 65K chars → ~160s thinking vs 300s bound.
-    f"{json.dumps(wrapped_round, default=str)[:32_000]}\n\n"
+    f"{json.dumps(wrapped_round, default=str)[:round_cap]}\n\n"
         f"PRIOR PASSES (earlier results, for citation):\n"
-        f"{_bounded_dump(wrapped_accum, 10_000)}\n\n"
+        f"{_bounded_dump(wrapped_accum, history_cap)}\n\n"
         f"{_data_checks}"
         f"{phase_block}"
         f"{TURN_CONTRACT_LINE}\n"

@@ -8,6 +8,7 @@ import pytest
 
 from tests.test_governance import _engine, _wake, _staged_narration
 from tests.test_engine import (
+    _collapse_turn,
     _TRACK_ASSEMBLE, _TRACK_DISCIPLINE, _TRACK_HYPOTHESIZE,
     _TRACK_FORECAST,
     _TRACK_INTERPRET, _track_tools,
@@ -51,6 +52,12 @@ async def capture(case, stage_trace=None):
         # citation; the repair turn dispatches the audit in the validation
         # home; the next final passes.
         turns = success_turns + [_staged_narration("P6", final=True)]
+    elif case == "authored":
+        # Clean authored ship (the canonical output of record): a valid
+        # COLLAPSE object turn, then the derive turn — the answer renders
+        # from what ships and the ledger pins it.
+        turns = success_turns[:10] + [
+            _collapse_turn(), _staged_narration("P6", final=True)]
     elif case == "parse":
         # Narrate#1 fails to parse on the first turn.
         turns = ["not json"]
@@ -137,12 +144,16 @@ async def capture(case, stage_trace=None):
             (core.output, "run_output"),
         ]
 
-    async def persist_pg(artifact):
-        effects.append(["postgres", artifact.to_dict()])
+    async def place_pg(output):
+        effects.append(["postgres", output.to_dict()])
         return True
 
-    async def persist_redis(artifact):
-        effects.append(["redis", artifact.to_dict()])
+    async def update_pg(output):
+        effects.append(["postgres", output.to_dict()])
+        return True
+
+    async def publish_redis(output):
+        effects.append(["redis", output.to_dict()])
         return "fixture-id"
 
     remember = memory.remember
@@ -164,17 +175,18 @@ async def capture(case, stage_trace=None):
         core.context, "_utc_now_iso", return_value="2026-01-01T00:00:00+00:00",
     ), patch("market_service.runtime.contracts.uuid.uuid4", return_value="00000000-0000-0000-0000-000000000001"), patch.object(
         engine, "_call_llm", side_effect=llm,
-    ), patch.object(postgres, "insert_inference_artifact", side_effect=persist_pg), patch.object(
-        store, "publish_inference_artifact", side_effect=persist_redis,
+    ), patch.object(postgres, "insert_canonical_output", side_effect=place_pg), patch.object(
+        postgres, "update_canonical_output", side_effect=update_pg,
+    ), patch.object(store, "publish_canonical_output", side_effect=publish_redis,
     ), patch.object(memory, "remember", side_effect=remember_spy):
-            artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"}, task="Explain the evidence")
+            output, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"}, task="Explain the evidence")
     finally:
         for _p in reversed(_extra_patchers):
             _p.stop()
-    return json.loads(json.dumps({"artifact": artifact.to_dict(), "meta": meta, "effects": effects}, default=str))
+    return json.loads(json.dumps({"artifact": output.to_dict(), "meta": meta, "effects": effects}, default=str))
 
 
-@pytest.mark.parametrize("case", ["success", "repair", "gate", "parse", "transport", "budget"])
+@pytest.mark.parametrize("case", ["success", "repair", "authored", "gate", "parse", "transport", "budget"])
 def test_cycle_characterization(case):
     expected = json.loads(FIXTURE.read_text())
     assert asyncio.run(capture(case)) == expected[case]
@@ -196,9 +208,12 @@ def test_staged_cycle_converges_and_preserves_placement_order():
     # MemoryNode rows) AND the engine no longer disposes the agent's memory.
     # This scripted walk never calls memory.remember, so NO memory write occurs
     # — the agent's memory is written only through the memory.* tools.
-    # Settlement side effects: pending projection, final projection, final-trace.
+    # Canonical-output placement side effects (BY DESIGN under the canonical
+    # path): durable insert + live projection, then the post-SETTLE row
+    # refresh + its projection. The run record is bookkeeping; the answer is
+    # the deliverable.
     assert [effect[0] for effect in result["effects"] if effect[0] in ("postgres", "redis", "memory")] == [
-        "postgres", "redis", "redis", "redis",
+        "postgres", "redis", "postgres", "redis",
     ]
 
 

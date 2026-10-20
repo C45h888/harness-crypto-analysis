@@ -40,6 +40,7 @@ from .context import (
     freeze_chain,
     run_runtime_failure,
 )
+from ..llm import NarrationStalledError, narration_failure_kind
 from ..fsm import GovernanceEventKind
 from .. import kb
 from .. import receipts
@@ -147,23 +148,30 @@ async def run_evidence(
     )
     raw_1: str | None = None
     first_error = ""
+    terminal_kind = "narration_failed"
     try:
         raw_1 = await engine._call_llm(user_prompt_1)
         context.record_tier(st)
     except Exception as exc:
         log.exception("narration#1 failed")
         first_error = f"{type(exc).__name__}: {exc}"
-        # Bounded RETRY for TRANSIENT transport stalls only (timeout-class).
-        # Live 2026-10-19: narration#1 stalled past the 150s bound twice and
-        # the single-shot terminal burned the cycle (provisional artifact,
-        # llm_calls 0, validation never reached). Deterministic failures
-        # (auth, bugs, scripted refusals) keep the instant terminal the
+        # Bounded RETRY for TRANSIENT transport stalls: timeout-class plus
+        # Signal B stall verdicts (cause-carrying kinds). Live 2026-10-19:
+        # narration#1 stalled past the bound twice and the single-shot
+        # terminal burned the cycle (provisional artifact, llm_calls 0,
+        # validation never reached). Deterministic failures (auth, bugs,
+        # scripted refusals) keep the instant terminal the
         # characterization fixtures pin. Same retry plane the validation
         # repair path uses — substrate dispatches the narration worker,
-        # which re-attempts the call (worker owns the transport). A
-        # recovered turn falls through to the shared downstream path below.
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            st.failure_kind = "narration_failed"
+        # which re-attempts the call (worker owns the transport). Narrate#1
+        # carries no shrinkable history (envelope digest is already ~4K),
+        # so stall retries here are identical-prompt; the KIND still rides
+        # the ledger for the audit. A recovered turn falls through to the
+        # shared downstream path below.
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError,
+                            NarrationStalledError)):
+            terminal_kind = narration_failure_kind(exc)
+            st.failure_kind = terminal_kind
             st.failure_detail = first_error
             raw_1 = await context.recover_narration_call(
                 engine, ctx, st, user_prompt_1,
@@ -174,17 +182,17 @@ async def run_evidence(
                 return await run_runtime_failure(engine, ctx, st)
     if raw_1 is None:
         st.controller = st.controller.advance(
-            context.failure_event("narration_failed")
+            context.failure_event(terminal_kind)
         )
         terminal = (
             st.controller.terminal.value if st.controller.terminal
-            else "narration_failed"
+            else terminal_kind
         )
         ctx.controller = st.controller
         st.deterministic_state["terminal"] = terminal
         return await engine._degraded_artifact(
             st.deterministic_state, st.capability_log,
-            f"narration_failed: {first_error}",
+            f"{terminal_kind}: {first_error}",
         ), {"task": (ctx.task or "")[:200] or None,
             "scenario": ctx.scenario,
             "llm_calls": st.llm_calls, "terminal": terminal}

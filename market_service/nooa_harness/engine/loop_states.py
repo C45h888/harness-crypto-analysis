@@ -270,15 +270,19 @@ class LoopTerminal(str, Enum):
       - ``VALIDATION_FAILED`` — the final could not be repaired to passing.
       - ``BUDGET_EXHAUSTED``  — turns/rounds spent before the loop resolved.
       - ``INFRA_FAILED``      — store / db / dispatch infrastructure error.
+      - ``DELIVERY_FAILED``   — the ANSWER could not be delivered (composer
+        render or sink failure). The run record still lands; the failure is
+        honest and distinct from persistence failures.
     """
 
-    SETTLED = "settled"                # success: artifact persisted
+    SETTLED = "settled"                # success: the answer delivered + record placed
     GATE_REFUSED = "gate_refused"      # insufficient data, zero LLM tokens
     NARRATION_FAILED = "narration_failed"  # LLM call/transport failed
     PARSE_FAILED = "parse_failed"      # LLM output was unparseable
     VALIDATION_FAILED = "validation_failed"  # repaired-out, never passed
     BUDGET_EXHAUSTED = "budget_exhausted"    # turns/rounds spent
     INFRA_FAILED = "infra_failed"      # store/db/dispatch exception
+    DELIVERY_FAILED = "delivery_failed"  # answer delivery (render/sink) failed
 
 
 SUCCESS_TERMINALS: frozenset[LoopTerminal] = frozenset({LoopTerminal.SETTLED})

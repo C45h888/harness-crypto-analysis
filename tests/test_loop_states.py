@@ -315,6 +315,8 @@ class TerminalTests(unittest.TestCase):
             LoopTerminal.VALIDATION_FAILED,
             LoopTerminal.BUDGET_EXHAUSTED,
             LoopTerminal.INFRA_FAILED,
+            # Canonical-output plane: the answer could not be delivered.
+            LoopTerminal.DELIVERY_FAILED,
         }
         self.assertEqual(FAILURE_TERMINALS, frozenset(expected))
 

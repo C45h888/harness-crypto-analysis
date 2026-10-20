@@ -10,8 +10,8 @@ The runner is the OUTER loop; the nested loops are derived within it via
     _STAGE_RUNNERS;
   - the orchestration membrane: ``GovernanceDenied`` → canonical FSM
     failure route (sits between the governance membrane and the stages);
-  - durable writes (persist / finalize / degraded artifact) over the
-    engine's stores.
+  - canonical-output placement (place / finalize / degraded output) over
+    the engine's stores — the answer lands, the record is bookkeeping.
 
 Phase R7 (fetch semantic removed): there are no fetch/data-gate stages —
 ``run_wake`` is deterministic INTAKE (no tools), ``run_comprehension`` is
@@ -23,7 +23,7 @@ handle), no loop bodies (those live in ``wake`` / ``gather`` /
 ``reasoning`` / ``output``), and no legality (``engine.fsm`` /
 ``engine.controller``). ``InferenceEngine`` (``core.driver``) is a handle
 bag + transport + pure forwards; every ``engine.narrate_cycle`` /
-``engine._persist`` call forwards here and owns no logic.
+``engine._place_output`` call forwards here and owns no logic.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from market_service.runtime.contracts import InferenceArtifact
+from market_service.runtime.contracts import CanonicalOutput
 
 from . import context
 from . import gather, output, reasoning, validation
@@ -145,9 +145,10 @@ __all__ = [
     "OUTER_SEQUENCE",
     "StageReceipt",
     "narrate_cycle",
-    "persist_artifact",
-    "finalize_persisted",
-    "degraded_artifact",
+    "place_output",
+    "finalize_output",
+    "run_record_errors_of",
+    "degraded_output",
 ]
 
 
@@ -155,7 +156,7 @@ async def narrate_cycle(
     engine: Any, wake: Any, wake_meta: dict[str, Any],
     task: str | None = None,
     scenario: dict[str, Any] | None = None,
-) -> tuple[InferenceArtifact, dict[str, Any]]:
+) -> tuple[CanonicalOutput, dict[str, Any]]:
     """One narration cycle — READ-PLANE, envelope-driven.
 
     The controller receives the envelope (task, scenario, wake identity)
@@ -195,8 +196,8 @@ async def narrate_cycle(
                 engine, ctx, st, wake, wake_meta, task, scenario,
             )
             if completed is not None:
-                return completed
-        return completed
+                return await _mirror_cycle(engine, ctx, completed)
+        return await _mirror_cycle(engine, ctx, completed)
     except context.GovernanceDenied as exc:
         # --- ORCHESTRATION MEMBRANE (governance → runner) ---
         # A governance denial is an infrastructure/contract failure, not
@@ -221,12 +222,33 @@ async def narrate_cycle(
         artifact = await degraded_artifact(
             engine, state, ctx.capability_log, f"governance_denied: {exc}",
         )
-        return artifact, {
+        return await _mirror_cycle(engine, ctx, (artifact, {
             "task": task[:200] if task else None,
             "scenario": scenario,
             "terminal": terminal,
             "governance_denial": str(exc),
-        }
+        }))
+
+
+async def _mirror_cycle(engine: Any, ctx: Any, completed: Any) -> Any:
+    """Return the cycle result unchanged, after mirroring it to telemetry.
+
+    The ONE agentic emission seam. Every exit from ``narrate_cycle`` passes
+    through here, so the telemetry mirror sees settled cycles only — the FSM
+    has already adjudicated every transition this cycle will ever make, and
+    the artifact is already durable. Telemetry failure never changes the
+    returned result.
+    """
+    if not (isinstance(completed, tuple) and len(completed) == 2):
+        return completed
+    artifact, cycle_meta = completed
+    try:
+        from ..telemetry import emit_cycle_telemetry
+
+        await emit_cycle_telemetry(engine, ctx, artifact, cycle_meta)
+    except Exception:  # noqa: BLE001 — telemetry cannot gate the settled cycle
+        log.warning("agentic telemetry mirror failed", exc_info=True)
+    return completed
 
 
 async def _place_understanding(engine: Any, ctx: Any, st: Any) -> None:
@@ -252,19 +274,21 @@ async def _place_understanding(engine: Any, ctx: Any, st: Any) -> None:
         )
 
 
-async def degraded_artifact(
+async def degraded_output(
     engine: Any,
     deterministic_state: dict[str, Any],
     capability_log: list[dict[str, Any]],
     error: str,
-) -> InferenceArtifact:
-    """Narration-failure artifact: deterministic state preserved, interpretation NULL."""
-    artifact = InferenceArtifact.create(
+) -> CanonicalOutput:
+    """Narration-failure record: deterministic state preserved, no answer.
+
+    Null discipline: no authored ship means a NULL ``answer_text`` /
+    ``interpretation`` — the durable record of the failure, never filler.
+    """
+    output = CanonicalOutput.create(
         symbol=engine.symbol, venue=engine.venue,
         generated_at=context._utc_now_iso(), completed_at=context._utc_now_iso(),
         status="provisional", window_minutes=30, interval_seconds=10,
-        deterministic_state=deterministic_state,
-        capability_log=capability_log,
         input_hash=str(
             (deterministic_state.get("forecast_result") or {}).get("input_hash")
             or (deterministic_state.get("microstructure_evidence") or {}).get("input_hash")
@@ -274,78 +298,108 @@ async def degraded_artifact(
             (deterministic_state.get("forecast_result") or {}).get("model_version")
             or "inference-engine-v1"
         ),
-        interpretation=None,
+        run_record={
+            "deterministic_state": dict(deterministic_state),
+            "capability_log": list(capability_log),
+            "errors": [{"source": "narration", "error": error}],
+        },
+        task=str(deterministic_state.get("task") or "")[:200] or None,
+        terminal=str(deterministic_state.get("terminal") or "") or None,
         session_id=engine.session_id,
-        errors=[{"source": "narration", "error": error}],
     )
-    await persist_artifact(engine, artifact)
-    return artifact
+    await place_output(engine, output)
+    return output
 
 
-async def persist_artifact(
-    engine: Any, artifact: InferenceArtifact,
+async def place_output(
+    engine: Any, output: CanonicalOutput,
 ) -> dict[str, Any]:
-    """Write the pending artifact to the durable authority first.
+    """PLACE the canonical output: durable insert first, then projection.
 
-    Postgres is the canonical durable ledger.  Redis is published only
-    after the primary write succeeds; a projection failure therefore
-    cannot create a live artifact that has no durable source.
+    Canonical-output doctrine: the answer lands in Postgres (the deliverable
+    plane); the Redis projection is only the live read surface (nervous
+    system, never the historical authority). Postgres-first so a projection
+    can never show an answer with no durable record. **Never raises** —
+    failures ride the returned receipt and surface as ``run_record_errors``:
+    placement never blocks settlement (the answer is the product).
     """
-    persistence: dict[str, Any] = {
-        "postgres": engine.postgres is None,
-        "redis": False,
-        "projection_error": None,
+    placement: dict[str, Any] = {
+        "postgres": False, "redis": False, "projection_error": None,
     }
-    if engine.postgres is not None:
+    if engine.postgres is None:
+        placement["skipped"] = "no durable store configured"
+        placement["postgres"] = True
+    else:
         try:
-            persistence["postgres"] = bool(
-                await engine.postgres.insert_inference_artifact(artifact)
+            placement["postgres"] = bool(
+                await engine.postgres.insert_canonical_output(output)
             )
         except Exception as exc:
-            log.exception("postgres artifact insert failed")
-            persistence["postgres_error"] = f"{type(exc).__name__}: {exc}"
-    if not persistence["postgres"]:
-        persistence["redis_skipped"] = True
-        return persistence
+            log.exception("canonical output insert failed")
+            placement["postgres_error"] = f"{type(exc).__name__}: {exc}"
+    if not placement["postgres"]:
+        placement["redis_skipped"] = True
+        return placement
     try:
-        await engine.store.publish_inference_artifact(artifact)
-        persistence["redis"] = True
+        await engine.store.publish_canonical_output(output)
+        placement["redis"] = True
     except Exception as exc:
-        log.exception("redis artifact publish failed")
-        persistence["projection_error"] = f"{type(exc).__name__}: {exc}"
-    return persistence
+        log.exception("canonical output projection failed")
+        placement["projection_error"] = f"{type(exc).__name__}: {exc}"
+    return placement
 
 
-async def finalize_persisted(
-    engine: Any, artifact: InferenceArtifact,
+def run_record_errors_of(placement: dict[str, Any]) -> list[dict[str, str]]:
+    """The honest run-record error list of one placement receipt (pure).
+
+    Placement never blocks settlement; what it could not land is RECORDED
+    here (cycle meta + the row's errors), never hidden.
+    """
+    errors: list[dict[str, str]] = []
+    for source_key in ("postgres_error", "projection_error"):
+        if placement.get(source_key):
+            errors.append({"source": "run_record",
+                           "error": str(placement[source_key])})
+    if placement.get("skipped"):
+        errors.append({"source": "run_record",
+                       "error": str(placement["skipped"])})
+    if (not placement.get("postgres") and not placement.get("postgres_error")
+            and not placement.get("skipped")):
+        errors.append({"source": "run_record",
+                       "error": "durable record receipt missing"})
+    return errors
+
+
+async def finalize_output(
+    engine: Any, output: CanonicalOutput,
 ) -> dict[str, Any]:
-    """Finalize the pending durable row and refresh its Redis projection.
+    """Refresh the canonical row in place (terminal + full FSM trace).
 
-    The production Postgres adapter exposes an update seam.  The small
-    fallback is retained for lightweight injected test doubles that only
-    implement the historical insert contract; production never uses it.
+    The insert establishes the record; this pass closes the metadata gap
+    SETTLE itself creates. Never raises; best-effort projection refresh.
     """
     result: dict[str, Any] = {"postgres": False, "redis": False}
     if engine.postgres is None:
         result["postgres"] = True
+        result["skipped"] = "no durable store configured"
     else:
-        updater = getattr(engine.postgres, "update_inference_artifact", None)
+        updater = getattr(engine.postgres, "update_canonical_output", None)
         if updater is None:
-            # Compatibility for injected legacy fakes; the real adapter
-            # is required to implement the update method.
+            # Compatibility for injected legacy test doubles; production is
+            # required to implement the update method.
             result["postgres"] = True
         else:
             try:
-                result["postgres"] = bool(await updater(artifact))
+                result["postgres"] = bool(await updater(output))
             except Exception as exc:
-                log.exception("postgres artifact finalization failed")
+                log.exception("canonical output finalization failed")
                 result["postgres_error"] = f"{type(exc).__name__}: {exc}"
     if not result["postgres"]:
         return result
     try:
-        await engine.store.publish_inference_artifact(artifact)
+        await engine.store.publish_canonical_output(output)
         result["redis"] = True
     except Exception as exc:
-        log.exception("redis finalized projection failed")
+        log.exception("canonical output projection refresh failed")
         result["redis_error"] = f"{type(exc).__name__}: {exc}"
     return result

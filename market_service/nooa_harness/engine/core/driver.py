@@ -12,11 +12,17 @@ body module — only ``runner`` (outer loop) and ``wake`` (INTAKE forwards).
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+from datetime import datetime
 from typing import Any, Mapping
 
-from market_service.runtime.contracts import InferenceArtifact, WakeEnvelope
+from market_service.runtime.contracts import (
+    CanonicalOutput,
+    WakeEnvelope,
+    run_record_of,
+)
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 
@@ -102,7 +108,7 @@ def _derived_hypothesis_id(
     basis = h0 or (ctx.task or "").strip() or "autonomous-H0"
     digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
     return f"hyp-{digest}", h0, h1
-from ..llm import call_narration_llm
+from ..llm import call_narration_llm, call_narration_llm_streaming, NarrationStalledError, narration_failure_kind, streaming_enabled
 from ..scenario_contract import render_status_block
 from market_service.nooa_harness.inference import (
     _normalize_tool_name,
@@ -141,6 +147,7 @@ class InferenceEngine:
         venue: str = "spot",
         session_id: str | None = None,
         settings: Any | None = None,
+        answer_sink: Any | None = None,
     ) -> None:
         self.store = store
         self.postgres = postgres
@@ -149,6 +156,10 @@ class InferenceEngine:
         self.symbol = symbol.upper()
         self.venue = venue
         self.session_id = session_id or _stable_session_id(self.symbol, self.venue)
+        # C2 delivery sink: where THE answer is delivered at PLACEMENT
+        # (CLI channel / interaction plane). None = headless; the host
+        # surface picks the answer up from the cycle meta.
+        self.answer_sink = answer_sink
         # Cycle-scoped system prompt: rendered lazily on first narration
         # call, then reused for every turn in every cycle of this engine.
         # The KB payload is constant for (symbol, venue, budgets), which
@@ -176,9 +187,9 @@ class InferenceEngine:
         prior = None
         if self.postgres is not None:
             try:
-                prior = await self.postgres.read_inference_artifact(self.symbol)
+                prior = await self.postgres.read_canonical_output(self.symbol)
             except Exception:
-                log.exception("collect_snapshot: prior-artifact read failed")
+                log.exception("collect_snapshot: prior-record read failed")
         prior_state = self._prior_headline(prior)
         return {
             "event_stream_len": stream_len,
@@ -199,10 +210,10 @@ class InferenceEngine:
 
     @staticmethod
     def _prior_headline(prior: dict[str, Any] | None) -> dict[str, Any]:
-        """Extract the bounded headline of a prior artifact (provenance + last numbers)."""
+        """Extract the bounded headline of a prior run (provenance + last numbers)."""
         if not prior:
             return {}
-        deterministic = prior.get("deterministic_state") or {}
+        deterministic = run_record_of(prior).get("deterministic_state") or {}
         coverage = deterministic.get("coverage") or {}
         pif = deterministic.get("price_impact_fit") or {}
         completed_at = prior.get("completed_at")
@@ -213,7 +224,7 @@ class InferenceEngine:
         except (ValueError, TypeError):
             completed_ms = None
         return {
-            "artifact_id": prior.get("artifact_id"),
+            "run_id": prior.get("run_id") or prior.get("artifact_id"),
             "status": prior.get("status"),
             "events_total": coverage.get("events_total"),
             "capture_state": coverage.get("capture_state"),
@@ -232,18 +243,19 @@ class InferenceEngine:
         """Read the engine's own prior CENTRAL LEDGER as a context block.
 
         The central ledger is the ONE home for engine memory. Cross-cycle, the
-        prior artifact carries it; this reads it by key (symbol/venue), never by
-        similarity or scoring. Returns ``(rows, rendered block)``.
+        prior canonical record carries it (run_record.deterministic_state);
+        this reads it by key (symbol/venue), never by similarity or scoring.
+        Returns ``(rows, rendered block)``.
         """
         prior = None
         if self.postgres is not None:
             try:
-                prior = await self.postgres.read_inference_artifact(self.symbol)
+                prior = await self.postgres.read_canonical_output(self.symbol)
             except Exception:  # noqa: BLE001 — ledger read must never kill the cycle
                 prior = None
         if prior is None:
             try:
-                prior = await self.store.read_latest_inference_artifact(
+                prior = await self.store.read_latest_canonical_output(
                     self.symbol, self.venue,
                 )
             except Exception:  # noqa: BLE001
@@ -251,9 +263,13 @@ class InferenceEngine:
         if prior is None:
             return [], ""
         if isinstance(prior, Mapping):
-            ds = prior.get("deterministic_state")
+            ds = run_record_of(prior).get("deterministic_state")
         else:
-            ds = getattr(prior, "deterministic_state", None)
+            run_record = getattr(prior, "run_record", None)
+            if isinstance(run_record, Mapping):
+                ds = run_record.get("deterministic_state")
+            else:
+                ds = getattr(prior, "deterministic_state", None)
         if not isinstance(ds, Mapping):
             return [], ""
         rows = ledger_rows(ds, segment=segment)
@@ -264,15 +280,15 @@ class InferenceEngine:
         )
 
     async def _prior_change_note(self) -> str:
-        """Deterministic self-consistency diff vs the prior artifact."""
+        """Deterministic self-consistency diff vs the prior run record."""
         prior = None
         if self.postgres is not None:
             try:
-                prior = await self.postgres.read_inference_artifact(self.symbol)
+                prior = await self.postgres.read_canonical_output(self.symbol)
             except Exception:  # noqa: BLE001 — ledger read must never kill the cycle
                 prior = None
         if prior is None:
-            prior = await self.store.read_latest_inference_artifact(
+            prior = await self.store.read_latest_canonical_output(
                 self.symbol, self.venue,
             )
         headline = self._prior_headline(prior)
@@ -306,7 +322,22 @@ class InferenceEngine:
         cycle-constant, so per-turn re-reads were pure waste (up to 12 KB
         disk reads + formatting per cycle, and the same ~34 KB payload
         re-sent as message content regardless).
+
+        Signal B: when streaming is enabled, the turn goes over SSE with
+        cadence supervision (heartbeats + progressive parse); stall
+        verdicts surface as ``NarrationStalledError`` carrying cadence
+        evidence. Streaming unavailability (``RuntimeError``) falls back
+        to the buffered call — supervision degrades, the turn does not.
         """
+        if streaming_enabled():
+            try:
+                return await call_narration_llm_streaming(
+                    self.llm, user_prompt,
+                    system_prompt=self._system_prompt_cache.get(),
+                    engine=self,
+                )
+            except RuntimeError:
+                log.debug("streaming unavailable; buffered narration fallback")
         return await call_narration_llm(
             self.llm, user_prompt,
             system_prompt=self._system_prompt_cache.get(),
@@ -797,7 +828,13 @@ class InferenceEngine:
                     "was shown on early passes): "
                     + ", ".join(_all_ids)
                 )
-        user_prompt_next = kb.compose_followup_prompt(
+        # Signal B shrink-retry: the composer is a closure over caps so a
+        # stalled_thinking turn can be recomposed tighter (halved history)
+        # instead of repeating the oversized prompt blindly. Defaults carry
+        # the production widths.
+        def _compose_followup(round_cap: int = 32_000,
+                              history_cap: int = 10_000) -> str:
+            return kb.compose_followup_prompt(
             controller=st.controller,
             loop=("context" if st.loop_tag == "evidence" else st.loop_tag),
             sub_loop=("acquisition" if st.loop_tag == "evidence"
@@ -817,21 +854,38 @@ class InferenceEngine:
             next_phase=next_phase,
             chain_block=chain_block,
             reasoning_entry_block=_entry_block,
+            round_cap=round_cap,
+            history_cap=history_cap,
         )
+
+        user_prompt_next = _compose_followup()
         try:
             raw_next = await self._call_llm(user_prompt_next)
             context.record_tier(st)
         except Exception as exc:
             log.exception("pass narration round failed; dispatching to the failure node")
-            st.failure_kind = "narration_failed"
+            # Cause-carrying kinds: Signal B stall verdicts route as their
+            # stall kind (classified transient/narration); everything else
+            # keeps the legacy narration_failed kind. A stalled_thinking
+            # turn retries against a shrunk recomposition (halved caps) —
+            # the retry attacks the proven killer (prompt out-thinking the
+            # clock) instead of repeating it. All other stalls retry the
+            # same prompt; budgets stay substrate-owned.
+            stall_kind = narration_failure_kind(exc)
+            st.failure_kind = stall_kind
             st.failure_detail = f"{type(exc).__name__}: {exc}"
+            retry_prompt = user_prompt_next
+            if (isinstance(exc, NarrationStalledError)
+                    and exc.verdict == "stalled_thinking"):
+                retry_prompt = _compose_followup(16_000, 5_000)
+                st.failure_detail += " (retrying shrunk: round 16K/history 5K)"
             # Bounded RETRY remediation: the substrate dispatches the narration
             # worker, which re-attempts the LLM call (the worker owns transport).
             # On escalation the failure kind stays set, so the caller's existing
             # `if st.failure_kind: return run_runtime_failure(...)` writes the
             # terminal exactly once.
             raw_next = await context.recover_narration_call(
-                self, ctx, st, user_prompt_next,
+                self, ctx, st, retry_prompt,
             )
             if raw_next is None:
                 return None
@@ -867,7 +921,7 @@ class InferenceEngine:
         self, wake: WakeEnvelope, wake_meta: dict[str, Any],
         task: str | None = None,
         scenario: dict[str, Any] | None = None,
-    ) -> tuple[InferenceArtifact, dict[str, Any]]:
+    ) -> tuple[CanonicalOutput, dict[str, Any]]:
         """One narration cycle — READ-PLANE, envelope-driven.
 
         Pure forward — the outer loop lives in ``core.runner.narrate_cycle``.
@@ -876,25 +930,55 @@ class InferenceEngine:
         """
         return await runner.narrate_cycle(self, wake, wake_meta, task, scenario)
 
+    async def _deliver_answer(self, answer_text: str) -> None:
+        """Deliver THE answer to the interaction-plane sink (C2 PLACEMENT).
+
+        Delivery is CONFIRMED when this call returns without error — the
+        deliverable reaching its surface is what SETTLE gates on. An
+        injected ``answer_sink`` transports (CLI channel, interaction
+        plane); the headless default lets the host surface pick the answer
+        up from the cycle meta.
+        """
+        sink = self.answer_sink
+        if sink is None:
+            return
+        result = sink(answer_text)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _degraded_output(
+        self,
+        deterministic_state: dict[str, Any],
+        capability_log: list[dict[str, Any]],
+        error: str,
+    ) -> CanonicalOutput:
+        """Pure forward — implementation lives in ``core.runner``."""
+        return await runner.degraded_output(
+            self, deterministic_state, capability_log, error)
+
     async def _degraded_artifact(
         self,
         deterministic_state: dict[str, Any],
         capability_log: list[dict[str, Any]],
         error: str,
-    ) -> InferenceArtifact:
-        """Pure forward — implementation lives in ``core.runner``."""
-        return await runner.degraded_artifact(
-            self, deterministic_state, capability_log, error)
+    ) -> CanonicalOutput:
+        """Deprecated alias of ``_degraded_output`` (legacy artifact name).
 
-    async def _persist(self, artifact: InferenceArtifact) -> dict[str, Any]:
-        """Pure forward — implementation lives in ``core.runner``."""
-        return await runner.persist_artifact(self, artifact)
+        Kept only because a parallel workstream still calls the legacy name
+        from ``core.reasoning``; retire it when that lands.
+        """
+        return await self._degraded_output(
+            deterministic_state, capability_log, error)
 
-    async def _finalize_persisted(
-        self, artifact: InferenceArtifact,
+    async def _place_output(self, output: CanonicalOutput) -> dict[str, Any]:
+        """Pure forward — implementation lives in ``core.runner``."""
+        return await runner.place_output(self, output)
+
+    async def _finalize_output(
+        self, output: CanonicalOutput,
     ) -> dict[str, Any]:
         """Pure forward — implementation lives in ``core.runner``."""
-        return await runner.finalize_persisted(self, artifact)
+        return await runner.finalize_output(self, output)
 
     async def close(self) -> None:
         await self.store.close()

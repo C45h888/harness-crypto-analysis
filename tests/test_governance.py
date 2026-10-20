@@ -92,20 +92,42 @@ class _FakeStore:
     async def read_latest_inference_artifact(self, symbol, venue):
         return None
 
+    async def read_latest_canonical_output(self, symbol, venue):
+        return None
+
     async def publish_inference_artifact(self, artifact):
         self.published.append(artifact)
+        return "stream-id"
+
+    async def publish_canonical_output(self, output):
+        self.published.append(output)
         return "stream-id"
 
 
 class _FakePostgres:
     def __init__(self):
         self.inserted: list[Any] = []
+        self.updated: list[Any] = []
 
-    async def read_inference_artifact(self, symbol):
+    async def read_inference_artifact(self, symbol, artifact_id=None):
         return None
 
     async def insert_inference_artifact(self, artifact):
         self.inserted.append(artifact)
+        return True
+
+    async def read_canonical_output(self, symbol=None, run_id=None):
+        return None
+
+    async def read_recent_canonical_outputs(self, symbol, *, venue=None, limit=8):
+        return []
+
+    async def insert_canonical_output(self, output):
+        self.inserted.append(output)
+        return True
+
+    async def update_canonical_output(self, output):
+        self.updated.append(output)
         return True
 
     async def close(self):
@@ -355,7 +377,7 @@ class EvidenceBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((GovernanceEventKind.SET_TASK, "infer_order_flow", True),
                       requests)
         self.assertEqual(meta["llm_calls"], 1)
-        self.assertEqual(artifact.deterministic_state["terminal"], meta["terminal"])
+        self.assertEqual(artifact.run_record["deterministic_state"]["terminal"], meta["terminal"])
 
 
 class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
@@ -408,7 +430,7 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["terminal"], "settled")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "settled")
+        self.assertEqual(artifact.run_record["deterministic_state"].get("terminal"), "settled")
         self.assertTrue(meta["final_validation"]["passed"])
 
     async def test_thin_tape_no_gate_terminal(self):
@@ -423,16 +445,16 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
         )
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["terminal"], "narration_failed")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "narration_failed")
+        self.assertEqual(artifact.run_record["deterministic_state"].get("terminal"), "narration_failed")
         self.assertEqual(meta["llm_calls"], 1)
-        self.assertIsNotNone(artifact.deterministic_state.get("understanding_receipt"))
+        self.assertIsNotNone(artifact.run_record["deterministic_state"].get("understanding_receipt"))
 
     async def test_parse_failure_terminals_parse_failed(self):
         engine, _s, _p, _m = _engine(llm_responses=["no json here at all",
                                                       "no json here at all"])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["terminal"], "parse_failed")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "parse_failed")
+        self.assertEqual(artifact.run_record["deterministic_state"].get("terminal"), "parse_failed")
         self.assertIsNone(artifact.interpretation)
 
     async def test_narration_failure_terminals_narration_failed(self):
@@ -444,7 +466,7 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
         engine.llm.acall = _boom  # type: ignore[union-attr]
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["terminal"], "narration_failed")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "narration_failed")
+        self.assertEqual(artifact.run_record["deterministic_state"].get("terminal"), "narration_failed")
 
     async def test_budget_exhaustion_terminals_budget_exhausted(self):
         # Round follow-up is unparseable.  Parse failure is a distinct
@@ -456,8 +478,8 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
         ])
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertEqual(meta["terminal"], "parse_failed")
-        self.assertEqual(artifact.deterministic_state.get("terminal"), "parse_failed")
-        self.assertEqual(artifact.deterministic_state["failure"]["kind"], "parse_failed")
+        self.assertEqual(artifact.run_record["deterministic_state"].get("terminal"), "parse_failed")
+        self.assertEqual(artifact.run_record["deterministic_state"]["failure"]["kind"], "parse_failed")
 
 
 if __name__ == "__main__":

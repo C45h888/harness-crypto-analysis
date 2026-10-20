@@ -59,6 +59,12 @@ from .workers import (
 #: by CLASS (the class value IS the worker name).
 WORKER_FOR_KIND: dict[str, str] = {
     "narration_failed": "narration",
+    # Signal B: stall verdicts route to the narration worker explicitly so
+    # a class rename or fallback change cannot silently reroute them. The
+    # worker branches on kind: no_bytes re-attempts identically, thinking
+    # re-attempts against a caller-shrunk prompt (see recover paths).
+    "narration_stalled_no_bytes": "narration",
+    "narration_stalled_thinking": "narration",
     # F6: explicit (was class-fallback only) so a class rename or fallback
     # change cannot silently reroute caller-fault narration failures.
     "narration_refused": "narration",

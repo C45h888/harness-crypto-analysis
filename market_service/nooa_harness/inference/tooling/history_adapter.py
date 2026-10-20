@@ -98,7 +98,7 @@ async def _load_prior_block_fits(
     if postgres is None:
         return []
     try:
-        rows = await postgres.read_recent_inference_artifacts(
+        rows = await postgres.read_recent_canonical_outputs(
             symbol, venue=venue, limit=limit,
         )
     except Exception:
@@ -106,7 +106,8 @@ async def _load_prior_block_fits(
     fits: list[Any] = []
     seen: set[str] = set()
     for row in rows or []:
-        state = (row or {}).get("deterministic_state") or {}
+        from market_service.runtime.contracts import run_record_of
+        state = run_record_of(row).get("deterministic_state") or {}
         micro = state.get("microstructure_evidence") or {}
         fit_dict = micro.get("price_impact_fit")
         if not isinstance(fit_dict, dict):

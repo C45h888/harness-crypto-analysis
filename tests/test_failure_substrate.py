@@ -393,7 +393,7 @@ class TestCycleFailureEndToEnd:
 
         assert meta["terminal"] == expected_terminal, \
             f"{case}: got {meta['terminal']}"
-        det_state = artifact.to_dict().get("deterministic_state", {})
+        det_state = artifact.to_dict().get("run_record", {}).get("deterministic_state", {})
         assert det_state.get("terminal") == expected_terminal
 
     def test_successful_cycle_still_reachable(self):

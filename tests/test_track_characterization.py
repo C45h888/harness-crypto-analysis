@@ -81,9 +81,9 @@ def _scenario_close(reason: str = "no_market_price") -> str:
 
 def _metrics(artifact: Any, meta: dict[str, Any]) -> dict[str, Any]:
     """Characterisation reading off one completed walk (pure projection)."""
-    chain = (artifact.deterministic_state.get("statistical_chain") or {})
+    chain = (artifact.run_record["deterministic_state"].get("statistical_chain") or {})
     positions = chain.get("positions") or {}
-    log = artifact.capability_log or []
+    log = artifact.run_record["capability_log"] or []
     return {
         "terminal": meta.get("terminal"),
         "llm_calls": meta.get("llm_calls"),
@@ -98,7 +98,7 @@ def _metrics(artifact: Any, meta: dict[str, Any]) -> dict[str, Any]:
         "chain_complete": chain.get("complete"),
         "chain_missing": list(chain.get("missing") or []),
         "chain_refused": [r.get("tool") for r in (chain.get("refused") or [])],
-        "chain_halt": artifact.deterministic_state.get("chain_halt"),
+        "chain_halt": artifact.run_record["deterministic_state"].get("chain_halt"),
         "out_of_position": sum(
             1 for e in log
             if str(e.get("capability", "")).startswith("tool.out_of_position")),
@@ -106,7 +106,7 @@ def _metrics(artifact: Any, meta: dict[str, Any]) -> dict[str, Any]:
             1 for e in log
             if str(e.get("capability", "")).startswith("tool.suppressed")),
         "trace": [s.get("step") for s in
-                  ((artifact.deterministic_state.get("forecast_result") or {})
+                  ((artifact.run_record["deterministic_state"].get("forecast_result") or {})
                    .get("diagnostics", {}).get("chain_trace") or [])],
     }
 
@@ -139,7 +139,7 @@ class HealthyTrackWalkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m["chain_halt"], None)
         self.assertEqual(m["out_of_position"], 0)
         # Budgets fit the floor with headroom (5/14/10 ceilings).
-        passes = artifact.deterministic_state.get("loop_traversal", {})
+        passes = artifact.run_record["deterministic_state"].get("loop_traversal", {})
         self.assertLessEqual(
             (passes.get("reasoning") or {}).get("passes_spent", 99), 6)
         self.assertLessEqual(m["llm_calls"], 14)
@@ -173,7 +173,7 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="prove the provenance layers")
         self.assertEqual(meta.get("terminal"), "settled")
-        log = artifact.capability_log or []
+        log = artifact.run_record["capability_log"] or []
         by_cap: dict[str, list[dict[str, Any]]] = {}
         for entry in log:
             by_cap.setdefault(str(entry.get("capability") or ""), []).append(entry)
@@ -194,10 +194,10 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
                   for e in by_cap.get("engine.ledger.stage_record", [])]
         self.assertEqual(stages, ["base", "refined", "verdict-basis"])
         # Frozen base + chain pointer travel on the artifact.
-        base = artifact.deterministic_state.get("base_summary") or {}
+        base = artifact.run_record["deterministic_state"].get("base_summary") or {}
         self.assertTrue(base.get("base_complete"))
         self.assertGreater(int(base.get("n_pairs") or 0), 0)
-        chain = artifact.deterministic_state.get("statistical_chain") or {}
+        chain = artifact.run_record["deterministic_state"].get("statistical_chain") or {}
         self.assertTrue((chain.get("base_summary") or {}).get("base_complete"))
         # Stage ids are central-ledger seq pointers (base -> refined ->
         # verdict-basis, the adjudication spine's reasoning-close record).
@@ -230,7 +230,7 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="verdict trace")
         self.assertEqual(meta.get("terminal"), "settled")
-        ds = artifact.deterministic_state
+        ds = artifact.run_record["deterministic_state"]
         chosen = ledger_rows(ds, (LedgerKind.OBSERVATION,),
                              stage="verdict-chosen")
         self.assertEqual(len(chosen), 1)
@@ -265,7 +265,7 @@ class ProvenanceWalkTests(unittest.IsolatedAsyncioTestCase):
         artifact, meta = await engine.narrate_cycle(
             _wake(), {"decision": "fire"}, task="failed verdict trace")
         self.assertEqual(meta.get("terminal"), "validation_failed")
-        chosen = ledger_rows(artifact.deterministic_state,
+        chosen = ledger_rows(artifact.run_record["deterministic_state"],
                              (LedgerKind.OBSERVATION,),
                              stage="verdict-chosen")
         self.assertEqual(len(chosen), 1)
@@ -327,7 +327,7 @@ class JumpAheadWalkTests(unittest.IsolatedAsyncioTestCase):
         _report("jump-ahead", m)
         # The early call is denied log-only: pending, never classified.
         self.assertEqual(m["out_of_position"], 1)
-        oop = [e for e in artifact.capability_log
+        oop = [e for e in artifact.run_record["capability_log"]
                if str(e.get("capability", "")).startswith("tool.out_of_position")]
         self.assertEqual(oop[0].get("result"), "denied")
         self.assertEqual((oop[0].get("detail") or {}).get("active_position"), "assemble")
@@ -423,12 +423,12 @@ class HaltWalkTests(unittest.IsolatedAsyncioTestCase):
         # halt persists into validation, and the FSM retry decision is
         # required (no suppression event: the offer made no re-attempt).
         ofi_entries = [
-            e for e in artifact.capability_log
+            e for e in artifact.run_record["capability_log"]
             if e.get("capability") == "calc.ofi.intervals"
         ]
         self.assertEqual(len(ofi_entries), 1)
         suppressed = [
-            e for e in artifact.capability_log
+            e for e in artifact.run_record["capability_log"]
             if str(e.get("capability", "")).startswith("tool.suppressed")
         ]
         self.assertEqual(len(suppressed), 0)
@@ -498,7 +498,7 @@ class ReformulationWalkTests(unittest.IsolatedAsyncioTestCase):
         # name while genuine executions log the registry capability
         # "calc.ofi_intervals" — count evaluated executions, not strings.
         evaluated = [
-            e for e in artifact.capability_log
+            e for e in artifact.run_record["capability_log"]
             if e.get("capability") == "calc.ofi_intervals"
             and e.get("result") == "ok"
             and not (isinstance(e.get("detail"), dict)
