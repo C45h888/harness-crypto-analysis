@@ -583,12 +583,22 @@ class FireMixin(SubstrateBase):
             if callable(evaluate) and callable(record):
                 from market_service.governance.contracts import GovernanceGate
 
+                # Full binding surface: the authority record declares
+                # (*INPUT_STREAMS, *DEPENDENCIES, *DERIVATIVE_INPUTS), so the
+                # observation must report the same surface. Passing only
+                # INPUT_STREAMS starves every worker with dependencies or
+                # derivative inputs into a permanent binding-drift denial.
+                binding = tuple(dict.fromkeys(
+                    (*self.INPUT_STREAMS,
+                     *type(self).DEPENDENCIES,
+                     *type(self).DERIVATIVE_INPUTS),
+                ))
                 observation, verdict = await evaluate(
                     GovernanceGate(gate),
                     substrate=self.SUBSTRATE_NAME,
                     symbol=self.symbol,
                     payload=payload,
-                    inputs=tuple(self.INPUT_STREAMS),
+                    inputs=binding,
                 )
                 if not verdict.allowed or record_allow:
                     await record(
@@ -629,7 +639,11 @@ class FireMixin(SubstrateBase):
                     substrate=self.SUBSTRATE_NAME,
                     symbol=self.symbol,
                     payload=payload,
-                    inputs=tuple(self.INPUT_STREAMS),
+                    inputs=tuple(dict.fromkeys(
+                        (*self.INPUT_STREAMS,
+                         *type(self).DEPENDENCIES,
+                         *type(self).DERIVATIVE_INPUTS),
+                    )),
                 )
         except Exception as exc:
             log.error("governance %s gate raised (failing closed): %s", gate, exc)

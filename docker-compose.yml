@@ -126,6 +126,7 @@ services:
       - path: .env
         required: false
     environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-marketflow}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
@@ -139,6 +140,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
     # Auto-resurrect disabled — see the RESTART_POLICY note on `poller`.
