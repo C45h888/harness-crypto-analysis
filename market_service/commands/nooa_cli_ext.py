@@ -1,7 +1,8 @@
 """``nooa market`` — the harness surface exposed inside the ``nooa`` CLI.
 
-This is the "nooa runtime harness CLI": it reads the collated runtime
-records straight from the stores (Redis primary, Postgres durable ledger)
+This is the "nooa runtime harness CLI": it reads the live venue-scoped
+runtime projections (microstructure + derivatives + substrate) and the
+durable canonical-output ledger (Redis primary, Postgres durable ledger)
 and runs the surviving agent classes directly from a terminal ``nooa``
 invocation. The envelope dataclass read path was retired 2026-08-30: the
 market read commands go through ``runtime.read_paths`` (raw Redis payload
@@ -35,37 +36,65 @@ from click import echo as click_echo
 
 from market_service.config import Settings
 from market_service.nooa_harness.memory import MemoryNode
-from market_service.runtime import read_paths
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.runtime.scope import (
+    CANONICAL_VENUE, DEFAULT_SYMBOL, VENUES, Scope, normalize_symbol,
+    normalize_venue,
+)
 
 
 def _settings() -> Settings:
     return Settings.from_env()
 
 
-async def _read_collated_run(
-    settings: Settings, symbol: str, run_id: str | None,
-) -> dict[str, Any] | None:
-    """Redis-first, Postgres-fallback read of a collated market run payload."""
-    redis = RedisRuntimeStore(
-        settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
-    )
-    postgres = PostgresRuntimeStore(settings.database_url)
+# --------------------------------------------------------------------------
+# Identity defaults — derived, NEVER literal.
+#
+# This CLI used to hardcode 11 symbol/venue defaults (7 agentic commands on
+# BTCUSDT/spot, 4 market commands on SOLUSDT) while the runtime captured
+# SOLUSDT on futures. Asking for a symbol nothing captured cost a full
+# 9-turn cycle before failing. Every default now resolves from the one
+# identity authority (runtime/scope.py) via Settings, so the CLI cannot
+# disagree with what the runtime actually trades.
+#
+# Click calls a callable default at parse time, so these read env lazily
+# rather than freezing identity at import.
+# --------------------------------------------------------------------------
+def _scope() -> Scope:
+    return Scope.from_settings(_settings())
+
+
+def _scope_or_default() -> Scope:
+    """The resolved scope, or the canonical identity if Settings cannot load.
+
+    Click evaluates a callable default at PARSE time, before the command
+    body runs. Requiring a resolvable Settings (i.e. DATABASE_URL) just to
+    parse ``--help`` would make the whole CLI unusable on a host without the
+    ledger — so an unloadable Settings degrades to the canonical identity.
+    The command body still fails loudly if it genuinely needs the DB.
+    """
     try:
-        await postgres.connect()
-        if run_id:
-            payload = await read_paths.read_collated_by_run(redis, run_id)
-            if payload is None:
-                payload = await postgres.read_run(run_id)
-        else:
-            payload = await read_paths.read_collated(redis, symbol)
-            if payload is None:
-                payload = await postgres.latest_run(symbol)
-        return payload
-    finally:
-        await redis.close()
-        await postgres.close()
+        return _scope()
+    except Exception:  # noqa: BLE001 — a default must never break parsing
+        return Scope(DEFAULT_SYMBOL, CANONICAL_VENUE)
+
+
+def _default_symbol() -> str:
+    return _scope_or_default().symbol
+
+
+def _default_venue() -> str:
+    return _scope_or_default().venue
+
+
+def _resolve_args(symbol: str | None, venue: str | None) -> Scope:
+    """Bind an explicit (symbol, venue) or fall back to the resolved scope."""
+    base = _scope_or_default()
+    return Scope(
+        symbol=normalize_symbol(symbol) if symbol else base.symbol,
+        venue=normalize_venue(venue) if venue else base.venue,
+    )
 
 
 def _emit(result: Any) -> None:
@@ -119,40 +148,81 @@ def command() -> None:
     """Commands mounted into the ``nooa`` tree by nooa_cli_install."""
 
 
-@command.command("read")
-@click.argument("symbol", default="SOLUSDT")
-@click.option("--run-id", default=None, help="read one exact collated run by id")
-@click.option(
-    "--mode", default="snapshot",
-    type=click.Choice(["snapshot", "inventory", "full"]),
-    help="output shape (same as the agent's market.read tool)",
-)
-def read_cmd(symbol: str, run_id: str | None, mode: str) -> None:
-    """Read a collated market run — via the canonical interaction plane."""
-    from market_service.interaction_plane import parsing as _parsing
-    from market_service.interaction_plane import prompts as _prompts
-    from market_service.interaction_plane import reads as _reads
+@command.command("scope")
+def scope_cmd() -> None:
+    """Show the identity this runtime will analyse (symbol + venue).
+
+    The operator-visible answer to "what will my run actually trade?" —
+    resolved live (Redis control key > env), the same authority the
+    poller, the wake guard, and the inference runner read, so a mismatch
+    between the CLI and the runtime is impossible to hide.
+    """
+    from market_service.runtime.scope import resolve_live_scope
 
     async def _op() -> dict:
-        payload, source, _ = await _reads.read_ledger(
-            symbol.upper(), run_id=run_id, mode=mode)
-        if payload is None:
-            surfaces = await _reads.read_surfaces(symbol.upper())
-            return _prompts.attach_header(
-                _parsing.empty_read(
-                    tool="market.read", segment="ledger", mode=mode,
-                    symbol=symbol.upper(), surfaces=surfaces), 
-                segment="ledger", mode=mode, source=None)
-        return _prompts.attach_header(
-            _parsing.wrap_result(
-                "market.read", payload, segment="ledger", mode=mode),
-            segment="ledger", mode=mode, source=source)
+        settings = _settings()
+        redis = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            return (await resolve_live_scope(settings, redis)).to_dict()
+        finally:
+            await redis.close()
+
+    _emit(asyncio.run(_op()))
+
+
+@command.command("read")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
+@click.option("--run-id", default=None,
+              help="run id is reported, never used as a read key (the "
+                   "collated run plane has no writer)")
+@click.option(
+    "--mode", default="snapshot",
+    type=click.Choice(["snapshot", "inventory", "surfaces", "full"]),
+    help="output shape (same as the agent's market.read tool)",
+)
+def read_cmd(symbol: str, venue: str, run_id: str | None, mode: str) -> None:
+    """Read LIVE venue-scoped Redis projections for one identity.
+
+    Shares ONE implementation with the agent's ``market.read`` tool. It used
+    to read the collated run plane, which has no writer (``publish_run`` and
+    ``insert_run`` have no production callers) — so the operator and the
+    agent could both be shown frozen prices with no age attached. Now both
+    read the live microstructure/derivative/substrate projections and every
+    number carries ``age_ms``.
+    """
+    from market_service.nooa_harness.inference.tooling.tools_market import (
+        dispatch_market_read,
+    )
+
+    resolved = _resolve_args(symbol, venue)
+
+    async def _op() -> dict:
+        settings = _settings()
+        redis = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            payload, _log = await dispatch_market_read(
+                redis, resolved.symbol, mode=mode, venue=resolved.venue,
+                run_id=run_id,
+            )
+            return payload if payload is not None else {
+                "status": "denied", "symbol": resolved.symbol,
+                "venue": resolved.venue, "mode": mode,
+            }
+        finally:
+            await redis.close()
 
     _emit(asyncio.run(_op()))
 
 
 @command.command("substrate-read")
-@click.argument("symbol", default="SOLUSDT")
+@click.argument("symbol", default=_default_symbol)
 @click.option("--substrate", default=None,
               help="single substrate name (default: all → snapshot)")
 @click.option("--mode", default="compact",
@@ -183,7 +253,7 @@ def substrate_group() -> None:
 
 
 @substrate_group.command("read")
-@click.argument("symbol", default="SOLUSDT")
+@click.argument("symbol", default=_default_symbol)
 @click.option("--substrate", default=None,
               help="single substrate name (default: all → snapshot)")
 @click.option("--mode", default="compact",
@@ -194,7 +264,7 @@ def substrate_group_read(symbol: str, substrate: str | None, mode: str) -> None:
 
 
 @substrate_group.command("invoke")
-@click.argument("symbol", default="SOLUSDT")
+@click.argument("symbol", default=_default_symbol)
 @click.argument("substrates", nargs=-1)
 def substrate_group_invoke(symbol: str, substrates: tuple[str, ...]) -> None:
     """Request bounded fire-ticks from the calculation plane.
@@ -335,11 +405,24 @@ def memory_forget(session_id, memory_id) -> None:
 # reconstructs the book, or fits coefficients in its prompt.
 # --------------------------------------------------------------------------
 
-# Bounded request scope — frozen for the initial soft-test phase.
-_MICRO_ALLOWED_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
-_MICRO_ALLOWED_VENUES = frozenset({"spot"})
+# Bounded request scope — DERIVED from the identity authority, never literal.
+#
+# These were hardcoded to {"BTCUSDT", "SOLUSDT", "ETHUSDT"} and {"spot"},
+# which admitted a symbol nothing captures and FORBADE the venue capture
+# actually writes (futures). The symbol set now comes from Settings.symbols
+# (the capture authority); the venue set from the frozen vocabulary in
+# runtime/scope.py.
 _MICRO_ALLOWED_INTERVALS_S = frozenset({10, 15, 30})
 _MICRO_ALLOWED_WINDOWS_M = frozenset({15, 30, 60})
+
+
+def _micro_allowed_symbols() -> frozenset[str]:
+    """Symbols this runtime captures (Settings is the sole authority)."""
+    return frozenset(_settings().symbols)
+
+
+def _micro_allowed_venues() -> frozenset[str]:
+    return frozenset(VENUES)
 
 
 def _parse_duration_ms(text: str) -> int:
@@ -362,14 +445,16 @@ def _parse_duration_ms(text: str) -> int:
 
 def _validate_micro_request(symbol: str, venue: str, interval_s: int, window_m: int) -> None:
     """Bounded-request gate: reject anything outside the frozen scope."""
-    if symbol.upper() not in _MICRO_ALLOWED_SYMBOLS:
+    allowed_symbols = _micro_allowed_symbols()
+    if symbol.upper() not in allowed_symbols:
         raise click.ClickException(
             f"symbol {symbol} outside the bounded microstructure scope "
-            f"(allowed: {sorted(_MICRO_ALLOWED_SYMBOLS)})"
+            f"(allowed: {sorted(allowed_symbols)})"
         )
-    if venue not in _MICRO_ALLOWED_VENUES:
+    allowed_venues = _micro_allowed_venues()
+    if venue not in allowed_venues:
         raise click.ClickException(
-            f"venue {venue} outside the bounded scope (allowed: {sorted(_MICRO_ALLOWED_VENUES)})"
+            f"venue {venue} outside the bounded scope (allowed: {sorted(allowed_venues)})"
         )
     if interval_s not in _MICRO_ALLOWED_INTERVALS_S:
         raise click.ClickException(
@@ -390,8 +475,9 @@ def microstructure_group() -> None:
 
 
 @microstructure_group.command("fit")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot", help="venue scope (spot only in Pass 3)")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue,
+              help="venue scope (futures|spot|perps; defaults to the runtime venue)")
 @click.option("--interval", "interval_s", type=int, default=10,
               help="OFI interval seconds (10|15|30)")
 @click.option("--fit-window", "window_m", type=int, default=30,
@@ -512,8 +598,8 @@ def micro_fit(symbol: str, venue: str, interval_s: int, window_m: int,
 
 
 @microstructure_group.command("evidence")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--evidence-id", default=None, help="read one exact evidence object")
 @click.option("--latest", "use_latest", is_flag=True, default=True,
               help="read the latest evidence (default)")
@@ -544,8 +630,8 @@ def micro_evidence(symbol: str, venue: str, evidence_id: str | None, use_latest:
 
 
 @microstructure_group.command("interpret")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--evidence-id", default=None, help="interpret one exact evidence object")
 def micro_interpret(symbol: str, venue: str, evidence_id: str | None) -> None:
     """Hand one MicrostructureEvidence to the NOOA interpretation agent.
@@ -618,8 +704,8 @@ def inference_group() -> None:
 
 
 @inference_group.command("run")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--force", is_flag=True,
               help="synthesize a manual wake (the human trigger IS the wake)")
 @click.option("--task", default=None,
@@ -652,6 +738,11 @@ def inference_run(symbol: str, venue: str, force: bool, task: str | None,
                                         task=task, scenario=scenario)
 
     result = asyncio.run(_run())
+    if result.get("status") == "refused":
+        # Identity refusal (0 LLM calls): report and exit non-zero so a
+        # scripted caller cannot mistake a no-op for a cycle.
+        _emit(result)
+        raise click.exceptions.Exit(2)
     answer = result.get("answer")
     if answer:
         # C2 (plan §4.1): the cycle-close stdout surface IS the answer —
@@ -663,8 +754,8 @@ def inference_run(symbol: str, venue: str, force: bool, task: str | None,
 
 
 @inference_group.command("answer")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--run-id", "run_id", default=None,
               help="render the answer of one exact run record")
 def inference_answer(symbol: str, venue: str, run_id: str | None) -> None:
@@ -695,8 +786,8 @@ def inference_answer(symbol: str, venue: str, run_id: str | None) -> None:
 
 
 @inference_group.command("read")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--run-id", "run_id", default=None,
               help="read one exact run record")
 @click.option("--redis-only", is_flag=True, help="skip Postgres; read the live projection")
@@ -716,8 +807,8 @@ def inference_read(symbol: str, venue: str, run_id: str | None,
 
 
 @inference_group.command("history")
-@click.argument("symbol", default="BTCUSDT")
-@click.option("--venue", default="spot")
+@click.argument("symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--limit", type=int, default=20)
 def inference_history(symbol: str, venue: str, limit: int) -> None:
     """Read the diagnostic run history (canonical ledger, newest first)."""

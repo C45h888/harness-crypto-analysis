@@ -25,6 +25,9 @@ from market_service.runtime.contracts import (
 )
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.runtime.scope import (
+    CANONICAL_VENUE, DEFAULT_SYMBOL, Scope,
+)
 
 from . import context
 from .context import (
@@ -143,8 +146,8 @@ class InferenceEngine:
         memory: Any | None,
         llm: Any | None,
         *,
-        symbol: str = "BTCUSDT",
-        venue: str = "spot",
+        symbol: str | None = None,
+        venue: str | None = None,
         session_id: str | None = None,
         settings: Any | None = None,
         answer_sink: Any | None = None,
@@ -153,6 +156,16 @@ class InferenceEngine:
         self.postgres = postgres
         self.memory = memory
         self.llm = llm
+        # IDENTITY: resolved from the ONE authority (runtime/scope.py) when the
+        # caller does not pin it. These defaults used to be the literals
+        # "BTCUSDT" / "spot" — which is how the engine came to analyse an
+        # instrument this runtime does not trade, on a venue capture does not
+        # write, while every internal check reported success.
+        if symbol is None or venue is None:
+            _scope = (Scope.from_settings(settings) if settings is not None
+                      else Scope(DEFAULT_SYMBOL, CANONICAL_VENUE))
+            symbol = symbol or _scope.symbol
+            venue = venue or _scope.venue
         self.symbol = symbol.upper()
         self.venue = venue
         self.session_id = session_id or _stable_session_id(self.symbol, self.venue)
@@ -273,7 +286,8 @@ class InferenceEngine:
         if not isinstance(ds, Mapping):
             return [], ""
         # Prompt isolation: only the context kinds enter narration. VERDICT /
-        # FINDING / SCENARIO rows are audit data and never prompt material.
+        # FINDING rows are audit data, never prompt material (a prior-gate
+        # outcome needs its own non-citable block, not entry into this one).
         rows = ledger_rows(ds, CONTEXT_KINDS, segment=segment)
         if not rows:
             return [], ""
@@ -637,7 +651,7 @@ class InferenceEngine:
                 st._round_had_execution = True  # type: ignore[attr-defined]
                 result, tool_log = await context.execute_tool(
                     self.store, raw_name, args, postgres=self.postgres,
-                    memory=self.memory, settings=self.settings,
+                    memory=self.memory, settings=self.settings, venue=self.venue,
                     session_id=self.session_id,
                     segment=getattr(ctx, "task_id", None),
                 )

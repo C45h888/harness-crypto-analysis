@@ -367,9 +367,7 @@ class ScenarioRegistryTests(unittest.TestCase):
             return {"price_impact_fit": _fit().to_dict()}, {"result": "ok"}
 
         async def _run():
-            with patch.object(dispatch_mod, "_tool_fit_beta", _fake_fit), \
-                 patch("market_service.runtime.read_paths.read_collated",
-                       return_value=None):
+            with patch.object(dispatch_mod, "_tool_fit_beta", _fake_fit):
                 return await dispatch_mod.dispatch_calc_scenario_evaluate(
                     _StubStore(), "SOLUSDT", "futures",
                     target_price="102.00", horizon="15m",

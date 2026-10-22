@@ -20,10 +20,10 @@ SEGMENTS: dict[str, dict] = {
         "description": "warm-plane worker projections per (substrate, symbol) + age_ms",
     },
     "ledger": {
-        "planes": ("redis", "postgres"),
+        "planes": ("redis",),
         "modes": ("snapshot", "inventory", "full"),
         "tools": ("market.read",),
-        "description": "collated envelope ledger, Redis-first / Postgres-fallback",
+        "description": "live venue-scoped projections (microstructure + derivatives + substrate), Redis-only",
     },
     "micro": {
         "planes": ("redis",),
@@ -57,13 +57,6 @@ SEGMENTS: dict[str, dict] = {
 # `full` is human-only everywhere it appears: models may receive it only
 # with an explicit parse warning (see parsing.enforce_mode).
 HUMAN_ONLY_MODES: frozenset[str] = frozenset({"full"})
-
-# Horizon-span slice vocabulary (per-horizon keys — sibling projections of
-# the collated ledger, read via `--read --span <h>`; see runtime/horizon_spans).
-# Phase S-2 (docs/STATE_CHARTER_SPEC.md): resolves to the charter owner by
-# IDENTITY — the same names runtime/horizon_spans (and runtime/horizons)
-# declare, so the interaction plane can never fork the span set.
-from market_service.runtime.horizon_spans import SPAN_HORIZONS
 
 # Outer CLI flag → segment. The CLI adapter (cli.py) routes purely on this.
 FLAG_SEGMENTS: dict[str, str] = {

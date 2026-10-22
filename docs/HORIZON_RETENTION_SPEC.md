@@ -1,7 +1,22 @@
 # Horizon Retention & Worker Cadence Spec — Time-Horizon Segmentation (Phase H1)
 
-Status: **implemented and green — H1 AND the A/B/C rollout landed**
-(1104 tests incl. 48 new horizon/retention/rollout contract tests).
+Status: **retention/cadence landed; the SPAN PLANE described in Part 3 was
+retired (see the record below)**.
+
+> **Retirement record (audit D2).** Part 3 shipped a per-horizon span *plane*
+> (`horizon_spans.build_span` → `publish_horizon_span` / `insert_horizon_span`
+> → `read_horizon_span_latest` / `latest_horizon_span`, surfaced as
+> `--span`). Every writer had zero production callers, so the operator surface
+> could only ever answer `status:"empty"` — indistinguishable from a weak
+> capture. The plane was removed end-to-end (writers, readers, `--span`,
+> `horizon_span` schema registry entry, `tests/test_horizon_spans.py`).
+> `runtime/horizon_spans.py` keeps the horizon NAME vocabulary that the state
+> charter pins. The `horizon_span` table from alembic 0013 is retained as dead
+> storage; nothing reads or writes it, and it can be dropped in a later
+> migration. Part 1 (retention) and Part 2 (worker cadence) are unaffected.
+
+Original status line: implemented and green — H1 AND the A/B/C rollout
+landed (1104 tests incl. 48 new horizon/retention/rollout contract tests).
 Companion to
 `SUBSTRATE_WORKER_SPEC.md` (worker doctrine) and `CANONICAL_RUNTIME_DOCTRINE.md`
 (null discipline, evidence-first). Governs two change vectors decided in the

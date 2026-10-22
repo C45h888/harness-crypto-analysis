@@ -224,6 +224,10 @@ DETERMINISTIC_STATE_ROOTS: frozenset[str] = frozenset({
     # inputs (single writer, needed mid-cycle)
     "task", "scenario", "plan", "acquisition", "scenario_facts",
     "understanding",
+    # identity of the instrument this cycle describes — resolved from the ONE
+    # authority (runtime/scope.py: symbol + canonical venue). Every verdict,
+    # conformance row and tool scope is attributable to it.
+    "scope",
     # lifecycle
     "failure", "terminal", "persistence",
     # chain snapshot (statistical_chain carries chain_halt + base_summary)
@@ -504,6 +508,9 @@ class _EngineTransport:
             memory=self._engine.memory,
             settings=self._engine.settings,
             session_id=self._engine.session_id,
+            # The cycle's venue, never a tool-side default: every
+            # venue-scoped read must target the venue capture writes.
+            venue=getattr(self._engine, "venue", None),
         )
 
     async def call_llm(self, prompt: str) -> str:

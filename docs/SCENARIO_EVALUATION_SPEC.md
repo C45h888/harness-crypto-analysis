@@ -101,11 +101,13 @@ async def dispatch_calc_scenario_evaluate(
   15m/1h/4h).
 - Intervals via the established replay pattern (`read_microstructure_events`
   → `replay_events_from_payloads` → `replay_intervals`).
-- Current price resolved **inside the tool**: `read_paths.read_collated`
-  snapshot (`mark_price ?? last_price`) first, then the TTL-bounded
-  derivatives cache (`futures.funding.mark_price`); both absent/unparseable
-  → refused `no_market_price`. Winning source recorded on `price_source`.
-  The agent never supplies prices (NEVER-recompute rule).
+- Current price resolved **inside the tool**: `read_paths.read_live_price`
+  (LIVE projections only — TTL-bounded derivatives cache
+  `futures.funding.mark_price`, then microstructure evidence
+  `mark_price|last_price|mid_price`, then the venue-scoped book mid); all
+  absent/unparseable → refused `no_market_price`. Winning source recorded on
+  `price_source`. The collated plane is NOT a price source (it has no
+  writer). The agent never supplies prices (NEVER-recompute rule).
 - `horizon` validated against the frozen set; `target_price` parsed to
   Decimal or refused.
 - Returns `(result, capability_log_entry(...))` with

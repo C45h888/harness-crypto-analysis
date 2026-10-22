@@ -50,7 +50,6 @@ from .pipeline_interpretation import (  # noqa: F401
     MACRO_SYMBOLS,
     _keystone_snapshot_payload,
     _wall_snapshot_payload,
-    assemble_envelope,
     fetch_derivative_evidence,
 )
 
@@ -60,7 +59,6 @@ __all__ = [
     "GROUP_MAP",
     "MACRO_SYMBOLS",
     "WINDOW_MINUTES_MAP",
-    "assemble_envelope",
     "fetch_derivative_evidence",
     "read_raw_window",
     "run_analysis",

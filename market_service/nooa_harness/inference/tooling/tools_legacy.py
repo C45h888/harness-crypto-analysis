@@ -321,27 +321,18 @@ async def dispatch_calc_scenario_evaluate(
         dsf_dict = evidence_dict.get("depth_scaling_fit")
         depth_fit = (_depth_fit_from_dict(dsf_dict)
                      if isinstance(dsf_dict, dict) else None)
-        # Current price: tool-resolved. Collated snapshot first (mark ?? last),
-        # then the TTL-bounded derivatives cache (funding.mark_price — same
-        # exchange, Redis-expiry enforced, so a stale quote can never sneak in).
-        payload = await read_paths.read_collated(store, symbol.upper())
-        snap = read_paths.market_snapshot(payload) if payload is not None else {}
-        current_raw = snap.get("mark_price") or snap.get("last_price")
-        price_source = ("snapshot:" + ("mark_price" if snap.get("mark_price")
-                                         else "last_price")) if current_raw else None
-        if current_raw is None:
-            deriv = await store.read_derivative_evidence(symbol.upper())
-            futures = (deriv or {}).get("futures") or {}
-            funding = futures.get("funding") or {}
-            current_raw = funding.get("mark_price")
-            price_source = "derivatives:funding.mark_price" if current_raw else None
+        # Current price: tool-resolved from LIVE projections (derivatives
+        # cache first, then microstructure evidence/book) — never the
+        # collated plane, which has no writer.
+        current_raw, price_source = await read_paths.read_live_price(
+            store, symbol.upper(), venue)
         try:
             current_dec = Decimal(str(current_raw))
         except (InvalidOperation, ValueError, TypeError):
             return None, capability_log_entry(
                 cap.name, scope, "ok",
                 detail={"status": "refused",
-                        "reason": "no_market_price: collated snapshot and derivatives cache carry no usable price"},
+                        "reason": "no_market_price: live projections carry no usable price"},
             )
         if current_dec <= 0:
             return None, capability_log_entry(

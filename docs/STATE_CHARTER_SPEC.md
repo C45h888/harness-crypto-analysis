@@ -72,7 +72,7 @@ All verified by grep; the same width constants with zero imports between them:
 | # | Claimant | What it defines |
 |---|---|---|
 | 1 | `runtime/horizons.py` (H1) | `HORIZON_PERIOD_MS` {15m,1h,4h} + IST alignment + fold primitives — **the worker-plane owner**, consumed by `substrate_worker/core/base.py` |
-| 2 | `runtime/horizon_spans.py` | `NATIVE_HORIZONS` (1s/5s/30s/60s) + `LONG_HORIZONS` (15m/1h/4h) + `SPAN_HORIZONS` + `regime()` + own schema version |
+| 2 | `runtime/horizon_spans.py` | `NATIVE_HORIZONS` (1s/5s/30s/60s) + `LONG_HORIZONS` (15m/1h/4h) + `SPAN_HORIZONS` + `regime()` (names only — the span PAYLOAD plane and its `horizon_span` schema version were retired; nothing writes or reads spans) |
 | 3 | `microstructure/fitting_route_c.py` | `FORWARD_HORIZONS_MS` (1000/5000/30000/60000) — the native fits' numeric authority |
 | 4 | `microstructure/horizon_bridge.py` | `NATIVE_HORIZONS_MS` tuple — **self-declared mirror** ("Mirrors fitting_route_c / task_directive — kept equal by test — see tests/test_horizon_bridge.py"). That test **does not exist** (only `test_fix_plane.py:51` partially pins the fitting_route_c side) |
 | 5 | `engine/task_directive.py` | `NATIVE_HORIZONS_MS` dict + `LONG_HORIZONS_MS` — **self-declared mirror** ("mirror the deterministic plane; kept in sync by test, by value") |

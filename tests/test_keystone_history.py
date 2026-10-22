@@ -2,9 +2,7 @@
 
 Covers:
 - keystone_cycle_migration (pure cross-cycle migration verdict)
-- PostgresRuntimeStore._opt_float (null-discipline coercion)
 - _keystone_snapshot_payload (pipeline payload assembly, null discipline)
-- harness _projection signal inventory (scalar headlines, bounded)
 """
 
 from __future__ import annotations
@@ -80,18 +78,6 @@ class KeystoneCycleMigrationTests(unittest.TestCase):
         self.assertEqual(r["cycles"], [])
 
 
-class OptFloatTests(unittest.TestCase):
-    def test_null_discipline(self):
-        from market_service.runtime.postgres_store import PostgresRuntimeStore
-        f = PostgresRuntimeStore._opt_float
-        self.assertIsNone(f(None))
-        self.assertIsNone(f("garbage"))
-        self.assertIsNone(f(float("nan")))
-        self.assertIsNone(f(float("inf")))
-        self.assertAlmostEqual(f("93.5"), 93.5)
-        self.assertAlmostEqual(f(93.5), 93.5)
-
-
 class KeystoneSnapshotPayloadTests(unittest.TestCase):
     def test_null_discipline_on_missing_keystone(self):
         from market_service.nooa_harness.pipeline import _keystone_snapshot_payload
@@ -120,42 +106,6 @@ class KeystoneSnapshotPayloadTests(unittest.TestCase):
         self.assertAlmostEqual(payload["tight_hi"], 93.55)
         self.assertAlmostEqual(payload["keystone_bid_qty"], 14870.0)
         self.assertAlmostEqual(payload["ask_ladder_notional"], 41431290.0)
-
-
-class ProjectionInventoryTests(unittest.TestCase):
-    def test_signal_inventory_and_headlines(self):
-        from market_service.runtime import read_paths
-        env = {
-            "schema_version": 1, "symbol": "SOLUSDT", "status": "healthy",
-            "canonical_state": {
-                "calculations": {"calculations": {
-                    "orderbook": {
-                        "fut_keystone": {"bid": 93.5, "ask": 93.69},
-                        "keystone_bid_stack": {"tight": {"total_qty": 100.0}},
-                        "ask_wall_ladder": {"total_notional": 999.0},
-                        "keystone_trade_intensity": {"tight": {"buy_qty": 1.0, "sell_qty": 2.0}},
-                        "hourly_keystone_migration": {"verdict": "FLAT"},
-                    },
-                    "technical": {"seller_aggression": {"classification": "MEDIUM"}},
-                }},
-                "analysis": {"analysis": {"wall_migration": {}}},
-            },
-        }
-        out = read_paths.market_inventory(env)
-        self.assertIn("fut_keystone", out["orderbook_keys"])
-        self.assertIn("seller_aggression", out["technical_keys"])
-        # Headlines live inside the snapshot sub-projection now
-        snap = out["snapshot"]
-        self.assertEqual(snap["fut_keystone_bid"], 93.5)
-        self.assertEqual(snap["seller_aggression"], "MEDIUM")
-        self.assertEqual(snap["hourly_keystone_verdict"], "FLAT")
-
-    def test_headlines_null_when_absent(self):
-        from market_service.runtime import read_paths
-        out = read_paths.market_inventory({"canonical_state": {}})
-        snap = out["snapshot"]
-        self.assertIsNone(snap["fut_keystone_bid"])
-        self.assertIsNone(snap["seller_aggression"])
 
 
 if __name__ == "__main__":

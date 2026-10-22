@@ -51,7 +51,7 @@ class MicrostructureSettings:
     redis_url: str
     redis_prefix: str
     symbol: str
-    venue: str = "spot"
+    venue: str = "futures"
     stream_maxlen: int = 100_000
     snapshot_levels: int = 1_000
     reconnect_seconds: int = 2

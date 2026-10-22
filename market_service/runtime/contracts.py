@@ -31,7 +31,6 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     "substrate_state": 2,
     "microstructure": 1,
     "interaction_budget": 1,
-    "horizon_span": 1,
     "group_envelope": 1,
     "directive": 1,
     # Engine scenario contract (nooa_harness/engine/scenario_contract.py) —

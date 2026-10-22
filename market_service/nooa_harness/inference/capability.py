@@ -29,10 +29,17 @@ class Capability:
     allowed_venues: frozenset[str]
 
     def validate_scope(self, symbol: str, venue: str) -> None:
-        if symbol.upper() not in self.allowed_symbols:
+        """Format gate: well-formed symbol, known venue vocabulary.
+
+        This does NOT decide whether the symbol is captured — liveness is
+        enforced at the dispatch seams (wake, ``run_inference_once``, and
+        each tool's live control-key check) via ``validate_live_scope``.
+        A static set cannot know a runtime re-point, so it must never be
+        the authority on what is captured.
+        """
+        if not str(symbol or "").strip():
             raise CapabilityDenied(
-                f"capability {self.name!r} denied: symbol {symbol} outside "
-                f"bounded scope {sorted(self.allowed_symbols)}"
+                f"capability {self.name!r} denied: symbol is required"
             )
         if venue not in self.allowed_venues:
             raise CapabilityDenied(
@@ -40,12 +47,29 @@ class Capability:
                 f"bounded scope {sorted(self.allowed_venues)}"
             )
 
+    def validate_live_scope(
+        self, symbol: str, active_symbols: tuple[str, ...] | list[str] | None,
+    ) -> None:
+        """Liveness gate: refuse symbols nothing captures.
 
-# Frozen initial scope — extended for SOL-USDT perps (per/user request).
-# Microstructure capture remains spot-only (event-level tape), but
-# calculation modules (substrate tools/market.read) are venue-agnostic via raw poller
-# which fetches spot + USD-M perps. This lets inference validate SOL perps
-# statistically even when micro evidence is spot-derived.
+        ``active_symbols`` is the live resolved set (Redis control key >
+        env). ``None``/empty means "unknown — defer to the wake guard"
+        so a store-less probe never invents a refusal.
+        """
+        if not active_symbols:
+            return
+        if symbol.upper() not in {s.upper() for s in active_symbols}:
+            raise CapabilityDenied(
+                f"capability {self.name!r} denied: symbol_not_captured: "
+                f"{symbol} is not in the live active set "
+                f"({', '.join(active_symbols)}) — refusing before any work"
+            )
+
+
+# Static format bound for the capability gates. Liveness ("is this symbol
+# captured right now?") is NOT decided here — the wake guard, the
+# inference runner, and each tool's live control-key check own that, since
+# a static set cannot track a runtime re-point of the poller control key.
 _INITIAL_SYMBOLS = frozenset({"BTCUSDT", "SOLUSDT", "ETHUSDT"})
 _INITIAL_VENUES = frozenset({"spot", "perps", "perp", "usdm", "futures"})
 
@@ -98,7 +122,7 @@ _MARKET_TOOLS: dict[str, Capability] = {
     for name, description in {
         "redis.read_intervals": "Read completed OFI interval rows from the capture ledger.",
         "redis.read_evidence": "Read the latest immutable MicrostructureEvidence projection.",
-        "market.read": "Read the latest collated market run from Redis. Modes: snapshot (bounded headline view, default), inventory (section keys + snapshot), full (raw payload deep-dive).",
+        "market.read": "Read live venue-scoped projections (microstructure + derivatives + substrate), each with age_ms. Modes: snapshot (default), inventory, surfaces, full.",
         "market.read_derivatives": "Read the cached derivative evidence (funding, OI, cross-asset).",
         "market.read_keystone_history": "Read the bounded keystone cross-cycle ledger.",
         "market.read_wall_history": "Read the bounded wall cross-cycle ledger.",

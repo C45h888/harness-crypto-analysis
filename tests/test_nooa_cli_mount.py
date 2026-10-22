@@ -43,7 +43,7 @@ class NooaCliMountTests(unittest.TestCase):
         names = set(_MOUNTED.commands["market"].commands)
         self.assertEqual(
             names,
-            {"read", "memory", "microstructure", "inference",
+            {"read", "scope", "memory", "microstructure", "inference",
              "substrate-read", "substrate", "telemetry"},
         )
 

@@ -112,6 +112,11 @@ class Settings:
     symbols: tuple[str, ...]
     poll_symbols: tuple[str, ...]
     poll_seconds: int
+    # The venue this runtime trades (runtime/scope.py owns the vocabulary).
+    # Resolved from MICROSTRUCTURE_VENUE — the SAME env var the capture
+    # container reads — so the engine and capture can never disagree. A
+    # default is required here rather than optional: a missing env var must
+    # not silently point the engine at a venue capture is not writing.
     flow_window_seconds: int
     depth_levels: int
     max_domain_state_age_seconds: int = 90
@@ -136,6 +141,7 @@ class Settings:
     # capacity at the poll cadence or the count cap silently shortens the
     # time retention. Spec §1.3: 20 000 entries ≈ 28h at 5s cadence.
     redis_raw_guardrail_maxlen: int = 20_000
+    venue: str = "futures"
     wall_scorecard_weights: dict[str, float] = field(default_factory=lambda: {
         # Each weight scales the corresponding factor's raw contribution
         # (0 / 1 / 2 from the legacy ladder). Default weight 1.0
@@ -179,6 +185,13 @@ class Settings:
 
     @classmethod
     def _resolve(cls, *, require_db: bool) -> "Settings":
+        # Function-level import: runtime/__init__ pulls in contracts, so a
+        # module-level import here would risk a cycle. scope.py itself is
+        # dependency-free (dataclasses + typing).
+        from market_service.runtime.scope import (
+            DEFAULT_SYMBOL, DEFAULT_VENUE, normalize_venue,
+        )
+
         url = os.getenv("DATABASE_URL")
         if require_db and not url:
             raise ValueError(
@@ -186,9 +199,16 @@ class Settings:
                 "Use Settings.from_redis_env() for Redis-only paths."
             )
         redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-        symbols = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip())
+        # Default matches the instrument this runtime actually trades. The
+        # old BTCUSDT,ETHUSDT,SOLUSDT default silently reactivated a symbol
+        # nothing was capturing whenever .env was absent.
+        symbols = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOL).split(",") if s.strip())
         if not symbols:
             raise ValueError("SYMBOLS must contain at least one symbol")
+        # Venue comes from the SAME env var the capture container reads, so
+        # engine reads and capture writes always agree. Normalised + validated
+        # here (raises on an unknown venue rather than coercing).
+        venue = normalize_venue(os.getenv("MICROSTRUCTURE_VENUE", DEFAULT_VENUE))
         # POLL_SYMBOLS: the subset the poller actively pulls. Separates
         # "what exists in the system" (SYMBOLS) from "what the poller
         # spends Binance weight on". Empty/unset -> full SYMBOLS set.
@@ -208,6 +228,7 @@ class Settings:
             wall_history_maxlen=_positive_int("WALL_HISTORY_MAXLEN", 200),
             symbols=symbols,
             poll_symbols=poll_env or symbols,
+            venue=venue,
             poll_seconds=_positive_int("POLL_SECONDS", 5),
             flow_window_seconds=_positive_int("FLOW_WINDOW_SECONDS", 300),
             depth_levels=default_depth_levels(),

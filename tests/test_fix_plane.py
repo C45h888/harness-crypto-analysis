@@ -337,7 +337,15 @@ class EmptyReadSurfaceTests(unittest.TestCase):
         result, _log = asyncio.run(dispatch_market_read(
             _Store(), "SOLUSDT", venue="futures", mode="surfaces"))
         self.assertIn("surfaces", result)
-        self.assertTrue(result["available_surfaces"])
+        # The inventory names the LIVE planes this tool actually consults.
+        # The former collated / domain / wall / keystone planes were dropped:
+        # their publishers have no production caller, so an inventory of them
+        # described data nothing writes.
+        self.assertEqual(
+            set(result["surfaces"]),
+            {"microstructure", "derivatives", "substrate"})
+        self.assertIn("read_tools", result)
+        self.assertIn("market.read", result["read_tools"])
 
 
 class ArgContractTests(unittest.TestCase):

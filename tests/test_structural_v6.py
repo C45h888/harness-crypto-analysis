@@ -12,8 +12,6 @@ def _fake_store():
         prefix = "test"
         redis = _Redis()
 
-        async def read_collated(self, *a, **k):
-            return None
     return _Store()
 
 

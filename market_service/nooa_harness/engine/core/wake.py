@@ -34,6 +34,9 @@ import logging
 from typing import Any
 
 from market_service.runtime.contracts import WakeEnvelope
+from market_service.runtime.scope import (
+    CANONICAL_VENUE, DEFAULT_SYMBOL, Scope,
+)
 
 from . import context
 from .context import CycleRuntimeState, _CycleContext
@@ -177,6 +180,19 @@ def run_wake(
     cycle capability log with bounded task preview. Canonical ownership lives
     here; the runner calls this function directly (driver boundary).
     """
+    # Identity guard (defensive). ``run_inference_once`` already refuses an
+    # uncaptured symbol before constructing the engine, but a directly
+    # injected WakeEnvelope bypasses that seam. Refuse here too — before the
+    # controller exists — so no observation is ever opened for an instrument
+    # nothing captures. Cheap: no LLM call, no store write.
+    _settings = getattr(engine, "settings", None)
+    _captured = tuple(getattr(_settings, "symbols", ()) or ())
+    _symbol = str(getattr(engine, "symbol", "") or "").upper()
+    if _captured and _symbol and _symbol not in _captured:
+        raise context.GovernanceDenied(
+            f"symbol_not_captured: {_symbol} is not in Settings.symbols "
+            f"({', '.join(_captured)}) — refusing to open a cycle"
+        )
     # Canonical injection: the raw CLI prompt normalizes ONCE here into the
     # PromptVariable; every downstream consumer reads its bounded fields.
     prompt = PromptVariable.from_cli(task, scenario)
@@ -305,9 +321,23 @@ async def run_comprehension(
     # microstructure_evidence / data_quality are None placeholders
     # until the agent pulls the reads (null = not-provided, never
     # zero); plan-bound acquisition merges forecast/scenario in place.
+    # The identity every verdict in this cycle describes. Resolved from the
+    # ONE authority (runtime/scope.py) and read off the injected engine, so a
+    # finding, a conformance row, or a tool scope can never be attributed to
+    # an instrument the runtime is not trading.
+    _fallback = (
+        Scope.from_settings(engine.settings)
+        if getattr(engine, "settings", None) is not None
+        else Scope(DEFAULT_SYMBOL, CANONICAL_VENUE)
+    )
+    _scope = Scope(
+        symbol=getattr(engine, "symbol", None) or _fallback.symbol,
+        venue=getattr(engine, "venue", None) or _fallback.venue,
+    )
     deterministic_state: dict[str, Any] = {
         "task": prompt.raw,
         "scenario": scenario,
+        "scope": _scope.to_state(),
         # One acquisition root (legacy keys are artifact projections).
         "acquisition": {
             "wake": {

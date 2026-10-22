@@ -48,10 +48,15 @@ class LedgerKind(str, Enum):
     OBSERVATION = "observation"      # what was derived (base/refined readings)
     VERDICT = "verdict"              # gate outcome (guard or loop close)
     FINDING = "finding"              # advisory/finding rows (never gate authority)
-    SCENARIO = "scenario"            # frozen scenario contract facts
 
 
-# The canonical section order (append + render). VERDICT/FINDING/SCENARIO are
+# Scenario facts are NOT a ledger kind: they live on the chartered
+# ``deterministic_state["scenario_facts"]`` root (one dict, stage-written,
+# projected by engine/projections.py). A ``SCENARIO`` member was declared here
+# with zero writers and zero readers — a kind nothing honoured. Deleted rather
+# than left as a third home for the same facts.
+
+# The canonical section order (append + render). VERDICT/FINDING are
 # audit rows: they are never rendered into the narration prompt.
 LEDGER_ORDER: tuple[LedgerKind, ...] = (
     LedgerKind.UNDERSTANDING,

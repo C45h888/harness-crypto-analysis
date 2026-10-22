@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from market_service.interaction_plane.cli import (
     _poller_control,
-    _read_horizon,
     _read_keystone_history,
     _read_market,
     _read_microstructure_status,
@@ -21,7 +20,6 @@ from market_service.interaction_plane.cli import (
 
 __all__ = [
     "_poller_control",
-    "_read_horizon",
     "_read_keystone_history",
     "_read_market",
     "_read_microstructure_status",

@@ -257,9 +257,8 @@ async def dispatch_calc_forward_scenario(
         except ValueError as vex:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": str(vex), "fit_id": fit.fit_id})
-        payload = await read_paths.read_collated(store, symbol.upper())
-        snap = read_paths.market_snapshot(payload) if payload is not None else {}
-        spot_raw = snap.get("mark_price") or snap.get("last_price")
+        spot_raw, _price_source = await read_paths.read_live_price(
+            store, symbol.upper(), venue)
         if spot_raw is None:
             return None, capability_log_entry(cap.name, scope, "ok",
                 detail={"status": "refused", "reason": "no_market_price"})

@@ -88,32 +88,6 @@ class HarnessRouteDispatchTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         mock_read.assert_awaited_once()
 
-class HarnessInventoryProjectionTests(unittest.TestCase):
-    """Compact inventory projection (shared read_paths surface)."""
-
-    def test_projection_strips_raw_evidence(self):
-        env = {
-            "schema_version": 1, "symbol": "SOLUSDT", "status": "healthy",
-            "generated_at": "2024-01-01T00:00:00Z", "completed_at": "2024-01-01T00:00:00Z",
-            "coverage": {}, "run_id": "uuid",
-            "canonical_state": {
-                "analysis": {
-                    "analysis": {
-                        "auction": {"verdict": "X"},
-                        "delta": {"delta": 0.5},
-                        "demand": {"verdict": "Y"},
-                    }
-                }
-            },
-        }
-        proj = read_paths.market_inventory(env)
-        self.assertEqual(proj["symbol"], "SOLUSDT")
-        self.assertEqual(proj["run_id"], "uuid")
-        self.assertNotIn("canonical_state", proj)
-        self.assertIn("analysis_keys", proj)
-        self.assertEqual(sorted(proj["analysis_keys"]),
-                         ["auction", "delta", "demand"])
-
 class HarnessReadToolTests(unittest.TestCase):
     """The designated outer-CLI read tool (``--read``): parser + schema guard."""
 
@@ -136,93 +110,6 @@ class HarnessReadToolTests(unittest.TestCase):
             p.parse_args(["SOLUSDT", "--read", "--mode", "bogus"])
 
 
-class ReadCollatedFallbackTests(unittest.IsolatedAsyncioTestCase):
-    """``read_paths.read_collated_with_fallback``: redis-first, pg-fallback, guard."""
-
-    _PAYLOAD = {
-        "schema_version": 1,
-        "symbol": "SOLUSDT",
-        "run_id": "r-unique",
-        "status": "healthy",
-        "generated_at": "2026-09-02T00:00:00Z",
-        "completed_at": "2026-09-02T00:00:00Z",
-        "data_source": "binance",
-        "canonical_state": {
-            "data-access": {"evidence": {"futures": {}}},
-            "calculations": {"calculations": {}},
-            "analysis": {"analysis": {}},
-        },
-    }
-
-    class FakeRedis:
-        def __init__(self, latest: object = None, prefix: str = "marketflow"):
-            self.prefix = prefix
-            self._latest = latest
-            self.redis = self._Client(self)
-
-        class _Client:
-            def __init__(self, outer: ReadCollatedFallbackTests.FakeRedis):
-                self._outer = outer
-
-            async def get(self, _key: str) -> object:
-                return self._outer._latest
-
-        def collated_latest_key(self, symbol: str) -> str:
-            return f"{self.prefix}:latest:{symbol.upper()}:collated"
-
-    class FakePg:
-        def __init__(self, latest: object = None, by_run: object = None):
-            self.latest = latest
-            self.by_run = by_run
-
-        async def latest_run(self, _symbol: str) -> object:
-            return self.latest
-
-        async def read_run(self, _run_id: str) -> object:
-            return self.by_run
-
-    async def test_redis_hit_tagged_redis(self):
-        redis = self.FakeRedis('{"schema_version": 1, "run_id": "r-unique"}')
-        payload, source = await read_paths.read_collated_with_fallback(
-            redis, self.FakePg(), symbol="SOLUSDT")
-        self.assertEqual(source, "redis")
-        self.assertEqual(payload["run_id"], "r-unique")
-
-    async def test_redis_miss_falls_back_to_postgres(self):
-        redis = self.FakeRedis(latest=None)
-        pg = self.FakePg(latest=dict(self._PAYLOAD))
-        payload, source = await read_paths.read_collated_with_fallback(
-            redis, pg, symbol="SOLUSDT")
-        self.assertEqual(source, "postgres")
-        self.assertEqual(payload["run_id"], "r-unique")
-
-    async def test_both_miss_return_none(self):
-        payload, source = await read_paths.read_collated_with_fallback(
-            self.FakeRedis(latest=None), self.FakePg(), symbol="SOLUSDT")
-        self.assertIsNone(payload)
-        self.assertIsNone(source)
-
-    async def test_postgres_absent_degrades_to_redis(self):
-        payload, source = await read_paths.read_collated_with_fallback(
-            self.FakeRedis(latest=None), None, symbol="SOLUSDT")
-        self.assertIsNone(payload)
-        self.assertIsNone(source)
-
-    async def test_postgres_schema_mismatch_raises(self):
-        redis = self.FakeRedis(latest=None)
-        pg = self.FakePg(latest={"schema_version": 99})
-        with self.assertRaises(ValueError):
-            await read_paths.read_collated_with_fallback(redis, pg, symbol="SOLUSDT")
-
-    async def test_run_id_addr_redis_first_then_postgres(self):
-        redis = self.FakeRedis(latest=None)  # simulated run-id redis miss
-        pg = self.FakePg(by_run=dict(self._PAYLOAD))
-        payload, source = await read_paths.read_collated_with_fallback(
-            redis, pg, run_id="r-unique")
-        self.assertEqual(source, "postgres")
-        self.assertEqual(payload["run_id"], "r-unique")
-
-
 class HarnessReadMarketHandlerTests(unittest.IsolatedAsyncioTestCase):
     """``_read_market`` mode routing + source tagging + empty-read discipline."""
 
@@ -232,18 +119,20 @@ class HarnessReadMarketHandlerTests(unittest.IsolatedAsyncioTestCase):
         return argparse.Namespace(**base)
 
     async def test_snapshot_returns_projection_with_source(self):
-        from tests._nooa_fixtures import _SAMPLE_ENVELOPE
-
-        env = dict(_SAMPLE_ENVELOPE)
+        # The live read shape (dispatch_market_read): every section carries its
+        # own age_ms; there is no collated-envelope projection to unwrap.
+        live = {
+            "symbol": "SOLUSDT", "venue": "futures", "status": "ok",
+            "source": "redis", "mode": "snapshot",
+            "sections": {
+                "microstructure": {"available": True, "age_ms": 5,
+                                   "last_price": "93.5"},
+            },
+        }
         with patch("market_service.interaction_plane.reads.read_ledger") as m_ledger:
             async def _ledger(symbol, *, run_id=None, mode="snapshot",
                               include_errors=False):
-                from market_service.runtime import read_paths as _rp
-                return ({
-                    "symbol": symbol, "run_id": env.get("run_id"),
-                    "source": "redis", "mode": mode,
-                    "read": _rp.market_snapshot(env),
-                }, "redis", None)
+                return (dict(live, symbol=symbol, mode=mode), "redis", None)
             m_ledger.side_effect = _ledger
             result, source = await _read_market(self._args(), "snapshot")
         self.assertEqual(source, "redis")
@@ -251,7 +140,11 @@ class HarnessReadMarketHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ok")
         self.assertIn("data", result)
         self.assertIn("budget_receipt", result)
-        self.assertIn("read", result["data"])
+        # The live payload IS the data (no envelope re-projection): every
+        # section carries the age_ms the read measured.
+        self.assertIn("sections", result["data"])
+        self.assertEqual(
+            result["data"]["sections"]["microstructure"]["age_ms"], 5)
 
     async def test_empty_read_returns_empty_envelope(self):
         with patch("market_service.interaction_plane.reads.read_ledger") as m_ledger, \

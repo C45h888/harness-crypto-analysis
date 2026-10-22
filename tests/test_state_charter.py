@@ -101,10 +101,9 @@ class HorizonNamespaceTests(unittest.TestCase):
         self.assertIs(horizon_spans.LONG_HORIZONS, horizons.HORIZON_NAMES)
         self.assertIs(horizon_spans.SPAN_HORIZONS,
                       horizons.SPAN_HORIZON_NAMES)
-        # Interaction plane's span slice vocabulary is the SAME object.
-        from market_service.interaction_plane import segments as seg
-        from market_service.runtime import horizon_spans as spans
-        self.assertIs(seg.SPAN_HORIZONS, spans.SPAN_HORIZONS)
+        # The span slice surface (interaction_plane --span + the horizon_span
+        # plane) is retired, so the interaction plane no longer re-exports this
+        # vocabulary at all: there is exactly one claimant left.
 
     def test_no_module_outside_the_owner_defines_horizon_numbers(self):
         """AST scan: any MODULE-LEVEL assignment whose target name mentions

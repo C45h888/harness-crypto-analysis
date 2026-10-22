@@ -30,6 +30,9 @@ from market_service.nooa_harness.engine import InferenceEngine
 from market_service.runtime.contracts import WakeEnvelope
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
+from market_service.runtime.scope import (
+    Scope, normalize_symbol, normalize_venue,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,14 +68,20 @@ def _build_memory(settings: Settings):
 
 
 async def _build_engine(
-    settings: Settings, *, symbol: str, venue: str = "spot",
+    settings: Settings, *, symbol: str, venue: str | None = None,
 ) -> InferenceEngine:
     """Assemble the engine with its stores, memory, and narration LLM.
 
     ONE Settings object (already resolved by the caller) is constructed
     here and injected into the engine — tools never re-read the environment
     (two-plane boundary pass).
+
+    ``venue`` defaults to the scope resolved from Settings (futures), never
+    to a literal: the engine's venue must match the venue capture writes or
+    every venue-scoped microstructure read silently returns zero intervals.
     """
+    if venue is None:
+        venue = Scope.from_settings(settings).venue
     store = RedisRuntimeStore(
         settings.redis_url, settings.redis_key_prefix, settings.redis_stream_maxlen,
     )
@@ -93,7 +102,7 @@ async def _build_engine(
 
 
 async def run_inference_once(
-    symbol: str, *, venue: str = "spot", force: bool = False,
+    symbol: str | None = None, *, venue: str | None = None, force: bool = False,
     envelope: WakeEnvelope | None = None,
     task: str | None = None,
     scenario: dict[str, Any] | None = None,
@@ -113,9 +122,52 @@ async def run_inference_once(
     ``deterministic_state["scenario"]``.
     Neither envelope nor force → ``{"status": "no_wake"}`` — nothing
     computed, nothing persisted, never a fabricated cycle.
+
+    Identity is resolved ONCE from the live set (Redis control key > env)
+    and an uncaptured symbol is REFUSED here — before the engine, the LLM
+    client, or any store write is constructed. A cycle that cannot possibly
+    read data must not cost nine narration turns to discover that.
     """
     settings = Settings.from_env()
-    engine = await _build_engine(settings, symbol=symbol.upper(), venue=venue)
+    resolved = Scope.from_settings(settings)
+    resolved_symbol = normalize_symbol(symbol) if symbol else resolved.symbol
+    resolved_venue = normalize_venue(venue) if venue else resolved.venue
+    # Live active set: the poller control key wins when present (a runtime
+    # re-point takes effect without restart); env is the fallback.
+    live_symbols: tuple[str, ...] | None = None
+    try:
+        _probe = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            live_symbols = await _probe.read_poller_symbols()
+        finally:
+            await _probe.close()
+    except Exception:  # noqa: BLE001 — liveness is best-effort here
+        live_symbols = None
+    captured = tuple(live_symbols) if live_symbols else tuple(settings.symbols)
+    if resolved_symbol not in captured:
+        # Fail closed, cheaply: no engine, no LLM, no artifact, no write.
+        log.warning(
+            "refusing cycle: %s is not captured (captured: %s)",
+            resolved_symbol, ", ".join(captured),
+        )
+        return {
+            "status": "refused",
+            "reason": "symbol_not_captured",
+            "symbol": resolved_symbol,
+            "venue": resolved_venue,
+            "captured": list(captured),
+            "message": (
+                f"{resolved_symbol} is not captured by this runtime "
+                f"(captured: {', '.join(captured)}) — nothing to "
+                "analyse; no cycle was run"
+            ),
+        }
+    engine = await _build_engine(
+        settings, symbol=resolved_symbol, venue=resolved_venue,
+    )
     try:
         if envelope is not None:
             wake, wake_meta = envelope, {
@@ -127,8 +179,8 @@ async def run_inference_once(
         else:
             return {
                 "status": "no_wake",
-                "symbol": symbol.upper(),
-                "venue": venue,
+                "symbol": resolved_symbol,
+                "venue": resolved_venue,
                 "decision": {"source": "none", "reason": "no envelope and not forced"},
             }
         artifact, cycle_meta = await engine.narrate_cycle(

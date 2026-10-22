@@ -46,61 +46,6 @@ def _trade(ts: int, tid: int, qty: float = 1.0, maker: bool = False) -> dict[str
             "quote_qty": 100.0 * qty, "is_buyer_maker": maker, "side": "buy"}
 
 
-class EnvelopeSummaryProjectionTests(unittest.TestCase):
-    """The snapshot reads REAL payload paths — no math, no dead keys."""
-
-    def _envelope(self) -> dict[str, Any]:
-        from market_service.runtime import read_paths
-        return read_paths.market_snapshot({
-            "schema_version": 1,
-            "symbol": "SOLUSDT",
-            "status": "healthy",
-            "generated_at": "2026-01-01T00:00:00+00:00",
-            "completed_at": "2026-01-01T00:00:01+00:00",
-            "data_source": "domain_pipeline",
-            "coverage": {"domain_status": {"data-access": "healthy"}},
-            "errors": [],
-            "canonical_state": {
-                "data-access": {"status": "healthy", "errors": [], "evidence": {
-                    "futures": {
-                        "ticker_24h": {"last_price": 100.5, "quote_volume": 900.0,
-                                        "high_price": 101.0, "low_price": 99.0},
-                        "funding": {"last_funding_rate": 0.0001, "mark_price": 100.4},
-                        "open_interest": {"open_interest": 12345.0},
-                    },
-                }},
-                "calculations": {"calculations": {"flow": {
-                    "spot_flow": {"cvd": 12.0},
-                    "futures_flow": {"cvd": -3.5},
-                }}},
-                "analysis": {"analysis": {"demand": {"decomposition": {
-                    "spot": {"obi": 0.2}, "futures": {"obi": -0.1},
-                }}}},
-            },
-        })
-
-    def test_snake_case_paths_are_read(self):
-        s = self._envelope()
-        # Client normalizes Binance camelCase → snake_case at its boundary;
-        # the summary must read the normalized keys.
-        self.assertEqual(s["last_price"], 100.5)
-        self.assertEqual(s["volume_24h"], 900.0)
-        self.assertEqual(s["funding_rate"], 0.0001)
-        self.assertEqual(s["mark_price"], 100.4)
-        self.assertEqual(s["open_interest"], 12345.0)
-
-    def test_cvd_is_read_from_calculations_layer(self):
-        s = self._envelope()
-        self.assertEqual(s["spot_cvd"], 12.0)
-        self.assertEqual(s["futures_cvd"], -3.5)
-
-    def test_missing_values_stay_null(self):
-        s = self._envelope()
-        self.assertIsNone(s["spot_obi"] if s["spot_obi"] is None else None) if False else None
-        self.assertEqual(s["spot_obi"], 0.2)
-        self.assertEqual(s["futures_obi"], -0.1)
-
-
 class FindKeystoneBidAliasTests(unittest.TestCase):
     def test_bid_alias_is_native(self):
         bids = [[99.9, 5.0], [99.85, 10.0], [99.8, 2.0]]

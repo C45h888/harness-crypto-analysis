@@ -67,13 +67,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="scenario horizon (default 1h)")
     p.add_argument("--history-limit", type=int, default=100,
                    help="max keystone history entries (default 100)")
-    p.add_argument("--span", default=None,
-                   choices=("1s", "5s", "30s", "60s", "15m", "1h", "4h"),
-                   help="horizon-span slice: read one deterministic horizon block "
-                        "(Redis latest:horizon → Postgres fallback). "
-                        "Native 1s/5s/30s/60s fit directly; long 15m/1h/4h are "
-                        "bridge projections (extrapolated, provisional). "
-                        "Unset = headline behavior (unchanged).")
     p.add_argument("--describe-interaction", action="store_true",
                    help="emit the segment/mode/budget/prompt manifest and exit")
     return p
@@ -106,15 +99,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.read:
-        if args.span is not None:
-            result, source = asyncio.run(_read_horizon(args))
-            _emit(result, segment="ledger", mode=args.mode, source=source)
-            inner = result.get("data", {}) if isinstance(result, dict) else {}
-            # Refused horizon (unsupported) exits non-zero; empty span exits 0
-            # (null is legitimate "no data", same discipline as --read).
-            if isinstance(inner, dict) and inner.get("refused"):
-                return 1
-            return 0
         result, source = asyncio.run(_read_market(args, args.mode))
         _emit(result, segment="ledger", mode=args.mode, source=source)
         return 0
@@ -178,12 +162,12 @@ async def _read_market(args: argparse.Namespace, mode: str) -> tuple[dict[str, A
     payload, source, _ = await _reads.read_ledger(
         args.symbol.upper(), run_id=args.run_id, mode=mode,
         include_errors=bool(args.read_errors))
-    if payload is None:
+    if payload is None or payload.get("status") == "empty":
         surfaces = await _reads.read_surfaces(args.symbol.upper())
         return _parsing.empty_read(
             tool="market.read", segment="ledger", mode=mode,
             symbol=args.symbol.upper(), surfaces=surfaces,
-            errors=["no run persisted (redis miss, postgres absent/empty)"]), None
+            errors=["no live data (nothing captured or computed for this identity)"]), None
     return _parsing.wrap_result(
         "market.read", payload, segment="ledger", mode=mode), source
 
@@ -207,37 +191,6 @@ async def _read_microstructure_status(args: argparse.Namespace) -> tuple[dict[st
         "micro.capture_status", payload, segment="micro", mode="compact"), source
 
 
-async def _read_horizon(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
-    """Horizon-span slice: one deterministic block at the requested horizon."""
-    from market_service.runtime.horizon_spans import (
-        SPAN_HORIZONS,
-        is_supported,
-    )
-
-    horizon = str(args.span or "").lower()
-    if not is_supported(horizon):
-        return _parsing.wrap_result(
-            "market.read", {"refused": True, "horizon": args.span,
-                              "supported_horizons": list(SPAN_HORIZONS)},
-            segment="ledger", mode=args.mode,
-            status="refused", reason="unsupported horizon"), None
-    payload, source = await _reads.read_horizon(args.symbol.upper(), horizon)
-    if payload is None:
-        presence = await _reads.horizons_presence(args.symbol.upper())
-        surfaces = await _reads.read_surfaces(args.symbol.upper())
-        data = {"symbol": args.symbol.upper(), "horizon": horizon,
-                "present_horizons": presence.get("present", []),
-                "absent_horizons": presence.get("absent", []),
-                "surfaces": (surfaces or {}).get("surfaces", []),
-                "errors": [f"no span persisted for horizon {horizon!r} "
-                             "(redis miss, postgres absent)"]}
-        return _parsing.wrap_result(
-            "market.read", data, segment="ledger", mode=args.mode,
-            status="empty", reason="no span persisted"), None
-    return _parsing.wrap_result(
-        "market.read", payload, segment="ledger", mode=args.mode), source
-
-
 if __name__ == "__main__":
     raise SystemExit(main())
 
@@ -246,7 +199,6 @@ __all__ = [
     "build_parser",
     "main",
     "_poller_control",
-    "_read_horizon",
     "_read_keystone_history",
     "_read_market",
     "_read_microstructure_status",

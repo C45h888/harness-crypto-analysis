@@ -324,9 +324,16 @@ async def run_output(
             if row.get("kind") == LedgerKind.FINDING.value
             and (row.get("payload") or {}).get("finding_kind") == "assembly_dropped"
         ]
+        # The verdict states WHICH instrument it describes. Without this a
+        # conformance row is unattributable once more than one (symbol, venue)
+        # has ever been analysed — the exact ambiguity that let a BTC/spot
+        # cycle report on data captured for SOL/futures.
+        _scope = deterministic_state.get("scope") or {}
         record_finding(
             deterministic_state, "conformance", "authored ship conformance",
             detail={
+                "symbol": _scope.get("symbol"),
+                "venue": _scope.get("venue"),
                 "tier": "authored",
                 "dropped": _dropped_now[-8:],
                 "hard_misses": list(hard)[:8],

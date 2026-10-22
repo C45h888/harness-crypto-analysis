@@ -63,107 +63,6 @@ from market_service.runtime.raw_window import (
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Step 4 — collate into the canonical run payload (plain dict)
-# ---------------------------------------------------------------------------
-
-def assemble_envelope(
-    symbol: str,
-    evidence: dict[str, Any],
-    calculations: dict[str, Any],
-    analysis: dict[str, Any],
-    run_id: str | None = None,
-) -> dict[str, Any]:
-    """Assemble the canonical run payload dict from the three domain outputs.
-
-    The frozen ``MarketRunEnvelope`` dataclass was retired 2026-08-31: this
-    function emits the EXACT field names the dataclass's ``to_dict()`` used
-    to publish (schema_version, run_id, symbol, generated_at, completed_at,
-    status, data_source, coverage, canonical_state, domain_outputs, errors,
-    source_metadata) so the Redis/Postgres stored format is byte-compatible
-    with every existing read path (``runtime.read_paths`` guards on the
-    same schema_version) — the payload shape IS the contract. JSON-safety
-    (NaN/Inf scrub via ``_json_safe``) happens here at the write seam,
-    where the dataclass's ``to_dict()`` did it before.
-    """
-    started_ms = int(time.time() * 1000)
-    completed_ms = started_ms
-    run_id = run_id or str(uuid.uuid4())
-
-    data_access_status = "healthy" if not evidence.get("errors") else "degraded"
-    calc_status = calculations.get("status", "degraded")
-    analysis_status = analysis.get("status", "degraded")
-
-    domain_status = {
-        "data-access": data_access_status,
-        "calculations": calc_status,
-        "analysis": analysis_status,
-    }
-
-    all_errors: list[dict[str, Any]] = []
-    for err in evidence.get("errors", []):
-        all_errors.append({"domain": "data-access", **err})
-    for err in calculations.get("errors", []):
-        all_errors.append({"domain": "calculations", **err})
-    for err in analysis.get("errors", []):
-        all_errors.append({"domain": "analysis", **err})
-
-    if "invalid" in domain_status.values():
-        status = "invalid"
-    elif "degraded" in domain_status.values() or all_errors:
-        status = "degraded"
-    else:
-        status = "healthy"
-
-    coverage = {
-        "flow_window_seconds": evidence.get("fetch_window_ms", 0) // 1000,
-        "domain_observed_at": {
-            "data-access": evidence.get("observed_at", _utc_iso()),
-            "calculations": _utc_iso(),
-            "analysis": _utc_iso(),
-        },
-        "domain_status": domain_status,
-    }
-    # Measured evidence coverage (actual trade span, dedupe stats, stream
-    # staleness) recorded by read_raw_window — the run payload reports what
-    # the window really contains, not just the requested window.
-    if evidence.get("coverage"):
-        coverage["evidence"] = dict(evidence["coverage"])
-
-    canonical_state: dict[str, Any] = {"domain_status": dict(domain_status)}
-    canonical_state["data-access"] = {
-        "status": data_access_status,
-        "errors": evidence.get("errors", []),
-        "evidence": {
-            "spot": evidence.get("spot", {}),
-            "futures": evidence.get("futures", {}),
-        },
-        "coverage_seconds": evidence.get("fetch_window_ms", 0) // 1000,
-    }
-    canonical_state["calculations"] = dict(calculations)
-    canonical_state["analysis"] = dict(analysis)
-
-    payload: dict[str, Any] = {
-        "schema_version": MARKET_RUN_SCHEMA_VERSION,
-        "run_id": run_id,
-        "symbol": symbol.upper(),
-        "generated_at": _utc_iso(),
-        "completed_at": _utc_iso(),
-        "status": status,
-        "data_source": "domain_pipeline",
-        "coverage": _json_safe(coverage),
-        "canonical_state": _json_safe(canonical_state),
-        "domain_outputs": _json_safe(canonical_state),
-        "errors": list(all_errors),
-        "source_metadata": _json_safe({
-            "runtime": "market_service",
-            "path": "harness_pipeline",
-            "latency_ms": round((completed_ms - started_ms), 1),
-        }),
-    }
-    return payload
-
-
-# ---------------------------------------------------------------------------
 # Persistence — Postgres first, then Redis
 # ---------------------------------------------------------------------------
 
@@ -363,7 +262,6 @@ __all__ = [
     "GROUP_MAP",
     "MACRO_SYMBOLS",
     "WINDOW_MINUTES_MAP",
-    "assemble_envelope",
     "fetch_derivative_evidence",
     "read_raw_window",
     "run_analysis",

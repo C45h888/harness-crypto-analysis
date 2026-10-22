@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from market_service.runtime.scope import CANONICAL_VENUE
+
 from ..capability import CAPABILITIES, CapabilityDenied, capability_log_entry
 from .history_adapter import _tool_fit_beta
 from .registry import TOOL_NAMES, _normalize_tool_name
@@ -55,6 +57,7 @@ async def execute_tool(
     *, postgres: Any | None = None, memory: Any | None = None,
     settings: Any | None = None,
     session_id: str | None = None, segment: str | None = None,
+    venue: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Execute one tool call by public name with scope validation + audit.
 
@@ -67,6 +70,11 @@ async def execute_tool(
     - ``postgres`` — the engine's durable store, for fit tools' prior cycles
     - ``memory``   — the engine's MemoryNode, for the agent memory.* tools
     - ``settings`` — the operator Settings (tolerated by every tool).
+    - ``venue``    — the ENGINE's venue, threaded from the cycle. Tool calls
+      never carry a venue (the model is not asked for one), so this was
+      previously defaulted to the literal ``"spot"`` — which silently routed
+      EVERY dispatch to the legacy venue while capture wrote ``futures``, and
+      returned zero OFI intervals with no error anywhere.
     """
     canonical = _normalize_tool_name(name)
     if canonical is None:
@@ -80,7 +88,40 @@ async def execute_tool(
         )
     name = canonical
     symbol = str(args.get("symbol", "")).upper()
-    venue = str(args.get("venue", "spot"))
+    # Identity precedence: explicit arg > the engine's cycle venue > the
+    # Settings scope > the canonical venue. The last resort is CANONICAL_VENUE
+    # (futures — the venue capture writes), never the legacy "spot" literal
+    # that silently routed every dispatch to a venue with no data.
+    resolved_venue = args.get("venue") or venue
+    if not resolved_venue and settings is not None:
+        resolved_venue = getattr(settings, "venue", None)
+    venue = str(resolved_venue or CANONICAL_VENUE).strip().lower()
+    # Liveness gate (Plane A): refuse symbols nothing captures — one check
+    # for every tool, so a phantom can never reach a dispatch. Live set =
+    # Redis control key when the store can answer, else the injected
+    # Settings, else skip (the wake/inference-runner guards own that path).
+    # Structured denial, never an exception to the caller.
+    _active: tuple[str, ...] | None = None
+    if store is not None:
+        try:
+            _control = await store.read_poller_symbols()
+        except Exception:  # noqa: BLE001 — best-effort liveness
+            _control = None
+        if _control:
+            _active = tuple(_control)
+    if _active is None and settings is not None:
+        _syms = tuple(getattr(settings, "symbols", ()) or ())
+        if _syms:
+            _active = _syms
+    if _active and symbol and symbol not in {s.upper() for s in _active}:
+        return None, capability_log_entry(
+            name, {"symbol": symbol, "venue": venue}, "denied",
+            detail={
+                "reason": "symbol_not_captured",
+                "symbol": symbol,
+                "active_symbols": list(_active),
+            },
+        )
     if name == "micro.capture_status":
         return await dispatch_read_capture_status(store, symbol, venue)
     if name == "micro.events":

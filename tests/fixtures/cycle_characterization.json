@@ -212,6 +212,8 @@
     "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
    },
    "conformance": {
+    "symbol": "BTCUSDT",
+    "venue": "spot",
     "tier": "authored",
     "dropped": [
      "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -226,6 +228,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -1095,6 +1101,8 @@
         "finding_kind": "conformance",
         "message": "authored ship conformance",
         "detail": {
+         "symbol": "BTCUSDT",
+         "venue": "spot",
          "tier": "authored",
          "dropped": [
           "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -1321,6 +1329,8 @@
       "disposition": "degraded"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -2801,6 +2811,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -2815,6 +2827,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -3684,6 +3700,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -3873,6 +3891,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -5019,6 +5039,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -5033,6 +5055,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -5902,6 +5928,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -6091,6 +6119,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -7237,6 +7267,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -7251,6 +7283,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -8120,6 +8156,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -8346,6 +8384,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -9576,6 +9616,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -9590,6 +9632,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -10459,6 +10505,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -10685,6 +10733,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -11916,6 +11966,8 @@
     "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
    },
    "conformance": {
+    "symbol": "BTCUSDT",
+    "venue": "spot",
     "tier": "authored",
     "dropped": [
      "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -11930,6 +11982,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -12799,6 +12855,8 @@
         "finding_kind": "conformance",
         "message": "authored ship conformance",
         "detail": {
+         "symbol": "BTCUSDT",
+         "venue": "spot",
          "tier": "authored",
          "dropped": [
           "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -13025,6 +13083,8 @@
       "disposition": "degraded"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -14505,6 +14565,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -14519,6 +14581,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -15388,6 +15454,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -15577,6 +15645,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -16723,6 +16793,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -16737,6 +16809,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -17606,6 +17682,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -17795,6 +17873,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -18941,6 +19021,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -18955,6 +19037,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -19824,6 +19910,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -20050,6 +20138,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -21280,6 +21370,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -21294,6 +21386,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -22163,6 +22259,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -22389,6 +22487,8 @@
         "disposition": "degraded"
        },
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -23620,6 +23720,8 @@
     "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
    },
    "conformance": {
+    "symbol": "BTCUSDT",
+    "venue": "spot",
     "tier": "authored",
     "dropped": [
      "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -23634,6 +23736,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -24489,6 +24595,8 @@
         "finding_kind": "conformance",
         "message": "authored ship conformance",
         "detail": {
+         "symbol": "BTCUSDT",
+         "venue": "spot",
          "tier": "authored",
          "dropped": [
           "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -24709,6 +24817,8 @@
      ],
      "principle_findings": [],
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -26175,6 +26285,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -26189,6 +26301,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -27044,6 +27160,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -27227,6 +27345,8 @@
        ],
        "principle_findings": [],
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -28359,6 +28479,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -28373,6 +28495,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -29228,6 +29354,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -29411,6 +29539,8 @@
        ],
        "principle_findings": [],
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -30543,6 +30673,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -30557,6 +30689,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -31412,6 +31548,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -31632,6 +31770,8 @@
        ],
        "principle_findings": [],
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -32848,6 +32988,8 @@
       "split_note": "AD and OFI read as separate tools by the agent; final DeltaP is derived hypothesis, not shortcut"
      },
      "conformance": {
+      "symbol": "BTCUSDT",
+      "venue": "spot",
       "tier": "authored",
       "dropped": [
        "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -32862,6 +33004,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -33717,6 +33863,8 @@
           "finding_kind": "conformance",
           "message": "authored ship conformance",
           "detail": {
+           "symbol": "BTCUSDT",
+           "venue": "spot",
            "tier": "authored",
            "dropped": [
             "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -33937,6 +34085,8 @@
        ],
        "principle_findings": [],
        "conformance": {
+        "symbol": "BTCUSDT",
+        "venue": "spot",
         "tier": "authored",
         "dropped": [
          "calc.price.delta \u2192 route_a_direct.delta_ticks"
@@ -34966,6 +35116,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -36060,6 +36214,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -37067,6 +37225,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -38075,6 +38237,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -38896,6 +39062,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -39697,6 +39867,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -40499,6 +40673,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -41320,6 +41498,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -42121,6 +42303,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -42923,6 +43109,10 @@
     "deterministic_state": {
      "task": "Explain the evidence",
      "scenario": null,
+     "scope": {
+      "symbol": "BTCUSDT",
+      "venue": "spot"
+     },
      "acquisition": {
       "wake": {
        "trigger_source": "watcher",
@@ -45100,6 +45290,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",
@@ -47136,6 +47330,10 @@
       "deterministic_state": {
        "task": "Explain the evidence",
        "scenario": null,
+       "scope": {
+        "symbol": "BTCUSDT",
+        "venue": "spot"
+       },
        "acquisition": {
         "wake": {
          "trigger_source": "watcher",

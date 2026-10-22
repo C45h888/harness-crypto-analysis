@@ -1,30 +1,31 @@
-"""Horizon spans — per-horizon deterministic blocks (pure module).
+"""Horizon names — the span vocabulary (pure module, no I/O, no payloads).
 
-No I/O. Vocabulary mirrors the deterministic plane exactly:
+This module is the NAME owner for horizon families; it no longer owns a span
+plane. The per-horizon ``horizon_span`` payload contract (``build_span`` /
+``guard_span`` / ``HORIZON_SPAN_SCHEMA_VERSION``) and its Redis/Postgres
+read-write pair were retired: ``publish_horizon_span`` and
+``insert_horizon_span`` had zero production callers while an operator surface
+(``--span``) read them, so the plane was removed end-to-end rather than left
+to answer "no data" forever. The ``horizon_span`` table from alembic 0013 is
+retained as dead storage; nothing in the runtime reads or writes it.
 
-* native ``1s/5s/30s/60s`` — fitted directly (``extrapolated: false``)
-* long   ``15m/1h/4h``    — long-horizon bridge (``extrapolated: true``)
+What remains is what other modules actually import: the frozen horizon names,
+the fit-status family, and the horizon→regime classifier.
 
-Anything else is ``unsupported`` — recorded, never guessed (same rule as
-``task_directive``). Each span is self-describing: its own status,
-coverage, and run back-pointer. Uncomputable = ``insufficient`` + nulls.
+Vocabulary mirrors the deterministic plane exactly:
+
+* native ``1s/5s/30s/60s`` — fitted directly
+* long   ``15m/1h/4h``    — long-horizon bridge
 """
 
 from __future__ import annotations
 
-import time
-from typing import Any
-
-from market_service.runtime.contracts import SCHEMA_VERSION_REGISTRY
 from market_service.runtime.horizons import (
     HORIZON_NAMES, NATIVE_HORIZON_NAMES, SPAN_HORIZON_NAMES,
 )
 
 # Phase S-2/S-4: the span horizons resolve to the charter owner's name
-# vocabulary (identity, not a local copy); the version resolves to the tree
-# registry.
-HORIZON_SPAN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["horizon_span"]
-
+# vocabulary (identity, not a local copy).
 NATIVE_HORIZONS: tuple[str, ...] = NATIVE_HORIZON_NAMES
 LONG_HORIZONS: tuple[str, ...] = HORIZON_NAMES
 SPAN_HORIZONS: tuple[str, ...] = SPAN_HORIZON_NAMES
@@ -45,79 +46,11 @@ def is_supported(horizon: str) -> bool:
     return horizon in SPAN_HORIZONS
 
 
-def build_span(
-    symbol: str,
-    horizon: str,
-    *,
-    run_id: str | None = None,
-    status: str = "insufficient",
-    fit: dict[str, Any] | None = None,
-    distribution: dict[str, Any] | None = None,
-    bridge: dict[str, Any] | None = None,
-    coverage: dict[str, Any] | None = None,
-    decay: dict[str, Any] | None = None,
-    errors: list[str] | None = None,
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Build one span payload. Returns (payload, error).
-
-    Unsupported horizon → (None, reason). Long horizons without a bridge
-    note are refused the same way — a bridge block without stated
-    assumptions is a guess, not a projection.
-    """
-    reg = regime(horizon)
-    if reg is None:
-        return None, (
-            f"horizon {horizon!r} outside the span vocabulary "
-            f"(native {list(NATIVE_HORIZONS)}, long {list(LONG_HORIZONS)})"
-        )
-    if status not in STATUSES:
-        return None, f"status {status!r} not in {sorted(STATUSES)}"
-    if reg == "long_horizon" and status != "insufficient" and not bridge:
-        return None, (
-            f"long-horizon span {horizon!r} requires a bridge block "
-            "(sigma scaling + skill decay, stated — never bare numbers)"
-        )
-    return {
-        "schema_version": HORIZON_SPAN_SCHEMA_VERSION,
-        "run_id": run_id,
-        "symbol": symbol.upper(),
-        "horizon": horizon,
-        "regime": reg,
-        "extrapolated": reg == "long_horizon",
-        "fit": fit,
-        "distribution": distribution,
-        "bridge": bridge,
-        "coverage": coverage or {},
-        "decay": decay or {},
-        "status": status,
-        "computed_at_ms": int(time.time() * 1000),
-        "errors": list(errors or []),
-    }, None
-
-
-def guard_span(payload: Any) -> dict[str, Any] | None:
-    """Schema-version guard. None passes through; mismatch raises."""
-    if payload is None:
-        return None
-    if not isinstance(payload, dict):
-        raise ValueError("horizon span payload is not a JSON object")
-    version = payload.get("schema_version")
-    if version != HORIZON_SPAN_SCHEMA_VERSION:
-        raise ValueError(
-            f"unsupported horizon span schema version: {version!r} "
-            f"(reader is on {HORIZON_SPAN_SCHEMA_VERSION})"
-        )
-    return payload
-
-
 __all__ = [
-    "HORIZON_SPAN_SCHEMA_VERSION",
     "LONG_HORIZONS",
     "NATIVE_HORIZONS",
     "SPAN_HORIZONS",
     "STATUSES",
-    "build_span",
-    "guard_span",
     "is_supported",
     "regime",
 ]

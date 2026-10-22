@@ -10,9 +10,10 @@ from typing import Any
 
 from redis.asyncio import Redis
 
+from .scope import CANONICAL_VENUE
+
 from .contracts import (
     AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, CanonicalOutput,
-    InferenceArtifact,
     MarketStateEnvelope,
 )
 
@@ -100,51 +101,8 @@ class RedisRuntimeStore:
     def _prefixed(prefix: str, key: str) -> str:
         return f"{prefix.strip(':')}:{key}"
 
-    def collated_latest_key(self, symbol: str) -> str:
-        return f"{self.prefix}:latest:{symbol.upper()}:collated"
-
-    def collated_stream(self, symbol: str) -> str:
-        return f"{self.prefix}:stream:collated:{symbol.upper()}"
-
-    def domain_stream(self, symbol: str, source: str) -> str:
-        """Per-domain append-only projection stream.
-
-        Sources: ``data-access``, ``calculations``, ``analysis``.
-        These streams are bounded by ``stream_maxlen``; the collated stream
-        is intentionally left unbounded by default so downstream replay and
-        auditing have the full history.
-        """
-        return f"{self.prefix}:stream:domain:{source.lower()}:{symbol.upper()}"
-
-    def domain_latest_key(self, symbol: str, source: str) -> str:
-        return f"{self.prefix}:latest:{symbol.upper()}:{source.lower()}"
-
     def agent_stream(self, session_id: str, artifact_type: str) -> str:
         return f"{self.prefix}:agent:{session_id}:{artifact_type}"
-
-    def run_domain_state_key(self, run_id: str, source: str) -> str:
-        return f"{self.prefix}:runtime-run:{run_id}:domain:{source.lower()}"
-
-    def wall_history_stream(self, symbol: str) -> str:
-        """Bounded stream of wall_snapshot payloads for one symbol.
-
-        Schema is per-entry:
-          schema_version, cycle_ts, run_id, symbol, payload (JSON)
-        Bounded by ``stream_maxlen`` (configurable per-store). This is
-        the prior-cycle seam for ``adapt_wall_migration``.
-        """
-        return f"{self.prefix}:history:{symbol.upper()}:walls"
-
-    def keystone_history_stream(self, symbol: str) -> str:
-        """Bounded stream of keystone snapshots for one symbol.
-
-        Schema is per-entry:
-          schema_version, cycle_ts, run_id, symbol, payload (JSON)
-        Bounded by ``stream_maxlen`` (configurable per-store). This is the
-        cross-cycle keystone-migration ledger (clean separation from the
-        wall-history stream: buyer defence vs seller walls).
-        """
-        return f"{self.prefix}:history:{symbol.upper()}:keystones"
 
     async def close(self) -> None:
         await self.redis.aclose()
@@ -184,44 +142,6 @@ class RedisRuntimeStore:
                 continue
             out.append({"id": entry_id, "ts": fields.get("ts", ""), **value})
         return out
-
-    async def publish_run(self, envelope: dict[str, Any]) -> str:
-        """Publish one canonical run payload dict to the collated stream.
-
-        The envelope dataclass was retired 2026-08-31 — the payload shape
-        (field names + schema_version) is the contract, assembled by
-        ``pipeline.assemble_envelope`` and JSON-safe at the write seam.
-        """
-        payload = json.dumps(envelope, default=str, separators=(",", ":"))
-        run_id = str(envelope["run_id"])
-        symbol = str(envelope["symbol"]).upper()
-        schema_version = str(envelope.get("schema_version", ""))
-        dedupe_key = f"{self.prefix}:run:{run_id}"
-        # One Redis-side transaction makes the latest projection, stream entry,
-        # and idempotency marker succeed or fail together. The XADD
-        # uses MAXLEN ~ to bound the collated stream (telemetry hygiene
-        # spec — prevents the AOF rewrite chain from growing
-        # unbounded while preserving a generous replay window).
-        # The dedupe key (and the latest-by-symbol copy) carry EXPIRE so
-        # per-run_id STRING keys cannot accumulate forever.
-        maxlen = int(self.collated_stream_maxlen)
-        script = f"""
-        if redis.call('EXISTS', KEYS[1]) == 1 then return 'duplicate' end
-        redis.call('SET', KEYS[2], ARGV[1])
-        local id = redis.call('XADD', KEYS[3], 'MAXLEN', '~', {maxlen}, '*',
-            'event_type', 'market_run', 'run_id', ARGV[2],
-            'symbol', ARGV[3], 'schema_version', ARGV[4], 'payload', ARGV[1])
-        redis.call('SET', KEYS[1], ARGV[1], 'EX', {int(_PER_RUN_KEY_TTL_S)})
-        return id
-        """
-        return str(await self.redis.eval(
-            script, 3, dedupe_key, self.collated_latest_key(symbol),
-            self.collated_stream(symbol), payload, run_id,
-            symbol, schema_version,
-        ))
-
-    async def has_run(self, run_id: str) -> bool:
-        return bool(await self.redis.exists(f"{self.prefix}:run:{run_id}"))
 
     async def publish_agent_artifact(
         self, session_id: str, artifact_type: str, payload: str,
@@ -280,208 +200,9 @@ class RedisRuntimeStore:
             newest.setdefault(m.memory_id, m)
         return [m for m in newest.values() if not m.forgotten]
 
-    async def publish_domain_state(self, state: MarketStateEnvelope) -> str:
-        """Publish a domain service envelope to its latest projection + stream."""
-        if state.source not in ("data-access", "calculations", "analysis"):
-            raise ValueError(f"unknown domain source: {state.source}")
-        state.validate() if hasattr(state, "validate") else None
-        payload = state.to_json()
-        latest_key = self.domain_latest_key(state.symbol, state.source)
-        stream = self.domain_stream(state.symbol, state.source)
-        async with self.redis.pipeline(transaction=True) as pipe:
-            pipe.set(latest_key, payload)
-            if state.run_id:
-                # TTL bounds growth of per-run_id per-source STRING keys
-                # so a long-running harness does not accumulate them.
-                pipe.set(
-                    self.run_domain_state_key(state.run_id, state.source),
-                    payload,
-                    ex=int(_PER_RUN_KEY_TTL_S),
-                )
-            pipe.xadd(
-                stream,
-                {
-                    "event_type": "market_state",
-                    "source": state.source,
-                    "symbol": state.symbol,
-                    "schema_version": str(state.schema_version),
-                    "status": state.status,
-                    "payload": payload,
-                },
-                maxlen=self.stream_maxlen,
-                approximate=True,
-            )
-            results = await pipe.execute()
-        return str(results[-1])
-
-    async def read_latest_domain_state(
-        self, symbol: str, source: str
-    ) -> MarketStateEnvelope | None:
-        raw = await self.redis.get(self.domain_latest_key(symbol, source))
-        if not raw:
-            return None
-        try:
-            return MarketStateEnvelope.from_mapping(json.loads(raw))
-        except (ValueError, json.JSONDecodeError):
-            return None
-
-    async def read_run_domain_state(
-        self, run_id: str, source: str
-    ) -> MarketStateEnvelope | None:
-        raw = await self.redis.get(self.run_domain_state_key(run_id, source))
-        if not raw:
-            return None
-        try:
-            state = MarketStateEnvelope.from_mapping(json.loads(raw))
-            return state if state.run_id == run_id else None
-        except (ValueError, json.JSONDecodeError):
-            return None
-
-    async def record_wall_snapshot(self, symbol: str, run_id: str,
-                                   payload: dict[str, Any]) -> str:
-        """Append a wall snapshot to the bounded history stream.
-
-        ``payload`` is the wall_migration input set: asks, bids,
-        fuel_ratio, bid_pool, ask_pool, bid_floor, ask_target,
-        ask_walls_built, ask_walls_eroded, cycle_ts. The payload
-        is JSON-encoded into the stream entry so callers can decode
-        the full picture without the run envelope.
-        """
-        stream = self.wall_history_stream(symbol)
-        cycle_ts = payload.get("cycle_ts") or ""
-        body = json.dumps(payload, separators=(",", ":"), default=str)
-        return await self.redis.xadd(
-            stream,
-            {
-                "event_type": "wall_snapshot",
-                "symbol": symbol.upper(),
-                "run_id": run_id,
-                "schema_version": "1",
-                "cycle_ts": cycle_ts,
-                "payload": body,
-            },
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
-
-    async def read_wall_history(self, symbol: str, count: int = 1000) -> list[dict[str, Any]]:
-        """Read the recorded wall snapshots for ``symbol``, newest first.
-
-        Unlike ``read_last_wall_snapshot`` this surfaces the FULL recorded
-        wall history (bounded by the stream cap), so the wall-migration
-        analysis can probe every historically-recorded seller-wall level and
-        not just the most recent pull.
-        """
-        rows = await self.redis.xrevrange(self.wall_history_stream(symbol), count=count)
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out
-
-    async def read_last_wall_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        """Read the most recent wall snapshot for ``symbol``.
-
-        Returns None when the stream is empty (legitimate "no history
-        yet" state — not a fabricated zero).
-        """
-        rows = await self.redis.xrevrange(self.wall_history_stream(symbol), count=1)
-        if not rows:
-            return None
-        _entry_id, fields = rows[0]
-        raw = fields.get("payload")
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
-
-    async def read_wall_history_count(self, symbol: str) -> int:
-        """Return XLEN of the wall history stream for diagnostics."""
-        return int(await self.redis.xlen(self.wall_history_stream(symbol)))
-
     # ------------------------------------------------------------------
     # Keystone history — cross-cycle keystone-migration ledger
     # ------------------------------------------------------------------
-
-    async def record_keystone_snapshot(self, symbol: str, run_id: str,
-                                       payload: dict[str, Any]) -> str:
-        """Append one cycle's keystone snapshot to the bounded history stream.
-
-        ``payload`` is the keystone state set: cycle_ts, keystone_price,
-        window_qty, tight/wide bands, keystone_bid_qty, ask_ladder_notional.
-        JSON-encoded into the stream entry so callers can decode the full
-        picture without the run envelope. Mirrors ``record_wall_snapshot``.
-        """
-        stream = self.keystone_history_stream(symbol)
-        cycle_ts = payload.get("cycle_ts") or ""
-        body = json.dumps(payload, separators=(",", ":"), default=str)
-        return await self.redis.xadd(
-            stream,
-            {
-                "event_type": "keystone_snapshot",
-                "symbol": symbol.upper(),
-                "run_id": run_id,
-                "schema_version": "1",
-                "cycle_ts": cycle_ts,
-                "payload": body,
-            },
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
-
-    async def read_keystone_history(self, symbol: str, count: int = 1000) -> list[dict[str, Any]]:
-        """Read the recorded keystone snapshots for ``symbol``, newest first.
-
-        Surfaces the FULL recorded keystone history (bounded by the stream
-        cap) so the cross-cycle migration verdict can probe every recorded
-        keystone, not just the most recent pull. Mirrors ``read_wall_history``.
-        """
-        rows = await self.redis.xrevrange(self.keystone_history_stream(symbol), count=count)
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out
-
-    async def read_last_keystone_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        """Read the most recent keystone snapshot for ``symbol``.
-
-        Returns None when the stream is empty (legitimate "no history
-        yet" state — not a fabricated zero). Mirrors ``read_last_wall_snapshot``.
-        """
-        rows = await self.redis.xrevrange(self.keystone_history_stream(symbol), count=1)
-        if not rows:
-            return None
-        _entry_id, fields = rows[0]
-        raw = fields.get("payload")
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
-
-    async def read_keystone_history_count(self, symbol: str) -> int:
-        """Return XLEN of the keystone history stream for diagnostics."""
-        return int(await self.redis.xlen(self.keystone_history_stream(symbol)))
 
     # ------------------------------------------------------------------
     # Derivative evidence — command-triggered fetch writes, harness reads
@@ -869,46 +590,15 @@ class RedisRuntimeStore:
         return payloads
 
     # ------------------------------------------------------------------
-    # Inference-engine artifact projection — latest key + bounded stream.
+    # Canonical-output projection — latest key + bounded stream.
     # Postgres owns the durable ledger; these are the live read surfaces.
     # ------------------------------------------------------------------
 
-    def inference_latest_key(self, symbol: str, venue: str = "spot") -> str:
-        return f"{self.prefix}:latest:inference:{venue.lower()}:{symbol.upper()}"
+    def inference_latest_key(self, symbol: str, venue: str) -> str:
+        return f"{self.prefix}:latest:inference:{venue}:{symbol.upper()}"
 
-    def inference_stream(self, symbol: str, venue: str = "spot") -> str:
-        return f"{self.prefix}:stream:inference:{venue.lower()}:{symbol.upper()}"
-
-    async def publish_inference_artifact(
-        self, artifact: InferenceArtifact, *, stream_maxlen: int | None = None,
-    ) -> str:
-        """Publish one inference artifact: latest-key projection + stream entry.
-
-        .. deprecated:: canonical-output plane
-           **Deprecated writer (legacy).** New cycles publish
-           ``CanonicalOutput`` rows (``publish_canonical_output``).
-        """
-        artifact.validate()
-        body = artifact.to_json()
-        await self.redis.set(self.inference_latest_key(artifact.symbol, artifact.venue), body)
-        return str(await self.redis.xadd(
-            self.inference_stream(artifact.symbol, artifact.venue),
-            {"payload": body, "artifact_id": artifact.artifact_id,
-             "status": artifact.status},
-            maxlen=stream_maxlen or self.stream_maxlen, approximate=True,
-        ))
-
-    async def read_latest_inference_artifact(
-        self, symbol: str, venue: str = "spot",
-    ) -> dict[str, Any] | None:
-        raw = await self.redis.get(self.inference_latest_key(symbol, venue))
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
+    def inference_stream(self, symbol: str, venue: str) -> str:
+        return f"{self.prefix}:stream:inference:{venue}:{symbol.upper()}"
 
     async def publish_canonical_output(
         self, output: CanonicalOutput, *, stream_maxlen: int | None = None,
@@ -931,10 +621,18 @@ class RedisRuntimeStore:
         ))
 
     async def read_latest_canonical_output(
-        self, symbol: str, venue: str = "spot",
+        self, symbol: str, venue: str = CANONICAL_VENUE,
     ) -> dict[str, Any] | None:
-        """Latest canonical output projection (same read path as legacy)."""
-        return await self.read_latest_inference_artifact(symbol, venue)
+        """Latest canonical output projection (live read surface)."""
+        raw = await self.redis.get(
+            self.inference_latest_key(symbol.upper(), venue))
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
 
     # ------------------------------------------------------------------
     # Poller control plane — dynamic symbol selection
@@ -1022,49 +720,6 @@ class RedisRuntimeStore:
     # collated-stream-style unbounded replay is deliberately NOT kept per
     # horizon (7 unbounded streams would 7x the AOF cost).
     # ------------------------------------------------------------------
-
-    def horizon_span_stream(self, horizon: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:horizon:{horizon.lower()}:{symbol.upper()}"
-
-    def horizon_span_latest_key(self, horizon: str, symbol: str) -> str:
-        return f"{self.prefix}:latest:{symbol.upper()}:horizon:{horizon.lower()}"
-
-    async def publish_horizon_span(
-        self, horizon: str, symbol: str, payload: dict[str, Any],
-    ) -> str:
-        """Atomically SET(latest) + XADD(bounded span stream) for one horizon."""
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        ts = str(payload.get("computed_at_ms") or "")
-        maxlen = str(int(self.stream_maxlen))
-        script = """
-        redis.call('SET', KEYS[1], ARGV[1])
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
-            'horizon', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[4], 'payload', ARGV[1])
-        """
-        return str(await self.redis.eval(
-            script, 2,
-            self.horizon_span_latest_key(horizon, symbol),
-            self.horizon_span_stream(horizon, symbol),
-            body, horizon.lower(), symbol.upper(), ts, maxlen,
-        ))
-
-    async def read_horizon_span_latest(
-        self, horizon: str, symbol: str,
-    ) -> dict[str, Any] | None:
-        """Read one horizon's latest span + schema guard. None = absent."""
-        from market_service.runtime.horizon_spans import guard_span
-
-        raw = await self.redis.get(
-            self.horizon_span_latest_key(horizon, symbol))
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        if not isinstance(value, dict):
-            return None
-        return guard_span(value)
 
     async def publish_substrate_state(
         self, substrate: str, symbol: str, payload: dict[str, Any],
