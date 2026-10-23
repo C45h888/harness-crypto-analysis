@@ -18,7 +18,6 @@ from typing import Any, Literal
 # public constant resolves to its registry entry (identity, not a copy), so
 # a version bump is ONE edit here + the charter test pins every consumer.
 SCHEMA_VERSION_REGISTRY: dict[str, int] = {
-    "market_run": 1,
     "specialist_report": 2,
     "agent_memory": 1,
     "inference_artifact": 1,
@@ -44,7 +43,9 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     # market/worker/governance ledgers; Redis is only its live projection.
     "telemetry_event": 1,
 }
-MARKET_RUN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_run"]
+# Retired with the collated-run plane (no writer ever existed). Kept as a
+# plain retired marker — not a registry entry — so old payloads still parse.
+RETIRED_MARKET_RUN_SCHEMA = 1
 SPECIALIST_REPORT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["specialist_report"]
 AGENT_MEMORY_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["agent_memory"]
 INFERENCE_ARTIFACT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["inference_artifact"]

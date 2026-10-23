@@ -246,9 +246,11 @@ class SchemaRegistryTests(unittest.TestCase):
                              f"{name} ({rel}) disagrees with the registry")
 
     def test_registry_values_are_frozen_by_identity(self):
-        # The runtime-owned constants ARE the registry entries.
-        self.assertIs(runtime_contracts.MARKET_RUN_SCHEMA_VERSION,
-                      runtime_contracts.SCHEMA_VERSION_REGISTRY["market_run"])
+        # The runtime-owned constants ARE the registry entries. The retired
+        # market_run plane is deliberately absent: RETIRED_MARKET_RUN_SCHEMA
+        # is a plain marker, not a registry member.
+        self.assertNotIn("market_run", runtime_contracts.SCHEMA_VERSION_REGISTRY)
+        self.assertEqual(runtime_contracts.RETIRED_MARKET_RUN_SCHEMA, 1)
         # Cross-plane constants resolve to the same registry entries.
         self.assertIs(substrate_contracts.SUBSTRATE_STATE_SCHEMA_VERSION,
                       runtime_contracts.SCHEMA_VERSION_REGISTRY["substrate_state"])

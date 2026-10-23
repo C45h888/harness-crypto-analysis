@@ -47,7 +47,6 @@ from market_service.runtime.bounds import (  # noqa: F401
     _evidence_headlines,
 )
 from market_service.runtime.contracts import (
-    MARKET_RUN_SCHEMA_VERSION,
     _json_safe,
 )
 from market_service.runtime.derivatives import (  # noqa: F401

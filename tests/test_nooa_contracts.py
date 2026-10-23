@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from market_service.nooa_harness.backends import ModelBackendConfig
 from market_service.runtime.contracts import (
-    MARKET_RUN_SCHEMA_VERSION,
     SPECIALIST_REPORT_SCHEMA_VERSION,
     SpecialistReport,
     SpecialistReportParseError,
