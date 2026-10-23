@@ -116,7 +116,8 @@ class _FakePostgres:
         self.inserted.append(artifact)
         return True
 
-    async def read_canonical_output(self, symbol=None, run_id=None):
+    async def read_canonical_output(self, symbol=None, run_id=None,
+                                    venue=None):
         return None
 
     async def read_recent_canonical_outputs(self, symbol, *, venue=None, limit=8):

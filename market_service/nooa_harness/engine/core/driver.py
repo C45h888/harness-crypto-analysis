@@ -65,7 +65,7 @@ from .chain import (
 from ..principles import evaluate_principles, render_findings
 from .. import gates
 from ..cadence import INTERVAL_SECONDS, WINDOW_MINUTES
-from ..ledger import CONTEXT_KINDS, ledger_rows, render_ledger
+from ..ledger import CONTEXT_KINDS, LedgerKind, ledger_rows, render_ledger
 
 
 def _cadence_arg_refusals(canonical: str, args: dict[str, Any]) -> list[str]:
@@ -124,7 +124,8 @@ from ..config import (
     LOOP_PASS_BUDGET,
     MAX_DISPATCHES_PER_PASS,
     MEMORY_CONTEXT_BUDGET,
-    _PRIOR_HEADLINE_MAX_CHARS,
+    _PRIOR_OUTCOMES_CHARS,
+    _PRIOR_OUTCOMES_MAX,
 )
 
 log = logging.getLogger(__name__)
@@ -197,12 +198,11 @@ class InferenceEngine:
                 self.store.microstructure_event_stream(self.venue, self.symbol),
             ) or 0
         )
-        prior = None
-        if self.postgres is not None:
-            try:
-                prior = await self.postgres.read_canonical_output(self.symbol)
-            except Exception:
-                log.exception("collect_snapshot: prior-record read failed")
+        try:
+            prior = await self._prior_canonical_record()
+        except Exception:
+            log.exception("collect_snapshot: prior-record read failed")
+            prior = None
         prior_state = self._prior_headline(prior)
         return {
             "event_stream_len": stream_len,
@@ -260,29 +260,10 @@ class InferenceEngine:
         this reads it by key (symbol/venue), never by similarity or scoring.
         Returns ``(rows, rendered block)``.
         """
-        prior = None
-        if self.postgres is not None:
-            try:
-                prior = await self.postgres.read_canonical_output(self.symbol)
-            except Exception:  # noqa: BLE001 — ledger read must never kill the cycle
-                prior = None
-        if prior is None:
-            try:
-                prior = await self.store.read_latest_canonical_output(
-                    self.symbol, self.venue,
-                )
-            except Exception:  # noqa: BLE001
-                prior = None
+        prior = await self._prior_canonical_record()
         if prior is None:
             return [], ""
-        if isinstance(prior, Mapping):
-            ds = run_record_of(prior).get("deterministic_state")
-        else:
-            run_record = getattr(prior, "run_record", None)
-            if isinstance(run_record, Mapping):
-                ds = run_record.get("deterministic_state")
-            else:
-                ds = getattr(prior, "deterministic_state", None)
+        ds = self._prior_state(prior)
         if not isinstance(ds, Mapping):
             return [], ""
         # Prompt isolation: only the context kinds enter narration. VERDICT /
@@ -295,25 +276,83 @@ class InferenceEngine:
             ds, segment=segment, budget=MEMORY_CONTEXT_BUDGET,
         )
 
-    async def _prior_change_note(self) -> str:
-        """Deterministic self-consistency diff vs the prior run record."""
-        prior = None
+    async def _prior_canonical_record(self) -> Any | None:
+        """The prior canonical record for THIS cycle's ``(symbol, venue)``.
+
+        Postgres is durable and therefore preferred — but only when it can
+        answer for the same identity: the read is venue-scoped so a futures
+        cycle never diffs against a spot run. Redis is the live projection
+        fallback (also venue-scoped). ``None`` means "no prior run".
+        """
         if self.postgres is not None:
             try:
-                prior = await self.postgres.read_canonical_output(self.symbol)
-            except Exception:  # noqa: BLE001 — ledger read must never kill the cycle
+                prior = await self.postgres.read_canonical_output(
+                    self.symbol, venue=self.venue,
+                )
+            except Exception:  # noqa: BLE001 — a prior read must never kill the cycle
+                log.exception("prior canonical read failed")
                 prior = None
-        if prior is None:
-            prior = await self.store.read_latest_canonical_output(
+            if prior is not None:
+                return prior
+        try:
+            return await self.store.read_latest_canonical_output(
                 self.symbol, self.venue,
             )
-        headline = self._prior_headline(prior)
-        if not headline:
-            return "No prior artifact: this is the first inference cycle."
-        return (
-            "Prior artifact headline (deterministic diff basis):\n"
-            + json.dumps(headline, default=str)[:_PRIOR_HEADLINE_MAX_CHARS]
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _prior_state(prior: Any) -> Any:
+        """``deterministic_state`` of a prior record (dict or contract)."""
+        if isinstance(prior, Mapping):
+            return run_record_of(prior).get("deterministic_state")
+        run_record = getattr(prior, "run_record", None)
+        if isinstance(run_record, Mapping):
+            return run_record.get("deterministic_state")
+        return getattr(prior, "deterministic_state", None)
+
+    async def _prior_outcomes(self, *, segment: str | None) -> str:
+        """Render prior gate OUTCOMES for this task segment (non-citable).
+
+        Prompt isolation keeps VERDICT rows out of the ledger context because
+        they are audit data, never evidence — but a cycle that cannot see that
+        the same task already failed will repeat it verbatim. This block is
+        the narrow, explicitly non-citable relay: gate/status/reason from the
+        prior record, newest-last, bounded.
+
+        Empty string when there is no prior run, no identity, or no verdict.
+        """
+        prior = await self._prior_canonical_record()
+        if prior is None:
+            return ""
+        ds = self._prior_state(prior)
+        if not isinstance(ds, Mapping):
+            return ""
+        rows = ledger_rows(ds, (LedgerKind.VERDICT,), segment=segment)
+        if not rows:
+            return ""
+        lines = [
+            "PRIOR OUTCOMES on this task (deterministic record — NOT evidence, "
+            "never cite. If a gate refused, change the input that caused it "
+            "or say why it cannot recur):",
+        ]
+        for row in rows[-_PRIOR_OUTCOMES_MAX:]:
+            payload = row.get("payload") or {}
+            gate = payload.get("gate") or "?"
+            status = payload.get("status") or payload.get("disposition") or "?"
+            reasons = payload.get("reasons") or []
+            reason = str(reasons[0] if len(reasons) > 0 else "")[:200]
+            line = f"  - gate={gate} status={status}"
+            if reason:
+                line += f" — {reason}"
+            lines.append(line)
+        terminal = (
+            prior.get("terminal") if isinstance(prior, Mapping)
+            else getattr(prior, "terminal", None)
         )
+        if terminal:
+            lines.append(f"  - prior cycle terminal: {terminal}")
+        return "\n".join(lines)[:_PRIOR_OUTCOMES_CHARS]
 
     def _system_prompt(self) -> str:
         """Build the per-cycle system prompt (delegates to ``kb``)."""

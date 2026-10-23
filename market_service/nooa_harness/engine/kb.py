@@ -37,6 +37,7 @@ from .config import (
     VALIDATION_RETRY_PASSES,
     _MEMORY_PROTOCOL,
     _TOOL_MANIFEST,
+    tool_policy_sentence,
 )
 from .tool_schemas import tool_schema_block, wrap_tool_result
 from .loop_states import (
@@ -603,7 +604,12 @@ TOOL_WINDOWS: dict[str, str] = {
         "One repair round exists; a second rejection ends the cycle with "
         "findings preserved — do not thrash."
     ),
-    "output": "No tools this pass — compose only. Any tool_calls returned are dropped.",
+    "output": (
+        "No tools on this pass — compose or collapse only. On the collapse "
+        "turn, memory.recall/memory.remember are the ONLY calls dispatched "
+        "(your own memory — context, never evidence); every other "
+        "tool_call is dropped."
+    ),
 }
 
 
@@ -820,8 +826,7 @@ def compose_output_prompt(
     reads (context, never evidence). Pure.
     """
     return (
-        "OUTPUT COMPOSITION PASS (no tools available — any tool_calls you "
-        "return will be dropped): compose the FINAL artifact JSON strictly "
+        f"OUTPUT COMPOSITION PASS ({tool_policy_sentence('composition')}): compose the FINAL artifact JSON strictly "
         "from this run's material below. Return ONLY one JSON object with "
         "EXACTLY {summary, evidence, confidence, limitations, "
         "model_separation, hypothesis, hypothesis_probabilities, scenario} — every "
@@ -871,7 +876,7 @@ def compose_narrate1_prompt(
     scenario_block: str,
     wake_block: str,
     deterministic_state: dict[str, Any],
-    prior_note: str,
+    prior_outcomes: str,
     ledger_block: str,
     output_format: str,
     workflow_block: str,
@@ -895,8 +900,12 @@ def compose_narrate1_prompt(
         "READ-PLANE; pull everything else yourself via tools; never "
         f"recompute values, COMMAND the read tools. {CITATION_LINE}):\n"
         f"{envelope_digest(deterministic_state)}\n\n"
-        f"{prior_note}\n\n"
     )
+    # Non-citable: the block names itself as record, never evidence, so a
+    # prior refusal cannot be laundered into a current citation. Emitted
+    # unconditionally (empty when there is no prior verdict) so the prompt
+    # layout is stable across cycles.
+    context_block += f"{prior_outcomes}\n\n"
     if ledger_block:
         context_block += (
             "RECALLED ENGINE LEDGER (deterministic, segment-scoped priors — "
@@ -1095,8 +1104,7 @@ def compose_forced_final_prompt(
             "ignored.\n\n"
         )
     return (
-        "FINALIZE NOW — no tools are available this turn and any tool_calls "
-        "you return are dropped. This is the LAST turn of the cycle: return "
+        f"FINALIZE NOW — {tool_policy_sentence('finalize')}. This is the LAST turn of the cycle: return "
         "the FINAL artifact JSON and nothing else.\n\n"
         f"{strict_block}"
         f"TASK (the question this output answers):\n{(task or '(autonomous microstructure inference)')[:2_000]}\n\n"
@@ -1182,7 +1190,10 @@ def compose_answer_prompt(
         "your prose so it reads honestly beside the verdict — never re-decide "
         "the choice, never restate the verdict as your own, never move a "
         "number. An omission ships as omission; do not fill what you did "
-        "not author. No tools are available; any tool_calls are dropped.\n\n"
+        "not author. The ENGINE FINDINGS block below is recorded truth "
+        "(validation findings, chain gaps, salvaged/dropped evidence): "
+        "reword each item into your limitations — never omit one. "
+        f"{tool_policy_sentence('answer')}.\n\n"
         "GATED FOUNDATION (read-only — verbalize from this, never against it):\n"
         f"{json.dumps(material, default=str)[:12_000]}\n\n"
         f"{frame_block}"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Mapping
@@ -41,16 +40,16 @@ def _utc_now_iso() -> str:
 
 
 def _stable_session_id(symbol: str, venue: str) -> str:
-    """Deterministic per-(symbol, venue) UUID session id.
+    """Deterministic per-(symbol, venue) UUID session id (thin re-export).
 
-    The durable stores (agent_memory, inference_artifact) cast session_id to
-    a UUID column, so the engine must hand them a real UUID. Deriving it from
-    symbol+venue keeps memory coherent across cycles for one scope — a random
-    id per cycle would fragment the memory plane.
+    The derivation is owned by ``nooa_harness.memory.session_id_for`` — the
+    same function the operator CLI uses — so the engine and the CLI can never
+    disagree about which session a memory row belongs to. Kept here as the
+    engine-side name existing call sites import.
     """
-    return str(uuid.uuid5(
-        uuid.NAMESPACE_URL, f"inference-engine://{symbol.lower()}/{venue}",
-    ))
+    from ...memory import session_id_for
+
+    return session_id_for(symbol, venue)
 
 
 class GovernanceDenied(RuntimeError):
@@ -282,7 +281,9 @@ class CycleRuntimeState:
     wake_block: str = ""
     workflow_block: str = ""
     ledger_block: str = ""
-    prior_note: str = ""
+    # Prior gate OUTCOMES for this task segment — non-citable relay rendered
+    # before the ledger block (prompt isolation keeps VERDICT rows out of it).
+    prior_outcomes: str = ""
     # Reasoning-entry partition context (first semantic of REASONING).
     # Recalled at REASONING entry from the task-segment partition writes
     # (understanding + plan + handoff) so the first passes reason over
@@ -511,6 +512,10 @@ class _EngineTransport:
             # The cycle's venue, never a tool-side default: every
             # venue-scoped read must target the venue capture writes.
             venue=getattr(self._engine, "venue", None),
+            # The cycle's task segment, exactly as the dispatch loop passes
+            # it. Omitting it here made this seam write/read UNSEGMENTED
+            # memory (segment=None reads are wider, not narrower).
+            segment=getattr(self._ctx, "task_id", None),
         )
 
     async def call_llm(self, prompt: str) -> str:

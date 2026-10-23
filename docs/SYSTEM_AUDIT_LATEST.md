@@ -136,3 +136,26 @@ The repository has 50 Markdown documents under `docs/` (about 9,400 Markdown lin
 - Current documents distinguish active contracts from proposals and historical records; old audit findings are explicitly superseded.
 - Ledger facts/verdicts remain canonical, derived compatibility projections are not writable authorities, and duplicated persisted query fields have a tested parity rule.
 - Full suite and live-runtime smoke checks pass before calling the system verified.
+
+---
+
+## Resolution status — Plane A/B/E pass (2026-10-23)
+
+| Finding | Status | Evidence |
+|---|---|---|
+| A-01 docs describe retired paths | **partially open** | runtime reads fixed; `README.md` / `nooa_harness/README.md` still describe collated/`AnalystBriefing` |
+| A-02 venue not enforced | **closed** | `inference_runner.run_inference_once` refuses `venue_not_captured` before `_build_engine`; `tests/test_plane_abe_contracts.py::VenueRefusalTests` |
+| A-03 PostgreSQL reads ignore venue | **closed** | `read_canonical_output(..., venue=)` / `read_canonical_history(..., venue=)`; all 3 call sites thread the cycle venue or the CLI `--venue`; `CanonicalReadVenueTests`, `PriorRecordVenueTests` |
+| A-04 projections easy to misread | **closed** | `tests/test_record_plane_contract.py` (idempotence, derived-not-authoritative, conformance parity) |
+| A-05 audit notes historical | **closed** | `Planne-based-audit-finidngs.md` retained as provenance; this file carries status |
+| A-06 docs lack lifecycle signals | **open** | 28 docs, no index; 3 carry lifecycle labels |
+
+Plane E (memory) closed in the same pass: segment identity is derived from
+`(symbol, venue)` + task shape + horizon + a paraphrase-tolerant word
+fingerprint (`memory.task_segment_id`), prior gate outcomes reach the prompt as
+a non-citable `prior_outcomes` block (`driver._prior_outcomes`), both dispatch
+seams carry the segment, and the operator can reproduce the agent's memory view
+(`nooa market memory session`).
+
+Acceptance items still unproven: the live Docker/Redis/PostgreSQL smoke run
+(the stack was down for every pass) and the README reconciliation above.

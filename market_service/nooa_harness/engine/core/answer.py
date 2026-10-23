@@ -41,13 +41,33 @@ from market_service.runtime.contracts import run_record_of
 __all__ = [
     "MISSING",
     "NOT_APPLICABLE",
+    "ENGINE_FINDING_KEYS",
     "answer_material_from_skeleton",
     "compose_answer",
     "compose_answer_structured",
     "answer_inputs_from_record",
     "answer_from_record",
+    "engine_findings_from_projections",
     "render_answer",
 ]
+
+#: Engine-recorded finding vectors that the answer MUST carry. The model
+#: verbalizes them into limitations (reword, never omit); the composer
+#: renders them verbatim as well, so a dropped model item still ships.
+#: Single owner for the key set — projections.py derives them, the answer
+#: schema preserves them, nothing else re-lists them.
+ENGINE_FINDING_KEYS: tuple[str, ...] = (
+    "validation_findings",
+    "chain_gaps",
+    "evidence_salvaged",
+    "assembly_dropped",
+    "principle_findings",
+)
+
+#: Per-key bound in answer material and rendered text (matches the
+#: conformance row caps — bounded by construction, never truncated mid-item
+#: by the tool-result budget).
+ENGINE_FINDINGS_CAP = 8
 
 #: The honest marker for a block the agent left empty (never filled).
 MISSING = "missing (flagged)"
@@ -75,6 +95,33 @@ def _text(value: Any) -> str | None:
     return as_str or None
 
 
+def engine_findings_from_projections(source: Any) -> dict[str, list[str]]:
+    """Engine-recorded findings, bounded per key (pure).
+
+    Reads the projected vector keys (``projections.build_artifact_state``
+    derives them from ledger FINDING rows at artifact write; the live
+    answer-turn skeleton carries them attached). Missing keys read as
+    empty — never null, never fabricated. Principle findings reduce to
+    their message strings; anything unshaped is stringified.
+    """
+    src = source if isinstance(source, dict) else {}
+    out: dict[str, list[str]] = {}
+    for key in ENGINE_FINDING_KEYS:
+        raw = src.get(key)
+        items: list[str] = []
+        if isinstance(raw, list):
+            for entry in raw[:ENGINE_FINDINGS_CAP]:
+                if isinstance(entry, dict):
+                    text = entry.get("message") or entry.get("detail") or entry
+                else:
+                    text = entry
+                text = str(text).strip() if text is not None else ""
+                if text:
+                    items.append(text)
+        out[key] = items
+    return out
+
+
 def _citation(entry: Any) -> dict[str, Any] | None:
     """One evidence entry reduced to the composer's citation shape (pure)."""
     if not isinstance(entry, dict):
@@ -92,8 +139,8 @@ def _root(path: Any) -> str:
 
 def answer_inputs_from_record(
     record: dict[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Build ``(authored, gate_data, conformance, run_meta)`` from a run record.
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, list[str]]]:
+    """Build ``(authored, gate_data, conformance, run_meta, engine_findings)`` from a run record.
 
     The record is the ``CanonicalOutput.to_dict()`` shape (the run record
     written to PG/Redis). Everything read here is engine-recorded state —
@@ -231,7 +278,12 @@ def answer_inputs_from_record(
         "task": _text(ds.get("task")),
         "gate": _text(record.get("status")),
     }
-    return authored, gate_data, conformance, run_meta
+    # Engine findings ride the record's projected vectors (filled by
+    # projections.build_artifact_state at artifact write). The composer
+    # renders them verbatim, so the answer carries recorded truth even
+    # when the model prose omits it.
+    engine_findings = engine_findings_from_projections(ds)
+    return authored, gate_data, conformance, run_meta, engine_findings
 
 
 def answer_material_from_skeleton(
@@ -299,6 +351,20 @@ def answer_material_from_skeleton(
         "model_separation": _text(interp.get("model_separation")),
         "calculations": _bounded(skeleton.get("calculations"), 4_000),
         "assembly_trail": [str(d) for d in (skeleton.get("dropped") or [])][:12],
+        # Engine findings the model MUST reword into limitations (the
+        # answer-turn prompt directs this explicitly) — plus the composer
+        # renders them verbatim, so an omission still ships. Skeleton may
+        # carry a prebuilt block (attached by the output plane from the
+        # ledger); assembly_dropped always resolves from `dropped`.
+        "engine_findings": engine_findings_from_projections(
+            {
+                **engine_findings_from_projections(
+                    skeleton.get("engine_findings")),
+                "assembly_dropped": [
+                    str(d) for d in (skeleton.get("dropped") or [])
+                ][:ENGINE_FINDINGS_CAP],
+            }
+        ),
         "conformance": {
             "hard_misses": [str(m) for m in (conformance.get("hard_misses") or [])][:8],
             "conflicts": [str(c) for c in (conformance.get("conflicts") or [])][:8],
@@ -321,8 +387,13 @@ def answer_from_record(record: dict[str, Any] | None) -> str | None:
     conformance = conformance if isinstance(conformance, dict) else {}
     if conformance.get("tier") != "authored":
         return None
-    authored, gate_data, conformance_in, run_meta = answer_inputs_from_record(record)
-    return compose_answer(authored, gate_data, conformance_in, run_meta)
+    inputs = answer_inputs_from_record(record)
+    authored, gate_data, conformance_in, run_meta = inputs[:4]
+    engine_findings = inputs[4] if len(inputs) > 4 else None
+    return compose_answer(
+        authored, gate_data, conformance_in, run_meta,
+        engine_findings=engine_findings,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +411,7 @@ def compose_answer_structured(
     gate_data: dict[str, Any] | None,
     conformance: dict[str, Any] | None,
     run_meta: dict[str, Any] | None,
+    engine_findings: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Structured variant of the answer (pure) — same content, machine shape.
 
@@ -378,6 +450,19 @@ def compose_answer_structured(
     limitations = list(authored.get("limitations") or [])
     if not limitations:
         limitations = [_missing(missing_blocks, "limitations")]
+    # Engine-recorded findings are APPENDED to the rendered limitations,
+    # tagged, never merged into prose: the model may reword them (directed
+    # by the answer-turn prompt), but a dropped model item still ships
+    # because the composer renders recorded truth verbatim. This is what
+    # makes the silent drop structurally impossible.
+    _engine_src = engine_findings_from_projections(engine_findings)
+    _engine_items: list[str] = []
+    for _key in ENGINE_FINDING_KEYS:
+        for _item in _engine_src.get(_key, []):
+            _tagged = f"{_item} (engine-recorded: {_key})"
+            if _tagged not in limitations and _item not in limitations:
+                _engine_items.append(_tagged)
+    limitations_out = limitations + _engine_items
 
     hypothesis = dict(gate.get("hypothesis") or {})
     h0 = _text(hypothesis.get("H0"))
@@ -475,7 +560,8 @@ def compose_answer_structured(
             "evidence_note": evidence_note,
             "scenario_rationale": scenario_rationale,
             "model_separation": model_separation,
-            "limitations": limitations,
+            "limitations": limitations_out,
+            "engine_findings": _engine_src,
         },
         "gate_data": {
             "hypothesis": {"H0": h0, "H1": h1},
@@ -557,6 +643,17 @@ def render_answer(structured: dict[str, Any]) -> str:
     lines.append("--- limitations ---")
     for item in answer["limitations"]:
         lines.append(f"- {item}")
+    lines.append("")
+    lines.append("--- engine findings (recorded truth, never dropped) ---")
+    _ef = answer.get("engine_findings") or {}
+    _ef_any = False
+    for _key in ("validation_findings", "chain_gaps", "evidence_salvaged",
+                 "assembly_dropped", "principle_findings"):
+        for _item in (_ef.get(_key) or []):
+            lines.append(f"- [{_key}] {_item}")
+            _ef_any = True
+    if not _ef_any:
+        lines.append("(none recorded)")
     lines.append("")
 
     gate = structured["gate_data"]
@@ -651,10 +748,13 @@ def compose_answer(
     gate_data: dict[str, Any] | None,
     conformance: dict[str, Any] | None,
     run_meta: dict[str, Any] | None,
+    engine_findings: dict[str, list[str]] | None = None,
 ) -> str:
     """Compose the answer surface (pure): the agent's words + gate data +
-    the OUTPUT CONFORMANCE footer. The composer renders — it never authors.
+    engine findings + the OUTPUT CONFORMANCE footer. The composer renders —
+    it never authors.
     """
     return render_answer(
         compose_answer_structured(
-            authored_interpretation, gate_data, conformance, run_meta))
+            authored_interpretation, gate_data, conformance, run_meta,
+            engine_findings))

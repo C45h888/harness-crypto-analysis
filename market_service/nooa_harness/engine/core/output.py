@@ -504,6 +504,16 @@ async def run_output(
         from .answer import answer_material_from_skeleton
         from .synthesize import _one_call
         from ..kb import compose_answer_prompt
+        from ..projections import engine_finding_vectors
+        # Engine findings attach to the skeleton BEFORE the answer turn:
+        # the model rewords them into limitations (directed by the
+        # answer-turn prompt), and the composer renders them verbatim, so
+        # recorded doubt can never silently drop out of the answer.
+        _engine_vectors = engine_finding_vectors(deterministic_state or {})
+        _dropped_trail = [str(d) for d in list(_dropped)]
+        for _d in _dropped_trail:
+            if _d not in _engine_vectors["assembly_dropped"]:
+                _engine_vectors["assembly_dropped"].append(_d)
         _skeleton = {
             "task": task,
             "gate": {"status": gate_status,
@@ -514,6 +524,7 @@ async def run_output(
             "hypothesis": hypothesis,
             "calculations": calculations,
             "dropped": list(_dropped),
+            "engine_findings": _engine_vectors,
             "conformance": {
                 "hard_misses": list(hard)[:8],
                 "conflicts": list(conflicts)[:8],

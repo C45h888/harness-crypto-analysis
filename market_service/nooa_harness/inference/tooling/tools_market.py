@@ -132,11 +132,9 @@ async def dispatch_market_read(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Tool: market.read — LIVE Redis projections, scoped by (symbol, venue).
 
-    This tool used to read the collated run plane. That plane has no writer:
-    ``publish_run`` and ``insert_run`` are referenced only by their
-    definitions and a test, and ``assemble_envelope`` has no production
-    caller. So the tool returned whatever was frozen there years ago — a
-    BTCUSDT read answered ``last_price 145.2`` with ``fut_microprice_skew_bps``
+    This tool used to read the collated run plane. That plane is deleted:
+    it had no writer, so the tool returned whatever was frozen there — a
+    BTCUSDT read answered ``last_price 145.2`` with futures-only fields
     attached, because the payload was futures-captured data under a stale key.
 
     It now reads the LIVE, venue-scoped projections the capture and worker

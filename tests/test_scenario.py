@@ -348,9 +348,9 @@ class ScenarioRegistryTests(unittest.TestCase):
         self.assertEqual(log["detail"]["status"], "refused")
 
     def test_derivatives_price_fallback(self):
-        # Collated snapshot absent + derivatives funding.mark_price present:
-        # price resolution must pass (failure moves downstream to the tape,
-        # never no_market_price).
+        # Derivatives funding.mark_price present: price resolution must
+        # pass (failure moves downstream to the tape, never
+        # no_market_price).
         import asyncio
         from unittest.mock import patch
 

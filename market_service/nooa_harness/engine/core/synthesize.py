@@ -32,7 +32,7 @@ from typing import Any
 from . import context
 from .. import kb
 from ..ledger import record_finding
-from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS
+from ..config import LOOP_PASS_BUDGET, SUMMARY_MIN_CHARS, tool_policy_sentence
 from ..loop_states import LoopStep, NestedLoop, SubLoop
 
 from ..predicates import (
@@ -398,14 +398,14 @@ def compose_collapse_prompt(
 ) -> str:
     """The COLLAPSE turn: read every vector, emit the strict object (pure).
 
-    The relaxed-loop window: the agent may return ``memory.*`` tool_calls
-    (its own memory reads — context, never evidence); every other tool is
-    dropped before dispatch.
+    The relaxed-loop window is stated by the single tool-policy owner
+    (config.tool_policy_sentence): the agent may return ``memory.*``
+    tool_calls (its own memory reads — context, never evidence); every
+    other tool is dropped before dispatch.
     """
     return (
         "OUTPUT SYNTHESIS — COLLAPSE PASS (return ONLY one JSON object, no "
-        "prose; you MAY return memory.* tool_calls — your own memory reads, "
-        "context only — every other tool is dropped). Read every independent "
+        f"prose; {tool_policy_sentence('collapse')}). Read every independent "
         "vector below and collapse them into the strict object. You decide "
         "NOTHING here (choice, verdict, and values are frozen upstream) — you "
         "read, note contradictions, and state where the vectors point.\n\n"

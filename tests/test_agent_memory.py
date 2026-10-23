@@ -125,9 +125,11 @@ class MemoryToolTests(unittest.TestCase):
             None, "memory.remember",
             {"symbol": "DOGEUSDT", "venue": "spot",
              "kind": "note", "content": "x"},
-            memory=_FakeMemory(), session_id="sess", segment="task:abc"))
-        self.assertFalse(out["stored"])
+            memory=_FakeMemory(), session_id="sess", segment="task:abc",
+            settings=SimpleNamespace(symbols=("SOLUSDT",), venue="futures")))
+        self.assertIsNone(out)
         self.assertEqual(log["result"], "denied")
+        self.assertEqual(log["detail"]["reason"], "symbol_not_captured")
 
 
 if __name__ == "__main__":

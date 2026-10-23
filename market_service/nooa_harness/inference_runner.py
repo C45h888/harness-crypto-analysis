@@ -125,8 +125,11 @@ async def run_inference_once(
 
     Identity is resolved ONCE from the live set (Redis control key > env)
     and an uncaptured symbol is REFUSED here — before the engine, the LLM
-    client, or any store write is constructed. A cycle that cannot possibly
-    read data must not cost nine narration turns to discover that.
+    client, or any store write is constructed. The VENUE half of identity is
+    refused the same way: the runtime captures exactly one venue
+    (``settings.venue``, the same env var the capture container reads), so a
+    request for another venue can only produce empty reads. A cycle that
+    cannot possibly read data must not cost nine narration turns to find out.
     """
     settings = Settings.from_env()
     resolved = Scope.from_settings(settings)
@@ -162,6 +165,28 @@ async def run_inference_once(
             "message": (
                 f"{resolved_symbol} is not captured by this runtime "
                 f"(captured: {', '.join(captured)}) — nothing to "
+                "analyse; no cycle was run"
+            ),
+        }
+    configured_venue = resolved.venue
+    if resolved_venue != configured_venue:
+        # Fail closed on the other half of identity, for the same reason the
+        # symbol gate exists: the capture plane writes ONE venue, so every
+        # venue-scoped read for another one is structurally empty.
+        log.warning(
+            "refusing cycle: venue %s is not captured (capture venue: %s)",
+            resolved_venue, configured_venue,
+        )
+        return {
+            "status": "refused",
+            "reason": "venue_not_captured",
+            "symbol": resolved_symbol,
+            "venue": resolved_venue,
+            "configured_venue": configured_venue,
+            "captured_venues": [configured_venue],
+            "message": (
+                f"{resolved_symbol}/{resolved_venue} is not captured by this "
+                f"runtime (capture venue: {configured_venue}) — nothing to "
                 "analyse; no cycle was run"
             ),
         }

@@ -347,12 +347,19 @@ class RunRecordParityTests(unittest.TestCase):
         self.assertEqual(answer_from_record(record), answer_from_record(record))
 
     def test_inputs_consume_record_directives_and_delta(self):
-        _, gate_data, conformance, run_meta = answer_inputs_from_record(self._record())
+        _, gate_data, conformance, run_meta, engine_findings = answer_inputs_from_record(self._record())
         self.assertTrue(gate_data["delta"]["required"])
         self.assertEqual(gate_data["directive"]["targets"], ["245.30"])
         self.assertEqual(gate_data["confidence"], "medium")
         self.assertEqual(conformance["correction_used"], False)
         self.assertEqual(run_meta["task"], "can price hit 245.30?")
+        # Engine findings ride the record even when the model prose is thin.
+        self.assertIsInstance(engine_findings, dict)
+        self.assertEqual(
+            sorted(engine_findings),
+            ["assembly_dropped", "chain_gaps", "evidence_salvaged",
+             "principle_findings", "validation_findings"],
+        )
 
     def test_no_authored_ship_renders_no_answer(self):
         record = self._record()
@@ -428,7 +435,7 @@ class EngineVerdictLineTests(unittest.TestCase):
 
     def test_record_verdict_flows_into_gate_data(self):
         record = RunRecordParityTests()._record()
-        _, gate_data, _, _ = answer_inputs_from_record(record)
+        _, gate_data, _, _, engine_findings = answer_inputs_from_record(record)
         self.assertEqual(gate_data["verdict"]["engine"], "validated")
         self.assertIn("confirmed", gate_data["verdict"]["reason"])
 
@@ -490,6 +497,79 @@ class AnswerMaterialTests(unittest.TestCase):
         self.assertNotIn({"path": "mutated"}, fresh["evidence"])
 
 
+class EngineFindingsGuaranteeTests(unittest.TestCase):
+    """N1: recorded engine doubt can never silently drop from the answer.
+
+    The model is directed to reword engine findings into limitations, but
+    even a model that omits them still ships them: the composer renders
+    recorded truth verbatim and appends it to the rendered limitations.
+    """
+
+    def test_engine_items_appended_to_limitations_when_model_omits(self):
+        from market_service.nooa_harness.engine.core.answer import (
+            engine_findings_from_projections,
+        )
+        authored = _authored(limitations=["synthetic window"])
+        gate, conf, meta = _gate(), _conformance(), _meta()
+        engine = engine_findings_from_projections({
+            "validation_findings": ["fit unvalidated: n=2"],
+            "chain_gaps": ["gap at 15m bridge"],
+            "evidence_salvaged": [],
+            "assembly_dropped": ["calc.depth.average → x"],
+            "principle_findings": [],
+        })
+        structured = compose_answer_structured(
+            authored, gate, conf, meta, engine)
+        limitations = structured["answer"]["limitations"]
+        self.assertIn("synthetic window", limitations)
+        self.assertIn(
+            "fit unvalidated: n=2 (engine-recorded: validation_findings)",
+            limitations,
+        )
+        self.assertIn(
+            "gap at 15m bridge (engine-recorded: chain_gaps)", limitations,
+        )
+        self.assertIn(
+            "calc.depth.average → x (engine-recorded: assembly_dropped)",
+            limitations,
+        )
+        out = compose_answer(authored, gate, conf, meta, engine)
+        self.assertIn("--- engine findings (recorded truth, never dropped) ---", out)
+        self.assertIn("[validation_findings] fit unvalidated: n=2", out)
+
+    def test_empty_engine_findings_render_honest_none(self):
+        structured = compose_answer_structured(
+            _authored(), _gate(), _conformance(), _meta(), {})
+        self.assertEqual(
+            structured["answer"]["engine_findings"],
+            {"validation_findings": [], "chain_gaps": [],
+             "evidence_salvaged": [], "assembly_dropped": [],
+             "principle_findings": []},
+        )
+        out = compose_answer(_authored(), _gate(), _conformance(), _meta(), {})
+        self.assertIn("(none recorded)", out)
+
+    def test_material_carries_engine_findings_for_the_answer_turn(self):
+        skeleton = {
+            "task": "can price hit 245.30?",
+            "gate": {"status": "provisional", "reasons": []},
+            "hypothesis_verdict": "inconclusive",
+            "verdict_reason": "Gate provisional",
+            "interpretation": dict(_authored()),
+            "hypothesis": {"H0": "beta > 0", "H1": "beta <= 0"},
+            "calculations": {},
+            "dropped": ["bogus.tool → x"],
+            "conformance": dict(_conformance()),
+            "engine_findings": {"chain_gaps": ["gap at 15m bridge"]},
+        }
+        material = answer_material_from_skeleton(skeleton)
+        self.assertEqual(
+            material["engine_findings"]["chain_gaps"], ["gap at 15m bridge"])
+        # assembly_dropped always resolves from the skeleton trail.
+        self.assertEqual(
+            material["engine_findings"]["assembly_dropped"], ["bogus.tool → x"])
+
+
 #: The ONLY words the renderer may contribute beyond the input payloads.
 _LABEL_WORDS = {
     "ANSWER", "GATE", "DATA", "OUTPUT", "CONFORMANCE", "H0", "H1",
@@ -501,7 +581,8 @@ _LABEL_WORDS = {
     "horizon", "cited", "kind", "answer", "basis", "chosen", "tiebreak",
     "refusals", "confidence", "hard", "misses", "conflicts", "quality",
     "findings", "correction", "used", "terminal", "delta", "p", "of",
-    "note", "id", "engine", "reason", "fallback",
+    "note", "id", "engine", "reason", "fallback", "recorded", "truth",
+    "never", "dropped",
 }
 
 

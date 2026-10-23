@@ -35,7 +35,10 @@ import click
 from click import echo as click_echo
 
 from market_service.config import Settings
-from market_service.nooa_harness.memory import MemoryNode
+from market_service.nooa_harness.memory import (
+    MemoryNode, session_id_for, task_segment_id,
+)
+from market_service.runtime.contracts import ValidMemoryKinds
 from market_service.runtime.postgres_store import PostgresRuntimeStore
 from market_service.runtime.redis_store import RedisRuntimeStore
 from market_service.runtime.scope import (
@@ -119,7 +122,7 @@ async def _load_run_record(
         try:
             await postgres.connect()
             record = await postgres.read_canonical_output(
-                symbol, run_id=run_id,
+                symbol, run_id=run_id, venue=venue,
             )
             if record is not None:
                 source = "postgres"
@@ -315,48 +318,121 @@ async def _with_node(op) -> Any:
         await _close_node(node)
 
 
+#: Kinds the OPERATOR may WRITE here. ``fact`` is seed-only (deterministic
+#: paper truth the agent may read but never writes). ``request``/``briefing``
+#: remain in the contract for legacy rows and stay readable through
+#: ``--kind``, but are no longer writable: an operator could otherwise seed
+#: rows the agent can never reproduce (the old Q5 asymmetry).
+_OPERATOR_WRITABLE_KINDS = ("observation", "hypothesis", "note", "fact")
+
+
+def _memory_session(
+    session_id: str | None, *, symbol: str | None, venue: str | None,
+) -> tuple[str, Any]:
+    """Resolve a memory session: explicit id wins, else derived from identity.
+
+    Derivation is the SAME function the engine uses
+    (``nooa_harness.memory.session_id_for``), so the operator never has to
+    hand-compute ``uuid5(NS_URL, inference-engine://<symbol>/<venue>)`` and
+    can always reach the session the agent actually writes.
+    """
+    scope = _resolve_args(symbol, venue)
+    resolved = session_id or session_id_for(scope.symbol, scope.venue)
+    return resolved, scope
+
+
+@memory_group.command("session")
+@click.option("--session-id", default=None,
+              help="session UUID (default: derived from --symbol/--venue)")
+@click.option("--symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
+@click.option("--task", default=None,
+              help="the task text the cycle ran (to derive its segment)")
+@click.option("--target", default=None, help="scenario target_price")
+@click.option("--horizon", default=None,
+              type=click.Choice(("15m", "1h", "4h")))
+def memory_session(session_id, symbol, venue, task, target, horizon) -> None:
+    """Print the agent's exact memory identity (session + task segment).
+
+    This is the operator's reproduction key: pass the same --task/--target/
+    --horizon the cycle ran and you get the segment the agent read and wrote,
+    so ``memory recall --segment`` shows the agent's own view instead of the
+    whole session.
+    """
+    scope = _resolve_args(symbol, venue)
+    scenario = None
+    if target is not None or horizon is not None:
+        scenario = {"target_price": target, "horizon": horizon}
+    _emit({
+        "symbol": scope.symbol,
+        "venue": scope.venue,
+        "session_id": session_id or session_id_for(scope.symbol, scope.venue),
+        "segment": task_segment_id(scope.symbol, scope.venue, task, scenario),
+        "task": task,
+        "scenario": scenario,
+    })
+
+
 @memory_group.command("remember")
-@click.option("--session-id", required=True)
+@click.option("--session-id", default=None,
+              help="session UUID (default: derived from --symbol/--venue)")
+@click.option("--symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--kind", required=True,
-              type=click.Choice(("observation", "hypothesis", "request",
-                                 "briefing", "fact", "note")))
+              type=click.Choice(_OPERATOR_WRITABLE_KINDS),
+              help="observation|hypothesis|note (agent kinds); fact is seed-only")
 @click.option("--content", required=True)
 @click.option("--run-id", default=None)
 @click.option("--title", default=None)
 @click.option("--importance", type=float, default=5.0)
 @click.option("--tag", "tags", multiple=True, default=())
 @click.option("--evidence", "evidence_refs", multiple=True, default=())
-def memory_remember(session_id, kind, content, run_id, title, importance,
-                    tags, evidence_refs) -> None:
-    """Write one durable analyst memory."""
+@click.option("--segment", default=None,
+              help="task segment (default: unsegmented/operator row)")
+def memory_remember(session_id, symbol, venue, kind, content, run_id, title,
+                    importance, tags, evidence_refs, segment) -> None:
+    """Write one durable memory into the agent-reachable session."""
+    resolved, _scope = _memory_session(session_id, symbol=symbol, venue=venue)
+
     async def _op(node: MemoryNode) -> dict:
         memory = await node.remember(
-            session_id=session_id, kind=kind, content=content,
+            session_id=resolved, kind=kind, content=content,
             run_id=run_id, title=title, importance=importance,
             tags=tuple(tags), evidence_refs=tuple(evidence_refs),
+            segment=segment,
         )
-        return {"stored": True, "memory": memory.to_dict()}
+        return {"stored": True, "session_id": resolved, "segment": segment,
+                "memory": memory.to_dict()}
 
     _emit(asyncio.run(_with_node(_op)))
 
 
 @memory_group.command("recall")
-@click.option("--session-id", required=True)
-@click.option("--kind", default=None,
-              type=click.Choice(("observation", "hypothesis", "request",
-                                 "briefing", "fact", "note")))
+@click.option("--session-id", default=None,
+              help="session UUID (default: derived from --symbol/--venue)")
+@click.option("--symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
+@click.option("--segment", default=None,
+              help="task segment (see `memory session`); default = whole "
+                   "session, which is WIDER than the agent's own view")
+@click.option("--kind", default=None, type=click.Choice(ValidMemoryKinds),
+              help="filter by kind (legacy kinds stay queryable)")
 @click.option("--run-id", default=None)
 @click.option("--query", default=None, help="keyword relevance query")
 @click.option("--limit", type=int, default=16)
-def memory_recall(session_id, kind, run_id, query, limit) -> None:
-    """Recall the session's prior analyst memories (Redis-first read)."""
+def memory_recall(session_id, symbol, venue, segment, kind, run_id, query,
+                  limit) -> None:
+    """Recall prior memories (Redis-first read), optionally one task segment."""
+    resolved, _scope = _memory_session(session_id, symbol=symbol, venue=venue)
+
     async def _op(node: MemoryNode) -> dict:
         memories = await node.recall(
-            session_id=session_id, kind=kind, run_id=run_id,
-            query=query, limit=limit,
+            session_id=resolved, kind=kind, run_id=run_id,
+            query=query, limit=limit, segment=segment,
         )
         return {
-            "session_id": session_id, "count": len(memories),
+            "session_id": resolved, "segment": segment,
+            "count": len(memories),
             "memories": [m.to_dict() for m in memories],
         }
 
@@ -364,24 +440,34 @@ def memory_recall(session_id, kind, run_id, query, limit) -> None:
 
 
 @memory_group.command("stats")
-@click.option("--session-id", required=True)
-def memory_stats(session_id) -> None:
+@click.option("--session-id", default=None,
+              help="session UUID (default: derived from --symbol/--venue)")
+@click.option("--symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
+def memory_stats(session_id, symbol, venue) -> None:
     """Per-kind usage counts for one session (durable ledger authority)."""
+    resolved, _scope = _memory_session(session_id, symbol=symbol, venue=venue)
+
     async def _op(node: MemoryNode) -> dict:
-        counts = await node.stats(session_id)
-        return {"session_id": session_id, "count_by_kind": counts,
+        counts = await node.stats(resolved)
+        return {"session_id": resolved, "count_by_kind": counts,
                 "total": sum(counts.values())}
 
     _emit(asyncio.run(_with_node(_op)))
 
 
 @memory_group.command("forget")
-@click.option("--session-id", required=True)
+@click.option("--session-id", default=None,
+              help="session UUID (default: derived from --symbol/--venue)")
+@click.option("--symbol", default=_default_symbol)
+@click.option("--venue", default=_default_venue)
 @click.option("--memory-id", required=True)
-def memory_forget(session_id, memory_id) -> None:
+def memory_forget(session_id, symbol, venue, memory_id) -> None:
     """Tombstone one memory (audit row and Redis projection survive)."""
+    resolved, _scope = _memory_session(session_id, symbol=symbol, venue=venue)
+
     async def _op(node: MemoryNode) -> dict:
-        memory = await node.forget(session_id, memory_id)
+        memory = await node.forget(resolved, memory_id)
         return {"forgotten": memory is not None,
                 "memory": memory.to_dict() if memory else None}
 
@@ -817,7 +903,8 @@ def inference_history(symbol: str, venue: str, limit: int) -> None:
         postgres = PostgresRuntimeStore(settings.database_url)
         try:
             await postgres.connect()
-            history = await postgres.read_canonical_history(symbol, limit=limit)
+            history = await postgres.read_canonical_history(
+                symbol, limit=limit, venue=venue)
             return {"symbol": symbol.upper(), "count": len(history),
                     "source": "postgres", "history": history}
         finally:

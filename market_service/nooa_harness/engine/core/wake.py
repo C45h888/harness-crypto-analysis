@@ -153,20 +153,20 @@ async def build_manual_wake(
                       "consumed_wake_ids": [envelope.wake_id]}
 
 
-def _task_segment_id(prompt: "PromptVariable") -> str | None:
-    """Deterministic task-scoped memory segment id (state redistribution).
+def _task_segment_id(
+    prompt: "PromptVariable", symbol: str | None, venue: str | None,
+) -> str | None:
+    """Deterministic task-scoped memory segment id (identity, not raw text).
 
-    The normalized prompt hash is the segment key: re-invoking the same task
-    recalls the same segment, and different tasks cannot pollute each other's
-    plan/handoff carry. Empty prompts are unsegmented (None) — legacy shape.
+    The derivation lives in ``nooa_harness.memory.task_segment_id`` — the ONE
+    owner, shared with the operator CLI so a human can reproduce the agent's
+    segment instead of guessing a hash. Keyed by ``(symbol, venue)`` + task
+    shape + horizon + a paraphrase-tolerant word fingerprint: the same
+    question reworded recalls, a different question does not.
     """
-    import hashlib
+    from ...memory import task_segment_id
 
-    basis = (prompt.raw or "").strip()
-    if not basis:
-        return None
-    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
-    return f"task:{digest}"
+    return task_segment_id(symbol, venue, prompt.raw, prompt.scenario)
 
 
 def run_wake(
@@ -249,7 +249,11 @@ def run_wake(
         controller=controller, capability_log=capability_log,
         scenario_contract=scenario_contract,
         prompt=prompt,
-        task_id=_task_segment_id(prompt),
+        task_id=_task_segment_id(
+            prompt,
+            getattr(engine, "symbol", None),
+            getattr(engine, "venue", None),
+        ),
     )
 
 
@@ -410,7 +414,11 @@ async def run_comprehension(
     _ledger_rows, st.ledger_block = await engine._recall_ledger(
         segment=ctx.task_id,
     )
-    st.prior_note = ""  # fetch_note removed (R7)
+    # Prior OUTCOMES get their own non-citable block. Prompt isolation keeps
+    # VERDICT/FINDING rows out of the ledger context (they are not evidence),
+    # which is exactly why a cycle could not see that this same task already
+    # failed its gate. Deterministic, bounded, never citable.
+    st.prior_outcomes = await engine._prior_outcomes(segment=ctx.task_id)
     st.scenario_reminder = (
         render_reminder(contract)
         if contract is not None else

@@ -108,6 +108,36 @@ VALIDATION_RETRY_PASSES = 2
 # runtime and prompt use the same number; excess calls are named on the
 # cycle's unexecuted list rather than silently dropped.
 MAX_DISPATCHES_PER_PASS = AGENTIC_PER_ROUND_CALL_CAP
+
+# SINGLE OWNER for per-turn tool policy in the OUTPUT sequence.
+# synthesize.py ENFORCES this table (collapse dispatches memory.* only;
+# derive drops tool_calls); kb.py prompt strings QUOTE it via
+# tool_policy_sentence(). Never restate the policy in prose elsewhere —
+# a second wording is how the output-loop contradiction happened.
+# Values are the allowed tool-name prefixes per turn; () = none.
+TURN_TOOL_POLICY: dict[str, tuple[str, ...]] = {
+    "collapse": ("memory.",),
+    "derive": (),
+    "composition": (),
+    "finalize": (),
+    "answer": (),
+}
+
+
+def tool_policy_sentence(turn: str) -> str:
+    """The canonical tool-policy sentence for one OUTPUT-sequence turn.
+
+    The ONLY wording prompt builders may use. ``collapse`` opens the
+    memory window (own memory reads, context only — every other tool is
+    dropped); every other turn is tool-free (any tool_calls are dropped).
+    """
+    allowed = TURN_TOOL_POLICY.get(turn, ())
+    if allowed == ("memory.",):
+        return (
+            "you MAY return memory.* tool_calls — your own memory reads, "
+            "context only — every other tool is dropped"
+        )
+    return "no tools are available; any tool_calls are dropped"
 # P4 explanation floor — thinner finals are repaired.
 SUMMARY_MIN_CHARS = 200
 
@@ -137,8 +167,11 @@ MAX_MERGED_EVIDENCE = _recall_int("NOOA_MAX_MERGED_EVIDENCE", 24, lo=8, hi=64)
 # terminals instead of being laundered into a settled artifact.
 MAX_SALVAGE_ENTRIES = _recall_int("NOOA_MAX_SALVAGE_ENTRIES", 8, lo=1, hi=32)
 
-# --- Headline bound for the prior-artifact block in the prompt. ---
-_PRIOR_HEADLINE_MAX_CHARS = _recall_int("NOOA_PRIOR_HEADLINE_CHARS", 2_000, lo=500, hi=8_000)
+# --- Prior-outcome relay (non-citable): how many gate verdicts ride the
+# prompt, and the hard character bound. Small by design — this is a reminder
+# of what already failed, not a second ledger. ---
+_PRIOR_OUTCOMES_MAX = _recall_int("NOOA_PRIOR_OUTCOMES_MAX", 3, lo=1, hi=8)
+_PRIOR_OUTCOMES_CHARS = _recall_int("NOOA_PRIOR_OUTCOMES_CHARS", 1_200, lo=300, hi=4_000)
 
 # --- Structured-output probe flag ---
 # Module-level probe flag: once a backend rejects output_model, stop paying
@@ -237,6 +270,7 @@ __all__ = [
     "AGENTIC_MAX_LLM_TURNS",
     "AGENTIC_PER_ROUND_CALL_CAP",
     "LOOP_PASS_BUDGET",
+    "TURN_TOOL_POLICY",
     "VALIDATION_RETRY_PASSES",
     "MAX_DISPATCHES_PER_PASS",
     "SUMMARY_MIN_CHARS",
@@ -244,7 +278,8 @@ __all__ = [
     "MEMORY_CONTEXT_BUDGET",
     "MAX_MERGED_EVIDENCE",
     "MAX_SALVAGE_ENTRIES",
-    "_PRIOR_HEADLINE_MAX_CHARS",
+    "_PRIOR_OUTCOMES_CHARS",
+    "_PRIOR_OUTCOMES_MAX",
     "_STRUCTURED_OK",
     "_TOOL_MANIFEST",
     "_MEMORY_PROTOCOL",

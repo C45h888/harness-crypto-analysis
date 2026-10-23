@@ -98,13 +98,15 @@ class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log["capability"], "tool.unknown")
 
     def test_out_of_scope_symbol_denied(self):
+        from types import SimpleNamespace
         result, log = _run(execute_tool(
             _FakeStore(), "micro.capture_status",
             {"symbol": "XRPUSDT", "venue": "spot"},
+            settings=SimpleNamespace(symbols=("SOLUSDT",), venue="futures"),
         ))
         self.assertIsNone(result)
         self.assertEqual(log["result"], "denied")
-        self.assertIn("outside", log["detail"])
+        self.assertEqual(log["detail"]["reason"], "symbol_not_captured")
 
     def test_out_of_scope_venue_denied(self):
         result, log = _run(execute_tool(

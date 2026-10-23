@@ -22,6 +22,9 @@ nu*OFI is heteroskedastic; never merged.
 --- limitations ---
 - synthetic window
 
+--- engine findings (recorded truth, never dropped) ---
+(none recorded)
+
 GATE DATA
 ======================================================================
 --- hypothesis ---

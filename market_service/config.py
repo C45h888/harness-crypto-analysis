@@ -119,7 +119,6 @@ class Settings:
     # not silently point the engine at a venue capture is not writing.
     flow_window_seconds: int
     depth_levels: int
-    max_domain_state_age_seconds: int = 90
     wall_history_maxlen: int = 200
     # Phase 2.4: tier + scorecard configuration (USD-notional buckets and
     # weight overrides for the wall/keystone-holds scorecard). Defaults
@@ -232,7 +231,6 @@ class Settings:
             poll_seconds=_positive_int("POLL_SECONDS", 5),
             flow_window_seconds=_positive_int("FLOW_WINDOW_SECONDS", 300),
             depth_levels=default_depth_levels(),
-            max_domain_state_age_seconds=_positive_int("MAX_DOMAIN_STATE_AGE_SECONDS", 90),
             wall_tier_config=tier_config,
             wall_scorecard_weights=scorecard_weights,
         )

@@ -112,5 +112,70 @@ class SynthesisWalkTests(unittest.IsolatedAsyncioTestCase):
                                   "REFUSED composition receipt")
 
 
+class ToolPolicySingleOwnerTests(unittest.TestCase):
+    """N9c: one tool-policy owner — kb strings quote synthesize's table.
+
+    The OUTPUT-sequence tool rule lives in exactly one place
+    (config.TURN_TOOL_POLICY). Every prompt that states it must render the
+    canonical sentence, and the enforced behavior must match the table.
+    """
+
+    def test_prompts_quote_the_canonical_sentences(self):
+        from market_service.nooa_harness.engine import kb
+        from market_service.nooa_harness.engine.config import (
+            TURN_TOOL_POLICY, tool_policy_sentence,
+        )
+        from market_service.nooa_harness.engine.core.synthesize import (
+            compose_collapse_prompt,
+        )
+        # Table shape: collapse opens the memory window, everything else shut.
+        self.assertEqual(TURN_TOOL_POLICY["collapse"], ("memory.",))
+        for turn in ("derive", "composition", "finalize", "answer"):
+            self.assertEqual(TURN_TOOL_POLICY[turn], ())
+        # kb-owned prompts quote the owner verbatim.
+        self.assertIn(
+            tool_policy_sentence("composition"),
+            kb.compose_output_prompt(
+                directive_block="", synthesis_material={},
+                accumulated_keys=[], traversal={}, chain_line=""),
+        )
+        finalize = kb.compose_forced_final_prompt(
+            task="t", missing=[], evidence_digest="",
+        )
+        self.assertIn(tool_policy_sentence("finalize"), finalize)
+        self.assertIn(
+            tool_policy_sentence("collapse"),
+            compose_collapse_prompt(
+                task="t", verdict_rows=[], base_summary=None,
+                chain_line="", frame_steer="", gate_line=""),
+        )
+        material = {
+            "task": "t", "engine_verdict": "v", "verdict_reason": "r",
+            "gate_status": "validated", "gate_reasons": [],
+            "summary": "s", "evidence": [], "hypothesis": {},
+            "adjudication": {}, "scenario": {},
+            "forward_scenario": {}, "hypothesis_evidence": {},
+            "confidence": "medium", "limitations": [],
+            "model_separation": "m", "calculations": {},
+            "dropped": [], "conformance": {},
+            "engine_findings": {},
+        }
+        self.assertIn(
+            tool_policy_sentence("answer"),
+            kb.compose_answer_prompt(material=material),
+        )
+
+    def test_enforcement_matches_the_table(self):
+        # synthesize drops non-memory calls on collapse and all calls on
+        # derive — the behavior the sentences promise.
+        import inspect
+        from market_service.nooa_harness.engine.core import synthesize
+        from market_service.nooa_harness.engine.config import TURN_TOOL_POLICY
+        src = inspect.getsource(synthesize)
+        self.assertIn('startswith("memory.")', src)
+        self.assertIn("tool_calls", src)
+        self.assertEqual(TURN_TOOL_POLICY["derive"], ())
+
+
 if __name__ == "__main__":
     unittest.main()

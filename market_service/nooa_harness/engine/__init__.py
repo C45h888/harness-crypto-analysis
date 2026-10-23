@@ -307,5 +307,3 @@ _narration_max_tokens = narration_max_tokens
 _next_uncovered_phase = next_uncovered_phase
 # `from .engine import _load_kb` -> kb
 _load_kb = load_kb
-# `from .engine import _PRIOR_HEADLINE_MAX_CHARS` -> config (int constant)
-from .config import _PRIOR_HEADLINE_MAX_CHARS

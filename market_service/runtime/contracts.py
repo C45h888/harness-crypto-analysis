@@ -18,7 +18,6 @@ from typing import Any, Literal
 # public constant resolves to its registry entry (identity, not a copy), so
 # a version bump is ONE edit here + the charter test pins every consumer.
 SCHEMA_VERSION_REGISTRY: dict[str, int] = {
-    "market_state": 1,
     "market_run": 1,
     "specialist_report": 2,
     "agent_memory": 1,
@@ -45,7 +44,6 @@ SCHEMA_VERSION_REGISTRY: dict[str, int] = {
     # market/worker/governance ledgers; Redis is only its live projection.
     "telemetry_event": 1,
 }
-MARKET_STATE_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_state"]
 MARKET_RUN_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["market_run"]
 SPECIALIST_REPORT_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["specialist_report"]
 AGENT_MEMORY_SCHEMA_VERSION = SCHEMA_VERSION_REGISTRY["agent_memory"]
@@ -66,7 +64,6 @@ ValidWakeSources: tuple[str, ...] = ("manual", "watcher", "hook")
 ValidWakePredicates: tuple[str, ...] = (
     "event_delta", "capture_recovery", "cold_start", "manual",
 )
-StateStatus = Literal["healthy", "degraded", "invalid"]
 ConfidenceLevel = Literal["low", "medium", "high"]
 ValidConfidence: tuple[str, ...] = ("low", "medium", "high")
 # LLMs sometimes use "moderate" instead of "medium" — accept it as an alias.
@@ -442,63 +439,10 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-@dataclass(frozen=True)
-class MarketStateEnvelope:
-    """A latest-state projection published by a domain data node."""
-
-    symbol: str
-    source: str
-    observed_at: str
-    produced_at: str
-    status: StateStatus
-    data: dict[str, Any]
-    run_id: str | None = None
-    errors: tuple[dict[str, Any], ...] = ()
-    coverage_seconds: int | None = None
-    schema_version: int = MARKET_STATE_SCHEMA_VERSION
-
-    @classmethod
-    def from_mapping(cls, value: dict[str, Any]) -> "MarketStateEnvelope":
-        envelope = cls(
-            symbol=str(value["symbol"]).upper(),
-            source=str(value["source"]),
-            observed_at=str(value["observed_at"]),
-            produced_at=str(value.get("produced_at") or _utc_iso()),
-            status=value.get("status", "degraded"),
-            data=dict(value.get("data") or {}),
-            run_id=str(value["run_id"]) if value.get("run_id") else None,
-            errors=tuple(value.get("errors") or ()),
-            coverage_seconds=value.get("coverage_seconds"),
-            schema_version=int(value.get("schema_version", MARKET_STATE_SCHEMA_VERSION)),
-        )
-        if envelope.schema_version != MARKET_STATE_SCHEMA_VERSION:
-            raise ValueError(f"unsupported market state schema version: {envelope.schema_version}")
-        if envelope.status not in ("healthy", "degraded", "invalid"):
-            raise ValueError(f"invalid market state status: {envelope.status}")
-        return envelope
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "symbol": self.symbol,
-            "source": self.source,
-            "observed_at": self.observed_at,
-            "produced_at": self.produced_at,
-            "status": self.status,
-            "coverage_seconds": self.coverage_seconds,
-            "data": _json_safe(self.data),
-            "run_id": self.run_id,
-            "errors": list(self.errors),
-        }
-
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), default=str, separators=(",", ":"))
-
-
 # ---------------------------------------------------------------------------
 # Analyst-layer contracts.
 #
-# These reuse the same discipline as MarketRunEnvelope / MarketStateEnvelope:
+# These reuse the same discipline as CanonicalOutput (the one deliverable row):
 # frozen dataclass, schema-versioned, JSON-serializable, validated on
 # construction. They live next to the canonical envelopes so the analyst
 # layer shares one contract surface with the runtime that produces the

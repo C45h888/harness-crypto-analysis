@@ -32,15 +32,57 @@ def _messages(state: Mapping[str, Any], kind: str) -> list[str]:
     return [str(payload.get("message") or "") for payload in _findings(state, kind)]
 
 
+def _salvaged(state: Mapping[str, Any]) -> list[Any]:
+    salvaged: list[Any] = []
+    for payload in _findings(state, "evidence_salvaged"):
+        salvaged.extend((payload.get("detail") or {}).get("dropped") or [])
+    return salvaged
+
+
+def engine_finding_vectors(state: Mapping[str, Any]) -> dict[str, list[str]]:
+    """The five answer-schema finding vectors, bounded strings (pure).
+
+    Single owner for the vector derivation: ``build_artifact_state`` and
+    the answer-turn skeleton both read through here, so the material the
+    model verbalizes FROM and the record the composer renders can never
+    diverge on what the engine recorded.
+    """
+    # Local import: answer.py is pure (no engine imports) while this module
+    # already lives inside the engine — the constant flows one way only.
+    from market_service.nooa_harness.engine.core.answer import (
+        ENGINE_FINDINGS_CAP,
+    )
+
+    def _bounded(items: list[Any]) -> list[str]:
+        out: list[str] = []
+        for item in items[:ENGINE_FINDINGS_CAP]:
+            text = str(item).strip() if item is not None else ""
+            if text:
+                out.append(text)
+        return out
+
+    return {
+        "validation_findings": _bounded(_messages(state, "validation")),
+        "chain_gaps": _bounded(_messages(state, "chain_gap")),
+        "evidence_salvaged": _bounded(_salvaged(state)),
+        "assembly_dropped": _bounded(_messages(state, "assembly_dropped")),
+        "principle_findings": _bounded([
+            str(payload.get("message") or "")
+            for payload in _findings(state, "principle")
+        ]),
+    }
+
+
 def build_artifact_state(
     state: Mapping[str, Any], controller: Any | None = None,
 ) -> dict[str, Any]:
     """Return a copy of ``state`` with every projected legacy key filled."""
     out: dict[str, Any] = dict(state)
 
-    out["validation_findings"] = _messages(state, "validation")
-    out["chain_gaps"] = _messages(state, "chain_gap")
-    out["assembly_dropped"] = _messages(state, "assembly_dropped")
+    vectors = engine_finding_vectors(state)
+    out["validation_findings"] = vectors["validation_findings"]
+    out["chain_gaps"] = vectors["chain_gaps"]
+    out["assembly_dropped"] = vectors["assembly_dropped"]
 
     out["principle_findings"] = [
         {"principle": (payload.get("detail") or {}).get("principle"),
@@ -64,9 +106,7 @@ def build_artifact_state(
         }
         break
 
-    salvaged: list[Any] = []
-    for payload in _findings(state, "evidence_salvaged"):
-        salvaged.extend((payload.get("detail") or {}).get("dropped") or [])
+    salvaged = _salvaged(state)
     if salvaged:
         out["evidence_salvaged"] = salvaged
 

@@ -55,9 +55,8 @@ class PostgresRuntimeStore:
 
     # --- Durable archive reads (dict payload, 2026-08-31) -----------------
     # The envelope dataclass readers were retired with the dataclass. These
-    # reconstruct the SAME payload shape ``assemble_envelope`` publishes
-    # (runtime.read_paths guards the schema on the consumer side). The
-    # legacy `envelope` jsonb column is honoured for pre-dedupe rows.
+    # read the surviving durable tables directly (run records, signals);
+    # the collated-run plane they once reconstructed no longer exists.
 
     _RUN_COLUMNS = (
         "run_id, symbol, generated_at, completed_at, status, data_source, "
@@ -518,8 +517,17 @@ class PostgresRuntimeStore:
 
     async def read_canonical_output(
         self, symbol: str | None = None, run_id: str | None = None,
+        *, venue: str | None = None,
     ) -> dict[str, Any] | None:
-        """Durable read: one exact ``run_id``, or the latest for a symbol."""
+        """Durable read: one exact ``run_id``, or the latest per identity.
+
+        Identity is ``(symbol, venue)``. A latest-by-symbol read MUST pass
+        ``venue``: without it the query can return a row captured on another
+        venue for the same symbol, which is how prior-run state, history and
+        operator reads silently disagreed with the venue-scoped Redis
+        projection. An exact ``run_id`` read is global by contract — the run id
+        IS the identity — and ignores ``venue``.
+        """
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
@@ -534,6 +542,13 @@ class PostgresRuntimeStore:
             row = await self.pool.fetchrow(
                 f"SELECT {columns} FROM canonical_output WHERE run_id = $1",
                 uuid.UUID(run_id),
+            )
+        elif symbol and venue:
+            row = await self.pool.fetchrow(
+                f"SELECT {columns} FROM canonical_output"
+                " WHERE symbol = $1 AND venue = $2"
+                " ORDER BY generated_at DESC LIMIT 1",
+                symbol.upper(), venue,
             )
         elif symbol:
             row = await self.pool.fetchrow(
@@ -581,19 +596,32 @@ class PostgresRuntimeStore:
         return [self._parse_canonical_row(row) for row in rows]
 
     async def read_canonical_history(
-        self, symbol: str, limit: int = 50,
+        self, symbol: str, limit: int = 50, *, venue: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Durable read: canonical-run headlines for one symbol, newest first."""
+        """Durable read: canonical-run headlines for one identity, newest first.
+
+        ``venue`` scopes the read to the identity the caller asked about; a
+        symbol-only read mixes venues for the same instrument.
+        """
         if self.pool is None:
             await self.connect()
         assert self.pool is not None
-        rows = await self.pool.fetch(
-            "SELECT run_id, symbol, venue, generated_at, status, terminal,"
-            " window_minutes, interval_seconds, input_hash, model_version"
-            " FROM canonical_output WHERE symbol = $1"
-            " ORDER BY generated_at DESC LIMIT $2",
-            symbol.upper(), limit,
-        )
+        if venue:
+            rows = await self.pool.fetch(
+                "SELECT run_id, symbol, venue, generated_at, status, terminal,"
+                " window_minutes, interval_seconds, input_hash, model_version"
+                " FROM canonical_output WHERE symbol = $1 AND venue = $2"
+                " ORDER BY generated_at DESC LIMIT $3",
+                symbol.upper(), venue, limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT run_id, symbol, venue, generated_at, status, terminal,"
+                " window_minutes, interval_seconds, input_hash, model_version"
+                " FROM canonical_output WHERE symbol = $1"
+                " ORDER BY generated_at DESC LIMIT $2",
+                symbol.upper(), limit,
+            )
         out: list[dict[str, Any]] = []
         for row in rows:
             entry = dict(row)
@@ -618,11 +646,6 @@ class PostgresRuntimeStore:
             if hasattr(result.get(col), "isoformat"):
                 result[col] = result[col].isoformat()
         return result
-
-    # ------------------------------------------------------------------
-    # Horizon spans — durable fallback for per-horizon blocks.
-    # Latest-per-(symbol,horizon); absent rows read as empty, never errors.
-    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Substrate calculation ledger — Phase 3 PG-first write path
@@ -699,8 +722,8 @@ class PostgresRuntimeStore:
         holds ``signals`` (list of {signal_type, severity, summary, evidence})
         and ``snapshot`` (dict). Each tripped signal becomes one ``signal_event``
         row. The ``snapshot_id`` FK is left NULL (nullable) — the embedded
-        snapshot is a re-derivable dict and we never fabricate a market_snapshot
-        id. Dedup is enforced by the table's UNIQUE (symbol, observed_at,
+        snapshot is a re-derivable dict and we never fabricate snapshot
+        ids. Dedup is enforced by the table's UNIQUE (symbol, observed_at,
         signal_type). Returns rows written.
         """
         if self.pool is None:

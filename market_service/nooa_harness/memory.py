@@ -9,9 +9,11 @@ flight through the ``memory.*`` tools, which dispatch through the
 Scope and recall discipline:
 
 * **Scope** — ``session_id`` is a deterministic per-``(symbol, venue)`` id
-  (``engine/core/context.py::_stable_session_id``), so rows survive across
-  cycles for one scope; ``segment`` (``AgentMemory.segment``, the task id)
-  partitions them, so one task can never read or write another's rows.
+  (``session_id_for`` below — the ONE derivation; the engine re-exports it
+  and the operator CLI calls it directly), so rows survive across cycles for
+  one scope; ``segment`` (``AgentMemory.segment``, derived by
+  ``task_segment_id`` below) partitions them, so one task can never read or
+  write another's rows.
 * **Recall is agent-initiated** — nothing here reaches a prompt unless the
   agent calls ``memory.recall``. The single relay that does surface those
   reads is ``engine/core/synthesize.py::memory_context_block``.
@@ -22,9 +24,10 @@ as context but never writes it. Loop closes are recorded as gate verdicts
 (``engine/gates.py``) on the engine ledger.
 likewise never projected into this node. No cycle path writes a row here —
 ``AgentMemory`` rows come only from the agent's own ``memory.*`` calls or the
-operator CLI (``commands/memory.py``). Cross-run continuity the engine
+operator CLI (``nooa market memory``). Cross-run continuity the engine
 provides *without* a tool call is the ledger's prior-run recall
-(``engine/core/driver.py::_prior_memory_context``), not this node.
+(``engine/core/driver.py::_recall_ledger``) and its prior-outcome block
+(``_prior_outcomes``), not this node.
 
 Persistence discipline mirrors the rest of the runtime:
 
@@ -47,6 +50,7 @@ tool-dispatch time so the fast test path stays clean.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -63,8 +67,92 @@ log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
+
 def _keywords(text: str) -> set[str]:
     return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+# ---------------------------------------------------------------------------
+# Segment identity — the ONE derivation of a task-scoped memory segment.
+#
+# The segment used to be ``sha256(raw prompt text)``, which made memory a
+# fingerprint of one wording: rephrasing the same question orphaned it, and an
+# empty prompt produced ``None`` — which recall treated as "no filter" (wider
+# than a segment, not narrower). The key below is derived from IDENTITY (the
+# ``(symbol, venue)`` the runtime analyses), the task SHAPE (scenario vs
+# general) and its horizon, plus a paraphrase-tolerant fingerprint of the
+# significant words. Punctuation, case, word order, duplicates and numbers are
+# normalised away, so "Analyse SOL OFI depth" and "analyse sol ofi depth."
+# land on the same segment; a different question does not.
+# ---------------------------------------------------------------------------
+
+_SEGMENT_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "this", "that", "from", "into", "over",
+    "under", "about", "what", "when", "where", "which", "while", "will",
+    "would", "could", "should", "does", "did", "are", "was", "were", "has",
+    "have", "had", "you", "your", "our", "its", "his", "her", "their",
+    "them", "they", "can", "may", "might", "must", "let", "now", "then",
+    "than", "too", "very", "just", "also", "how", "why", "use", "using",
+})
+
+_SEGMENT_TOKEN_CAP = 6
+
+
+def segment_tokens(task: str | None) -> tuple[str, ...]:
+    """Significant task words — order/case/punctuation/number insensitive."""
+    words = re.findall(r"[a-z]+", str(task or "").lower())
+    kept = {
+        word for word in words
+        if len(word) > 2 and word not in _SEGMENT_STOPWORDS
+    }
+    return tuple(sorted(kept)[:_SEGMENT_TOKEN_CAP])
+
+
+def task_segment_id(
+    symbol: str | None,
+    venue: str | None,
+    task: str | None,
+    scenario: dict[str, Any] | None,
+) -> str | None:
+    """Derive the task-scoped memory segment id (deterministic, derivable).
+
+    Shape: ``task:<SYMBOL>/<venue>:<shape>:<horizon>:<fingerprint>``.
+
+    ``shape``  — ``scenario`` when a price-target question was supplied,
+                 ``general`` otherwise (finer directive kinds are derived
+                 AFTER recall; they are not memory identity).
+    ``horizon``— the scenario horizon when present, ``-`` otherwise.
+    ``fingerprint`` — 8 hex chars over the significant-word set; ``-`` when
+                 the task carries no significant words.
+
+    Returns ``None`` only when there is no identity at all (no symbol or no
+    venue): a runtime that analyses an instrument always has one, so a real
+    cycle is never unsegmented.
+    """
+    if not str(symbol or "").strip() or not str(venue or "").strip():
+        return None
+    shape = "scenario" if scenario else "general"
+    horizon = str((scenario or {}).get("horizon") or "-").strip().lower() or "-"
+    tokens = segment_tokens(task)
+    fingerprint = (
+        hashlib.sha256("|".join(tokens).encode("utf-8")).hexdigest()[:8]
+        if tokens else "-"
+    )
+    return (f"task:{str(symbol).upper()}/{venue}:"
+            f"{shape}:{horizon}:{fingerprint}")
+
+
+def session_id_for(symbol: str, venue: str) -> str:
+    """Deterministic per-``(symbol, venue)`` UUID session id (the one owner).
+
+    The durable stores cast ``session_id`` to a UUID column, so it must be a
+    real UUID. Deriving it from identity keeps memory coherent across cycles
+    for one scope; a random id per cycle would fragment the memory plane.
+    """
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"inference-engine://{str(symbol).lower()}/{venue}",
+    ))
 
 
 class MemoryNode:
@@ -428,13 +516,14 @@ class AgentMemorySurface:
 
 __all__ = [
     "AGENT_WRITABLE_KINDS",
+    "AgentMemorySurface",
     "DEFAULT_RECALL_LIMIT",
     "MAX_CONTENT_CHARS",
     "MAX_RECALL_LIMIT",
-    "AgentMemorySurface",
+    "MemoryNode",
     "RESERVED_KINDS",
+    "new_memory_id",
+    "segment_tokens",
+    "session_id_for",
+    "task_segment_id",
 ]
-
-
-__all__ = ["AgentMemorySurface", "AGENT_WRITABLE_KINDS",
-           "MAX_CONTENT_CHARS", "MemoryNode", "new_memory_id"]

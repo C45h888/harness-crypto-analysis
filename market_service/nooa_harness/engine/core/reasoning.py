@@ -139,7 +139,7 @@ async def run_evidence(
         scenario_block=st.scenario_block,
         wake_block=st.wake_block,
         deterministic_state=st.deterministic_state,
-        prior_note=st.prior_note,
+        prior_outcomes=st.prior_outcomes,
         ledger_block=st.ledger_block,
         output_format=engine._output_format(),
         workflow_block=st.workflow_block,

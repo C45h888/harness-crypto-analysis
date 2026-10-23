@@ -14,7 +14,6 @@ from .scope import CANONICAL_VENUE
 
 from .contracts import (
     AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, CanonicalOutput,
-    MarketStateEnvelope,
 )
 
 

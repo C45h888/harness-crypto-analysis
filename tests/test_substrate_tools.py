@@ -136,10 +136,12 @@ class DispatchToolTests(unittest.TestCase):
         self.assertEqual(audit["result"], "denied")
 
     def test_out_of_scope_denied(self):
+        from types import SimpleNamespace
         from market_service.nooa_harness.inference.dispatch import execute_tool
         result, audit = _run(execute_tool(_FakeStore(_FakeRedis()),
                                           "substrate.tape",
-                                          {"symbol": "FAKEUSDT"}))
+                                          {"symbol": "FAKEUSDT"},
+                                          settings=SimpleNamespace(symbols=("SOLUSDT",), venue="futures")))
         self.assertIsNone(result)
         self.assertEqual(audit["result"], "denied")
 

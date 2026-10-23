@@ -133,10 +133,16 @@ class CapabilityRegistryTests(unittest.TestCase):
     def test_registry_scope_is_frozen(self):
         for name, cap in CAPABILITIES.items():
             self.assertEqual(cap.name, name)
-            with self.assertRaises(CapabilityDenied):
-                cap.validate_scope("XRPUSDT", "spot")
+            # Format gate: unknown venue vocabulary is denied.
             with self.assertRaises(CapabilityDenied):
                 cap.validate_scope("BTCUSDT", "binance-options")
+            # Format gate accepts any well-formed symbol; liveness is a
+            # separate gate against the live active set.
+            cap.validate_scope("XRPUSDT", "spot")
+            with self.assertRaises(CapabilityDenied):
+                cap.validate_live_scope("XRPUSDT", ("SOLUSDT",))
+            cap.validate_live_scope("SOLUSDT", ("SOLUSDT",))
+            cap.validate_live_scope("XRPUSDT", None)
 
     def test_replay_dispatch_ok_and_denied_paths(self):
         payloads = [_synthetic_event_payload(1, "5", 100)]
@@ -149,7 +155,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertEqual(log["result"], "ok")
 
         _e, _i, _d, denied = dispatch_replay(
-            payloads, symbol="XRPUSDT", venue="spot", interval_ms=10_000,
+            payloads, symbol="XRPUSDT", venue="binance-options", interval_ms=10_000,
         )
         self.assertEqual(denied["result"], "denied")
 
@@ -164,7 +170,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertEqual(evidence.symbol, "BTCUSDT")
 
         _none, denied = dispatch_assemble_evidence(
-            intervals, symbol="XRPUSDT", venue="spot", tick_size=Decimal("0.01"),
+            intervals, symbol="XRPUSDT", venue="binance-options", tick_size=Decimal("0.01"),
             interval_seconds=10, evidence_id="ev-x", generated_at_ms=400_000,
         )
         self.assertEqual(denied["result"], "denied")
