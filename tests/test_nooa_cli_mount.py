@@ -44,7 +44,7 @@ class NooaCliMountTests(unittest.TestCase):
         self.assertEqual(
             names,
             {"read", "scope", "memory", "microstructure", "inference",
-             "substrate-read", "substrate", "telemetry"},
+             "substrate-read", "substrate", "telemetry", "store"},
         )
 
     def test_mount_does_not_write_into_framework_package(self):

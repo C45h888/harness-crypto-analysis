@@ -127,7 +127,7 @@ Doctrine ripples to update in the same pass:
 run-record stores; what stops is treating their row as *the output*.
 
 ## 4. CLI surface points (decision 2)
-
+ 
 1. **Cycle close** — `nooa market inference run …` prints the answer block
    when `narrate_cycle` returns. The command's stdout becomes the answer
    surface (today it prints metadata).

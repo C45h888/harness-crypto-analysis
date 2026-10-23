@@ -43,7 +43,6 @@ def _store_with_redis(fake_redis: MagicMock) -> RedisRuntimeStore:
     store.redis = fake_redis
     store.prefix = "marketflow"
     store.stream_maxlen = 1200
-    store.collated_stream_maxlen = 5000
     store._postgres_store = None
     return store
 

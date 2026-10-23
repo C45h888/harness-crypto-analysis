@@ -151,6 +151,63 @@ def command() -> None:
     """Commands mounted into the ``nooa`` tree by nooa_cli_install."""
 
 
+@command.group("store", help="Redis store: configured namespaces + retired-key upkeep.")
+def store_group() -> None:
+    """The store's own configuration surface (read-only introspection)."""
+
+
+@store_group.command("namespaces")
+def store_namespaces() -> None:
+    """List every configured namespace (key template, kind, writer, contract).
+
+    This is the same table the write paths resolve through — an operator can
+    see the whole persisted surface without reading code, and a namespace
+    that is not listed here does not exist for the runtime.
+    """
+    from market_service.runtime.redis_store import NAMESPACES
+
+    _emit({
+        namespace: {
+            "template": spec.template,
+            "kind": spec.kind,
+            "writer": spec.writer,
+            "schema": spec.schema,
+            "required": list(spec.required),
+            "retention": {
+                "maxlen": spec.retention.maxlen,
+                "ttl_s": spec.retention.ttl_s,
+                "retention_ms": spec.retention.retention_ms,
+                "guardrail_maxlen": spec.retention.guardrail_maxlen,
+            },
+        }
+        for namespace, spec in sorted(NAMESPACES.items())
+    })
+
+
+@store_group.command("purge-legacy")
+@click.option("--yes", is_flag=True, default=False,
+              help="actually delete the matched keys (default: dry run)")
+def store_purge_legacy(yes: bool) -> None:
+    """Drop keys from RETIRED families (collated, domain-state, per-run, horizon).
+
+    Those planes have no writer and no reader in the runtime; their leftovers
+    are enumerated by ``RETIRED_KEY_PATTERNS``. Dry run by default — pass
+    ``--yes`` to unlink the matched keys.
+    """
+    async def _op() -> dict:
+        settings = _settings()
+        redis = RedisRuntimeStore(
+            settings.redis_url, settings.redis_key_prefix,
+            settings.redis_stream_maxlen,
+        )
+        try:
+            return await redis.purge_retired(dry_run=not yes)
+        finally:
+            await redis.close()
+
+    _emit(asyncio.run(_op()))
+
+
 @command.command("scope")
 def scope_cmd() -> None:
     """Show the identity this runtime will analyse (symbol + venue).

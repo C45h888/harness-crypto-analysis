@@ -8,12 +8,17 @@ import os
 import time
 from typing import Any
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
+
 from redis.asyncio import Redis
 
 from .scope import CANONICAL_VENUE
 
 from .contracts import (
     AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, CanonicalOutput,
+    SCHEMA_VERSION_REGISTRY,
 )
 
 
@@ -53,9 +58,272 @@ def _slim_stream_body(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# Default TTL for per-run STRING keys (run:<run_id>, runtime-run:<run_id>:domain:*).
-# 24h bounds growth while keeping a generous re-run guard and replay window.
-_PER_RUN_KEY_TTL_S = 86_400
+# ===========================================================================
+# NAMESPACE CONFIGURATION — the store's spine.
+#
+# A namespace is the ONLY declaration of a Redis key family: its key template,
+# what kind of value it holds, which plane writes it, the payload contract the
+# writer must satisfy, and the retention it is stored under. Write paths derive
+# their key from this table (``key(ns_id, ...)``) and are validated against it
+# (``_contract``) — there is no second place where a key or a payload shape is
+# decided.
+#
+# The worker families (substrate.*, analysis.*) are written out EXPLICITLY
+# below. They are configured, not discovered: importing a worker registry here
+# would make the surface depend on import order, and a new worker would silently
+# acquire (or fail to acquire) keys. ``tests/test_store_namespaces.py`` pins the
+# literal lists against the worker registries so drift fails loudly.
+# ===========================================================================
+
+class StoreContractError(RuntimeError):
+    """A payload violated its namespace contract (strict write-side gate)."""
+
+
+#: Age precedence for read surfaces — first present field wins; unknown is
+#: None, never 0.
+DEFAULT_AGE_FIELDS: tuple[str, ...] = (
+    "computed_at_ms", "observed_at_ms", "received_ts_ms", "ts_ms",
+    "updated_at_ms", "generated_at", "decided_at_ms",
+)
+
+Kind = Literal["latest", "stream", "text", "sequence"]
+
+
+@dataclass(frozen=True)
+class Retention:
+    """Storage policy for one namespace family."""
+
+    maxlen: int | None = None          # stream cap (None = store default)
+    ttl_s: int | None = None           # latest-key TTL (None = persist)
+    retention_ms: int | None = None    # time-based trim floor (raw stream)
+    guardrail_maxlen: int | None = None  # pathological-burst count cap
+
+
+@dataclass(frozen=True)
+class Namespace:
+    """One Redis key family, declared as configuration."""
+
+    id: str
+    template: str                       # prefix-relative, ``{token}`` slots
+    kind: Kind
+    writer: str                         # owning plane (module path)
+    schema: str | None = None           # contracts.SCHEMA_VERSION_REGISTRY key
+    required: tuple[str, ...] = ()      # payload keys a valid write must carry
+    age_fields: tuple[str, ...] = DEFAULT_AGE_FIELDS
+    retention: Retention = Retention()
+    description: str = ""
+
+
+#: Worker names — CONFIGURED here (see module note above); pinned to the
+#: worker registries by test.
+SUBSTRATE_NAMES: tuple[str, ...] = (
+    "anchors", "delta", "density", "ladders", "large_print", "migration",
+    "oi", "signals", "tape", "technicals", "tiers", "volume_profile",
+)
+ANALYSIS_NAMES: tuple[str, ...] = (
+    "demand", "liquidation", "oi_analysis", "regime", "stage",
+    "wall_migration",
+)
+
+
+def _fixed_namespaces() -> tuple[Namespace, ...]:
+    return (
+        Namespace(
+            id="raw.latest", template="latest:{symbol}:raw", kind="latest",
+            writer="poller", required=("observed_at_ms",),
+            description="Latest raw poller evidence snapshot.",
+        ),
+        Namespace(
+            id="raw.stream", template="stream:raw:{symbol}", kind="stream",
+            writer="poller", required=("observed_at_ms",),
+            retention=Retention(retention_ms=43_200_000,
+                                guardrail_maxlen=20_000),
+            description="Time-trimmed raw evidence stream.",
+        ),
+        Namespace(
+            id="raw.dedupe", template="raw-dedupe:{symbol}:{observed_at_ms}",
+            kind="latest", writer="poller",
+            description="Idempotency guard for one raw snapshot.",
+        ),
+        Namespace(
+            id="derivatives.latest", template="latest:{symbol}:derivatives",
+            kind="latest", writer="poller", retention=Retention(ttl_s=300),
+            description="TTL-bounded derivative evidence projection.",
+        ),
+        Namespace(
+            id="derivatives.stream", template="stream:domain:derivatives:{symbol}",
+            kind="stream", writer="poller",
+            description="Derivative evidence fetch history.",
+        ),
+        Namespace(
+            id="micro.raw", template="stream:microstructure:raw:{venue}:{symbol}",
+            kind="stream", writer="microstructure.capture",
+            schema="microstructure", required=("symbol", "venue"),
+            description="Depth-delta frames from the exchange stream.",
+        ),
+        Namespace(
+            id="micro.events", template="stream:microstructure:events:{venue}:{symbol}",
+            kind="stream", writer="microstructure.capture",
+            schema="microstructure", required=("event_type", "current"),
+            description="Best-quote transition ledger (replay source).",
+        ),
+        Namespace(
+            id="micro.ofi", template="stream:microstructure:ofi:{venue}:{symbol}",
+            kind="stream", writer="microstructure.capture",
+            schema="microstructure", required=("symbol", "venue", "end_ts_ms"),
+            description="Completed deterministic OFI/AD intervals.",
+        ),
+        Namespace(
+            id="micro.book", template="latest:microstructure:{venue}:{symbol}:book",
+            kind="latest", writer="microstructure.capture",
+            schema="microstructure",
+            required=("symbol", "venue", "bid_price", "ask_price"),
+            description="Best-quote projection (live top of book).",
+        ),
+        Namespace(
+            id="micro.status", template="latest:microstructure:{venue}:{symbol}:status",
+            kind="latest", writer="microstructure.capture", required=("state",),
+            description="Capture worker state (liveness, gaps, reconnects).",
+        ),
+        Namespace(
+            id="micro.status.events",
+            template="stream:microstructure:status:{venue}:{symbol}",
+            kind="stream", writer="microstructure.capture", required=("state",),
+            description="Capture state transitions (written on change only).",
+        ),
+        Namespace(
+            id="micro.evidence", template="latest:microstructure:{venue}:{symbol}:evidence",
+            kind="latest", writer="microstructure.fitting", schema="microstructure",
+            required=("symbol", "venue"),
+            description="Immutable fitted microstructure evidence.",
+        ),
+        Namespace(
+            id="inference.latest", template="latest:inference:{venue}:{symbol}",
+            kind="latest", writer="engine (canonical output)",
+            schema="canonical_output", required=("run_id", "symbol", "venue"),
+            description="Latest canonical run record projection.",
+        ),
+        Namespace(
+            id="inference.stream", template="stream:inference:{venue}:{symbol}",
+            kind="stream", writer="engine (canonical output)",
+            schema="canonical_output", required=("run_id", "symbol", "venue"),
+            description="Canonical output history for one identity.",
+        ),
+        Namespace(
+            id="poller.active", template="poller:active_symbols", kind="sequence",
+            writer="poller / operator control key",
+            description="The LIVE active-symbol set.",
+        ),
+        Namespace(
+            id="poller.status", template="poller:status", kind="latest",
+            writer="poller", description="Poller heartbeat / per-symbol status.",
+        ),
+        Namespace(
+            id="agent.artifacts", template="agent:{session}:{artifact}", kind="text",
+            writer="nooa_harness.memory",
+            description="Agent-owned memory stream (Postgres is the ledger).",
+        ),
+        Namespace(
+            id="governance.latest",
+            template="latest:governance:{plane}:{name}:{symbol}", kind="latest",
+            writer="governance.ledger", schema="governance_ledger",
+            required=("plane", "symbol", "gate"),
+            description="Latest governance decision per plane+substrate.",
+        ),
+        Namespace(
+            id="governance.stream", template="stream:governance:{plane}:{symbol}",
+            kind="stream", writer="governance.ledger", schema="governance_ledger",
+            required=("plane", "symbol", "gate"),
+            description="Governance decision ledger (Redis projection).",
+        ),
+        Namespace(
+            id="governance.denials",
+            template="stream:governance:denials:{plane}:{symbol}", kind="stream",
+            writer="governance.ledger", schema="governance_ledger",
+            required=("plane", "symbol", "gate"),
+            description="Denied decisions only (fast audit read).",
+        ),
+        Namespace(
+            id="governance.supervisor",
+            template="governance:{plane}:{symbol}:supervisor", kind="latest",
+            writer="governance.ledger",
+            description="Governance supervisor liveness marker.",
+        ),
+    )
+
+
+def _worker_namespaces() -> tuple[Namespace, ...]:
+    """Concrete namespaces for the CONFIGURED worker families (eager)."""
+    specs: list[Namespace] = []
+    for name in SUBSTRATE_NAMES:
+        specs.extend((
+            Namespace(
+                id=f"substrate.{name}",
+                template=f"latest:substrate:{name}:{{symbol}}", kind="latest",
+                writer=f"substrate_worker.{name}", schema="substrate_state",
+                required=("substrate", "symbol", "computed_at_ms"),
+                description=f"{name} calculation projection (always fresh).",
+            ),
+            Namespace(
+                id=f"substrate.{name}.events",
+                template=f"stream:substrate:{name}:{{symbol}}", kind="stream",
+                writer=f"substrate_worker.{name}", schema="substrate_state",
+                required=("substrate", "symbol", "computed_at_ms"),
+                description=f"{name} calculation state history.",
+            ),
+            Namespace(
+                id=f"substrate.{name}.supervisor",
+                template=f"substrate:{name}:{{symbol}}:supervisor", kind="latest",
+                writer=f"substrate_worker.{name}",
+                description=f"{name} worker heartbeat marker.",
+            ),
+        ))
+    for name in ANALYSIS_NAMES:
+        specs.extend((
+            Namespace(
+                id=f"analysis.{name}",
+                template=f"latest:analysis:{name}:{{symbol}}", kind="latest",
+                writer=f"analysis_worker.{name}", schema="substrate_state",
+                required=("substrate", "symbol", "computed_at_ms"),
+                description=f"{name} analysis projection (always fresh).",
+            ),
+            Namespace(
+                id=f"analysis.{name}.events",
+                template=f"stream:analysis:{name}:{{symbol}}", kind="stream",
+                writer=f"analysis_worker.{name}", schema="substrate_state",
+                required=("substrate", "symbol", "computed_at_ms"),
+                description=f"{name} analysis state history.",
+            ),
+            Namespace(
+                id=f"analysis.{name}.supervisor",
+                template=f"analysis:{name}:{{symbol}}:supervisor", kind="latest",
+                writer=f"analysis_worker.{name}",
+                description=f"{name} worker heartbeat marker.",
+            ),
+        ))
+    return tuple(specs)
+
+
+#: The whole configured surface. Built once, at import, from the literals above.
+NAMESPACES: dict[str, Namespace] = {
+    spec.id: spec for spec in _fixed_namespaces() + _worker_namespaces()
+}
+
+#: Key families from RETIRED planes. Nothing reads or writes them; they are
+#: listed here so ``purge_retired()`` can drop their leftovers from a live
+#: Redis and so a stale reader can never be pointed at them again.
+RETIRED_KEY_PATTERNS: tuple[str, ...] = (
+    "{prefix}:latest:*:collated",
+    "{prefix}:stream:collated:*",
+    "{prefix}:latest:*:data-access",
+    "{prefix}:latest:*:calculations",
+    "{prefix}:latest:*:analysis",
+    "{prefix}:run:*",
+    "{prefix}:runtime-run:*",
+    "{prefix}:latest:horizon:*",
+    "{prefix}:stream:horizon:*",
+    "{prefix}:horizon:*",
+)
 
 
 class RedisRuntimeStore:
@@ -63,7 +331,6 @@ class RedisRuntimeStore:
 
     def __init__(self, url: str, prefix: str = "marketflow", stream_maxlen: int = 10_000,
                  postgres_store: Any | None = None,
-                 collated_stream_maxlen: int = 5_000,
                  raw_retention_ms: int = 43_200_000,
                  raw_guardrail_maxlen: int = 20_000):
         self.redis: Redis = Redis.from_url(url, decode_responses=True)
@@ -84,13 +351,6 @@ class RedisRuntimeStore:
         # defaults to the spec §1.3 burst ceiling (20 000 entries ≈ 28h
         # at 5s cadence).
         self.raw_guardrail_maxlen = int(raw_guardrail_maxlen)
-        # Doctrine §4 leaves the collated stream "intentionally
-        # unbounded by default so downstream replay and auditing have
-        # the full history". In practice this lets the AOF rewrite
-        # chain grow without bound; the cap here bounds the
-        # in-memory cost while keeping a generous replay window
-        # (5_000 entries ≈ 5 hours at the 30s orchestrator cycle).
-        self.collated_stream_maxlen = collated_stream_maxlen
         # Layer C: optional PostgresRuntimeStore companion for
         # durable wall-history reads/writes. When present, the
         # analysis adapter uses postgres in preference to Redis.
@@ -100,8 +360,104 @@ class RedisRuntimeStore:
     def _prefixed(prefix: str, key: str) -> str:
         return f"{prefix.strip(':')}:{key}"
 
+    # ------------------------------------------------------------------
+    # Namespace configuration — the spine every write path resolves through.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def ns(namespace: str) -> Namespace:
+        """Return the configured namespace (raises on an undeclared id)."""
+        try:
+            return NAMESPACES[namespace]
+        except KeyError:
+            raise StoreContractError(
+                f"unknown namespace {namespace!r}; configured: "
+                f"{', '.join(sorted(NAMESPACES))}") from None
+
+    def key(self, namespace: str, **ids: Any) -> str:
+        """Build one namespace key from the configuration (the ONLY way)."""
+        spec = self.ns(namespace)
+        try:
+            body = spec.template.format(**ids)
+        except KeyError as exc:
+            raise StoreContractError(
+                f"{namespace}: missing key token {exc}") from None
+        return f"{self.prefix}:{body}"
+
+    def _contract(self, namespace: str, payload: Any) -> Any:
+        """Strict write-side contract: shape, required keys, schema version.
+
+        A violation raises ``StoreContractError`` — a writer that drifts from
+        its namespace contract fails at the write, not silently in a reader
+        three planes away. A payload missing ``schema_version`` for a
+        schema-bearing namespace is STAMPED, so the contractual layer is kept
+        in harmony at exactly one place.
+        """
+        spec = self.ns(namespace)
+        if spec.kind == "text":
+            if not isinstance(payload, str) or not payload:
+                raise StoreContractError(
+                    f"{namespace}: payload must be a non-empty string")
+            return payload
+        if spec.kind == "sequence":
+            if not isinstance(payload, (list, tuple)) or not payload:
+                raise StoreContractError(
+                    f"{namespace}: payload must be a non-empty sequence")
+            return list(payload)
+        if not isinstance(payload, Mapping):
+            raise StoreContractError(
+                f"{namespace}: payload must be an object, "
+                f"got {type(payload).__name__}")
+        missing = [key for key in spec.required if key not in payload]
+        if missing:
+            raise StoreContractError(
+                f"{namespace}: payload missing required keys {missing} "
+                f"(writer: {spec.writer})")
+        if spec.schema:
+            expected = SCHEMA_VERSION_REGISTRY.get(spec.schema)
+            version = payload.get("schema_version")
+            if version is None:
+                payload = {**payload, "schema_version": expected}
+            elif int(version) != expected:
+                raise StoreContractError(
+                    f"{namespace}: schema_version {version} != {expected} "
+                    f"for {spec.schema!r} (stale writer?)")
+        return payload
+
+    def _maxlen(self, namespace: str, override: int | None = None) -> int:
+        """Stream cap: the namespace config wins, then the caller, then default."""
+        spec = self.ns(namespace)
+        if spec.retention.maxlen is not None:
+            return int(spec.retention.maxlen)
+        return int(override if override is not None else self.stream_maxlen)
+
+    async def purge_retired(self, *, dry_run: bool = True) -> dict[str, Any]:
+        """Drop leftovers of RETIRED key families (old planes, no writer).
+
+        ``dry_run`` (the default) reports what WOULD be removed. Nothing in the
+        live namespace set is matched: the patterns name only the collated,
+        domain-state, per-run and horizon families, all of which the runtime no
+        longer reads or writes.
+        """
+        matched: dict[str, list[str]] = {}
+        for template in RETIRED_KEY_PATTERNS:
+            pattern = template.format(prefix=self.prefix)
+            keys = [key async for key in self.redis.scan_iter(
+                match=pattern, count=500)]
+            if keys:
+                matched[pattern] = sorted(keys)
+        deleted = 0
+        if not dry_run:
+            for keys in matched.values():
+                for start in range(0, len(keys), 200):
+                    chunk = keys[start:start + 200]
+                    deleted += int(await self.redis.unlink(*chunk) or 0)
+        return {"dry_run": dry_run, "matched": matched,
+                "matched_count": sum(len(v) for v in matched.values()),
+                "deleted": deleted}
+
     def agent_stream(self, session_id: str, artifact_type: str) -> str:
-        return f"{self.prefix}:agent:{session_id}:{artifact_type}"
+        return self.key("agent.artifacts", session=session_id,
+                        artifact=artifact_type)
 
     async def close(self) -> None:
         await self.redis.aclose()
@@ -153,6 +509,7 @@ class RedisRuntimeStore:
         # reflects the true payload version (memory=1).
         # The contract is the source of truth — keeps Redis entries
         # in sync if a future bump changes the constant.
+        payload = self._contract("agent.artifacts", payload)
         schema_version = _AGENT_ARTIFACT_SCHEMA_VERSION.get(artifact_type, 1)
         fields = {
             "schema_version": str(schema_version),
@@ -209,11 +566,11 @@ class RedisRuntimeStore:
 
     def derivatives_key(self, symbol: str) -> str:
         """Latest projection for command-fetched derivative evidence."""
-        return f"{self.prefix}:latest:{symbol.upper()}:derivatives"
+        return self.key("derivatives.latest", symbol=symbol.upper())
 
     def derivatives_stream(self, symbol: str) -> str:
         """Append-only audit trail of every derivative evidence fetch."""
-        return f"{self.prefix}:stream:domain:derivatives:{symbol.upper()}"
+        return self.key("derivatives.stream", symbol=symbol.upper())
 
     async def publish_derivative_evidence(
         self,
@@ -233,6 +590,8 @@ class RedisRuntimeStore:
         """
         if ttl_s <= 0:
             raise ValueError("ttl_s must be positive")
+        payload = self._contract("derivatives.latest", payload)
+        ttl_s = int(self.ns("derivatives.latest").retention.ttl_s or ttl_s)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         ts = str(int(time.time() * 1000))
         maxlen = int(self.stream_maxlen)
@@ -273,14 +632,15 @@ class RedisRuntimeStore:
     # ------------------------------------------------------------------
 
     def raw_stream(self, symbol: str) -> str:
-        return f"{self.prefix}:stream:raw:{symbol.upper()}"
+        return self.key("raw.stream", symbol=symbol.upper())
 
     def raw_latest_key(self, symbol: str) -> str:
-        return f"{self.prefix}:latest:{symbol.upper()}:raw"
+        return self.key("raw.latest", symbol=symbol.upper())
 
     def raw_dedupe_key(self, symbol: str, observed_at_ms: str) -> str:
         """Idempotency guard key for one raw evidence snapshot."""
-        return f"{self.prefix}:raw-dedupe:{symbol.upper()}:{observed_at_ms}"
+        return self.key("raw.dedupe", symbol=symbol.upper(),
+                        observed_at_ms=observed_at_ms)
 
     async def publish_raw_evidence(self, symbol: str, payload: dict[str, Any]) -> str | None:
         """Atomically write one raw evidence snapshot to Redis.
@@ -307,15 +667,21 @@ class RedisRuntimeStore:
 
         Returns the stream id, or ``None`` when the snapshot was a duplicate.
         """
+        ns_raw = self.ns("raw.stream")
+        payload = self._contract("raw.latest", payload)
+        self._contract("raw.stream", payload)
         full_body = json.dumps(payload, default=str, separators=(",", ":"))
         stream_body = json.dumps(
             _slim_stream_body(payload), default=str, separators=(",", ":"))
         ts = str(payload.get("observed_at_ms", ""))
-        maxlen = str(int(self.raw_guardrail_maxlen))
+        maxlen = str(int(ns_raw.retention.guardrail_maxlen
+                         or self.raw_guardrail_maxlen))
         # Trim floor: entries older than this are evicted in the same
         # atomic step that publishes the new one (approximate trim —
         # exact-mode XTRIM is O(n) and would tax the 5s publish path).
-        minid = str(int(time.time() * 1000) - int(self.raw_retention_ms))
+        minid = str(int(time.time() * 1000)
+                    - int(ns_raw.retention.retention_ms
+                          or self.raw_retention_ms))
         script = """
         if ARGV[2] ~= '' then
           local guard = redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[3])
@@ -405,19 +771,24 @@ class RedisRuntimeStore:
     # ------------------------------------------------------------------
 
     def microstructure_raw_stream(self, venue: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:microstructure:raw:{venue.lower()}:{symbol.upper()}"
+        return self.key("micro.raw", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     def microstructure_event_stream(self, venue: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:microstructure:events:{venue.lower()}:{symbol.upper()}"
+        return self.key("micro.events", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     def microstructure_ofi_stream(self, venue: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:microstructure:ofi:{venue.lower()}:{symbol.upper()}"
+        return self.key("micro.ofi", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     def microstructure_book_key(self, venue: str, symbol: str) -> str:
-        return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:book"
+        return self.key("micro.book", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     def microstructure_status_key(self, venue: str, symbol: str) -> str:
-        return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:status"
+        return self.key("micro.status", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     def microstructure_status_stream(self, venue: str, symbol: str) -> str:
         """Status-TRANSITION ledger stream (written only on state change).
@@ -427,15 +798,18 @@ class RedisRuntimeStore:
         (running -> gap -> reconnecting -> running ...). Event-time is
         carried in the entry id, so age checks need no extra payload fields.
         """
-        return f"{self.prefix}:stream:microstructure:status:{venue.lower()}:{symbol.upper()}"
+        return self.key("micro.status.events", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     def microstructure_evidence_key(self, venue: str, symbol: str) -> str:
-        return f"{self.prefix}:latest:microstructure:{venue.lower()}:{symbol.upper()}:evidence"
+        return self.key("micro.evidence", venue=venue.lower(),
+                        symbol=symbol.upper())
 
     async def publish_microstructure_delta(
         self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
     ) -> str:
         """Append raw depth evidence without sharing poller retention or keys."""
+        payload = self._contract("micro.raw", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         return str(await self.redis.xadd(
             self.microstructure_raw_stream(venue, symbol),
@@ -446,6 +820,7 @@ class RedisRuntimeStore:
     async def publish_microstructure_event(
         self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
     ) -> str:
+        payload = self._contract("micro.events", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         return str(await self.redis.xadd(
             self.microstructure_event_stream(venue, symbol),
@@ -457,6 +832,7 @@ class RedisRuntimeStore:
         self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
     ) -> str:
         """Append one completed deterministic OFI/AD measurement interval."""
+        payload = self._contract("micro.ofi", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         return str(await self.redis.xadd(
             self.microstructure_ofi_stream(venue, symbol),
@@ -465,12 +841,14 @@ class RedisRuntimeStore:
         ))
 
     async def set_microstructure_book(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
+        payload = self._contract("micro.book", payload)
         await self.redis.set(
             self.microstructure_book_key(venue, symbol),
             json.dumps(payload, default=str, separators=(",", ":")),
         )
 
     async def set_microstructure_status(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
+        payload = self._contract("micro.status", payload)
         await self.redis.set(
             self.microstructure_status_key(venue, symbol),
             json.dumps(payload, default=str, separators=(",", ":")),
@@ -485,6 +863,7 @@ class RedisRuntimeStore:
         Bounded and best-effort: a failed append is
         tolerated by the capture loop (latest-key status remains authoritative).
         """
+        payload = self._contract("micro.status.events", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         return str(await self.redis.xadd(
             self.microstructure_status_stream(venue, symbol),
@@ -518,6 +897,7 @@ class RedisRuntimeStore:
 
     async def publish_microstructure_evidence(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
         """Persist one immutable MicrostructureEvidence projection (latest)."""
+        payload = self._contract("micro.evidence", payload)
         await self.redis.set(
             self.microstructure_evidence_key(venue, symbol),
             json.dumps(payload, default=str, separators=(",", ":")),
@@ -594,10 +974,12 @@ class RedisRuntimeStore:
     # ------------------------------------------------------------------
 
     def inference_latest_key(self, symbol: str, venue: str) -> str:
-        return f"{self.prefix}:latest:inference:{venue}:{symbol.upper()}"
+        return self.key("inference.latest", symbol=symbol.upper(),
+                        venue=venue)
 
     def inference_stream(self, symbol: str, venue: str) -> str:
-        return f"{self.prefix}:stream:inference:{venue}:{symbol.upper()}"
+        return self.key("inference.stream", symbol=symbol.upper(),
+                        venue=venue)
 
     async def publish_canonical_output(
         self, output: CanonicalOutput, *, stream_maxlen: int | None = None,
@@ -609,6 +991,7 @@ class RedisRuntimeStore:
         and stream carry the canonical row now.
         """
         output.validate()
+        self._contract("inference.latest", output.to_dict())
         body = output.to_json()
         await self.redis.set(
             self.inference_latest_key(output.symbol, output.venue), body)
@@ -646,10 +1029,10 @@ class RedisRuntimeStore:
     # Deleting the control key restores env-based resolution.
 
     def poller_control_key(self) -> str:
-        return f"{self.prefix}:poller:active_symbols"
+        return self.key("poller.active")
 
     def poller_status_key(self) -> str:
-        return f"{self.prefix}:poller:status"
+        return self.key("poller.status")
 
     async def set_poller_symbols(self, symbols: list[str]) -> None:
         """Write the active-symbol override the poller picks up next cycle."""
@@ -658,6 +1041,7 @@ class RedisRuntimeStore:
         cleaned = sorted({s.strip().upper() for s in symbols if s.strip()})
         if not cleaned:
             raise ValueError("set_poller_symbols: at least one symbol required")
+        cleaned = self._contract("poller.active", cleaned)
         await self.redis.set(self.poller_control_key(), json.dumps(cleaned))
 
     async def read_poller_symbols(self) -> list[str] | None:
@@ -679,6 +1063,7 @@ class RedisRuntimeStore:
 
     async def publish_poller_status(self, payload: dict[str, Any]) -> None:
         """Operator-visible confirmation of what the poller is doing now."""
+        payload = self._contract("poller.status", payload)
         await self.redis.set(
             self.poller_status_key(),
             json.dumps(payload, default=str, separators=(",", ":")),
@@ -703,13 +1088,16 @@ class RedisRuntimeStore:
     # ------------------------------------------------------------------
 
     def substrate_stream(self, substrate: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:substrate:{substrate.lower()}:{symbol.upper()}"
+        return self.key(f"substrate.{substrate.lower()}.events",
+                        symbol=symbol.upper())
 
     def substrate_latest_key(self, substrate: str, symbol: str) -> str:
-        return f"{self.prefix}:latest:substrate:{substrate.lower()}:{symbol.upper()}"
+        return self.key(f"substrate.{substrate.lower()}",
+                        symbol=symbol.upper())
 
     def substrate_supervisor_key(self, substrate: str, symbol: str) -> str:
-        return f"{self.prefix}:substrate:{substrate.lower()}:{symbol.upper()}:supervisor"
+        return self.key(f"substrate.{substrate.lower()}.supervisor",
+                        symbol=symbol.upper())
 
     # ------------------------------------------------------------------
     # Horizon spans — per-horizon deterministic blocks (spec: interaction
@@ -731,6 +1119,8 @@ class RedisRuntimeStore:
         whose stream entry is missing. Stream length is bounded by
         ``self.stream_maxlen``.
         """
+        payload = self._contract(
+            f"substrate.{substrate.lower()}", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         ts = str(payload.get("computed_at_ms") or payload.get("observed_at_ms") or "")
         maxlen = str(int(self.stream_maxlen))
@@ -799,18 +1189,23 @@ class RedisRuntimeStore:
     # symbol) — never the process. Spec: docs/ANALYSIS_WORKER_SPEC.md.
 
     def analysis_stream(self, analysis: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:analysis:{analysis.lower()}:{symbol.upper()}"
+        return self.key(f"analysis.{analysis.lower()}.events",
+                        symbol=symbol.upper())
 
     def analysis_latest_key(self, analysis: str, symbol: str) -> str:
-        return f"{self.prefix}:latest:analysis:{analysis.lower()}:{symbol.upper()}"
+        return self.key(f"analysis.{analysis.lower()}",
+                        symbol=symbol.upper())
 
     def analysis_supervisor_key(self, analysis: str, symbol: str) -> str:
-        return f"{self.prefix}:analysis:{analysis.lower()}:{symbol.upper()}:supervisor"
+        return self.key(f"analysis.{analysis.lower()}.supervisor",
+                        symbol=symbol.upper())
 
     async def publish_analysis_state(
         self, analysis: str, symbol: str, payload: dict[str, Any],
     ) -> str:
         """Atomic SET(latest) + XADD(state stream) — the substrate publish Lua."""
+        payload = self._contract(
+            f"analysis.{analysis.lower()}", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         ts = str(payload.get("computed_at_ms") or payload.get("observed_at_ms") or "")
         maxlen = str(int(self.stream_maxlen))
@@ -870,18 +1265,20 @@ class RedisRuntimeStore:
     # ------------------------------------------------------------------
 
     def governance_latest_key(self, plane: str, substrate: str, symbol: str) -> str:
-        return (f"{self.prefix}:latest:governance:{plane.lower()}:"
-                f"{substrate.lower()}:{symbol.upper()}")
+        return self.key("governance.latest", plane=plane.lower(),
+                        name=substrate.lower(), symbol=symbol.upper())
 
     def governance_stream(self, plane: str, symbol: str) -> str:
-        return f"{self.prefix}:stream:governance:{plane.lower()}:{symbol.upper()}"
+        return self.key("governance.stream", plane=plane.lower(),
+                        symbol=symbol.upper())
 
     def governance_denial_stream(self, plane: str, symbol: str) -> str:
-        return (f"{self.prefix}:stream:governance:denials:"
-                f"{plane.lower()}:{symbol.upper()}")
+        return self.key("governance.denials", plane=plane.lower(),
+                        symbol=symbol.upper())
 
     def governance_supervisor_key(self, plane: str, symbol: str) -> str:
-        return f"{self.prefix}:governance:{plane.lower()}:{symbol.upper()}:supervisor"
+        return self.key("governance.supervisor", plane=plane.lower(),
+                        symbol=symbol.upper())
 
     async def publish_governance_decision(
         self, plane: str, substrate: str, symbol: str, payload: dict[str, Any],
@@ -896,6 +1293,7 @@ class RedisRuntimeStore:
         Same Lua ordering-hole closure as ``publish_substrate_state``: no
         reader can observe a latest decision whose stream entry is missing.
         """
+        payload = self._contract("governance.latest", payload)
         body = json.dumps(payload, default=str, separators=(",", ":"))
         ts = str(payload.get("decided_at_ms") or "")
         allowed = "1" if payload.get("allowed") else "0"
