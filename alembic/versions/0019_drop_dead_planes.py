@@ -25,8 +25,16 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("DROP TABLE IF EXISTS market_run;")
+    # market_snapshot has live dependents: drop them first. The FK from
+    # signal_event is nullable bookkeeping (writes leave it NULL); the
+    # latest_market_state view has no code readers (schema-only).
+    op.execute(
+        "ALTER TABLE IF EXISTS signal_event "
+        "DROP CONSTRAINT IF EXISTS signal_event_snapshot_id_fkey;"
+    )
+    op.execute("DROP VIEW IF EXISTS latest_market_state;")
     op.execute("DROP TABLE IF EXISTS market_snapshot;")
+    op.execute("DROP TABLE IF EXISTS market_run;")
     op.execute("DROP TABLE IF EXISTS inference_artifact;")
     op.execute("DROP TABLE IF EXISTS horizon_span;")
 
