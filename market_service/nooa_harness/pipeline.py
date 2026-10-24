@@ -48,8 +48,6 @@ from market_service.runtime.raw_window import (
 )
 from .pipeline_interpretation import (  # noqa: F401
     MACRO_SYMBOLS,
-    _keystone_snapshot_payload,
-    _wall_snapshot_payload,
     fetch_derivative_evidence,
 )
 

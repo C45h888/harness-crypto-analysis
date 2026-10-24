@@ -1,8 +1,8 @@
 """INTERPRETATION PLANE — envelope assembly + durable fetch surfaces.
 
 This module owns the interpretation-plane surface that used to live in
-``pipeline.py``: envelope assembly, the on-demand Binance derivative fetch,
-and the cross-cycle wall/keystone payload builders. Computation cycles
+``pipeline.py``: envelope assembly and the on-demand Binance derivative
+fetch. Computation cycles
 (the former cycle wrappers) were removed with the tool-first
 migration: agents and operators invoke substrate workers as tools
 (``substrate_worker.tools``) instead of running cycles.
@@ -60,103 +60,6 @@ from market_service.runtime.raw_window import (
 )
 
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Persistence — Postgres first, then Redis
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Wall-snapshot seam — read the FULL recorded wall history into the migration
-# analysis, and WRITE the current cycle's wall state so the next cycle sees it.
-# ---------------------------------------------------------------------------
-
-
-def _wall_snapshot_payload(
-    symbol: str,
-    run_id: str,
-    evidence: dict[str, Any],
-    analysis_result: dict[str, Any],
-) -> dict[str, Any]:
-    """Assemble one wall-snapshot payload from this cycle's evidence + analysis.
-
-    The payload shape matches what ``record_wall_snapshot`` persists (both
-    Redis and Postgres): asks/bids plus the deterministic fuel/migration
-    metrics. ``cycle_ts`` is the envelope/run generation timestamp so a
-    re-run within the same cycle is an idempotent upsert, not a duplicate.
-    """
-    futures_book = (evidence.get("futures") or {}).get("order_book") or {}
-    asks_raw = futures_book.get("asks") or []
-    bids_raw = futures_book.get("bids") or []
-    wm = ((analysis_result.get("analysis") or {}).get("wall_migration")) or {}
-    fuel = wm.get("fuel_ratio") or {}
-    inputs = wm.get("inputs_used") or {}
-    # Null discipline: ``None`` (analysis degraded / not measured) must reach
-    # the ledger as NULL, not as a fabricated 0.0 fuel ratio. Keystone payload
-    # already follows this via its ``_f`` helper.
-    def _f(v: Any) -> float | None:
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "cycle_ts": _utc_iso(),
-        "schema_version": 1,
-        "asks": asks_raw,
-        "bids": bids_raw,
-        "fuel_ratio": _f(inputs.get("fuel_ratio_value")),
-        "bid_pool": _f(fuel.get("bid_pool")),
-        "ask_pool": _f(fuel.get("ask_pool")),
-        "bid_floor": _f(fuel.get("bid_floor")),
-        "ask_target": _f(fuel.get("ask_target")),
-        "ask_walls_built": int(inputs.get("ask_walls_built") or 0),
-        "ask_walls_eroded": int(inputs.get("ask_walls_eroded") or 0),
-    }
-
-
-def _keystone_snapshot_payload(
-    symbol: str,
-    run_id: str,
-    calc_result: dict[str, Any],
-) -> dict[str, Any]:
-    """Assemble one keystone-snapshot payload from this cycle's calculations.
-
-    Extracts the fut_keystone (price + tight/wide bands), the keystone bid
-    stack tight-zone total qty, and the ask-wall ladder total notional —
-    the scalar state needed to reconstruct cross-cycle keystone migration.
-    ``cycle_ts`` is the cycle generation timestamp so a re-run within the
-    same cycle is an idempotent upsert, not a duplicate.
-
-    Null discipline: a missing keystone (orderbook section degraded / no
-    last_price) yields keystone_price=None — never a fabricated price.
-    """
-    calculations = (calc_result.get("calculations") or {})
-    orderbook = calculations.get("orderbook") or {}
-    kz = orderbook.get("fut_keystone") or {}
-    kz_price = kz.get("keystone")
-    tight = kz.get("tight") or {}
-    wide = kz.get("wide") or {}
-    stack = orderbook.get("keystone_bid_stack") or {}
-    ladder = orderbook.get("ask_wall_ladder") or {}
-
-    def _f(v: Any) -> float | None:
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "cycle_ts": _utc_iso(),
-        "schema_version": 1,
-        "keystone_price": _f(kz_price),
-        "window_qty": _f(kz.get("window_qty")),
-        "tight_lo": _f(tight.get("lo")),
-        "tight_hi": _f(tight.get("hi")),
-        "wide_lo": _f(wide.get("lo")),
-        "wide_hi": _f(wide.get("hi")),
-        "keystone_bid_qty": _f((stack.get("tight") or {}).get("total_qty")),
-        "ask_ladder_notional": _f(ladder.get("total_notional")),
-    }
 
 
 # ---------------------------------------------------------------------------

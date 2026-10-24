@@ -2,7 +2,6 @@
 
 Covers:
 - keystone_cycle_migration (pure cross-cycle migration verdict)
-- _keystone_snapshot_payload (pipeline payload assembly, null discipline)
 """
 
 from __future__ import annotations
@@ -76,36 +75,6 @@ class KeystoneCycleMigrationTests(unittest.TestCase):
     def test_non_dict_rows_skipped(self):
         r = keystone_cycle_migration([None, "garbage", {"keystone_price": "bad"}])
         self.assertEqual(r["cycles"], [])
-
-
-class KeystoneSnapshotPayloadTests(unittest.TestCase):
-    def test_null_discipline_on_missing_keystone(self):
-        from market_service.nooa_harness.pipeline import _keystone_snapshot_payload
-        payload = _keystone_snapshot_payload("SOLUSDT", "run-1", {"calculations": {}})
-        self.assertIsNone(payload["keystone_price"])
-        self.assertIsNone(payload["window_qty"])
-        self.assertIsNone(payload["keystone_bid_qty"])
-        self.assertIsNone(payload["ask_ladder_notional"])
-        self.assertEqual(payload["schema_version"], 1)
-
-    def test_extraction_from_calculations(self):
-        from market_service.nooa_harness.pipeline import _keystone_snapshot_payload
-        calc = {"calculations": {"orderbook": {
-            "fut_keystone": {
-                "keystone": 93.50, "window_qty": 1200.0,
-                "tight": {"lo": 93.45, "hi": 93.55},
-                "wide": {"lo": 93.40, "hi": 93.60},
-            },
-            "keystone_bid_stack": {"tight": {"total_qty": 14870.0}},
-            "ask_wall_ladder": {"total_notional": 41431290.0},
-        }}}
-        payload = _keystone_snapshot_payload("SOLUSDT", "run-1", calc)
-        self.assertAlmostEqual(payload["keystone_price"], 93.50)
-        self.assertAlmostEqual(payload["window_qty"], 1200.0)
-        self.assertAlmostEqual(payload["tight_lo"], 93.45)
-        self.assertAlmostEqual(payload["tight_hi"], 93.55)
-        self.assertAlmostEqual(payload["keystone_bid_qty"], 14870.0)
-        self.assertAlmostEqual(payload["ask_ladder_notional"], 41431290.0)
 
 
 if __name__ == "__main__":
