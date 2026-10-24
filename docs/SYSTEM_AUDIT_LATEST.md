@@ -170,22 +170,35 @@ of writing.
 
 | Seam | State | Probed evidence |
 |---|---|---|
-| **S1** store → namespace | **DONE (code)** | `RedisRuntimeStore.NAMESPACES` = **75** namespaces (12 substrate + 6 analysis × latest/events/supervisor, plus 21 fixed). **27/27** key builders delegate to `key(ns, …)`; the class contains exactly one `f"{self.prefix}:…"`. **16/16** publishers call `_contract()` (required keys + schema stamp/guard, `StoreContractError`). Retention is declared in config for `derivatives.latest` (`ttl_s=300`) and `raw.stream` (`retention_ms=43.2M`, `guardrail_maxlen=20_000`) and read by the publishers. `RETIRED_KEY_PATTERNS` + `purge_retired()`; CLI `market store namespaces` / `purge-legacy`. `tests/test_store_namespaces.py` = 23 tests. |
+| **S1** store → namespace | **DONE — verified live** | `RedisRuntimeStore.NAMESPACES` = **80** namespaces (12 substrate + 6 analysis × latest/events/supervisor, 21 fixed, 5 telemetry). **27/27** store builders delegate to `key(ns, …)`; **telemetry_kernel now resolves its 5 key families through the same config** (`namespace_key`) and its payloads through `namespace_contract`. **16/16** store publishers call `_contract()` (required keys + schema stamp/guard, `StoreContractError`); telemetry events/projections are contract-checked before the Lua pipeline. Retention comes from config (`derivatives.latest` 300s, `raw.stream` 12h/20k, `telemetry.dedupe` marker TTL). `RETIRED_KEY_PATTERNS` + `purge_retired()`; CLI `market store namespaces` / `purge-legacy`. **Live proof (Redis up): 7 928 / 7 928 keys map to a configured namespace, 0 unconfigured, 0 retired leftovers.** `tests/test_store_namespaces.py` = 28 tests. |
 | **S2** read surface | **NOT STARTED (deferred by decision)** | `read_paths.py` still owns `json_safe`, `_age_ms`, `read_substrate_*`, `read_analysis_*`, `read_live_price`, `read_surface_inventory`; per-tool extraction remains in `tools_market` (`_age` field lists + snapshot allowlist) and in `substrate_worker/tools._project` / `analysis_worker/tools._project`. No shared read envelope exists. |
 | **S3** tool → agent | **OPEN** | One read surface costs **8** file edits: `tooling/registry.py` (name + phase; optionally homes/alias), `inference/capability.py`, `engine/tool_schemas.py` (**two** dicts: shape + arg contract), `tooling/executor.py` (dispatch branch), `tooling/__init__.py` (import + `__all__`), `tooling/tools_market.py` (dispatch fn), `engine/kb.py` (tool window + P3 chain text). Citation grammar is tool-bound: `CITATION_LINE = "Cite tool fields as ``<tool> → data.<field>``"`; validation reads `basis_path`/citation paths. |
 | **S4** tool → interpretation | **OPEN** | `pipeline_interpretation.py` imports `calculations.composition`, `runtime.bounds/contracts/derivatives/raw_window`, `clients.binance` — it does **not** import the inference plane (doctrine holds). It reads raw windows through `runtime/raw_window` and assembles payloads itself; there is no shared read contract with the agent. |
 | **S5** read → CLI / containers | **OPEN** | `interaction_plane/reads.py` = 5 shaping functions (`read_warm`, `read_ledger`, `read_surfaces`, `read_history`, `read_micro_status`); CLI exposes 14 read/command surfaces (`read`, `substrate read/invoke`, `memory session/remember/recall/stats/forget`, `microstructure fit/evidence/interpret`, `inference run/answer/read/history`). Containers expose `/status` (which embeds `read_state`) and `/invoke` — **no `/read` endpoint**. Each site shapes its own response. |
 | **S6** live → durable | **PARTIAL** | Durable read paths exist for **7** tables: `canonical_output`, `agent_memory`, `microstructure_evidence`, `microstructure_event_tape`, `substrate_calculation`, `governance_ledger`, `runtime_telemetry_event`. Redis→PG fallback exists **only** for canonical output (CLI/engine) and agent memory. Agent tools have **no** PG fallback: `dispatch_market_read` accepts `postgres` and never uses it; `micro.evidence` reads Redis only. Write-only / dead chains: `keystone_history`, `wall_snapshot`, `signal_event` (their writers have **0** production callers; `record_signal_events` is only called by the equally orphaned `record_wall_snapshot`). Retired tables: `analyst_briefing`, `market_run`, `market_snapshot`, `inference_artifact`, `horizon_span`. |
 
-### Pending operational action
+### Executed operational action
 
-`purge_retired()` could not be executed at probe time (Redis `6379` refused).
-When the stack is up:
+The blocker was the Docker daemon, not the code: `~/.docker/run/docker.sock`
+was absent, so no container existed to answer on `6379`. Started Docker
+Desktop, brought the `redis` service up (`docker compose up -d redis`), then:
 
 ```
-nooa market store purge-legacy            # dry run: lists matched legacy keys
-nooa market store purge-legacy --yes      # unlinks them
+nooa market store purge-legacy            # matched exactly 2 keys
+nooa market store purge-legacy --yes      # deleted 2 (dbsize 7930 -> 7928)
 ```
+
+Matched: `latest:BTCUSDT:collated`, `stream:collated:BTCUSDT` — nothing else.
+
+Namespace orientation audit after the purge found **7 856 keys outside the
+configured surface**: the whole telemetry plane (`telemetry:event-id` 7 712,
+`telemetry:latest` 70, `telemetry:events` 70, `telemetry:health` 4), because
+`telemetry_kernel.store` composed its own key strings. That is now closed:
+the five telemetry families are configured namespaces, the store's key
+helpers moved to module level (`namespace_key` / `namespace_contract` /
+`namespace_retention`) and are the single implementation, and every
+telemetry write (event, projection, health, cursor, dedupe marker) resolves
+through them.
 
 ### Deferred by decision
 
@@ -196,5 +209,4 @@ nooa market store purge-legacy --yes      # unlinks them
    and drops for the five retired tables.
 3. **Retention unification** — namespaces that do not declare a `maxlen` still
    fall back to the constructor `stream_maxlen`.
-4. **Post-purge verification** — mapping live Redis keys to configured
-   namespaces and reporting any unconfigured leftover (runs after the purge).
+
