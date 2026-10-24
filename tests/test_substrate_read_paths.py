@@ -19,6 +19,28 @@ class _DictStore:
     async def read_substrate_latest(self, substrate: str, symbol: str):
         return self.latests.get(substrate.lower())
 
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        if namespace.startswith("substrate."):
+            sub = namespace.split(".", 1)[1].removesuffix(".events")
+            if namespace.endswith(".events"):
+                return []
+            return self.latests.get(sub.lower())
+        return None
+
+    def ns(self, namespace):
+        from tests._singular_compat import fake_ns
+        return fake_ns(namespace)
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        # _DictStore speaks substrate latest only; bridge it.
+        if namespace.startswith("substrate."):
+            sub = namespace.split(".", 1)[1].removesuffix(".events")
+            if namespace.endswith(".events"):
+                return []
+            return self.latests.get(sub.lower())
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
 
 class ReadPathsTests(unittest.TestCase):
     def test_latest_returns_payload_plus_age(self):

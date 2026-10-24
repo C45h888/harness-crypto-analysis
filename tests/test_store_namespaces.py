@@ -175,7 +175,8 @@ class NamespaceConfigTests(unittest.TestCase):
 
     def test_templates_only_use_known_tokens(self):
         allowed = {"symbol", "venue", "name", "plane", "session", "artifact",
-                   "observed_at_ms"}
+                   "observed_at_ms", "owner", "subject_type", "subject_id",
+                   "consumer", "event_id"}
         for spec in rs.NAMESPACES.values():
             tokens = {part.split("}")[0] for part in spec.template.split("{")[1:]}
             self.assertTrue(tokens <= allowed,
@@ -272,8 +273,9 @@ class PublisherContractTests(unittest.TestCase):
         redis = _FakeRedis()
         store = _store(redis)
         with self.assertRaises(rs.StoreContractError):
-            asyncio.run(store.publish_microstructure_event(
-                "futures", "SOLUSDT", {"previous": {}}, maxlen=10))
+            asyncio.run(store.publish(
+                "micro.events", {"previous": {}},
+                ids={"venue": "futures", "symbol": "SOLUSDT"}, maxlen=10))
         self.assertEqual(redis.calls, [])
 
     def test_valid_payload_writes_the_configured_key(self):
@@ -281,8 +283,9 @@ class PublisherContractTests(unittest.TestCase):
         store = _store(redis)
         payload = {"schema_version": 1, "event_type": "best_quote_transition",
                    "current": {"bid_price": "1"}, "previous": {}}
-        asyncio.run(store.publish_microstructure_event(
-            "futures", "SOLUSDT", payload, maxlen=10))
+        asyncio.run(store.publish(
+            "micro.events", payload,
+            ids={"venue": "futures", "symbol": "SOLUSDT"}, maxlen=10))
         self.assertEqual(redis.calls[0][0], "xadd")
         self.assertEqual(
             redis.calls[0][1][0],
@@ -291,8 +294,9 @@ class PublisherContractTests(unittest.TestCase):
     def test_configured_ttl_wins_over_the_caller(self):
         redis = _FakeRedis()
         store = _store(redis)
-        asyncio.run(store.publish_derivative_evidence(
-            "SOLUSDT", {"observed_at_ms": 1}, ttl_s=9_999))
+        asyncio.run(store.publish(
+            "derivatives.latest", {"observed_at_ms": 1},
+            ids={"symbol": "SOLUSDT"}))
         # eval(script, numkeys, key1, key2, ...) — the script is the first arg
         script = redis.calls[0][1][0]
         self.assertIn("'EX', 300", script)
@@ -300,8 +304,9 @@ class PublisherContractTests(unittest.TestCase):
     def test_configured_raw_retention_is_used(self):
         redis = _FakeRedis()
         store = _store(redis, raw_retention_ms=1, raw_guardrail_maxlen=1)
-        asyncio.run(store.publish_raw_evidence(
-            "SOLUSDT", {"observed_at_ms": 1, "spot": {}, "futures": {}}))
+        asyncio.run(store.publish(
+            "raw.latest", {"observed_at_ms": 1, "spot": {}, "futures": {}},
+            ids={"symbol": "SOLUSDT"}))
         # eval(script, keys, body, ts, guard_ttl, stream_body, maxlen, minid)
         args = redis.calls[0][1]
         self.assertEqual(args[-2], str(20_000))   # guardrail maxlen from config
@@ -318,7 +323,9 @@ class RetiredNamespaceTests(unittest.TestCase):
         for spec in rs.NAMESPACES.values():
             ids = {"symbol": "SOLUSDT", "venue": "futures", "name": "tape",
                    "plane": "calculation", "session": "s", "artifact": "memory",
-                   "observed_at_ms": "1"}
+                   "observed_at_ms": "1", "owner": "sink",
+                   "subject_type": "symbol", "subject_id": "SOLUSDT",
+                   "consumer": "projection", "event_id": "e1"}
             keys.append(f"{store.prefix}:{spec.template.format(**ids)}")
         return keys
 
@@ -347,6 +354,98 @@ class RetiredNamespaceTests(unittest.TestCase):
         result = asyncio.run(_store(redis).purge_retired(dry_run=False))
         self.assertEqual(result["deleted"], 1)
         self.assertTrue(any(call[0] == "unlink" for call in redis.calls))
+
+
+# ---------------------------------------------------------------------------
+# The telemetry plane is a namespace like any other
+# ---------------------------------------------------------------------------
+
+class TelemetryNamespaceTests(unittest.TestCase):
+    """telemetry_kernel writes THROUGH the configuration, not beside it."""
+
+    def _telemetry(self):
+        from market_service.telemetry_kernel.contracts import TelemetryEvent
+        from market_service.telemetry_kernel.store import TelemetryStore
+
+        class _Stub:
+            prefix = "marketflow"
+            stream_maxlen = 47
+
+            def __init__(self) -> None:
+                self.redis = _FakeRedis()
+
+        store = TelemetryStore(_Stub())
+        event = TelemetryEvent.create(
+            plane="calculation", owner="density", subject_type="symbol",
+            subject_id="SOLUSDT", event_type="state_adjudicated",
+            source_sequence=7, occurred_at_ms=1_700_000_000_000,
+            state={"status": "ok"},
+        )
+        return store, event
+
+    def test_every_telemetry_key_resolves_to_a_configured_namespace(self):
+        from fnmatch import fnmatch
+
+        store, event = self._telemetry()
+        render = {token: "*" for token in (
+            "symbol", "venue", "name", "plane", "session", "artifact",
+            "observed_at_ms", "owner", "subject_type", "subject_id",
+            "consumer", "event_id")}
+        patterns = ["marketflow:" + spec.template.format(**render)
+                    for spec in rs.NAMESPACES.values()]
+        keys = [store.event_stream(event), store.latest_key(event),
+                store._event_marker(event), store.health_key("poller"),
+                store.cursor_key("projection")]
+        for key in keys:
+            self.assertTrue(any(fnmatch(key, p) for p in patterns),
+                            f"{key} is outside the configured namespaces")
+            self.assertTrue(key.startswith("marketflow:telemetry:"))
+
+    def test_telemetry_store_composes_no_keys_of_its_own(self):
+        source = (pathlib.Path(rs.__file__).parent.parent / "telemetry_kernel"
+                  / "store.py").read_text()
+        self.assertIn("namespace_key", source)
+        self.assertNotIn('\":\".join((', source)
+        self.assertNotIn("self.prefix}:", source)
+
+    def test_marker_ttl_comes_from_config_undeclared_maxlen_from_caller(self):
+        store, _event = self._telemetry()
+        self.assertEqual(
+            store.marker_ttl_s,
+            rs.namespace_retention("telemetry.dedupe").ttl_s)
+        self.assertEqual(store.stream_maxlen, 47)  # undeclared -> caller
+
+    def test_publish_stamps_the_schema_and_validates_both_payloads(self):
+        store, event = self._telemetry()
+        projection = {
+            "plane": event.plane, "owner": event.owner,
+            "subject_type": event.subject_type, "subject_id": event.subject_id,
+            "last_event_id": event.event_id,
+            "last_event_at_ms": event.occurred_at_ms,
+            "source_sequence": event.source_sequence,
+            "state": dict(event.state),
+        }
+        asyncio.run(store.publish(event, projection))
+        args = next(call[1] for call in store.redis.calls if call[0] == "eval")
+        body = json.loads(args[5])
+        projected = json.loads(args[6])
+        self.assertEqual(body["schema_version"],
+                         rs.SCHEMA_VERSION_REGISTRY["telemetry_event"])
+        self.assertEqual(projected["schema_version"],
+                         rs.SCHEMA_VERSION_REGISTRY["telemetry_event"])
+
+        with self.assertRaises(rs.StoreContractError):
+            asyncio.run(store.publish(event, {"plane": event.plane}))
+
+    def test_telemetry_contracts_reject_drift(self):
+        with self.assertRaises(rs.StoreContractError):
+            rs.namespace_contract("telemetry.events", {"plane": "calculation"})
+        with self.assertRaises(rs.StoreContractError):
+            rs.namespace_contract("telemetry.latest", {})
+        with self.assertRaises(rs.StoreContractError):
+            rs.namespace_contract("telemetry.dedupe", "")
+        self.assertEqual(
+            rs.namespace_contract("telemetry.dedupe", "1"), "1")
 
 
 if __name__ == "__main__":

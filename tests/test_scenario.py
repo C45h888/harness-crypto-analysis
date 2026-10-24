@@ -363,6 +363,18 @@ class ScenarioRegistryTests(unittest.TestCase):
             async def read_microstructure_events(self, venue, symbol):
                 return []
 
+            async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+                from tests._singular_compat import fake_read
+                return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+            def ns(self, namespace):
+                from tests._singular_compat import fake_ns
+                return fake_ns(namespace)
+
+            async def publish(self, namespace, payload, *, ids=None, **kw):
+                from tests._singular_compat import fake_publish
+                return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
         async def _fake_fit(store, symbol, venue, args, postgres=None):
             return {"price_impact_fit": _fit().to_dict()}, {"result": "ok"}
 

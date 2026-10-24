@@ -34,21 +34,15 @@ from typing import Any
 # the schema notes the semantic type.
 
 TOOL_OUTPUT_SCHEMAS: dict[str, str] = {
+    # ---- ns.read (the agent's only state read) ----
+    "ns.read": (
+        "{namespace: str, symbol: str, venue: str, key: str, "
+        "source: str(redis-live), as_of_ms: int, status: str(ok), "
+        "age_ms: int|null, data: <verbatim pared doc, or array for streams>} — "
+        "one configured namespace per call; absent key returns null with the "
+        "probed key named in the audit log (never an invented value)"
+    ),
     # ---- micro package (capture / tape / fit) ----
-    "micro.capture_status": (
-        "{state: str(running|stopped|degraded), sequence_gaps: int, "
-        "reconnects: int, first_event_ts_ms: int|null, last_event_ts_ms: int|null}"
-    ),
-    "micro.events": (
-        "array[{event_type: str, source_quality: str, contribution: str(decimal), "
-        "previous: {bid_price,ask_price,bid_qty,ask_qty}, "
-        "current: {bid_price,ask_price,bid_qty,ask_qty}}] — bounded to 200"
-    ),
-    "micro.ofi_intervals": (
-        "array[{start_ts_ms: int, end_ts_ms: int, ofi: str(decimal), "
-        "event_count: int, quality: str(exact_feed|estimated|degraded)}] — "
-        "AD excluded by design (call calc.depth.average separately)"
-    ),
     "micro.replay": (
         "{events: int, intervals: int, dropped: int, "
         "interval_ms: int, agreement: bool}"
@@ -58,10 +52,6 @@ TOOL_OUTPUT_SCHEMAS: dict[str, str] = {
         "n_observations: int, status: str(validated|provisional|insufficient)}, "
         "depth_scaling_fit: {c: str|null, lambda: str|null, status: str|null}, "
         "coverage: {events_in_window: int, n_intervals: int, ...}}"
-    ),
-    "micro.evidence": (
-        "last persisted evidence object (prior cycle, NOT a fresh fit) — "
-        "may be null if no prior cycle"
     ),
 
     # ---- calc-base package (split OFI/AD + OLS + derived ΔP + scenario) ----
@@ -176,53 +166,7 @@ TOOL_OUTPUT_SCHEMAS: dict[str, str] = {
         "go: bool, memo: str}"
     ),
 
-    # ---- market package (regime context) ----
-    "market.read": (
-        "{symbol: str, run_id: str|null, status: str, "
-        "coverage: {...}, canonical_state: {...}} — "
-        "truncated to snapshot by default; mode=full for deep-dive"
-    ),
-    "market.derivatives": (
-        "{oi_history: {...}|null, taker_buy_sell: {...}|null, "
-        "funding: {...}|null, cross_asset: {...}} — "
-        "null fields mean unavailable (not zero)"
-    ),
-    "market.keystone_history": (
-        "array[{cycle_ts: str, keystone_price: str|null, "
-        "tight_lo: str, tight_hi: str, ...}] — bounded to count arg"
-    ),
-    "market.wall_history": (
-        "array[{cycle_ts: str, fuel_ratio: str|null, "
-        "bid_pool: str|null, ask_pool: str|null, ...}]"
-    ),
-
-    # ---- substrate plane (always-fresh workers) ----
-    "substrate.read": (
-        "{symbol: str, substrates: {<name>: {status: str, "
-        "trigger_source: str|null, age_ms: int|null, "
-        "available: bool}}} — compact mode default"
-    ),
-    "substrate.invoke": (
-        "{substrate: str, symbol: str, invoked: bool, "
-        "fired: int|null, trigger_source: str|null, "
-        "status: str|null, dormant_reason: str|null, "
-        "last_error: str|null, available: bool} — "
-        "unknown substrate returns invoked=false with error"
-    ),
-    "substrate.tape": "same as substrate.invoke — invokes the tape worker",
-    "substrate.density": "same as substrate.invoke — invokes the density worker",
-    "substrate.delta": "same as substrate.invoke — invokes the delta worker",
-    "substrate.ladders": "same as substrate.invoke — invokes the ladders worker",
-    "substrate.anchors": "same as substrate.invoke — invokes the anchors worker",
-    "substrate.tiers": "same as substrate.invoke — invokes the tiers worker",
-    "substrate.volume_profile": "same as substrate.invoke — invokes the volume_profile worker",
-    "substrate.technicals": "same as substrate.invoke — invokes the technicals worker",
-    "substrate.migration": "same as substrate.invoke — invokes the migration worker",
-    "substrate.oi": "same as substrate.invoke — invokes the oi worker",
-    "substrate.signals": "same as substrate.invoke — invokes the signals worker",
-    "substrate.large_print": "same as substrate.invoke — invokes the large_print worker",
-
-    # ---- memory ----
+    # ---- memory (agent-owned; never evidence) ----
     "memory.remember": (
         "{stored: bool, kind: str, memory_id: str|null, segment: str|null, "
         "reason: str|null} — the agent's OWN segment memory"
@@ -322,17 +266,12 @@ TOOL_ARG_CONTRACTS: dict[str, str] = {
     "calc.discipline.audit": (
         "{window_minutes: 15|30|60, cost_statement: str|null}"
     ),
-    "market.read": (
-        "{mode: snapshot|inventory|surfaces|full, run_id: str|null} — "
-        "``surfaces`` lists EVERY persisted plane (presence, run_id, age_ms) "
-        "plus the read-tool map; an empty read returns that inventory as data "
-        "(status:\"empty\"), never a bare null"
+    "ns.read": (
+        "{namespace: str (configured family, e.g. micro.evidence|micro.events|"
+        "micro.ofi|micro.status|derivatives.latest|substrate.<name>|analysis.<name>|"
+        "inference.latest), symbol: str, venue: str, count: int<=200 (streams), "
+        "newest_first: bool} — streams return newest-first arrays"
     ),
-    "micro.events": "{count: int <= 200}",
-    "micro.ofi_intervals": "{count: int <= 200}",
-    "market.keystone_history|market.wall_history": "{count: int <= 100}",
-    "substrate.read": "{substrate: str|null, mode: compact|full}",
-    "substrate.invoke|substrate.*": "{substrate: str (worker name)}",
     "memory.remember": (
         "{kind: observation|hypothesis|note, content: str, importance: float, "
         "tags: array[str], evidence_refs: array[str], title: str|null}"
@@ -399,6 +338,19 @@ def tool_schema_block() -> str:
 # phase cares about, producing a compact summary block the prompt can show
 # alongside the raw JSON.
 
+def _ns_data(results: dict[str, Any], namespace: str) -> Any:
+    """Unwrap one ns.read result (namespace-keyed, `ns.read` fallback)."""
+    entry = results.get(namespace)
+    if entry is None and namespace != "ns.read":
+        entry = results.get("ns.read")
+        if isinstance(entry, dict) and entry.get("namespace") != namespace:
+            entry = None
+    if isinstance(entry, dict):
+        data = entry.get("data", entry)
+        return data
+    return entry
+
+
 def extract_p1_summary(results: dict[str, Any]) -> list[str]:
     """Extract P1-significant fields: OFI value, quality, intervals count."""
     lines: list[str] = []
@@ -410,10 +362,12 @@ def extract_p1_summary(results: dict[str, Any]) -> list[str]:
             qualities = set(d.get("quality") for d in data if isinstance(d, dict))
             qual_str = ",".join(sorted(q for q in qualities if q)) if qualities else "?"
             lines.append(f"OFI: {n} intervals, quality=[{qual_str}]")
-    cap = results.get("micro.capture_status")
-    if cap and isinstance(cap, dict) and cap.get("data"):
-        d = cap["data"]
-        lines.append(f"capture: state={d.get('state')}, gaps={d.get('sequence_gaps')}")
+    cap = _ns_data(results, "micro.status")
+    if isinstance(cap, dict):
+        lines.append(f"capture: state={cap.get('state')}, gaps={cap.get('sequence_gaps')}")
+    intervals = _ns_data(results, "micro.ofi")
+    if isinstance(intervals, list) and intervals:
+        lines.append(f"ns micro.ofi: {len(intervals)} rows")
     return lines
 
 
@@ -436,20 +390,22 @@ def extract_p2_summary(results: dict[str, Any]) -> list[str]:
 
 
 def extract_p3_summary(results: dict[str, Any]) -> list[str]:
-    """Extract P3-significant fields: substrate availability, age, freshness."""
+    """Extract P3-significant fields: worker freshness via ns.read namespaces."""
     lines: list[str] = []
-    sub_read = results.get("substrate.read")
-    if sub_read and isinstance(sub_read, dict) and sub_read.get("data"):
-        substrates = (sub_read["data"] or {}).get("substrates") or {}
-        for name, entry in substrates.items():
-            if isinstance(entry, dict):
-                avail = entry.get("available", False)
-                age = entry.get("age_ms", "?")
-                lines.append(f"  {name}: {'✓' if avail else '✗'}, age={age}ms")
-    market = results.get("market.read")
-    if market and isinstance(market, dict) and market.get("data"):
-        d = market["data"]
-        lines.append(f"market: status={d.get('status')}, run_id={d.get('run_id')}")
+    for key, entry in results.items():
+        if not isinstance(key, str):
+            continue
+        if not (key.startswith("substrate.") or key.startswith("analysis.")):
+            continue
+        data = entry.get("data", entry) if isinstance(entry, dict) else entry
+        if not isinstance(data, dict):
+            continue
+        avail = data.get("available", True)
+        age = entry.get("age_ms", "?") if isinstance(entry, dict) else "?"
+        lines.append(f"  {key}: {'✓' if avail else '✗'}, age={age}ms")
+    deriv = _ns_data(results, "derivatives.latest")
+    if isinstance(deriv, dict):
+        lines.append(f"derivatives: observed_at_ms={deriv.get('observed_at_ms')}")
     return lines
 
 

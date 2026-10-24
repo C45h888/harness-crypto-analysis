@@ -192,7 +192,7 @@ class InferenceEngine:
 
     async def collect_snapshot(self) -> dict[str, Any]:
         """Live counters + last-artifact high-water marks (pure reads)."""
-        status = await self.store.read_microstructure_status(self.venue, self.symbol)
+        status = await self.store.read("micro.status", ids={"venue": self.venue, "symbol": self.symbol})
         stream_len = int(
             await self.store.redis.xlen(
                 self.store.microstructure_event_stream(self.venue, self.symbol),
@@ -295,8 +295,9 @@ class InferenceEngine:
             if prior is not None:
                 return prior
         try:
-            return await self.store.read_latest_canonical_output(
-                self.symbol, self.venue,
+            return await self.store.read(
+                "inference.latest",
+                ids={"symbol": self.symbol, "venue": self.venue},
             )
         except Exception:  # noqa: BLE001
             return None
@@ -773,6 +774,16 @@ class InferenceEngine:
                     result_payload = {"_truncated": True, "preview": rendered[:4_000]}
             round_results[canonical] = result_payload
             st.accumulated_tool_results[canonical] = result_payload
+            if canonical == "ns.read":
+                # Namespace-addressed identity: the SAME envelope is also
+                # keyed by the namespace read, so citations, citable
+                # heads, distinct-root counting and basis-path resolution
+                # all operate on namespaces (``micro.evidence → field``)
+                # instead of the shared tool name.
+                _ns_key = str((args or {}).get("namespace", "") or "")
+                if _ns_key and _ns_key != canonical:
+                    round_results[_ns_key] = result_payload
+                    st.accumulated_tool_results[_ns_key] = result_payload
         st.tool_results.update(round_results)
         st._round_results = round_results  # type: ignore[attr-defined]
         # Deterministic output mirror: a malformed intended call is SALVAGED and

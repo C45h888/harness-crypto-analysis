@@ -227,18 +227,14 @@ class SubstrateBase:
     async def _read_own_state(self) -> dict[str, Any] | None:
         """Read this worker's last persisted projection (plane-routed)."""
         if self._plane == "analysis":
-            return await self.store.read_analysis_latest(
-                self.SUBSTRATE_NAME, self.symbol)
-        return await self.store.read_substrate_latest(
-            self.SUBSTRATE_NAME, self.symbol)
+            return await self.store.read(f"analysis.{self.SUBSTRATE_NAME.lower()}", ids={"symbol": self.symbol})
+        return await self.store.read(f"substrate.{self.SUBSTRATE_NAME.lower()}", ids={"symbol": self.symbol})
 
     async def _publish_own_state(self, payload: dict[str, Any]) -> str:
         """Publish this worker's projection (plane-routed; atomic SET+XADD)."""
         if self._plane == "analysis":
-            return await self.store.publish_analysis_state(
-                self.SUBSTRATE_NAME, self.symbol, payload)
-        return await self.store.publish_substrate_state(
-            self.SUBSTRATE_NAME, self.symbol, payload)
+            return await self.store.publish(f"analysis.{self.SUBSTRATE_NAME.lower()}", payload, ids={"symbol": self.symbol})
+        return await self.store.publish(f"substrate.{self.SUBSTRATE_NAME.lower()}", payload, ids={"symbol": self.symbol})
 
     async def _emit_telemetry_state(
         self, event_type: str, state: dict[str, Any], *,

@@ -546,6 +546,18 @@ class CaptureTelemetryTests(unittest.TestCase):
             self.status_calls = 0
             self.transition_calls = 0
 
+        async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+            return None
+
+        async def publish(self, namespace, payload, *, ids=None, **kw):
+            if namespace == "micro.status":
+                self.status_calls += 1
+                return "fake:micro.status"
+            if namespace == "micro.status.events":
+                self.transition_calls += 1
+                return f"{payload.get('updated_at_ms', 0)}-0"
+            return "1-1"
+
         async def set_microstructure_status(self, venue, symbol, payload):
             self.status_calls += 1
 

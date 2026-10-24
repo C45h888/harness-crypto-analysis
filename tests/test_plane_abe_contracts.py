@@ -176,6 +176,11 @@ class _FakeStorePrior:
         self.calls.append({"symbol": symbol, "venue": venue})
         return self.record
 
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        ids = ids or {}
+        self.calls.append({"symbol": ids.get("symbol"), "venue": ids.get("venue")})
+        return self.record
+
 
 def _prior_engine(*, venue="spot", record=None):
     """Driver methods bound to a tiny stand-in (no engine construction)."""

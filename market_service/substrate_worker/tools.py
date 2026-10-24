@@ -78,7 +78,7 @@ async def invoke(
             await _drain(worker)
     finally:
         await worker.stop()
-    latest = await store.read_substrate_latest(name, symbol.upper())
+    latest = await store.read(f"substrate.{name.lower()}", ids={"symbol": symbol.upper()})
     trigger = (latest or {}).get("trigger") or {}
     return {
         "substrate": name,

@@ -258,9 +258,7 @@ class BinanceSpotDepthCapture:
         into the capture loop. Persistence failure degrades reads to the
         bounded stream — it must never cost live evidence.
         """
-        await self.store.publish_microstructure_event(
-            self.settings.venue, self.settings.symbol, event_payload, maxlen=self.settings.stream_maxlen,
-        )
+        await self.store.publish("micro.events", event_payload, ids={"venue": self.settings.venue, "symbol": self.settings.symbol}, maxlen=self.settings.stream_maxlen)
         tape = await self._durable_tape()
         if tape is None:
             return
@@ -425,10 +423,7 @@ class BinanceSpotDepthCapture:
                     continue
                 if delta.final_update_id <= snapshot_id:
                     # Already inside the snapshot; keep raw evidence only.
-                    await self.store.publish_microstructure_delta(
-                        self.settings.venue, self.settings.symbol,
-                        delta.to_dict(), maxlen=self.settings.stream_maxlen,
-                    )
+                    await self.store.publish("micro.raw", delta.to_dict(), ids={"venue": self.settings.venue, "symbol": self.settings.symbol}, maxlen=self.settings.stream_maxlen)
                     continue
                 if self.settings.venue == "futures":
                     # Futures frames are non-contiguous in ID space; the
@@ -444,10 +439,7 @@ class BinanceSpotDepthCapture:
                     pu = delta.previous_update_id
                     if pu is not None and delta.final_update_id <= snapshot_id:
                         # Actually fully inside snapshot; keep raw only.
-                        await self.store.publish_microstructure_delta(
-                            self.settings.venue, self.settings.symbol,
-                            delta.to_dict(), maxlen=self.settings.stream_maxlen,
-                        )
+                        await self.store.publish("micro.raw", delta.to_dict(), ids={"venue": self.settings.venue, "symbol": self.settings.symbol}, maxlen=self.settings.stream_maxlen)
                         continue
                     bridge_ok = (
                         pu is not None
@@ -506,9 +498,7 @@ class BinanceSpotDepthCapture:
         before the REST cut (U < S) — a legitimate rewind, not an
         out-of-order arrival. Only the bootstrap path may set it.
         """
-        await self.store.publish_microstructure_delta(
-            self.settings.venue, self.settings.symbol, delta.to_dict(), maxlen=self.settings.stream_maxlen,
-        )
+        await self.store.publish("micro.raw", delta.to_dict(), ids={"venue": self.settings.venue, "symbol": self.settings.symbol}, maxlen=self.settings.stream_maxlen)
         if self._book is None:
             return
         try:
@@ -522,15 +512,13 @@ class BinanceSpotDepthCapture:
         self._record_success()
         quote = self._book.last_quote
         if quote is not None:
-            await self.store.set_microstructure_book(self.settings.venue, self.settings.symbol, quote.to_dict())
+            await self.store.publish("micro.book", quote.to_dict(), ids={"venue": self.settings.venue, "symbol": self.settings.symbol})
         if event is not None:
             self.events += 1
             await self._record_event(event.to_dict())
             for interval in self._aggregator.add(event):
                 self.intervals += 1
-                await self.store.publish_microstructure_interval(
-                    self.settings.venue, self.settings.symbol, interval.to_dict(), maxlen=self.settings.stream_maxlen,
-                )
+                await self.store.publish("micro.ofi", interval.to_dict(), ids={"venue": self.settings.venue, "symbol": self.settings.symbol}, maxlen=self.settings.stream_maxlen)
         if self.messages % 100 == 0:
             await self._status("running")
 
@@ -554,7 +542,7 @@ class BinanceSpotDepthCapture:
             "last_update_id": self._book.last_update_id if self._book else None,
             "error": error,
         }
-        await self.store.set_microstructure_status(self.settings.venue, self.settings.symbol, payload)
+        await self.store.publish("micro.status", payload, ids={"venue": self.settings.venue, "symbol": self.settings.symbol})
         # Event-driven status ledger: append ONE entry only on a state
         # transition (running -> gap -> reconnecting -> running ...). The
         # wake worker blocks on this stream to fire capture-recovery wakes
@@ -568,10 +556,7 @@ class BinanceSpotDepthCapture:
             transition_payload["to_state"] = state
             transition_id: str | None = None
             try:
-                stream_id = await self.store.publish_microstructure_status_transition(
-                    self.settings.venue, self.settings.symbol, transition_payload,
-                    maxlen=self.settings.stream_maxlen,
-                )
+                stream_id = await self.store.publish("micro.status.events", transition_payload, ids={"venue": self.settings.venue, "symbol": self.settings.symbol}, maxlen=self.settings.stream_maxlen)
                 transition_id = str(stream_id) if stream_id is not None else None
             except Exception:
                 # A failed transition append must NEVER break the capture

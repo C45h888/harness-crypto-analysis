@@ -720,7 +720,7 @@ def validate_final_turn(
                 )
             path = str(entry.get("path") or "")
             head = path.split("→")[0].strip()
-            # Root identity: the TOOL head (calc.ofi.intervals, market.read, …)
+            # Root identity: the NAMESPACE head (micro.evidence, calc.ofi.intervals, …)
             # is the root — splitting on "." collapsed every calc.* tool into
             # the single root "calc", so a perfectly-cited cycle could never
             # show "≥2 distinct roots". deterministic_state paths collapse to

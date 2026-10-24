@@ -100,6 +100,26 @@ class _FakeRedis:
 
 
 class _FakeStore:
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        from tests._singular_compat import fake_publish
+        return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
+
+    def ns(self, namespace):
+        from tests._singular_compat import fake_ns
+        return fake_ns(namespace)
+
+    def key(self, namespace, **ids):
+        try:
+            inner = ":".join(f"{k}={v}" for k, v in sorted(ids.items()))
+        except Exception:
+            inner = ""
+        return f"fake:{namespace}:{inner}"
     """RedisRuntimeStore-shaped adapter over _FakeRedis (test seam)."""
 
     def __init__(self, redis: _FakeRedis):

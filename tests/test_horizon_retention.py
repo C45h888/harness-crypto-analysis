@@ -263,7 +263,7 @@ class SlimmingTests(unittest.TestCase):
         store.stream_maxlen = 5000
         store.raw_retention_ms = 43_200_000
         store.raw_guardrail_maxlen = 20_000
-        sid = asyncio.run(store.publish_raw_evidence("SOLUSDT", _full_payload(1_000)))
+        sid = asyncio.run(store.publish("raw.latest", _full_payload(1_000), ids={"symbol": "SOLUSDT"}))
         self.assertEqual(sid, "1527-0")
         script, args = calls[0]
         self.assertIn("XTRIM", script)
@@ -322,6 +322,21 @@ class _CoverageStore:
 
     async def read_raw_oldest_ms(self, symbol):
         return self._oldest
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        if namespace == "raw.latest":
+            return self._latest
+        if namespace == "raw.stream":
+            return list(self._snapshots)
+        if namespace == "agent.artifacts":
+            return []
+        return None
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        return "1-1"
+
+    def key(self, namespace, **ids):
+        return f"fake:{namespace}"
 
 
 class CoverageHonestyTests(unittest.TestCase):

@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from redis.asyncio import Redis
 
-from .scope import CANONICAL_VENUE
+from .scope import CANONICAL_VENUE, normalize_symbol, normalize_venue
 
 from .contracts import (
     AGENT_MEMORY_SCHEMA_VERSION, AgentMemory, CanonicalOutput,
@@ -58,6 +58,49 @@ def _slim_stream_body(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_payload(namespace: str, payload: Any) -> Any:
+    """Canonicalise identity tokens before any contract check.
+
+    NORMALISATION LAYER (write-side, central): ``symbol`` becomes UPPER,
+    ``venue`` becomes the canonical vocabulary (``perps`` -> ``futures``).
+    Only the two identity keys are touched; every other field passes
+    through byte-identical so writer payloads are never reshaped here.
+    Unknown venue tokens are left lowercased so the capability gate (not
+    the store) owns the refusal - the store never invents an identity.
+    """
+    if not isinstance(payload, Mapping):
+        return payload
+    out = dict(payload)
+    symbol = out.get("symbol")
+    if isinstance(symbol, str) and symbol.strip():
+        try:
+            out["symbol"] = normalize_symbol(symbol)
+        except ValueError:
+            pass
+    venue = out.get("venue")
+    if isinstance(venue, str) and venue.strip():
+        try:
+            out["venue"] = normalize_venue(venue)
+        except ValueError:
+            out["venue"] = venue.strip().lower()
+    return out
+
+
+def pare_stream_body(namespace: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """PARING LAYER (write-side, central): slim stream bodies.
+
+    ``latest`` keys keep the FULL payload (point-in-time readers are
+    unaffected). Stream entries carry only what stream consumers read:
+    today that is just ``raw.stream`` (book / tickers / raw trade arrays
+    stripped, ``trades_normalized`` kept). Every other namespace pares to
+    identity so no second slimming site can drift. Add a new pared family
+    here, never in a publisher.
+    """
+    if namespace == "raw.stream":
+        return _slim_stream_body(payload)
+    return payload
+
+
 # ===========================================================================
 # NAMESPACE CONFIGURATION — the store's spine.
 #
@@ -86,7 +129,7 @@ DEFAULT_AGE_FIELDS: tuple[str, ...] = (
     "updated_at_ms", "generated_at", "decided_at_ms",
 )
 
-Kind = Literal["latest", "stream", "text", "sequence"]
+Kind = Literal["latest", "stream", "text", "sequence", "marker"]
 
 
 @dataclass(frozen=True)
@@ -249,6 +292,44 @@ def _fixed_namespaces() -> tuple[Namespace, ...]:
             writer="governance.ledger",
             description="Governance supervisor liveness marker.",
         ),
+        # -- telemetry plane -------------------------------------------
+        # The isolated telemetry namespace (telemetry_kernel/store.py). It
+        # owns no market/worker/governance/inference key, and its keys are
+        # configured here like every other family so the surface stays whole.
+        Namespace(
+            id="telemetry.events",
+            template="telemetry:events:{plane}:{owner}:{subject_type}:{subject_id}",
+            kind="stream", writer="telemetry_kernel.store",
+            schema="telemetry_event",
+            required=("event_id", "plane", "owner", "subject_type",
+                      "subject_id", "occurred_at_ms"),
+            description="Isolated telemetry event stream per subject.",
+        ),
+        Namespace(
+            id="telemetry.latest",
+            template="telemetry:latest:{plane}:{owner}:{subject_type}:{subject_id}",
+            kind="latest", writer="telemetry_kernel.store",
+            schema="telemetry_event",
+            required=("plane", "owner", "subject_type", "subject_id",
+                      "last_event_id", "last_event_at_ms"),
+            description="Telemetry projection: newest accepted state per subject.",
+        ),
+        Namespace(
+            id="telemetry.health", template="telemetry:health:{owner}",
+            kind="latest", writer="telemetry_kernel.store",
+            description="Per-owner sink health (never routed through events).",
+        ),
+        Namespace(
+            id="telemetry.cursor", template="telemetry:cursor:{consumer}",
+            kind="latest", writer="telemetry_kernel.store",
+            description="Durable replay cursor for one read consumer.",
+        ),
+        Namespace(
+            id="telemetry.dedupe", template="telemetry:event-id:{event_id}",
+            kind="marker", writer="telemetry_kernel.store",
+            retention=Retention(ttl_s=2_592_000),
+            description="Idempotency marker, one per accepted event id.",
+        ),
     )
 
 
@@ -309,6 +390,71 @@ NAMESPACES: dict[str, Namespace] = {
     spec.id: spec for spec in _fixed_namespaces() + _worker_namespaces()
 }
 
+
+def _namespace_spec(namespace: str) -> Namespace:
+    """Return the configured namespace (raises on an undeclared id)."""
+    try:
+        return NAMESPACES[namespace]
+    except KeyError:
+        raise StoreContractError(
+            f"unknown namespace {namespace!r}; configured: "
+            f"{', '.join(sorted(NAMESPACES))}") from None
+
+
+def namespace_key(prefix: str, namespace: str, **ids: Any) -> str:
+    """Render one configured key. THE key constructor (single template)."""
+    spec = _namespace_spec(namespace)
+    try:
+        body = spec.template.format(**ids)
+    except KeyError as exc:
+        raise StoreContractError(
+            f"{namespace}: missing key token {exc}") from None
+    return f"{prefix.strip(':')}:{body}"
+
+
+def namespace_contract(namespace: str, payload: Any) -> Any:
+    """Strict write-side contract shared by every writer of ``namespace``."""
+    spec = _namespace_spec(namespace)
+    if spec.kind == "text":
+        if not isinstance(payload, str) or not payload:
+            raise StoreContractError(
+                f"{namespace}: payload must be a non-empty string")
+        return payload
+    if spec.kind == "sequence":
+        if not isinstance(payload, (list, tuple)) or not payload:
+            raise StoreContractError(
+                f"{namespace}: payload must be a non-empty sequence")
+        return list(payload)
+    if spec.kind == "marker":
+        if not isinstance(payload, str) or not payload:
+            raise StoreContractError(
+                f"{namespace}: marker must be a non-empty string")
+        return payload
+    if not isinstance(payload, Mapping):
+        raise StoreContractError(
+            f"{namespace}: payload must be an object, "
+            f"got {type(payload).__name__}")
+    missing = [key for key in spec.required if key not in payload]
+    if missing:
+        raise StoreContractError(
+            f"{namespace}: payload missing required keys {missing} "
+            f"(writer: {spec.writer})")
+    if spec.schema:
+        expected = SCHEMA_VERSION_REGISTRY.get(spec.schema)
+        version = payload.get("schema_version")
+        if version is None:
+            payload = {**payload, "schema_version": expected}
+        elif int(version) != expected:
+            raise StoreContractError(
+                f"{namespace}: schema_version {version} != {expected} "
+                f"for {spec.schema!r} (stale writer?)")
+    return payload
+
+
+def namespace_retention(namespace: str) -> Retention:
+    """Storage policy declared for ``namespace``."""
+    return _namespace_spec(namespace).retention
+
 #: Key families from RETIRED planes. Nothing reads or writes them; they are
 #: listed here so ``purge_retired()`` can drop their leftovers from a live
 #: Redis and so a stale reader can never be pointed at them again.
@@ -366,25 +512,14 @@ class RedisRuntimeStore:
     @staticmethod
     def ns(namespace: str) -> Namespace:
         """Return the configured namespace (raises on an undeclared id)."""
-        try:
-            return NAMESPACES[namespace]
-        except KeyError:
-            raise StoreContractError(
-                f"unknown namespace {namespace!r}; configured: "
-                f"{', '.join(sorted(NAMESPACES))}") from None
+        return _namespace_spec(namespace)
 
     def key(self, namespace: str, **ids: Any) -> str:
         """Build one namespace key from the configuration (the ONLY way)."""
-        spec = self.ns(namespace)
-        try:
-            body = spec.template.format(**ids)
-        except KeyError as exc:
-            raise StoreContractError(
-                f"{namespace}: missing key token {exc}") from None
-        return f"{self.prefix}:{body}"
+        return namespace_key(self.prefix, namespace, **ids)
 
     def _contract(self, namespace: str, payload: Any) -> Any:
-        """Strict write-side contract: shape, required keys, schema version.
+        """Strict write-side gate: shape, required keys, schema version.
 
         A violation raises ``StoreContractError`` — a writer that drifts from
         its namespace contract fails at the write, not silently in a reader
@@ -392,36 +527,7 @@ class RedisRuntimeStore:
         schema-bearing namespace is STAMPED, so the contractual layer is kept
         in harmony at exactly one place.
         """
-        spec = self.ns(namespace)
-        if spec.kind == "text":
-            if not isinstance(payload, str) or not payload:
-                raise StoreContractError(
-                    f"{namespace}: payload must be a non-empty string")
-            return payload
-        if spec.kind == "sequence":
-            if not isinstance(payload, (list, tuple)) or not payload:
-                raise StoreContractError(
-                    f"{namespace}: payload must be a non-empty sequence")
-            return list(payload)
-        if not isinstance(payload, Mapping):
-            raise StoreContractError(
-                f"{namespace}: payload must be an object, "
-                f"got {type(payload).__name__}")
-        missing = [key for key in spec.required if key not in payload]
-        if missing:
-            raise StoreContractError(
-                f"{namespace}: payload missing required keys {missing} "
-                f"(writer: {spec.writer})")
-        if spec.schema:
-            expected = SCHEMA_VERSION_REGISTRY.get(spec.schema)
-            version = payload.get("schema_version")
-            if version is None:
-                payload = {**payload, "schema_version": expected}
-            elif int(version) != expected:
-                raise StoreContractError(
-                    f"{namespace}: schema_version {version} != {expected} "
-                    f"for {spec.schema!r} (stale writer?)")
-        return payload
+        return namespace_contract(namespace, payload)
 
     def _maxlen(self, namespace: str, override: int | None = None) -> int:
         """Stream cap: the namespace config wins, then the caller, then default."""
@@ -429,6 +535,485 @@ class RedisRuntimeStore:
         if spec.retention.maxlen is not None:
             return int(spec.retention.maxlen)
         return int(override if override is not None else self.stream_maxlen)
+
+    def _stream_cap(self, namespace: str, override: int | None = None) -> int:
+        """Count cap for one stream append (guardrail-aware)."""
+        spec = self.ns(namespace)
+        if spec.retention.maxlen is not None:
+            return int(spec.retention.maxlen)
+        if spec.retention.guardrail_maxlen is not None:
+            return int(spec.retention.guardrail_maxlen)
+        if namespace == "raw.stream":
+            return int(self.raw_guardrail_maxlen)
+        return int(override if override is not None else self.stream_maxlen)
+
+    def _ttl(self, namespace: str, override: int | None = None) -> int | None:
+        """TTL for one latest write: namespace config wins, then caller."""
+        spec = self.ns(namespace)
+        if spec.retention.ttl_s is not None:
+            return int(spec.retention.ttl_s)
+        if override is not None:
+            if int(override) <= 0:
+                raise ValueError("ttl_s must be positive")
+            return int(override)
+        return None
+
+    @staticmethod
+    def _encode(payload: Any) -> str:
+        return json.dumps(payload, default=str, separators=(",", ":"))
+
+    @staticmethod
+    def _decode(raw: Any) -> dict[str, Any] | None:
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if not isinstance(raw, str):
+            return None
+        try:
+            value = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def publish_latest(
+        self, namespace: str, payload: Any, *, ids: dict[str, Any],
+        ttl_s: int | None = None,
+    ) -> str:
+        """Shared latest-only write: normalise -> contract -> SET.
+
+        The model later reads this key verbatim (rawest pared form); no
+        shaping happens here beyond normalisation + contract stamping.
+        Returns the Redis key written.
+        """
+        payload = self._contract(namespace, normalize_payload(namespace, payload))
+        key = self.key(namespace, **ids)
+        body = self._encode(payload)
+        ttl = self._ttl(namespace, ttl_s)
+        if ttl is not None:
+            await self.redis.set(key, body, ex=int(ttl))
+        else:
+            await self.redis.set(key, body)
+        return key
+
+    async def publish_stream(
+        self, namespace: str, payload: Any, *, ids: dict[str, Any],
+        maxlen: int | None = None, extra_fields: dict[str, Any] | None = None,
+        ts_field: str | None = None,
+    ) -> str:
+        """Shared stream-only append: normalise -> contract -> pare -> XADD."""
+        payload = self._contract(namespace, normalize_payload(namespace, payload))
+        guard = dict(payload) if isinstance(payload, Mapping) else {}
+        stream_doc = pare_stream_body(
+            namespace, guard if isinstance(guard, dict) else {},
+        ) if isinstance(payload, Mapping) else payload
+        key = self.key(namespace, **ids)
+        body = self._encode(stream_doc)
+        fields: dict[str, Any] = {"payload": body}
+        if ts_field is not None and isinstance(payload, Mapping):
+            fields["ts"] = str(payload.get(ts_field, "") or "")
+        elif isinstance(payload, Mapping):
+            for candidate in ("ts", "end_ts_ms", "received_ts_ms",
+                              "observed_at_ms", "updated_at_ms"):
+                if payload.get(candidate) is not None:
+                    fields["ts"] = str(payload.get(candidate))
+                    break
+        if extra_fields:
+            fields.update({k: str(v) for k, v in extra_fields.items()})
+        cap = self._stream_cap(namespace, maxlen)
+        return str(await self.redis.xadd(
+            key, fields, maxlen=max(1, int(cap)), approximate=True,
+        ))
+
+    async def publish_latest_and_stream(
+        self, latest_ns: str, stream_ns: str, payload: Any, *,
+        ids_latest: dict[str, Any], ids_stream: dict[str, Any] | None = None,
+        ttl_s: int | None = None, maxlen: int | None = None,
+        extra_fields: dict[str, Any] | None = None, ts_field: str | None = None,
+        slim_stream: bool = False,
+    ) -> str:
+        """Shared atomic SET(latest) + XADD(stream) via one Lua script.
+
+        Closes the ordering hole every paired publisher used to close on its
+        own: no reader observes a latest snapshot whose stream entry is
+        missing. ``slim_stream`` routes the stream body through the paring
+        layer (today only ``raw.stream`` pares; other families are identity).
+        """
+        payload = self._contract(latest_ns, normalize_payload(latest_ns, payload))
+        if stream_ns != latest_ns:
+            self._contract(stream_ns, payload)
+        latest_key = self.key(latest_ns, **ids_latest)
+        stream_key = self.key(stream_ns, **(ids_stream or ids_latest))
+        latest_body = self._encode(payload)
+        stream_doc = pare_stream_body(stream_ns, dict(payload)) \
+            if slim_stream and isinstance(payload, Mapping) else payload
+        if stream_ns != latest_ns and isinstance(payload, Mapping):
+            stream_doc = pare_stream_body(stream_ns, dict(payload))
+        stream_body = self._encode(stream_doc)
+        ttl = self._ttl(latest_ns, ttl_s)
+        cap = self._stream_cap(stream_ns, maxlen)
+        ts = ""
+        if isinstance(payload, Mapping):
+            if ts_field is not None:
+                ts = str(payload.get(ts_field, "") or "")
+            else:
+                for candidate in ("computed_at_ms", "observed_at_ms", "ts",
+                                  "received_ts_ms", "updated_at_ms",
+                                  "decided_at_ms", "generated_at"):
+                    if payload.get(candidate) is not None:
+                        ts = str(payload.get(candidate))
+                        break
+        fields = {"payload": stream_body, "ts": ts}
+        if extra_fields:
+            fields.update({k: str(v) for k, v in extra_fields.items()})
+        field_names = list(fields.keys())
+        field_vals = [fields[n] for n in field_names]
+        # ARGV layout: [1]=latest_body, [2..1+N]=stream field values.
+        pairs = ", ".join(
+            f"'{name}', ARGV[{i + 2}]" for i, name in enumerate(field_names)
+        )
+        if ttl is not None:
+            script = (
+                f"redis.call('SET', KEYS[1], ARGV[1], 'EX', {int(ttl)})\n"
+                f"return redis.call('XADD', KEYS[2], 'MAXLEN', '~', "
+                f"{int(cap)}, '*', {pairs})"
+            )
+        else:
+            script = (
+                "redis.call('SET', KEYS[1], ARGV[1])\n"
+                f"return redis.call('XADD', KEYS[2], 'MAXLEN', '~', "
+                f"{int(cap)}, '*', {pairs})"
+            )
+        return str(await self.redis.eval(
+            script, 2, latest_key, stream_key, latest_body, *field_vals,
+        ))
+
+    async def read_latest(self, namespace: str, *, ids: dict[str, Any]) -> Any:
+        """Shared latest read: resolve key -> GET -> decode verbatim.
+
+        Returns the stored document in its rawest pared form (dict / str /
+        list) or ``None`` when absent or undecodable. Never shapes, never
+        fabricates - a missing key is ``None``, not an empty object.
+        """
+        spec = self.ns(namespace)
+        key = self.key(namespace, **ids)
+        raw = await self.redis.get(key)
+        if not raw:
+            return None
+        if spec.kind == "text":
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            return raw if isinstance(raw, str) and raw else None
+        if spec.kind == "sequence":
+            try:
+                value = json.loads(raw) if isinstance(raw, str) else None
+            except (ValueError, json.JSONDecodeError):
+                return None
+            if isinstance(value, bytes):
+                try:
+                    value = json.loads(value.decode("utf-8", errors="replace"))
+                except (ValueError, json.JSONDecodeError, AttributeError):
+                    return None
+            return value if isinstance(value, list) and value else None
+        return self._decode(raw)
+
+    async def read_stream(
+        self, namespace: str, *, ids: dict[str, Any], count: int | None = None,
+        newest_first: bool = True, start: str = "-", end: str = "+",
+    ) -> list[dict[str, Any]]:
+        """Shared stream read: resolve key -> XRANGE/XREVRANGE -> decode.
+
+        Each entry's ``payload`` field carries one JSON document; entries
+        that do not decode are skipped (never fabricated). Newest-first by
+        default (live reads); oldest-first when replaying a window.
+        """
+        self.ns(namespace)
+        key = self.key(namespace, **ids)
+        if newest_first:
+            rows = await self.redis.xrevrange(key, count=count)
+        else:
+            rows = await self.redis.xrange(key, min=start, max=end, count=count)
+        out: list[dict[str, Any]] = []
+        for _entry_id, fields in rows or []:
+            raw = (fields or {}).get("payload")
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if not isinstance(raw, str):
+                continue
+            try:
+                value = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    @staticmethod
+    def _normalize_ids(ids: dict[str, Any]) -> dict[str, Any]:
+        """Canonicalise identity tokens inside key ids (symbol/venue)."""
+        out = dict(ids or {})
+        if isinstance(out.get("symbol"), str):
+            try:
+                out["symbol"] = normalize_symbol(out["symbol"])
+            except ValueError:
+                pass
+        if isinstance(out.get("venue"), str):
+            try:
+                out["venue"] = normalize_venue(out["venue"])
+            except ValueError:
+                out["venue"] = str(out["venue"]).strip().lower()
+        if isinstance(out.get("substrate"), str):
+            out["substrate"] = out["substrate"].strip().lower()
+        if isinstance(out.get("analysis"), str):
+            out["analysis"] = out["analysis"].strip().lower()
+        if isinstance(out.get("plane"), str):
+            out["plane"] = out["plane"].strip().lower()
+        if isinstance(out.get("name"), str):
+            out["name"] = out["name"].strip().lower()
+        return out
+
+    def _paired_stream(self, namespace: str) -> str | None:
+        """Sibling stream for a latest namespace, or None (latest-only)."""
+        if namespace == "derivatives.latest":
+            return "derivatives.stream"
+        if namespace == "raw.latest":
+            return "raw.stream"
+        if namespace == "inference.latest":
+            return "inference.stream"
+        if namespace == "governance.latest":
+            return "governance.stream"
+        for prefix, suffix in (("substrate.", ".events"), ("analysis.", ".events")):
+            if namespace.startswith(prefix) and "." not in namespace[len(prefix):]:
+                return f"{namespace}{suffix}"
+        return None
+
+    async def publish(
+        self, namespace: str, payload: Any, *, ids: dict[str, Any],
+        ttl_s: int | None = None, maxlen: int | None = None,
+        extra_fields: dict[str, Any] | None = None,
+        run_id: str | None = None,
+    ) -> str | None:
+        """SINGULAR WRITE PATH: normalise -> contract -> pare -> store.
+
+        The ONLY publisher with Redis logic. ``namespace`` selects behaviour
+        from configuration (``Namespace.kind`` + ``_paired_stream`` + the
+        namespace's ``Retention``); ``ids`` selects the key. No caller names
+        a Redis key and no second publish path exists.
+
+        - latest (+paired stream) -> atomic SET+XADD (derivatives, raw,
+          substrate/analysis bare, inference, governance)
+        - latest-only -> SET (+EX from config); stream-only -> XADD (pared)
+        - ``raw.latest`` additionally dedupes on ``observed_at_ms`` and
+          MINID-trims to the configured retention horizon
+        - ``governance.latest`` additionally fans out denials + refreshes
+          the supervisor heartbeat
+        - ``agent.artifacts`` (kind=text used as a stream) appends the
+          advisory string with its schema/session/artifact fields
+        - ``CanonicalOutput`` objects are accepted for ``inference.latest``
+          (``to_dict``) so the engine passes the row, not a dict copy
+        Returns the stream entry id, the key written, or ``None`` for a
+        raw dedupe-hit (idempotent re-delivery).
+        """
+        spec = self.ns(namespace)
+        ids = self._normalize_ids(ids)
+        if namespace == "poller.active":
+            if not isinstance(payload, (list, tuple)):
+                raise StoreContractError(
+                    f"{namespace}: payload must be a non-empty sequence")
+            cleaned = sorted({s.strip().upper() for s in payload if isinstance(s, str) and s.strip()})
+            if not cleaned:
+                raise ValueError("poller.active: at least one symbol required")
+            payload = cleaned
+        # CanonicalOutput convenience: the engine hands the row itself.
+        if hasattr(payload, "to_dict") and callable(getattr(payload, "to_dict")):
+            try:
+                payload = payload.to_dict()  # type: ignore[union-attr]
+            except Exception:
+                pass
+        if namespace == "agent.artifacts":
+            if not isinstance(payload, str) or not payload:
+                raise StoreContractError(
+                    f"{namespace}: payload must be a non-empty string")
+            payload = self._contract(namespace, payload)
+            artifact = str(ids.get("artifact", ""))
+            session_id = str(ids.get("session", ""))
+            if artifact not in {"observations", "hypotheses", "memory"}:
+                raise ValueError(
+                    f"unsupported agent artifact type: {artifact}")
+            schema_version = _AGENT_ARTIFACT_SCHEMA_VERSION.get(artifact, 1)
+            fields: dict[str, Any] = {
+                "schema_version": str(schema_version),
+                "session_id": session_id,
+                "artifact_type": artifact,
+                "payload": payload,
+            }
+            if run_id is not None:
+                fields["run_id"] = run_id
+            if extra_fields:
+                fields.update({k: str(v) for k, v in extra_fields.items()})
+            return str(await self.redis.xadd(
+                self.key(namespace, **ids), fields,
+                maxlen=max(1, int(maxlen or self.stream_maxlen)),
+                approximate=True,
+            ))
+        if namespace == "raw.latest":
+            return await self._publish_raw(ids.get("symbol", ""), payload)  # type: ignore[arg-type]
+        if namespace == "governance.latest":
+            return await self._publish_governance(payload, ids)
+        paired = self._paired_stream(namespace)
+        if paired is not None and spec.kind == "latest":
+            # CanonicalOutput validation lives on the object; dicts validate
+            # through the contract inside publish_latest_and_stream.
+            if hasattr(payload, "validate") and callable(getattr(payload, "validate")):
+                try:
+                    payload.validate()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+            return await self.publish_latest_and_stream(
+                namespace, paired, payload,
+                ids_latest=ids, maxlen=maxlen, ttl_s=ttl_s,
+                extra_fields=extra_fields,
+            )
+        if spec.kind == "latest":
+            await self.publish_latest(
+                namespace, payload, ids=ids, ttl_s=ttl_s,
+            )
+            return self.key(namespace, **ids)
+        if spec.kind == "stream":
+            return await self.publish_stream(
+                namespace, payload, ids=ids, maxlen=maxlen,
+                extra_fields=extra_fields,
+            )
+        # sequence / marker / text (latest-shaped): single SET path.
+        await self.publish_latest(namespace, payload, ids=ids, ttl_s=ttl_s)
+        return self.key(namespace, **ids)
+
+    async def _publish_raw(self, symbol: Any, payload: Any) -> str | None:
+        """Raw evidence write: dedupe guard + SET latest + slim XADD + trim."""
+        symbol = normalize_symbol(symbol)
+        ns_raw = self.ns("raw.stream")
+        payload = normalize_payload("raw.latest", payload)
+        payload = self._contract("raw.latest", payload)
+        self._contract("raw.stream", payload)
+        full_body = self._encode(payload)
+        stream_body = self._encode(pare_stream_body("raw.stream", dict(payload)))
+        ts = str(payload.get("observed_at_ms", ""))  # type: ignore[union-attr]
+        maxlen = str(int(ns_raw.retention.guardrail_maxlen or self.raw_guardrail_maxlen))
+        minid = str(int(time.time() * 1000) - int(
+            ns_raw.retention.retention_ms or self.raw_retention_ms))
+        script = """
+        if ARGV[2] ~= '' then
+          local guard = redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[3])
+          if guard == false then return 'duplicate' end
+        end
+        redis.call('SET', KEYS[1], ARGV[1])
+        local id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'ts', ARGV[2], 'payload', ARGV[4])
+        redis.call('XTRIM', KEYS[2], 'MINID', '~', ARGV[6])
+        return id
+        """
+        result = await self.redis.eval(
+            script, 3,
+            self.key("raw.latest", symbol=symbol),
+            self.key("raw.stream", symbol=symbol),
+            self.key("raw.dedupe", symbol=symbol, observed_at_ms=ts),
+            full_body, ts, "600", stream_body, maxlen, minid,
+        )
+        if result == "duplicate":
+            return None
+        return str(result)
+
+    async def _publish_governance(self, payload: Any, ids: dict[str, Any]) -> str:
+        """Governance write: latest + stream + denials fan-out + supervisor."""
+        payload = normalize_payload("governance.latest", payload)
+        payload = self._contract("governance.latest", payload)
+        body = self._encode(payload)
+        plane = str(ids.get("plane", "")).lower()
+        substrate = str(ids.get("substrate", ids.get("name", ""))).lower()
+        symbol = str(ids.get("symbol", "")).upper()
+        ts = str(payload.get("decided_at_ms", "") or "")  # type: ignore[union-attr]
+        allowed = "1" if payload.get("allowed") else "0"  # type: ignore[union-attr]
+        maxlen = str(int(self.stream_maxlen))
+        ttl_ms = str(int(os.getenv("GOVERNANCE_SUPERVISOR_MS") or 900_000))
+        script = """
+        redis.call('SET', KEYS[1], ARGV[1])
+        local id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
+            'plane', ARGV[2], 'substrate', ARGV[3], 'symbol', ARGV[4],
+            'ts', ARGV[6], 'allowed', ARGV[7], 'payload', ARGV[1])
+        if ARGV[7] == '0' then
+            redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
+                'plane', ARGV[2], 'substrate', ARGV[3], 'symbol', ARGV[4],
+                'ts', ARGV[6], 'allowed', ARGV[7], 'payload', ARGV[1])
+        end
+        redis.call('SET', KEYS[4], ARGV[6], 'PX', ARGV[8])
+        return id
+        """
+        return str(await self.redis.eval(
+            script, 4,
+            self.key("governance.latest", plane=plane, name=substrate, symbol=symbol),
+            self.key("governance.stream", plane=plane, symbol=symbol),
+            self.key("governance.denials", plane=plane, symbol=symbol),
+            self.key("governance.supervisor", plane=plane, symbol=symbol),
+            body, plane, substrate, symbol, maxlen, ts, allowed, ttl_ms,
+        ))
+
+    async def read(
+        self, namespace: str, *, ids: dict[str, Any], count: int | None = None,
+        newest_first: bool = True, start: str = "-", end: str = "+",
+    ) -> Any:
+        """SINGULAR READ PATH: resolve key -> GET/XRANGE -> decode verbatim.
+
+        The ONLY reader with Redis logic. Returns the stored document in its
+        rawest pared form (dict / str / list) or ``None`` when absent — never
+        shaped, never fabricated. Stream namespaces return newest-first
+        payload lists; ``agent.artifacts`` returns ``AgentMemory`` rows
+        (deduped, tombstones dropped) to preserve the forget contract.
+        """
+        spec = self.ns(namespace)
+        ids = self._normalize_ids(ids)
+        if namespace == "agent.artifacts":
+            return await self._read_agent_memories(ids, count=count)
+        if namespace == "governance.latest" and "name" not in ids and "substrate" not in ids:
+            rows = await self.read_stream(
+                "governance.stream",
+                ids={"plane": ids.get("plane", ""), "symbol": ids.get("symbol", "")},
+                count=1 if count is None else count,
+            )
+            return rows[0] if rows else None
+        if spec.kind == "latest":
+            return await self.read_latest(namespace, ids=ids)
+        if spec.kind == "stream":
+            return await self.read_stream(
+                namespace, ids=ids, count=count,
+                newest_first=newest_first, start=start, end=end,
+            )
+        # sequence / text / marker: single-key verbatim read.
+        return await self.read_latest(namespace, ids=ids)
+
+    async def _read_agent_memories(
+        self, ids: dict[str, Any], count: int | None = 32,
+    ) -> list[AgentMemory]:
+        """Agent memory stream: newest-first, deduped, tombstones dropped."""
+        key = self.key("agent.artifacts", **ids)
+        rows = await self.redis.xrevrange(key, count=count or 32)
+        out: list[AgentMemory] = []
+        for _entry_id, fields in rows:
+            raw = (fields or {}).get("payload")
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if not isinstance(raw, str):
+                continue
+            try:
+                memory = AgentMemory.from_mapping(json.loads(raw))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            out.append(memory)
+        newest: dict[str, AgentMemory] = {}
+        for m in out:
+            newest.setdefault(m.memory_id, m)
+        return [m for m in newest.values() if not m.forgotten]
 
     async def purge_retired(self, *, dry_run: bool = True) -> dict[str, Any]:
         """Drop leftovers of RETIRED key families (old planes, no writer).
@@ -477,93 +1062,6 @@ class RedisRuntimeStore:
             await asyncio.sleep(delay_s)
         return False
 
-    async def read_recent_events(self, symbol: str, count: int = 100) -> list[dict[str, Any]]:
-        """Read the most recent raw evidence snapshots for one symbol.
-
-        Reads the canonical raw evidence stream (written by the poller) —
-        the single source of truth for market telemetry. Each returned dict
-        is a decoded evidence snapshot decorated with its stream ``id`` and
-        ``ts``, newest first.
-        """
-        rows = await self.redis.xrevrange(self.raw_stream(symbol), count=count)
-        out: list[dict[str, Any]] = []
-        for entry_id, fields in rows:
-            raw = fields.get("payload")
-            try:
-                value = json.loads(raw) if raw else None
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if not isinstance(value, dict):
-                continue
-            out.append({"id": entry_id, "ts": fields.get("ts", ""), **value})
-        return out
-
-    async def publish_agent_artifact(
-        self, session_id: str, artifact_type: str, payload: str,
-        *, run_id: str | None = None,
-    ) -> str:
-        """Publish advisory output into the agent-owned namespace only."""
-        if artifact_type not in {"observations", "hypotheses", "memory"}:
-            raise ValueError(f"unsupported agent artifact type: {artifact_type}")
-        # Resolve schema_version from the contract so the stream-field
-        # reflects the true payload version (memory=1).
-        # The contract is the source of truth — keeps Redis entries
-        # in sync if a future bump changes the constant.
-        payload = self._contract("agent.artifacts", payload)
-        schema_version = _AGENT_ARTIFACT_SCHEMA_VERSION.get(artifact_type, 1)
-        fields = {
-            "schema_version": str(schema_version),
-            "session_id": session_id,
-            "artifact_type": artifact_type,
-            "payload": payload,
-        }
-        if run_id is not None:
-            fields["run_id"] = run_id
-        return await self.redis.xadd(
-            self.agent_stream(session_id, artifact_type),
-            fields,
-            maxlen=self.stream_maxlen,
-            approximate=True,
-        )
-
-    async def read_recent_memories(
-        self, session_id: str, count: int = 32,
-    ) -> list[AgentMemory]:
-        """Read the most recent agent memories for one session (highest first).
-
-        Redis is the live projection; Postgres remains the durable authority
-        for history. Forgotten memories are skipped so the live projection
-        never resurrects a tombstoned row on a Postgres-empty fallback.
-        """
-        rows = await self.redis.xrevrange(
-            self.agent_stream(session_id, "memory"), count=count
-        )
-        out: list[AgentMemory] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                memory = AgentMemory.from_mapping(json.loads(raw))
-            except (ValueError, json.JSONDecodeError):
-                continue
-            out.append(memory)
-        # Dedupe by memory_id keeping the NEWEST version (xrevrange is
-        # highest-first), then drop tombstoned versions: a forget() append
-        # must exclude the original entry from the live read plan too.
-        newest: dict[str, AgentMemory] = {}
-        for m in out:
-            newest.setdefault(m.memory_id, m)
-        return [m for m in newest.values() if not m.forgotten]
-
-    # ------------------------------------------------------------------
-    # Keystone history — cross-cycle keystone-migration ledger
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Derivative evidence — command-triggered fetch writes, harness reads
-    # ------------------------------------------------------------------
-
     def derivatives_key(self, symbol: str) -> str:
         """Latest projection for command-fetched derivative evidence."""
         return self.key("derivatives.latest", symbol=symbol.upper())
@@ -571,57 +1069,6 @@ class RedisRuntimeStore:
     def derivatives_stream(self, symbol: str) -> str:
         """Append-only audit trail of every derivative evidence fetch."""
         return self.key("derivatives.stream", symbol=symbol.upper())
-
-    async def publish_derivative_evidence(
-        self,
-        symbol: str,
-        payload: dict[str, Any],
-        ttl_s: int = 300,
-    ) -> str:
-        """Atomically SET latest + XADD stream for one derivative evidence fetch.
-
-        ``ttl_s`` bounds how long the latest projection stays cached so back-to-
-        back ``--analyze`` cycles within the TTL reuse the same data instead of
-        re-hitting Binance. The stream entry carries the full payload so an
-        audit reader can replay the fetch history.
-
-        Single Lua script closes the SET/XADD ordering hole: no reader sees a
-        ``latest`` snapshot whose stream entry is missing.
-        """
-        if ttl_s <= 0:
-            raise ValueError("ttl_s must be positive")
-        payload = self._contract("derivatives.latest", payload)
-        ttl_s = int(self.ns("derivatives.latest").retention.ttl_s or ttl_s)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        ts = str(int(time.time() * 1000))
-        maxlen = int(self.stream_maxlen)
-        script = f"""
-        redis.call('SET', KEYS[1], ARGV[1], 'EX', {int(ttl_s)})
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', {maxlen}, '*',
-            'event_type', 'derivative_evidence', 'symbol', ARGV[3],
-            'schema_version', '1', 'ts', ARGV[2], 'payload', ARGV[1])
-        """
-        return str(await self.redis.eval(
-            script, 2,
-            self.derivatives_key(symbol), self.derivatives_stream(symbol),
-            body, ts, symbol.upper(),
-        ))
-
-    async def read_derivative_evidence(self, symbol: str) -> dict[str, Any] | None:
-        """Read the latest derivative evidence snapshot.
-
-        Returns ``None`` when the key is missing OR the cache has expired
-        (Redis returned nil after EX). Preserves the observed_at_ms field so
-        callers can decide whether the snapshot is fresh enough.
-        """
-        raw = await self.redis.get(self.derivatives_key(symbol))
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
 
     async def derivative_cache_ttl(self, symbol: str) -> int:
         """Diagnostic: remaining TTL on the derivative evidence key."""
@@ -641,67 +1088,6 @@ class RedisRuntimeStore:
         """Idempotency guard key for one raw evidence snapshot."""
         return self.key("raw.dedupe", symbol=symbol.upper(),
                         observed_at_ms=observed_at_ms)
-
-    async def publish_raw_evidence(self, symbol: str, payload: dict[str, Any]) -> str | None:
-        """Atomically write one raw evidence snapshot to Redis.
-
-        A single Lua script SETs the ``latest`` projection AND XADDs the raw
-        stream in one step, so no reader can observe a latest snapshot whose
-        stream entry is missing (atomicity closes the SET/XADD ordering hole).
-        A per-snapshot idempotency guard (keyed on ``observed_at_ms``, with a
-        TTL) dedupes a re-delivered snapshot from a concurrent poller.
-
-        Memory discipline (Phase H1, docs/HORIZON_RETENTION_SPEC.md):
-
-        * the stream entry carries a *slimmed* body (``_slim_stream_body``):
-          ``trades_raw`` / ``order_book`` / ``ticker_24h`` are stripped —
-          every stream consumer (``read_raw_window``) reads only
-          ``trades_normalized``; the point-in-time surfaces live in the
-          ``latest`` projection, which keeps the FULL payload.
-        * retention is TIME-based: after the XADD the script XTRIMs the
-          stream to ``MINID ~ (now - raw_retention_ms)`` — the observable
-          horizon is a clock contract, not a function of market activity.
-          ``stream_maxlen`` remains in the same script purely as a
-          pathological-burst memory guardrail (a count cap, NOT the
-          retention policy).
-
-        Returns the stream id, or ``None`` when the snapshot was a duplicate.
-        """
-        ns_raw = self.ns("raw.stream")
-        payload = self._contract("raw.latest", payload)
-        self._contract("raw.stream", payload)
-        full_body = json.dumps(payload, default=str, separators=(",", ":"))
-        stream_body = json.dumps(
-            _slim_stream_body(payload), default=str, separators=(",", ":"))
-        ts = str(payload.get("observed_at_ms", ""))
-        maxlen = str(int(ns_raw.retention.guardrail_maxlen
-                         or self.raw_guardrail_maxlen))
-        # Trim floor: entries older than this are evicted in the same
-        # atomic step that publishes the new one (approximate trim —
-        # exact-mode XTRIM is O(n) and would tax the 5s publish path).
-        minid = str(int(time.time() * 1000)
-                    - int(ns_raw.retention.retention_ms
-                          or self.raw_retention_ms))
-        script = """
-        if ARGV[2] ~= '' then
-          local guard = redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[3])
-          if guard == false then return 'duplicate' end
-        end
-        redis.call('SET', KEYS[1], ARGV[1])
-        local id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
-            'ts', ARGV[2], 'payload', ARGV[4])
-        redis.call('XTRIM', KEYS[2], 'MINID', '~', ARGV[6])
-        return id
-        """
-        result = await self.redis.eval(
-            script, 3,
-            self.raw_latest_key(symbol), self.raw_stream(symbol),
-            self.raw_dedupe_key(symbol, ts),
-            full_body, ts, "600", stream_body, maxlen, minid,
-        )
-        if result == "duplicate":
-            return None
-        return str(result)
 
     async def redis_maxmemory_bytes(self) -> int | None:
         """Server ``maxmemory`` in bytes (Phase H1 budget guard seam).
@@ -734,41 +1120,6 @@ class RedisRuntimeStore:
             return int(str(entry_id).split("-", 1)[0])
         except (TypeError, ValueError):
             return None
-
-    async def read_raw_window(
-        self, symbol: str, since_ms: int,
-    ) -> list[dict[str, Any]]:
-        """Read all raw evidence entries since ``since_ms`` (inclusive)."""
-        rows = await self.redis.xrange(
-            self.raw_stream(symbol), min=str(since_ms), max="+",
-        )
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out
-
-    async def read_raw_latest(self, symbol: str) -> dict[str, Any] | None:
-        """Read the latest raw evidence snapshot."""
-        raw = await self.redis.get(self.raw_latest_key(symbol))
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-            return value if isinstance(value, dict) else None
-        except (ValueError, json.JSONDecodeError):
-            return None
-
-    # ------------------------------------------------------------------
-    # Microstructure ledger — isolated from the five-second REST poller.
-    # ------------------------------------------------------------------
 
     def microstructure_raw_stream(self, venue: str, symbol: str) -> str:
         return self.key("micro.raw", venue=venue.lower(),
@@ -805,174 +1156,6 @@ class RedisRuntimeStore:
         return self.key("micro.evidence", venue=venue.lower(),
                         symbol=symbol.upper())
 
-    async def publish_microstructure_delta(
-        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
-    ) -> str:
-        """Append raw depth evidence without sharing poller retention or keys."""
-        payload = self._contract("micro.raw", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        return str(await self.redis.xadd(
-            self.microstructure_raw_stream(venue, symbol),
-            {"payload": body, "ts": str(payload.get("received_ts_ms", ""))},
-            maxlen=max(1, int(maxlen)), approximate=True,
-        ))
-
-    async def publish_microstructure_event(
-        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
-    ) -> str:
-        payload = self._contract("micro.events", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        return str(await self.redis.xadd(
-            self.microstructure_event_stream(venue, symbol),
-            {"payload": body, "ts": str((payload.get("current") or {}).get("exchange_ts_ms", ""))},
-            maxlen=max(1, int(maxlen)), approximate=True,
-        ))
-
-    async def publish_microstructure_interval(
-        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
-    ) -> str:
-        """Append one completed deterministic OFI/AD measurement interval."""
-        payload = self._contract("micro.ofi", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        return str(await self.redis.xadd(
-            self.microstructure_ofi_stream(venue, symbol),
-            {"payload": body, "ts": str(payload.get("end_ts_ms", ""))},
-            maxlen=max(1, int(maxlen)), approximate=True,
-        ))
-
-    async def set_microstructure_book(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
-        payload = self._contract("micro.book", payload)
-        await self.redis.set(
-            self.microstructure_book_key(venue, symbol),
-            json.dumps(payload, default=str, separators=(",", ":")),
-        )
-
-    async def set_microstructure_status(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
-        payload = self._contract("micro.status", payload)
-        await self.redis.set(
-            self.microstructure_status_key(venue, symbol),
-            json.dumps(payload, default=str, separators=(",", ":")),
-        )
-
-    async def publish_microstructure_status_transition(
-        self, venue: str, symbol: str, payload: dict[str, Any], *, maxlen: int,
-    ) -> str:
-        """Append one status-TRANSITION entry to the status ledger stream.
-
-        Written ONLY when capture state changes (see capture._status).
-        Bounded and best-effort: a failed append is
-        tolerated by the capture loop (latest-key status remains authoritative).
-        """
-        payload = self._contract("micro.status.events", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        return str(await self.redis.xadd(
-            self.microstructure_status_stream(venue, symbol),
-            {"payload": body, "state": str(payload.get("state", ""))},
-            maxlen=max(1, int(maxlen)), approximate=True,
-        ))
-
-    async def read_microstructure_status(self, venue: str, symbol: str) -> dict[str, Any] | None:
-        raw = await self.redis.get(self.microstructure_status_key(venue, symbol))
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
-
-    async def read_microstructure_status_transitions(
-        self, venue: str, symbol: str, *, count: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Read the status-TRANSITION ledger (window-scoped gap spans source).
-
-        Each entry is one capture state change with ``updated_at_ms``. This
-        is the ledger the forward plane derives DEGRADED SPANS from — the
-        cumulative ``sequence_gaps`` counter in the latest-key status payload
-        is transport telemetry only and must never gate data quality.
-        """
-        return await self._read_microstructure_stream(
-            self.microstructure_status_stream(venue, symbol), start="-", end="+", count=count,
-        )
-
-    async def publish_microstructure_evidence(self, venue: str, symbol: str, payload: dict[str, Any]) -> None:
-        """Persist one immutable MicrostructureEvidence projection (latest)."""
-        payload = self._contract("micro.evidence", payload)
-        await self.redis.set(
-            self.microstructure_evidence_key(venue, symbol),
-            json.dumps(payload, default=str, separators=(",", ":")),
-        )
-
-    async def read_microstructure_evidence(self, venue: str, symbol: str) -> dict[str, Any] | None:
-        raw = await self.redis.get(self.microstructure_evidence_key(venue, symbol))
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
-
-    async def read_microstructure_events(
-        self, venue: str, symbol: str, *, start: str = "-", end: str = "+", count: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Read best-quote transition events from the dedicated event stream.
-
-        Each entry's ``payload`` field carries one serialized OrderBookEvent;
-        entries whose payload does not decode are skipped (never fabricated).
-        """
-        return await self._read_microstructure_stream(
-            self.microstructure_event_stream(venue, symbol), start=start, end=end, count=count,
-        )
-
-    async def read_microstructure_intervals(
-        self, venue: str, symbol: str, *, start: str = "-", end: str = "+", count: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Read completed OFIInterval rows from the dedicated OFI stream."""
-        return await self._read_microstructure_stream(
-            self.microstructure_ofi_stream(venue, symbol), start=start, end=end, count=count,
-        )
-
-    async def read_microstructure_raw(
-        self, venue: str, symbol: str, *, start: str = "-", end: str = "+", count: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Read raw depth-delta snapshots from the WS microstructure raw stream.
-
-        Each entry is one WS ``@depth`` delta payload with ``exchange_ts_ms``,
-        ``received_ts_ms`` and ``bids``/``asks`` price-level updates. This is
-        the high-frequency surface the substrate workers need to fuse with
-        the five-second REST poller book — it is deliberately isolated from
-        the poller stream (retention + keyspace) so combining them is a read-
-        plane choice made here on demand, never a shared write.
-        """
-        return await self._read_microstructure_stream(
-            self.microstructure_raw_stream(venue, symbol), start=start, end=end, count=count,
-        )
-
-    async def _read_microstructure_stream(
-        self, key: str, *, start: str, end: str, count: int | None,
-    ) -> list[dict[str, Any]]:
-        rows = await self.redis.xrange(key, min=start, max=end, count=count)
-        payloads: list[dict[str, Any]] = []
-        for _entry_id, fields in rows or []:
-            raw = (fields or {}).get("payload")
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="replace")
-            if not isinstance(raw, str):
-                continue
-            try:
-                decoded = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(decoded, dict):
-                payloads.append(decoded)
-        return payloads
-
-    # ------------------------------------------------------------------
-    # Canonical-output projection — latest key + bounded stream.
-    # Postgres owns the durable ledger; these are the live read surfaces.
-    # ------------------------------------------------------------------
-
     def inference_latest_key(self, symbol: str, venue: str) -> str:
         return self.key("inference.latest", symbol=symbol.upper(),
                         venue=venue)
@@ -981,111 +1164,15 @@ class RedisRuntimeStore:
         return self.key("inference.stream", symbol=symbol.upper(),
                         venue=venue)
 
-    async def publish_canonical_output(
-        self, output: CanonicalOutput, *, stream_maxlen: int | None = None,
-    ) -> str:
-        """Publish one canonical output: latest-key projection + stream entry.
-
-        Same nervous-system role as the legacy artifact projection (the
-        live latest read surface, never the historical authority): the key
-        and stream carry the canonical row now.
-        """
-        output.validate()
-        self._contract("inference.latest", output.to_dict())
-        body = output.to_json()
-        await self.redis.set(
-            self.inference_latest_key(output.symbol, output.venue), body)
-        return str(await self.redis.xadd(
-            self.inference_stream(output.symbol, output.venue),
-            {"payload": body, "run_id": output.run_id,
-             "status": output.status},
-            maxlen=stream_maxlen or self.stream_maxlen, approximate=True,
-        ))
-
-    async def read_latest_canonical_output(
-        self, symbol: str, venue: str = CANONICAL_VENUE,
-    ) -> dict[str, Any] | None:
-        """Latest canonical output projection (live read surface)."""
-        raw = await self.redis.get(
-            self.inference_latest_key(symbol.upper(), venue))
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
-
-    # ------------------------------------------------------------------
-    # Poller control plane — dynamic symbol selection
-    # ------------------------------------------------------------------
-    # The poller is a long-running container that resolves its symbol set
-    # at boot from env (POLL_SYMBOLS > SYMBOLS). The harness writes a
-    # control key into Redis; the poller reads it every cycle so changes
-    # take effect within one poll interval without a container restart.
-    #
-    # Precedence (highest wins):
-    #   Redis control key  >  POLL_SYMBOLS env  >  SYMBOLS env
-    # Deleting the control key restores env-based resolution.
-
     def poller_control_key(self) -> str:
         return self.key("poller.active")
 
     def poller_status_key(self) -> str:
         return self.key("poller.status")
 
-    async def set_poller_symbols(self, symbols: list[str]) -> None:
-        """Write the active-symbol override the poller picks up next cycle."""
-        if not symbols:
-            raise ValueError("set_poller_symbols: at least one symbol required")
-        cleaned = sorted({s.strip().upper() for s in symbols if s.strip()})
-        if not cleaned:
-            raise ValueError("set_poller_symbols: at least one symbol required")
-        cleaned = self._contract("poller.active", cleaned)
-        await self.redis.set(self.poller_control_key(), json.dumps(cleaned))
-
-    async def read_poller_symbols(self) -> list[str] | None:
-        """Return the override list, or None when no control key is set."""
-        raw = await self.redis.get(self.poller_control_key())
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        if isinstance(decoded, list) and decoded:
-            return [s.upper() for s in decoded]
-        return None
-
     async def clear_poller_symbols(self) -> None:
         """Delete the override so the poller falls back to env defaults."""
         await self.redis.delete(self.poller_control_key())
-
-    async def publish_poller_status(self, payload: dict[str, Any]) -> None:
-        """Operator-visible confirmation of what the poller is doing now."""
-        payload = self._contract("poller.status", payload)
-        await self.redis.set(
-            self.poller_status_key(),
-            json.dumps(payload, default=str, separators=(",", ":")),
-        )
-
-    async def read_poller_status(self) -> dict[str, Any] | None:
-        raw = await self.redis.get(self.poller_status_key())
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
-
-    # ------------------------------------------------------------------
-    # Substrate worker state — the always-fresh calculation projections
-    # (spec: docs/SUBSTRATE_WORKER_SPEC.md). Each substrate worker owns:
-    #   latest STRING  — the always-fresh projection the harness reads
-    #   stream         — bounded history (replay/audit)
-    #   supervisor     — TTL heartbeat + dedupe state (observability)
-    # ------------------------------------------------------------------
 
     def substrate_stream(self, substrate: str, symbol: str) -> str:
         return self.key(f"substrate.{substrate.lower()}.events",
@@ -1107,73 +1194,6 @@ class RedisRuntimeStore:
     # collated-stream-style unbounded replay is deliberately NOT kept per
     # horizon (7 unbounded streams would 7x the AOF cost).
     # ------------------------------------------------------------------
-
-    async def publish_substrate_state(
-        self, substrate: str, symbol: str, payload: dict[str, Any],
-    ) -> str:
-        """Atomically write one substrate calculation state to Redis.
-
-        A single Lua script SETs the ``latest`` projection AND XADDs the
-        state stream in one step (same ordering-hole closure as
-        ``publish_raw_evidence``): no reader can observe a latest projection
-        whose stream entry is missing. Stream length is bounded by
-        ``self.stream_maxlen``.
-        """
-        payload = self._contract(
-            f"substrate.{substrate.lower()}", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        ts = str(payload.get("computed_at_ms") or payload.get("observed_at_ms") or "")
-        maxlen = str(int(self.stream_maxlen))
-        script = """
-        redis.call('SET', KEYS[1], ARGV[1])
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
-            'substrate', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[4], 'payload', ARGV[1])
-        """
-        return str(await self.redis.eval(
-            script, 2,
-            self.substrate_latest_key(substrate, symbol),
-            self.substrate_stream(substrate, symbol),
-            body, substrate.lower(), symbol.upper(), ts, maxlen,
-        ))
-
-
-
-    async def read_substrate_latest(
-        self, substrate: str, symbol: str,
-    ) -> dict[str, Any] | None:
-        """Read the latest substrate state projection.
-
-        Returns ``None`` when nothing has been aggregated yet (legitimate
-        "cold start" state — not a fabricated empty payload).
-        """
-        raw = await self.redis.get(self.substrate_latest_key(substrate, symbol))
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
-
-    async def read_substrate_history(
-        self, substrate: str, symbol: str, count: int = 100,
-    ) -> list[dict[str, Any]]:
-        """Read recorded substrate states, newest first."""
-        rows = await self.redis.xrevrange(
-            self.substrate_stream(substrate, symbol), count=count,
-        )
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out
 
     async def read_substrate_history_count(self, substrate: str, symbol: str) -> int:
         """Return XLEN of the substrate state stream for diagnostics."""
@@ -1200,70 +1220,6 @@ class RedisRuntimeStore:
         return self.key(f"analysis.{analysis.lower()}.supervisor",
                         symbol=symbol.upper())
 
-    async def publish_analysis_state(
-        self, analysis: str, symbol: str, payload: dict[str, Any],
-    ) -> str:
-        """Atomic SET(latest) + XADD(state stream) — the substrate publish Lua."""
-        payload = self._contract(
-            f"analysis.{analysis.lower()}", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        ts = str(payload.get("computed_at_ms") or payload.get("observed_at_ms") or "")
-        maxlen = str(int(self.stream_maxlen))
-        script = """
-        redis.call('SET', KEYS[1], ARGV[1])
-        return redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
-            'analysis', ARGV[2], 'symbol', ARGV[3], 'ts', ARGV[4], 'payload', ARGV[1])
-        """
-        return str(await self.redis.eval(
-            script, 2,
-            self.analysis_latest_key(analysis, symbol),
-            self.analysis_stream(analysis, symbol),
-            body, analysis.lower(), symbol.upper(), ts, maxlen,
-        ))
-
-    async def read_analysis_latest(self, analysis: str, symbol: str) -> dict[str, Any] | None:
-        """Read the latest analysis projection (None = legitimate cold start)."""
-        raw = await self.redis.get(self.analysis_latest_key(analysis, symbol))
-        if not raw:
-            return None
-        try:
-            value = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
-
-    async def read_analysis_history(
-        self, analysis: str, symbol: str, count: int = 100,
-    ) -> list[dict[str, Any]]:
-        """Read recorded analysis states, newest first."""
-        rows = await self.redis.xrevrange(
-            self.analysis_stream(analysis, symbol), count=count,
-        )
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out
-
-    # ------------------------------------------------------------------
-    # Governance plane keyspace (docs/PLANE_GOVERNANCE_SPEC.md)
-    #
-    #   latest     STRING — the plane's most recent governance decision
-    #   stream         — bounded decision history (audit; denied + allowed)
-    #   denials        — bounded denials-only stream (violations surface)
-    #   supervisor     — the governor's liveness heartbeat (observability)
-    #
-    # WRITTEN BY THE GOVERNANCE FSMs ONLY. Worker planes never touch these
-    # keys: the FSM is the sole writer of its own audit trail.
-    # ------------------------------------------------------------------
-
     def governance_latest_key(self, plane: str, substrate: str, symbol: str) -> str:
         return self.key("governance.latest", plane=plane.lower(),
                         name=substrate.lower(), symbol=symbol.upper())
@@ -1280,89 +1236,6 @@ class RedisRuntimeStore:
         return self.key("governance.supervisor", plane=plane.lower(),
                         symbol=symbol.upper())
 
-    async def publish_governance_decision(
-        self, plane: str, substrate: str, symbol: str, payload: dict[str, Any],
-        *, supervisor_ms: int | None = None,
-    ) -> str:
-        """Atomic SET(latest) + XADD(decision stream) + supervisor heartbeat.
-
-        Denials are additionally appended to the denials-only stream. The
-        supervisor key is refreshed by the DECISION itself (never by a timer):
-        a plane that keeps deciding is alive; one that stops is not.
-
-        Same Lua ordering-hole closure as ``publish_substrate_state``: no
-        reader can observe a latest decision whose stream entry is missing.
-        """
-        payload = self._contract("governance.latest", payload)
-        body = json.dumps(payload, default=str, separators=(",", ":"))
-        ts = str(payload.get("decided_at_ms") or "")
-        allowed = "1" if payload.get("allowed") else "0"
-        maxlen = str(int(self.stream_maxlen))
-        ttl_ms = str(int(
-            supervisor_ms if supervisor_ms is not None
-            else os.getenv("GOVERNANCE_SUPERVISOR_MS") or 900_000
-        ))
-        script = """
-        redis.call('SET', KEYS[1], ARGV[1])
-        local id = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*',
-            'plane', ARGV[2], 'substrate', ARGV[3], 'symbol', ARGV[4],
-            'ts', ARGV[6], 'allowed', ARGV[7], 'payload', ARGV[1])
-        if ARGV[7] == '0' then
-            redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
-                'plane', ARGV[2], 'substrate', ARGV[3], 'symbol', ARGV[4],
-                'ts', ARGV[6], 'allowed', ARGV[7], 'payload', ARGV[1])
-        end
-        redis.call('SET', KEYS[4], ARGV[6], 'PX', ARGV[8])
-        return id
-        """
-        return str(await self.redis.eval(
-            script, 4,
-            self.governance_latest_key(plane, substrate, symbol),
-            self.governance_stream(plane, symbol),
-            self.governance_denial_stream(plane, symbol),
-            self.governance_supervisor_key(plane, symbol),
-            body, plane.lower(), substrate.lower(), symbol.upper(),
-            maxlen, ts, allowed, ttl_ms,
-        ))
-
-    async def read_governance_latest(
-        self, plane: str, symbol: str, substrate: str = "",
-    ) -> dict[str, Any] | None:
-        """Read the plane's latest governance decision (None = none yet).
-
-        With a ``substrate`` the per-substrate latest projection is read. With
-        none, the HEAD of the plane's decision stream is read — so
-        ``GET /governance?symbol=X`` reports the plane's most recent decision
-        regardless of substrate (never a literal ``*`` key, which nothing
-        writes).
-        """
-        if substrate:
-            raw = await self.redis.get(
-                self.governance_latest_key(plane, substrate, symbol)
-            )
-            if not raw:
-                return None
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                return None
-            return value if isinstance(value, dict) else None
-
-        rows = await self.redis.xrevrange(
-            self.governance_stream(plane, symbol), count=1,
-        )
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                return value
-        return None
-
     async def governance_alive(self, plane: str, symbol: str) -> bool:
         """Liveness: has the plane's FSM decided recently? (decision-driven)"""
         try:
@@ -1371,42 +1244,3 @@ class RedisRuntimeStore:
         except Exception:
             return False
 
-    async def read_governance_denials(
-        self, plane: str, symbol: str, count: int = 20,
-    ) -> list[dict[str, Any]]:
-        """Read the plane's denials-only stream, newest first."""
-        rows = await self.redis.xrevrange(
-            self.governance_denial_stream(plane, symbol), count=count,
-        )
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out
-
-    async def read_governance_history(
-        self, plane: str, symbol: str, count: int = 100,
-    ) -> list[dict[str, Any]]:
-        """Read recorded governance decisions, newest first."""
-        rows = await self.redis.xrevrange(
-            self.governance_stream(plane, symbol), count=count,
-        )
-        out: list[dict[str, Any]] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("payload")
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                out.append(value)
-        return out

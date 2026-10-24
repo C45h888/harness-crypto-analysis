@@ -11,12 +11,9 @@ from ..capability import CAPABILITIES, CapabilityDenied, capability_log_entry
 
 TOOL_NAMES: dict[str, str] = {
     # T1 — microstructure (paper stack) — split AD/OFI per Pass C
-    "micro.capture_status": "redis.read_capture_status",
-    "micro.events": "redis.read_events",
-    "micro.ofi_intervals": "redis.read_intervals",
+    "ns.read": "ns.read",
     "micro.replay": "fitting.replay",
     "micro.fit_beta": "fitting.assemble_evidence",
-    "micro.evidence": "redis.read_evidence",
     # T1 split: AD/OFI separate tools, final fit is hypothesis validation
     "calc.ofi.intervals": "calc.ofi_intervals",
     "calc.depth.average": "calc.ad_average",
@@ -44,62 +41,24 @@ TOOL_NAMES: dict[str, str] = {
     "memory.forget": "memory.forget",
     "memory.stats": "memory.stats",
     # T2 — market correlation (canonical pipeline seams)
-    "market.read": "market.read",
-    "market.derivatives": "market.read_derivatives",
-    "market.keystone_history": "market.read_keystone_history",
-    "market.wall_history": "market.read_wall_history",
-    # T3 — substrate capability plane (tool-first invocation)
-    "substrate.read": "substrate.read",
-    "substrate.invoke": "substrate.invoke",
-    "substrate.anchors": "substrate.anchors",
-    "substrate.density": "substrate.density",
-    "substrate.delta": "substrate.delta",
-    "substrate.ladders": "substrate.ladders",
-    "substrate.large_print": "substrate.large_print",
-    "substrate.migration": "substrate.migration",
-    "substrate.oi": "substrate.oi",
-    "substrate.signals": "substrate.signals",
-    "substrate.tape": "substrate.tape",
-    "substrate.technicals": "substrate.technicals",
-    "substrate.tiers": "substrate.tiers",
-    "substrate.volume_profile": "substrate.volume_profile",
+    # (legacy market.read / substrate.read composite removed: ns.read covers
+    #  every namespace with one thin verbatim read)
 }
 
 
 TOOL_PHASE: dict[str, str] = {
-    # P1 — OFI / tape quality
-    "micro.capture_status": "P1",
-    "micro.events": "P1",
-    "micro.ofi_intervals": "P1",
+    # P1 — OFI / tape quality (ns.read credits dynamically by namespace;
+    # its static row is P3, the correlation home)
+    "ns.read": "P3",
     "micro.replay": "P1",
     "calc.ofi.intervals": "P1",
     # P2 — AD / observations / fits
     "micro.fit_beta": "P2",
-    "micro.evidence": "P2",
     "calc.depth.average": "P2",
     "calc.observation.build": "P2",
     "calc.fit.price_impact": "P2",
     "calc.fit.depth_scaling": "P2",
-    # P3 — market correlation (Redis plane)
-    "market.read": "P3",
-    "market.derivatives": "P3",
-    "market.keystone_history": "P3",
-    "market.wall_history": "P3",
-    # P3 — substrate capability plane (tool-first)
-    "substrate.read": "P3",
-    "substrate.invoke": "P3",
-    "substrate.anchors": "P3",
-    "substrate.density": "P3",
-    "substrate.delta": "P3",
-    "substrate.ladders": "P3",
-    "substrate.large_print": "P3",
-    "substrate.migration": "P3",
-    "substrate.oi": "P3",
-    "substrate.signals": "P3",
-    "substrate.tape": "P3",
-    "substrate.technicals": "P3",
-    "substrate.tiers": "P3",
-    "substrate.volume_profile": "P3",
+    # P3 — market correlation (ns.read covers every live namespace)
     # P5 — derived ΔP + Track D forward stack
     "calc.derived_diagnostic": "P5",
     "calc.price.delta": "P5",
@@ -182,7 +141,6 @@ TOOL_LOOP_OVERRIDES: dict[str, str] = {
     tool: home[0] for tool, home in TOOL_HOME_OVERRIDES.items()
 }
 TOOL_LOOP_OVERRIDES.update({
-    "micro.capture_status": "evidence",
     "micro.fit_beta": "evidence",
 })
 
@@ -223,17 +181,13 @@ _TOOL_ALIASES: dict[str, str] = {
     _norm_tool_key(_alias_key): _alias_key for _alias_key in TOOL_NAMES
 }
 _TOOL_ALIASES.update({
-    "micro.ofi": "micro.ofi_intervals",
     "micro.fit": "micro.fit_beta",
-    "micro.status": "micro.capture_status",
-    "micro.capture": "micro.capture_status",
     "calc.ofi": "calc.ofi.intervals",
     "calc.ad": "calc.depth.average",
     "calc.depth": "calc.depth.average",
     "calc.observations": "calc.observation.build",
     "calc.observation": "calc.observation.build",
     "calc.derived": "calc.derived_diagnostic",
-    "market.history": "market.keystone_history",
 })
 
 

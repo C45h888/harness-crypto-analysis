@@ -14,7 +14,7 @@ async def poller_set(symbols: list[str]) -> dict[str, Any]:
         cleaned = [s.strip().upper() for s in symbols if s.strip()]
         if not cleaned:
             return {"status": "error", "error": "no valid symbols provided"}
-        await store.set_poller_symbols(cleaned)
+        await store.publish("poller.active", cleaned, ids={})
         return {
             "status": "ok", "action": "set",
             "control_key": store.poller_control_key(),
@@ -44,7 +44,7 @@ async def poller_status() -> dict[str, Any]:
     settings = _stores.settings_redis()
     store = _stores.open_redis(settings)
     try:
-        status = await store.read_poller_status()
+        status = await store.read("poller.status", ids={})
         if status is None:
             return {"status": "error", "action": "status",
                     "error": "no poller status found — is the poller container running?"}

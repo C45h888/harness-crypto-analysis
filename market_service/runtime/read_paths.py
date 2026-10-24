@@ -81,15 +81,15 @@ async def read_surface_inventory(store: Any, symbol: str) -> dict[str, Any]:
         return row
 
     rows.append(await _value_row(
-        "derivatives", lambda: store.read_derivative_evidence(sym)))
+        "derivatives", lambda: store.read("derivatives.latest", ids={"symbol": sym})))
     try:
         venue = getattr(store, "venue", None) or "futures"
         rows.append(await _value_row(
             "microstructure.status",
-            lambda: store.read_microstructure_status(venue, sym)))
+            lambda: store.read("micro.status", ids={"venue": venue, "symbol": sym})))
         rows.append(await _value_row(
             "microstructure.evidence",
-            lambda: store.read_microstructure_evidence(venue, sym)))
+            lambda: store.read("micro.evidence", ids={"venue": venue, "symbol": sym})))
     except Exception:
         pass
     try:
@@ -97,7 +97,7 @@ async def read_surface_inventory(store: Any, symbol: str) -> dict[str, Any]:
         for name in sorted(WORKER_REGISTRY):
             rows.append(await _value_row(
                 f"substrate.{name}",
-                lambda n=name: store.read_substrate_latest(n, sym)))
+                lambda n=name: store.read(f"substrate.{n.lower()}", ids={"symbol": sym})))
     except Exception:
         pass
     return {
@@ -197,7 +197,7 @@ async def read_substrate_latest(store: Any, substrate: str, symbol: str) -> dict
     """
     import time as _time
 
-    payload = await store.read_substrate_latest(substrate, symbol.upper())
+    payload = await store.read(f"substrate.{substrate.lower()}", ids={"symbol": symbol.upper()})
     if payload is None:
         return None
     computed_at = payload.get("computed_at_ms") if isinstance(payload, dict) else None
@@ -232,7 +232,7 @@ async def read_analysis_latest(store: Any, analysis: str, symbol: str) -> dict[s
     """
     import time as _time
 
-    payload = await store.read_analysis_latest(analysis, symbol.upper())
+    payload = await store.read(f"analysis.{analysis.lower()}", ids={"symbol": symbol.upper()})
     if payload is None:
         return None
     computed_at = payload.get("computed_at_ms") if isinstance(payload, dict) else None
@@ -266,7 +266,7 @@ async def read_live_price(
     """
     sym = symbol.upper()
     try:
-        deriv = await store.read_derivative_evidence(sym)
+        deriv = await store.read("derivatives.latest", ids={"symbol": sym})
         funding = ((deriv or {}).get("futures") or {}).get("funding") or {}
         mark = funding.get("mark_price")
         if mark is not None:
@@ -274,7 +274,7 @@ async def read_live_price(
     except Exception:  # noqa: BLE001 — derivatives are best-effort
         pass
     try:
-        evidence = await store.read_microstructure_evidence(venue, sym)
+        evidence = await store.read("micro.evidence", ids={"venue": venue, "symbol": sym})
         if isinstance(evidence, dict):
             for key in ("mark_price", "last_price", "mid_price",
                         "microprice"):

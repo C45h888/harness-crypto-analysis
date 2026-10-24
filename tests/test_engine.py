@@ -42,6 +42,26 @@ class _FakeRedis:
 
 
 class _FakeStore:
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        from tests._singular_compat import fake_publish
+        return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
+
+    def ns(self, namespace):
+        from tests._singular_compat import fake_ns
+        return fake_ns(namespace)
+
+    def key(self, namespace, **ids):
+        try:
+            inner = ":".join(f"{k}={v}" for k, v in sorted(ids.items()))
+        except Exception:
+            inner = ""
+        return f"fake:{namespace}:{inner}"
     def __init__(self, *, capture_state: str = "running", event_len: int = 5_000):
         self.redis = _FakeRedis()
         self._capture_state = capture_state
@@ -191,8 +211,8 @@ def _good_narration(with_tools: bool = False) -> str:
     }
     if with_tools:
         payload["tool_calls"] = [
-            {"name": "micro.capture_status",
-             "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+            {"name": "ns.read",
+             "args": {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.status"}},
         ]
     return json.dumps(payload)
 
@@ -207,6 +227,10 @@ def _track_tools(*names, hypothesis_id=None):
     calls = []
     for name in names:
         args: dict[str, Any] = {"symbol": "BTCUSDT", "venue": "spot"}
+        if name.startswith("ns.read:"):
+            tool, namespace = name.split(":", 1)
+            args["namespace"] = namespace
+            name = tool
         if name == "calc.hypothesis.test":
             args.update({"hypothesis_id": hypothesis_id or "H-track",
                          "horizon_ms": 5000, "m_tests": 1})
@@ -324,7 +348,7 @@ def _wake():
 # Agent-first fetch turn shared by cycle-driving tests: the agent pulls
 # the two gate reads itself; the floor has nothing left to fill.
 _FETCH_TURN = _staged_narration("P1", tools=[
-    {"name": "micro.capture_status", "args": {}},
+    {"name": "ns.read", "args": {"namespace": "micro.status"}},
     {"name": "micro.fit_beta", "args": {}},
 ])
 
@@ -335,11 +359,11 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _FETCH_TURN,
             _staged_narration("P1", tools=[
                 {"name": "calc.ofi.intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
-                {"name": "micro.ofi_intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "ns.read", "args": {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.ofi"}},
             ]),
             _staged_narration("P2", tools=[
                 {"name": "calc.depth.average", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
-                {"name": "market.derivatives", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "ns.read", "args": {"symbol": "BTCUSDT", "venue": "spot", "namespace": "derivatives.latest"}},
             ]),
             _staged_narration("P5", tools=[
                 {"name": "calc.price.delta", "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},
@@ -370,7 +394,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
         # capability_log: wake + capture + fit + tool round
         capabilities = [entry["capability"] for entry in artifact.run_record["capability_log"]]
         self.assertIn("engine.wake", capabilities)
-        self.assertIn("redis.read_capture_status", capabilities)
+        self.assertIn("ns.read", capabilities)
         self.assertIn("fitting.assemble_evidence", capabilities)
         # Canonical placement: durable insert + live projection, then the
         # post-SETTLE row refresh + its projection; Redis is never published
@@ -495,7 +519,7 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _staged_narration("P2", tools=[
                 {"name": "calc.depth.average", "args": {}},
-                {"name": "market.derivatives", "args": {}},
+                {"name": "ns.read", "args": {"namespace": "derivatives.latest"}},
             ]),
             _staged_narration("P5", tools=[
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
@@ -567,17 +591,17 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             "limitations": [],
             "model_separation": "m",
             "tool_calls": [
-                {"name": "micro.capture_status", "args": {}},
-                {"name": "micro.ofi_intervals", "args": {}},
-                {"name": "micro.evidence", "args": {}},
-                {"name": "micro.events", "args": {}},  # 4th → must be ignored
+                {"name": "ns.read", "args": {"namespace": "micro.status"}},
+                {"name": "ns.read", "args": {"namespace": "micro.ofi"}},
+                {"name": "ns.read", "args": {"namespace": "micro.evidence"}},
+                {"name": "ns.read", "args": {"namespace": "micro.events"}},  # 4th → must be ignored
             ],
         })
         engine, _s, _p, _m = _engine(llm_responses=[
             _FETCH_TURN,
             narration,
             _staged_narration("P3", tools=[
-                {"name": "market.derivatives", "args": {}},
+                {"name": "ns.read", "args": {"namespace": "derivatives.latest"}},
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
             ]),
             # Hard track walks its three positions before closing.
@@ -591,16 +615,19 @@ class EngineCycleTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P6", final=True),
         ])
         _artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
-        # GATHER phase contributes exactly one capture_status dispatch; the
-        # tool round contributes capture_status + intervals + evidence (the
+        # GATHER phase contributes exactly one ns.read dispatch; the
+        # tool round contributes status + ofi + evidence (the
         # 4th requested call, micro.events, must be dropped by the cap).
         tool_round_entries = [
             e for e in _artifact.run_record["capability_log"]
-            if e["capability"] in ("redis.read_capture_status",
-                                   "redis.read_intervals", "redis.read_evidence",
-                                   "redis.read_events")
+            if e["capability"] == "ns.read"
         ]
-        self.assertEqual(len(tool_round_entries), 4)  # 1 gather + 3 capped round
+        self.assertEqual(len(tool_round_entries), 5)  # 1 gather + 3 capped round + 1 P3
+        # The capped-out 4th call never dispatched: no micro.events read.
+        self.assertFalse(any(
+            e.get("scope", {}).get("namespace") == "micro.events"
+            for e in tool_round_entries
+        ))
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
 
     async def test_budget_limited_narrate2_even_when_tool_called(self):
@@ -895,21 +922,19 @@ class FinalValidationTests(unittest.TestCase):
 
 class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_error_never_kills_cycle(self):
-        # market.derivatives has its cache knocked out → error payload,
+        # derivatives.latest has its cache knocked out → error payload,
         # cycle continues; coverage still completes via the other tools
-        # and final passes. (market.read now null-returns against the fake
-        # tape world instead of erroring, so the outage is injected on the
-        # derivatives read to preserve this test's error-path premise.)
+        # and final passes.
         engine, store, _p, _m = _engine(llm_responses=[
             _FETCH_TURN,
             _staged_narration("P1", tools=[
-                {"name": "market.read", "args": {}},
+                {"name": "ns.read", "args": {"namespace": "substrate.tape"}},
                 {"name": "calc.ofi.intervals", "args": {}},
             ]),
             _staged_narration("P2", tools=[
                 {"name": "calc.depth.average", "args": {}},
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
-                {"name": "market.derivatives", "args": {}},
+                {"name": "ns.read", "args": {"namespace": "derivatives.latest"}},
             ]),
             # Hard track walks its three positions before closing.
             _track_tools(*_TRACK_ASSEMBLE),
@@ -928,8 +953,10 @@ class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
         store.read_derivative_evidence = _outage  # type: ignore[method-assign]
         artifact, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"})
         self.assertTrue(meta["final_validation"]["passed"], meta["final_validation"])
+        # The outage surfaces as a structured ns.read error finding (never
+        # an exception): the agent sees WHICH namespace read failed and why.
         self.assertTrue(any(
-            str(e.get("capability", "")).startswith("tool.error:")
+            e.get("capability") == "ns.read" and e.get("result") == "error"
             for e in artifact.run_record["capability_log"]
         ))
         self.assertIsNotNone(artifact.interpretation)
@@ -999,7 +1026,7 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
             ]),
             _toolkey("P2", tools=[
                 {"name": "calc.depth.average", "args": {}},
-                {"name": "market.derivatives", "args": {}},
+                {"name": "ns.read", "args": {"namespace": "derivatives.latest"}},
             ]),
             _toolkey("P5", tools=[
                 {"name": "calc.price.delta", "args": {"ofi": "5"}},
@@ -1022,25 +1049,21 @@ class ToolKeyEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
 
 class P3PromptContractTests(unittest.TestCase):
-    """Pin the tooling-base prompt contract: substrate.read primary P3,
-    invoke-before-read two-beat, freshness/dormant findings discipline.
+    """Pin the tooling-base prompt contract: ns.read is the P3 evidence,
+    workers are never invoked by the agent, freshness/dormant findings discipline.
 
-    The engine keeps its invoke authority — the two-beat stays. What the
-    prompt must also teach is that invocation is a REQUEST to the calculation
-    plane (which applies its own cooldown gates), that an unreachable plane is
-    a finding, and that age_ms is judged against each worker's own cadence.
+    The agent is a consumer of worker state: it reads namespaces, never
+    fires workers. An empty or unreachable read is a finding, and age_ms is
+    judged against each read's own cadence.
     """
-    def test_p3_guidance_teaches_two_beat(self):
+    def test_p3_guidance_teaches_ns_read(self):
         from market_service.nooa_harness.engine import _PHASE_GUIDANCE
         p3 = _PHASE_GUIDANCE["P3"]
-        self.assertIn("substrate.read", p3)
-        # Intent + constraints, not a program: order a read after the
-        # invoke whose projection it must see; no scripted array layout.
-        self.assertNotIn("BEFORE", p3)
-        self.assertIn("sequentially", p3)
+        self.assertIn("ns.read", p3)
+        self.assertIn("one namespace per call", p3)
+        self.assertIn("never invokes", p3)
         self.assertIn("age_ms", p3)
-        self.assertIn("FINDINGS", p3)
-        self.assertIn("PRIMARY", p3)
+        self.assertIn("FINDING", p3)
 
     def test_p3_guidance_teaches_cadence_relative_freshness(self):
         """One global staleness threshold mislabels the slow workers."""
@@ -1058,21 +1081,18 @@ class P3PromptContractTests(unittest.TestCase):
         p3 = _PHASE_GUIDANCE["P3"]
         self.assertIn("unreachable", p3.lower())
 
-    def test_system_prompt_frames_invoke_as_a_request(self):
-        """A granted tool call is not a guaranteed fresh compute."""
-        # Load doctrine (Signal B): the invoke-as-request rule lives in the
-        # per-loop tool window the model sees on tool loops, not in the
-        # 350-word system charter.
+    def test_system_prompt_frames_reads_as_consumer_only(self):
+        """Worker state is read, never invoked, by the agent."""
         from market_service.nooa_harness.engine.kb import tool_window_for
-        self.assertIn("calculation plane", tool_window_for("context").lower())
+        self.assertIn("never invoked", tool_window_for("context").lower())
         self.assertIn("age_ms", tool_window_for("context").lower())
 
-    def test_output_format_names_substrate_primary(self):
+    def test_output_format_names_ns_read(self):
         from market_service.nooa_harness.engine import InferenceEngine
         fmt = InferenceEngine._output_format()
-        self.assertIn("substrate.read PRIMARY", fmt)
-        self.assertIn("TWO-BEAT", fmt)
-        self.assertIn("substrate.invoke", fmt)
+        self.assertIn("ns.read", fmt)
+        self.assertNotIn("TWO-BEAT", fmt)
+        self.assertNotIn("substrate.invoke", fmt)
         self.assertIn("age_ms", fmt)
 
     def test_loop_windows_name_no_phantom_memory_surface(self):
@@ -1327,7 +1347,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P2", tools=[
                 {"name": "calc.depth.average", "args": {}}]),
             _staged_narration("P3", tools=[
-                {"name": "market.derivatives", "args": {}}]),
+                {"name": "ns.read", "args": {"namespace": "derivatives.latest"}}]),
             _staged_narration("P5", tools=[
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
                 {"name": "calc.scenario.evaluate",
@@ -1414,7 +1434,7 @@ class ControllerAuthorityTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P2", tools=[
                 {"name": "calc.depth.average", "args": {}}]),
             _staged_narration("P3", tools=[
-                {"name": "market.derivatives", "args": {}}]),
+                {"name": "ns.read", "args": {"namespace": "derivatives.latest"}}]),
             _staged_narration("P5", tools=[
                 {"name": "calc.price.delta", "args": {"ofi": "10"}},
                 {"name": "calc.scenario.evaluate",

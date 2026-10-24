@@ -57,7 +57,7 @@ class PollerControlKeyTests(unittest.TestCase):
         fake = MagicMock()
         fake.set = AsyncMock()
         store = _store_with_redis(fake)
-        self._run(store.set_poller_symbols(["solusdt", " BTCUSDT "]))
+        self._run(store.publish("poller.active", ["solusdt", " BTCUSDT "], ids={}))
         fake.set.assert_awaited_once()
         key, value = fake.set.call_args.args
         self.assertEqual(key, "marketflow:poller:active_symbols")
@@ -68,29 +68,29 @@ class PollerControlKeyTests(unittest.TestCase):
         fake.set = AsyncMock()
         store = _store_with_redis(fake)
         with self.assertRaises(ValueError):
-            self._run(store.set_poller_symbols([]))
+            self._run(store.publish("poller.active", [], ids={}))
         with self.assertRaises(ValueError):
-            self._run(store.set_poller_symbols(["", "  "]))
+            self._run(store.publish("poller.active", ["", "  "], ids={}))
         fake.set.assert_not_awaited()
 
     def test_read_poller_symbols_returns_list(self):
         fake = MagicMock()
         fake.get = AsyncMock(return_value=json.dumps(["SOLUSDT"]))
         store = _store_with_redis(fake)
-        self.assertEqual(self._run(store.read_poller_symbols()), ["SOLUSDT"])
+        self.assertEqual(self._run(store.read("poller.active", ids={})), ["SOLUSDT"])
 
     def test_read_poller_symbols_none_when_absent(self):
         fake = MagicMock()
         fake.get = AsyncMock(return_value=None)
         store = _store_with_redis(fake)
-        self.assertIsNone(self._run(store.read_poller_symbols()))
+        self.assertIsNone(self._run(store.read("poller.active", ids={})))
 
     def test_read_poller_symbols_none_on_garbage(self):
         for bad in ("not-json", json.dumps({"oops": 1}), json.dumps([])):
             fake = MagicMock()
             fake.get = AsyncMock(return_value=bad)
             store = _store_with_redis(fake)
-            self.assertIsNone(self._run(store.read_poller_symbols()), f"bad={bad!r}")
+            self.assertIsNone(self._run(store.read("poller.active", ids={})), f"bad={bad!r}")
 
     def test_clear_poller_symbols_deletes_key(self):
         fake = MagicMock()
@@ -113,14 +113,14 @@ class PollerControlKeyTests(unittest.TestCase):
         fake.set = _set
         fake.get = _get
         store = _store_with_redis(fake)
-        self._run(store.publish_poller_status(payload))
-        self.assertEqual(self._run(store.read_poller_status()), payload)
+        self._run(store.publish("poller.status", payload, ids={}))
+        self.assertEqual(self._run(store.read("poller.status", ids={})), payload)
 
     def test_read_poller_status_none_when_absent(self):
         fake = MagicMock()
         fake.get = AsyncMock(return_value=None)
         store = _store_with_redis(fake)
-        self.assertIsNone(self._run(store.read_poller_status()))
+        self.assertIsNone(self._run(store.read("poller.status", ids={})))
 
 
 class ResolveActiveSymbolsTests(unittest.TestCase):
@@ -131,14 +131,14 @@ class ResolveActiveSymbolsTests(unittest.TestCase):
 
     def test_redis_control_key_wins(self):
         store = MagicMock()
-        store.read_poller_symbols = AsyncMock(return_value=["SOLUSDT"])
+        store.read = AsyncMock(return_value=["SOLUSDT"])
         symbols, source = self._run(resolve_active_symbols(store, _settings()))
         self.assertEqual(symbols, ("SOLUSDT",))
         self.assertEqual(source, "redis_control")
 
     def test_poll_symbols_env_used_when_narrower(self):
         store = MagicMock()
-        store.read_poller_symbols = AsyncMock(return_value=None)
+        store.read = AsyncMock(return_value=None)
         settings = _settings(poll_symbols=("SOLUSDT",))
         symbols, source = self._run(resolve_active_symbols(store, settings))
         self.assertEqual(symbols, ("SOLUSDT",))
@@ -146,7 +146,7 @@ class ResolveActiveSymbolsTests(unittest.TestCase):
 
     def test_symbols_env_fallback(self):
         store = MagicMock()
-        store.read_poller_symbols = AsyncMock(return_value=None)
+        store.read = AsyncMock(return_value=None)
         symbols, source = self._run(resolve_active_symbols(store, _settings()))
         self.assertEqual(symbols, ("BTCUSDT", "ETHUSDT", "SOLUSDT"))
         self.assertEqual(source, "symbols_env")

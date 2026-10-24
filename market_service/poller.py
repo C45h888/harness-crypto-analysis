@@ -207,7 +207,7 @@ async def poll_symbol(
         depth_levels=settings.depth_levels,
         flow_window_seconds=settings.flow_window_seconds,
     )
-    stream_id = await redis.publish_raw_evidence(symbol, evidence)
+    stream_id = await redis.publish("raw.latest", evidence, ids={"symbol": symbol})
     endpoint_errors = tuple(sorted(
         str(item.get("endpoint") or "unknown")
         for item in evidence.get("errors", ()) if isinstance(item, dict)
@@ -291,7 +291,7 @@ async def resolve_active_symbols(
     Returns (symbols, source) where source is one of
     "redis_control", "poll_symbols_env", "symbols_env".
     """
-    override = await redis.read_poller_symbols()
+    override = await redis.read("poller.active", ids={})
     if override:
         return tuple(override), "redis_control"
     if settings.poll_symbols != settings.symbols:
@@ -462,7 +462,7 @@ async def main() -> int:
                         "before the next cycle",
                         kind, len(rate_errors), len(active_symbols), backoff_s,
                     )
-                    await redis.publish_poller_status({
+                    await redis.publish("poller.status", {
                         "symbols": list(active_symbols),
                         "source": cycle_source,
                         "poll_seconds": settings.poll_seconds,
@@ -470,7 +470,7 @@ async def main() -> int:
                         "cycle_ms": int(elapsed * 1000),
                         "rate_limited": True,
                         "rate_backoff_s": backoff_s,
-                    })
+                    }, ids={})
                     state = ("rate_limited", int(backoff_s * 1000), kind)
                     if telemetry is not None and state != rate_limit_state:
                         event_ms = _now_ms()
@@ -504,13 +504,13 @@ async def main() -> int:
                                 elapsed, settings.poll_seconds)
                 # Operator-visible status: confirms what the poller is
                 # actually polling right now (readable via harness --poller-status).
-                await redis.publish_poller_status({
+                await redis.publish("poller.status", {
                     "symbols": list(active_symbols),
                     "source": cycle_source,
                     "poll_seconds": settings.poll_seconds,
                     "last_cycle_at": _iso_now(),
                     "cycle_ms": int(elapsed * 1000),
-                })
+                }, ids={})
                 sleep_s = max(0.0, settings.poll_seconds - elapsed)
                 await asyncio.sleep(sleep_s)
     finally:
@@ -567,7 +567,7 @@ async def _warm_one_symbol(
             client, symbol, include_cross_asset=cross_asset,
         )
         ttl_s = int(os.getenv("POLLER_DERIV_TTL_S", "300"))
-        await redis.publish_derivative_evidence(symbol, deriv, ttl_s=ttl_s)
+        await redis.publish("derivatives.latest", deriv, ids={"symbol": symbol})
         log.info("poller derivative cache refreshed: %s (ttl=%ss)", symbol, ttl_s)
     except Exception as exc:
         log.warning("poller derivative cache refresh failed for %s: %r", symbol, exc)

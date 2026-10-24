@@ -33,13 +33,18 @@ class ToolRegistryTests(unittest.TestCase):
     def test_dispatch_registry_covers_tools(self):
         from market_service.nooa_harness.inference.capability import CAPABILITIES
         from market_service.nooa_harness.inference.dispatch import TOOL_NAMES, TOOL_PHASE
+        # Decoupled by design: worker fire-ticks are NOT agent tools. The
+        # agent reads worker state through ns.read; invocation lives inside
+        # the worker cadence (substrate_worker/tools.invoke).
         for tool in tools.invoke_tool_names():
-            self.assertIn(tool, TOOL_NAMES, f"{tool} missing from TOOL_NAMES")
-            self.assertEqual(TOOL_PHASE[tool], "P3")
-        self.assertIn("substrate.read", TOOL_NAMES)
-        self.assertIn("substrate.invoke", TOOL_NAMES)
-        self.assertIn("substrate.read", CAPABILITIES)
-        self.assertIn("substrate.invoke", CAPABILITIES)
+            self.assertNotIn(tool, TOOL_NAMES, f"{tool} must not be an agent tool")
+        self.assertNotIn("substrate.read", TOOL_NAMES)
+        self.assertNotIn("substrate.invoke", TOOL_NAMES)
+        self.assertIn("ns.read", TOOL_NAMES)
+        self.assertEqual(TOOL_PHASE["ns.read"], "P3")
+        self.assertIn("ns.read", CAPABILITIES)
+        self.assertNotIn("substrate.read", CAPABILITIES)
+        self.assertNotIn("substrate.invoke", CAPABILITIES)
 
 
 class InvokeTests(unittest.TestCase):
@@ -93,40 +98,30 @@ class InvokeTests(unittest.TestCase):
 
 
 class DispatchToolTests(unittest.TestCase):
-    def test_substrate_read_tool(self):
+    def test_ns_read_covers_worker_state(self):
         from market_service.nooa_harness.inference.dispatch import execute_tool
         payload = {"substrate": "tape", "symbol": "SOLUSDT", "status": "healthy",
                    "computed_at_ms": 1_700_000_001_000,
                    "trigger": {"source": "probe", "predicates": {}},
                    "output": {}}
         store = _FakeStore(_FakeRedis(latest=payload))
-        result, audit = _run(execute_tool(store, "substrate.read",
-                                          {"symbol": "SOLUSDT"}))
-        self.assertEqual(audit["capability"], "substrate.read")
+        result, audit = _run(execute_tool(store, "ns.read",
+                                          {"symbol": "SOLUSDT",
+                                           "namespace": "substrate.tape"}))
+        self.assertEqual(audit["capability"], "ns.read")
         self.assertEqual(audit["result"], "ok")
-        self.assertIn("tape", result["substrates"])
+        self.assertEqual(result["namespace"], "substrate.tape")
+        self.assertEqual(result["data"]["status"], "healthy")
 
-    def test_per_worker_invoke_tool(self):
-        """Same outcome contract as the in-process era, over the control plane.
-
-        The engine's tool surface is unchanged; only the execution site moved
-        into the calculation container (see tests/test_dispatch_control_transport.py).
-        """
+    def test_per_worker_invoke_is_not_an_agent_tool(self):
+        """Fire-ticks live in the worker cadence, not on the agent plane."""
         from market_service.nooa_harness.inference.dispatch import execute_tool
         store = _FakeStore(_FakeRedis(rows=_rows()))
-        with patch("market_service.substrate_worker.control_client.request_invoke",
-                   new_callable=AsyncMock) as plane:
-            plane.return_value = {
-                "symbol": "SOLUSDT", "invoked": 1, "fired": 1,
-                "reports": [{"substrate": "density", "symbol": "SOLUSDT",
-                             "invoked": True, "fired": 1,
-                             "trigger_source": "cold_start", "available": True}],
-            }
-            result, audit = _run(execute_tool(store, "substrate.density",
-                                              {"symbol": "SOLUSDT"}))
-        self.assertEqual(audit["result"], "ok")
-        self.assertTrue(result["invoked"])
-        self.assertEqual(result["substrate"], "density")
+        result, audit = _run(execute_tool(store, "substrate.density",
+                                          {"symbol": "SOLUSDT"}))
+        self.assertIsNone(result)
+        self.assertEqual(audit["result"], "denied")
+        self.assertEqual(audit["capability"], "tool.unknown")
 
     def test_unknown_worker_denied(self):
         from market_service.nooa_harness.inference.dispatch import execute_tool
@@ -139,8 +134,9 @@ class DispatchToolTests(unittest.TestCase):
         from types import SimpleNamespace
         from market_service.nooa_harness.inference.dispatch import execute_tool
         result, audit = _run(execute_tool(_FakeStore(_FakeRedis()),
-                                          "substrate.tape",
-                                          {"symbol": "FAKEUSDT"},
+                                          "ns.read",
+                                          {"symbol": "FAKEUSDT",
+                                           "namespace": "substrate.tape"},
                                           settings=SimpleNamespace(symbols=("SOLUSDT",), venue="futures")))
         self.assertIsNone(result)
         self.assertEqual(audit["result"], "denied")

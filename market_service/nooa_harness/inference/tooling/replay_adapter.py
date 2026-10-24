@@ -69,7 +69,7 @@ async def _read_tape_payloads(
     failures fall back to stream-only silently (logged by the store layer).
     """
     sym = symbol.upper()
-    live = await store.read_microstructure_events(venue, sym)
+    live = await store.read("micro.events", ids={"venue": venue, "symbol": sym}, newest_first=False)
     if postgres is None:
         return live
     try:
@@ -176,7 +176,7 @@ async def _degraded_spans(
     """Window-scoped quality spans: status-transition ledger + discontinuities."""
     spans = _spans_from_discontinuities(windowed, max_event_gap_ms)
     try:
-        transitions = await store.read_microstructure_status_transitions(venue, symbol.upper())
+        transitions = await store.read("micro.status.events", ids={"venue": venue, "symbol": symbol.upper()}, newest_first=False)
     except Exception:
         transitions = []
     status_spans = _spans_from_status_transitions(transitions)
@@ -201,7 +201,7 @@ async def degraded_spans_in_window(
     Never reads the cumulative ``sequence_gaps`` transport counter.
     """
     try:
-        transitions = await store.read_microstructure_status_transitions(venue, symbol.upper())
+        transitions = await store.read("micro.status.events", ids={"venue": venue, "symbol": symbol.upper()}, newest_first=False)
     except Exception:
         return 0
     rows = [t for t in transitions if isinstance(t, dict)]

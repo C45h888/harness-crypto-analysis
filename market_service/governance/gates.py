@@ -120,9 +120,9 @@ class GovernanceGovernor:
         if read_previous:
             try:
                 if self.plane is GovernancePlane.ANALYSIS:
-                    previous = await self.store.read_analysis_latest(substrate, symbol)
+                    previous = await self.store.read(f"analysis.{substrate.lower()}", ids={"symbol": symbol})
                 else:
-                    previous = await self.store.read_substrate_latest(substrate, symbol)
+                    previous = await self.store.read(f"substrate.{substrate.lower()}", ids={"symbol": symbol})
             except Exception:
                 read_failed = True
                 previous = None
@@ -281,11 +281,9 @@ class GovernanceGovernor:
         for name in names:
             try:
                 if is_analysis:
-                    from market_service.runtime.read_paths import read_analysis_latest
-                    entry = await read_analysis_latest(self.store, name, symbol)
+                    entry = await self.store.read(f"analysis.{name.lower()}", ids={"symbol": symbol})
                 else:
-                    from market_service.runtime.read_paths import read_substrate_latest
-                    entry = await read_substrate_latest(self.store, name, symbol)
+                    entry = await self.store.read(f"substrate.{name.lower()}", ids={"symbol": symbol})
             except Exception:
                 ages[name] = None
                 continue
@@ -325,8 +323,7 @@ class GovernanceGovernor:
         names = [str(n).lower() for n in (requested or registered)]
         ages = await self._dispatch_ages(symbol=symbol_word, names=names)
         try:
-            denials = await self.store.read_governance_denials(
-                self.plane.value, symbol_word, count=20)
+            denials = await self.store.read("governance.denials", ids={"plane": self.plane.value, "symbol": symbol_word}, count=20)
         except Exception:
             denials = []
         quarantined = self.fsm.quarantine_from_denials(denials)

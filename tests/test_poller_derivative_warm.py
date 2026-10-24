@@ -87,7 +87,7 @@ class WarmOneSymbolTests(unittest.TestCase):
         try:
             client = MagicMock()
             store = MagicMock()
-            store.publish_derivative_evidence = AsyncMock(return_value="1234-0")
+            store.publish = AsyncMock(return_value="1234-0")
             deriv = {"observed_at_ms": 1, "futures": {"klines": []}}
 
             async def fake_fetch(_client, _symbol, include_cross_asset=True):
@@ -100,11 +100,11 @@ class WarmOneSymbolTests(unittest.TestCase):
             ):
                 _run(_warm_one_symbol(client, store, "SOLUSDT", cross_asset=False))
 
-            store.publish_derivative_evidence.assert_awaited_once()
-            args, kwargs = store.publish_derivative_evidence.call_args
-            self.assertEqual(args[0], "SOLUSDT")
+            store.publish.assert_awaited_once()
+            args, kwargs = store.publish.call_args
+            self.assertEqual(args[0], "derivatives.latest")
             self.assertEqual(args[1], deriv)
-            self.assertEqual(kwargs.get("ttl_s"), 300)
+            self.assertEqual(kwargs.get("ids"), {"symbol": "SOLUSDT"})
         finally:
             if old_ttl is None:
                 os_environ.pop("POLLER_DERIV_TTL_S", None)
@@ -134,8 +134,8 @@ class WarmLoopTests(unittest.TestCase):
     def test_loop_refreshes_each_symbol_then_sleeps(self):
         client = MagicMock()
         store = MagicMock()
-        store.read_poller_symbols = AsyncMock(side_effect=lambda: ["SOLUSDT"])
-        store.publish_derivative_evidence = AsyncMock(return_value="1234-0")
+        store.read = AsyncMock(side_effect=lambda *a, **k: ["SOLUSDT"])
+        store.publish = AsyncMock(return_value="1234-0")
 
         async def fake_fetch(_client, _symbol, include_cross_asset=True):
             return {"observed_at_ms": 1, "futures": {}}
@@ -153,7 +153,7 @@ class WarmLoopTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 _run(_derivative_warm_loop(client, store, _settings(), ("SOLUSDT",)))
 
-        store.publish_derivative_evidence.assert_awaited_once()
+        store.publish.assert_awaited_once()
         # First sleep is the configured refresh interval.
         self.assertEqual(sleep_calls, [_derivative_refresh_seconds()])
 

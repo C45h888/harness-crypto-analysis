@@ -43,6 +43,26 @@ def _now_ms() -> int:
 
 
 class _AnalysisFakeRedis(_FakeRedis):
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        from tests._singular_compat import fake_publish
+        return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
+
+    def ns(self, namespace):
+        from tests._singular_compat import fake_ns
+        return fake_ns(namespace)
+
+    def key(self, namespace, **ids):
+        try:
+            inner = ":".join(f"{k}={v}" for k, v in sorted(ids.items()))
+        except Exception:
+            inner = ""
+        return f"fake:{namespace}:{inner}"
     """Adds the analysis keyspace + derivative-cache surface to the shared fake."""
 
     def __init__(self, *, deps=None, derivative=None, analysis_latest=None):
@@ -64,6 +84,21 @@ class _AnalysisFakeRedis(_FakeRedis):
 
 
 class _AnalysisFakeStore:
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        from tests._singular_compat import fake_publish
+        return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
+    def key(self, namespace, **ids):
+        try:
+            inner = ":".join(f"{k}={v}" for k, v in sorted(ids.items()))
+        except Exception:
+            inner = ""
+        return f"fake:{namespace}:{inner}"
+
     """RedisRuntimeStore-shaped adapter with BOTH planes' keyspaces."""
 
     def __init__(self, redis):

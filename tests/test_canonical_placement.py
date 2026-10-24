@@ -34,11 +34,11 @@ class PlacementSemanticsTests(unittest.IsolatedAsyncioTestCase):
         )
 
         turns = [
-            _sn("P1", tools=[{"name": "micro.capture_status"},
+            _sn("P1", tools=[{"name": "ns.read", "args": {"namespace": "micro.status", "symbol": "BTCUSDT", "venue": "spot"}},
                              {"name": "micro.fit_beta"},
-                             {"name": "market.read"}]),
+                             {"name": "ns.read", "args": {"namespace": "derivatives.latest", "symbol": "BTCUSDT", "venue": "spot"}}]),
             _sn("P2", tools=[{"name": "calc.depth.average"},
-                             {"name": "market.derivatives"}]),
+                             {"name": "ns.read", "args": {"namespace": "derivatives.latest", "symbol": "BTCUSDT", "venue": "spot"}}]),
             _sn("P5", tools=[{"name": "calc.price.delta"}]),
             _track_tools(*_TRACK_ASSEMBLE),
             _track_tools(*_TRACK_INTERPRET),

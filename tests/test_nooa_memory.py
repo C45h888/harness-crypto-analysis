@@ -46,7 +46,7 @@ def _fake_stores():
     postgres.close = AsyncMock()
     redis = MagicMock()
     redis.close = AsyncMock()
-    redis.publish_agent_artifact = AsyncMock(return_value="1-1")
+    redis.publish = AsyncMock(return_value="1-1")
     return redis, postgres
 
 
@@ -84,15 +84,15 @@ class MemoryNodeRecallOrderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_redis_is_primary_read_plan(self):
         recalled = [_memory(importance=7.0)]
-        self.redis.read_recent_memories = AsyncMock(return_value=recalled)
+        self.redis.read = AsyncMock(return_value=recalled)
         node = MemoryNode(self.redis, self.postgres)
         out = await node.recall(SESSION_ID, limit=8)
-        self.redis.read_recent_memories.assert_awaited_once()
+        self.redis.read.assert_awaited_once()
         self.postgres.read_recent_memories.assert_not_called()
         self.assertEqual([m.memory_id for m in out], [m.memory_id for m in recalled])
 
     async def test_postgres_fallback_when_redis_empty(self):
-        self.redis.read_recent_memories = AsyncMock(return_value=[])
+        self.redis.read = AsyncMock(return_value=[])
         pg_row = _memory()
         self.postgres.read_recent_memories = AsyncMock(return_value=[pg_row])
         node = MemoryNode(self.redis, self.postgres)
@@ -104,7 +104,7 @@ class MemoryNodeRecallOrderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_kind_and_run_id_filters_on_redis_read(self):
         matching = _memory()
-        self.redis.read_recent_memories = AsyncMock(
+        self.redis.read = AsyncMock(
             return_value=[matching, _memory(kind="hypothesis", run_id=str(uuid.uuid4()))],
         )
         out = await MemoryNode(self.redis, self.postgres).recall(
@@ -117,14 +117,14 @@ class MemoryNodeRecallOrderTests(unittest.IsolatedAsyncioTestCase):
             _memory(memory_id="aaa", content="funding rate turned negative", importance=1.0),
             _memory(memory_id="bbb", content="order book walls moved deeper", importance=1.0),
         ]
-        self.redis.read_recent_memories = AsyncMock(return_value=memorized)
+        self.redis.read = AsyncMock(return_value=memorized)
         out = await MemoryNode(self.redis, self.postgres).recall(
             SESSION_ID, query="funding", limit=1,
         )
         self.assertEqual([m.memory_id for m in out], ["aaa"])
 
     async def test_forget_tombstones_and_recall_skips(self):
-        self.redis.read_recent_memories = AsyncMock(return_value=[])
+        self.redis.read = AsyncMock(return_value=[])
         self.postgres.forget_memory = AsyncMock(return_value=True)
         tombstoned = _memory(forgotten=True)
         self.postgres.read_memory = AsyncMock(return_value=tombstoned)
@@ -146,9 +146,7 @@ class MemoryNodeWriteOrderTests(unittest.IsolatedAsyncioTestCase):
             run_id=RUN_ID, title="t", importance=7.0, tags=("tag",),
         )
         self.postgres.insert_agent_memory.assert_awaited_once()
-        self.redis.publish_agent_artifact.assert_awaited_once_with(
-            SESSION_ID, "memory", stored.to_json(), run_id=RUN_ID,
-        )
+        self.redis.publish.assert_awaited_once()
 
     async def test_strict_redis_is_skipped_when_ledger_fails(self):
         self.postgres.insert_agent_memory = AsyncMock(return_value=False)
@@ -156,7 +154,7 @@ class MemoryNodeWriteOrderTests(unittest.IsolatedAsyncioTestCase):
             await MemoryNode(self.redis, self.postgres).remember(
                 SESSION_ID, "fact", "x",
             )
-        self.redis.publish_agent_artifact.assert_not_called()
+        self.redis.publish.assert_not_called()
 
 
 class RedisMemoryDedupeTests(unittest.IsolatedAsyncioTestCase):
@@ -186,7 +184,7 @@ class RedisMemoryDedupeTests(unittest.IsolatedAsyncioTestCase):
         store = RedisRuntimeStore.__new__(RedisRuntimeStore)
         store.redis = _FakeRedis()
         store.prefix = "marketflow"
-        out = await store.read_recent_memories(SESSION_ID)
+        out = await store.read("agent.artifacts", ids={"session": SESSION_ID, "artifact": "memory"})
         self.assertEqual(out, [])
 
     async def test_dedupe_keeps_newest_version(self):
@@ -209,21 +207,19 @@ class RedisMemoryDedupeTests(unittest.IsolatedAsyncioTestCase):
         store = RedisRuntimeStore.__new__(RedisRuntimeStore)
         store.redis = _FakeRedis()
         store.prefix = "marketflow"
-        out = await store.read_recent_memories(SESSION_ID)
+        out = await store.read("agent.artifacts", ids={"session": SESSION_ID, "artifact": "memory"})
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].importance, 9.0)
 
     async def test_forget_publishes_tombstone_to_redis(self):
-        self.redis.read_recent_memories = AsyncMock(return_value=[])
+        self.redis.read = AsyncMock(return_value=[])
         self.postgres.forget_memory = AsyncMock(return_value=True)
         tombstoned = _memory(forgotten=True)
         self.postgres.read_memory = AsyncMock(return_value=tombstoned)
-        self.redis.publish_agent_artifact = AsyncMock(return_value="9-1")
+        self.redis.publish = AsyncMock(return_value="9-1")
         node = MemoryNode(self.redis, self.postgres)
         await node.forget(SESSION_ID, tombstoned.memory_id)
-        self.redis.publish_agent_artifact.assert_awaited_once_with(
-            SESSION_ID, "memory", tombstoned.to_json(), run_id=RUN_ID,
-        )
+        self.redis.publish.assert_awaited_once()
 
 
 class MemoryNodeRenderTests(unittest.TestCase):

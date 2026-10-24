@@ -22,7 +22,7 @@ class SegmentTableTests(unittest.TestCase):
         self.assertIn("warm", segments.SEGMENTS)
         self.assertIn("ledger", segments.SEGMENTS)
         self.assertIn("micro", segments.SEGMENTS)
-        self.assertIn("history", segments.SEGMENTS)
+        self.assertNotIn("history", segments.SEGMENTS)
         self.assertIn("inference", segments.SEGMENTS)
         self.assertIn("control", segments.SEGMENTS)
 
@@ -32,8 +32,10 @@ class SegmentTableTests(unittest.TestCase):
     def test_all_tools_listed_once(self):
         tools = segments.all_tool_names()
         self.assertEqual(len(tools), len(set(tools)))
-        self.assertIn("market.read", tools)
-        self.assertIn("substrate.read", tools)
+        self.assertIn("ns.read", tools)
+        self.assertNotIn("market.read", tools)
+        self.assertNotIn("substrate.read", tools)
+        self.assertNotIn("market.keystone_history", tools)
 
 
 class ParsingEnvelopeTests(unittest.TestCase):

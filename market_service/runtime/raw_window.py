@@ -39,7 +39,7 @@ async def build_raw_window(
     trade ``id``** (stable Binance aggregate id) so volumes/CVD are not inflated
     by redeclaring each trade once per snapshot it appears in.
     """
-    latest = await redis.read_raw_latest(symbol)
+    latest = await redis.read("raw.latest", ids={"symbol": symbol})
     if latest is None:
         return {
             "observed_at": _utc_iso(),
@@ -65,7 +65,7 @@ async def build_raw_window(
         }
 
     since_ms = int(time.time() * 1000) - window_minutes * 60_000
-    snapshots = await redis.read_raw_window(symbol, since_ms)
+    snapshots = await redis.read("raw.stream", ids={"symbol": symbol}, newest_first=False, start=str(since_ms), end="+")
 
     def _dedupe(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[int] = set()
@@ -289,12 +289,12 @@ async def build_ws_surface(
     """
     now_ms = int(time.time() * 1000)
     try:
-        reader = getattr(redis, "read_microstructure_raw", None)
-        if not callable(reader):
-            return {"source": "microstructure_ws", "delta_count": 0, "deltas": []}
         # Read the window (oldest-first xrange); bucket via age below.
-        deltas = await reader(venue, symbol, start="-", end="+",
-                              count=int(window_minutes * 60 * 1000 // 100))
+        deltas = await redis.read(
+            "micro.raw", ids={"venue": venue, "symbol": symbol},
+            newest_first=False, start="-", end="+",
+            count=int(window_minutes * 60 * 1000 // 100),
+        )
     except Exception:
         # WS is best-effort; never let an absent WS surface fail a REST fire.
         return {"source": "microstructure_ws", "delta_count": 0, "deltas": []}

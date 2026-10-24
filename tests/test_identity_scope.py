@@ -219,6 +219,62 @@ class MarketReadLiveTests(unittest.TestCase):
         async def read_derivative_evidence(self, s):
             return self._load(self.derivatives_key(s))
 
+        def key(self, namespace, **ids):
+            venue = str(ids.get("venue", "futures")).lower()
+            symbol = str(ids.get("symbol", "SOLUSDT")).upper()
+            if namespace == "micro.evidence":
+                return self.microstructure_evidence_key(venue, symbol)
+            if namespace == "micro.status":
+                return self.microstructure_status_key(venue, symbol)
+            if namespace == "micro.book":
+                return self.microstructure_book_key(venue, symbol)
+            if namespace == "micro.ofi":
+                return self.microstructure_ofi_stream(venue, symbol)
+            if namespace == "derivatives.latest":
+                return self.derivatives_key(symbol)
+            if namespace.startswith("substrate."):
+                return self.substrate_latest_key(namespace.split(".", 1)[1], symbol)
+            return f"{namespace}:{venue}:{symbol}"
+
+        async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+            ids = ids or {}
+            symbol = str(ids.get("symbol", "SOLUSDT")).upper()
+            venue = str(ids.get("venue", "futures")).lower()
+            if namespace == "poller.active":
+                return None
+            if namespace == "derivatives.latest":
+                return await self.read_derivative_evidence(symbol)
+            if namespace == "micro.status":
+                return await self.read_microstructure_status(venue, symbol)
+            if namespace == "micro.evidence":
+                return await self.read_microstructure_evidence(venue, symbol)
+            if namespace == "micro.ofi":
+                return await self.read_microstructure_intervals(venue, symbol)
+            if namespace == "micro.book":
+                raw = await self.redis.get(self.microstructure_book_key(venue, symbol))
+                return json.loads(raw) if raw else None
+            if namespace.startswith("substrate."):
+                return None
+            return None
+
+        async def read_poller_symbols(self):
+            return None
+
+        def ns(self, namespace):
+            from types import SimpleNamespace
+            templates = {
+                "micro.evidence": "latest:microstructure:{venue}:{symbol}:evidence",
+                "micro.status": "latest:microstructure:{venue}:{symbol}:status",
+                "micro.book": "latest:microstructure:{venue}:{symbol}:book",
+                "micro.ofi": "stream:microstructure:ofi:{venue}:{symbol}",
+            }
+            return SimpleNamespace(
+                id=namespace,
+                template=templates.get(namespace, f"{namespace}:{{symbol}}"),
+                kind="stream" if namespace == "micro.ofi" else "latest",
+                age_fields=("received_ts_ms", "updated_at_ms", "observed_at_ms"),
+            )
+
         def _load(self, key):
             raw = self._data.get(key)
             return json.loads(raw) if raw else None
@@ -237,47 +293,51 @@ class MarketReadLiveTests(unittest.TestCase):
 
     def _read(self, store, **kwargs):
         from market_service.nooa_harness.inference.tooling.tools_market import (
-            dispatch_market_read,
+            dispatch_ns_read,
         )
-        return asyncio.run(dispatch_market_read(store, "SOLUSDT", **kwargs))
+        return asyncio.run(dispatch_ns_read(store, "SOLUSDT", **kwargs))
 
     def test_reads_live_venue_scoped_projection(self):
-        payload, _ = self._read(self._Store(self._seeded()), venue="futures")
+        payload, _ = self._read(
+            self._Store(self._seeded()), namespace="micro.evidence", venue="futures")
         self.assertEqual(payload["source"], "redis-live")
         self.assertEqual(payload["venue"], "futures")
         self.assertEqual(payload["symbol"], "SOLUSDT")
-        self.assertEqual(payload["capture_state"], "running")
-        self.assertEqual(payload["intervals_available"], 2)
-        # Every present section carries an age — no number without provenance.
-        for name, row in payload["sections"].items():
-            if row["status"] == "present":
-                self.assertIsNotNone(row["age_ms"], name)
+        self.assertEqual(payload["namespace"], "micro.evidence")
+        self.assertEqual(payload["data"]["last_price"], 145.2)
+        # Every number carries an age — no number without provenance.
+        self.assertIsNotNone(payload["age_ms"])
+        self.assertIn("microstructure:futures:SOLUSDT", payload["key"])
 
     def test_frozen_collated_plane_is_ignored(self):
         """The dead plane is never consulted, even when it holds data."""
         data = self._seeded()
         data["latest:BTCUSDT:collated"] = json.dumps(
             {"last_price": 145.2, "generated_at": "2020-01-01T00:00:00"})
-        payload, _ = self._read(self._Store(data), venue="futures")
-        self.assertNotIn("collated", json.dumps(payload["sections"]))
+        payload, _ = self._read(
+            self._Store(data), namespace="micro.evidence", venue="futures")
+        self.assertNotIn("collated", json.dumps(payload))
         self.assertEqual(payload["source"], "redis-live")
 
     def test_spot_is_a_different_identity_and_reads_empty(self):
-        payload, _ = self._read(self._Store(self._seeded()), venue="spot")
-        self.assertEqual(payload["status"], "empty")
-        self.assertEqual(payload["venue"], "spot")
+        payload, log = self._read(
+            self._Store(self._seeded()), namespace="micro.evidence", venue="spot")
+        self.assertIsNone(payload)
+        self.assertEqual(log["detail"]["status"], "empty")
+        self.assertIn("microstructure:spot:SOLUSDT", log["detail"]["key"])
 
-    def test_empty_names_the_venue_scoped_keys_probed(self):
-        payload, _ = self._read(self._Store({}), venue="futures")
-        self.assertEqual(payload["status"], "empty")
-        checked = json.dumps(payload["checked"])
-        self.assertIn("microstructure:futures:SOLUSDT", checked)
-        self.assertIn(payload["venue"], payload["reason"])
+    def test_empty_names_the_venue_scoped_key_probed(self):
+        payload, log = self._read(
+            self._Store({}), namespace="micro.evidence", venue="futures")
+        self.assertIsNone(payload)
+        self.assertEqual(log["detail"]["status"], "empty")
+        self.assertIn("microstructure:futures:SOLUSDT", log["detail"]["key"])
 
     def test_perps_alias_reads_the_futures_projection(self):
-        payload, _ = self._read(self._Store(self._seeded()), venue="perps")
+        payload, _ = self._read(
+            self._Store(self._seeded()), namespace="micro.evidence", venue="perps")
         self.assertEqual(payload["venue"], "futures")
-        self.assertEqual(payload["status"] in ("ok", "partial"), True)
+        self.assertEqual(payload["status"], "ok")
 
 
 class ExecutorVenueTests(unittest.TestCase):

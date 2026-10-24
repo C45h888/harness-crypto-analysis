@@ -378,6 +378,14 @@ class CycleController:
         coverage = dict(self.phase_coverage)
         if not refused and outcome_result == "ok":
             phase = TOOL_PHASE.get(canonical)
+            if canonical == "ns.read":
+                # One tool spans the read plane: credit the phase of the
+                # namespace actually read, not the tool's static row.
+                _ns = str((args or {}).get("namespace", ""))
+                if _ns.startswith("micro.") and not _ns.endswith(".evidence"):
+                    phase = "P1"
+                elif _ns == "micro.evidence":
+                    phase = "P2"
             if phase is not None:
                 coverage[phase] = coverage.get(phase, frozenset()) | {canonical}
         return replace(

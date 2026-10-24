@@ -144,7 +144,7 @@ async def run_inference_once(
             settings.redis_stream_maxlen,
         )
         try:
-            live_symbols = await _probe.read_poller_symbols()
+            live_symbols = await _probe.read("poller.active", ids={})
         finally:
             await _probe.close()
     except Exception:  # noqa: BLE001 — liveness is best-effort here

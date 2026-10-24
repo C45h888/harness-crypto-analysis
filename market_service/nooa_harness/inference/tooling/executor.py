@@ -35,21 +35,12 @@ from .tools_legacy import (
 )
 from .tools_market import (
     dispatch_assemble_evidence,
-    dispatch_market_read,
     dispatch_memory_remember,
     dispatch_memory_recall,
     dispatch_memory_forget,
     dispatch_memory_stats,
-    dispatch_read_capture_status,
-    dispatch_read_derivatives,
-    dispatch_read_events,
-    dispatch_read_evidence,
-    dispatch_read_intervals,
-    dispatch_read_keystone_history,
-    dispatch_read_wall_history,
+    dispatch_ns_read,
     dispatch_replay,
-    dispatch_substrate_invoke,
-    dispatch_substrate_read,
 )
 
 async def execute_tool(
@@ -104,7 +95,7 @@ async def execute_tool(
     _active: tuple[str, ...] | None = None
     if store is not None:
         try:
-            _control = await store.read_poller_symbols()
+            _control = await store.read("poller.active", ids={})
         except Exception:  # noqa: BLE001 — best-effort liveness
             _control = None
         if _control:
@@ -122,15 +113,19 @@ async def execute_tool(
                 "active_symbols": list(_active),
             },
         )
-    if name == "micro.capture_status":
-        return await dispatch_read_capture_status(store, symbol, venue)
-    if name == "micro.events":
-        return await dispatch_read_events(
-            store, symbol, venue, count=int(args.get("count") or 200),
-        )
-    if name == "micro.ofi_intervals":
-        return await dispatch_read_intervals(
-            store, symbol, venue, count=int(args.get("count") or 200),
+    if name == "ns.read":
+        try:
+            _count = args.get("count")
+            _count = int(_count) if _count is not None else None
+        except (TypeError, ValueError):
+            return None, capability_log_entry(
+                name, {"symbol": symbol, "venue": venue}, "denied",
+                detail="count must be an integer",
+            )
+        return await dispatch_ns_read(
+            store, symbol, namespace=str(args.get("namespace") or ""),
+            venue=venue, count=_count,
+            newest_first=bool(args.get("newest_first", True)),
         )
     if name == "micro.replay":
         payloads = list(args.get("event_payloads") or [])
@@ -140,44 +135,6 @@ async def execute_tool(
         )
     if name == "micro.fit_beta":
         return await _tool_fit_beta(store, symbol, venue, args, postgres=postgres)
-    if name == "micro.evidence":
-        return await dispatch_read_evidence(store, symbol, venue)
-    if name == "market.read":
-        return await dispatch_market_read(
-            store, symbol, mode=str(args.get("mode") or "snapshot"),
-            venue=venue,
-            run_id=(str(args["run_id"]) if args.get("run_id") else None),
-            postgres=postgres)
-    if name == "market.derivatives":
-        return await dispatch_read_derivatives(store, symbol, venue=venue)
-    if name == "market.keystone_history":
-        return await dispatch_read_keystone_history(
-            store, symbol, count=int(args.get("count") or 100), venue=venue,
-        )
-    if name == "market.wall_history":
-        return await dispatch_read_wall_history(
-            store, symbol, count=int(args.get("count") or 100), venue=venue,
-        )
-    if name == "substrate.read":
-        return await dispatch_substrate_read(
-            store, symbol,
-            substrate=args.get("substrate"),
-            mode=str(args.get("mode") or "compact"), venue=venue,
-        )
-    if name == "substrate.invoke" or (
-        name.startswith("substrate.") and name not in ("substrate.read",)
-    ):
-        # ``substrate.invoke`` means "every registered worker" — target stays
-        # None unless the caller names one. Deriving it from the tool name
-        # would yield the literal "invoke", which is not a registered worker
-        # and gets denied.
-        if name == "substrate.invoke":
-            target = str(args["substrate"]) if args.get("substrate") else None
-        else:
-            target = str(args.get("substrate") or name.split(".", 1)[1])
-        return await dispatch_substrate_invoke(
-            store, symbol, target, postgres=postgres, venue=venue,
-        )
     if name == "calc.ofi.intervals":
         return await dispatch_calc_ofi_intervals(store, symbol, venue, interval_ms=int(args.get("interval_ms") or args.get("interval_seconds", 10)*1000 if "interval_seconds" in args else 10_000), window_minutes=int(args.get("window_minutes") or 30), postgres=postgres)
     if name == "calc.depth.average":

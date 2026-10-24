@@ -51,8 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="delete Redis control key (fall back to env)")
     p.add_argument("--poller-status", action="store_true",
                    help="read poller live status from Redis")
-    p.add_argument("--keystone-history", action="store_true",
-                   help="cross-cycle keystone ledger + migration verdict")
     p.add_argument("--microstructure-status", action="store_true",
                    help="isolated capture health (Redis-only, no compute)")
     p.add_argument("--inference", action="store_true",
@@ -65,8 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="scenario price target (quote currency)")
     p.add_argument("--horizon", default="1h", choices=("15m", "1h", "4h"),
                    help="scenario horizon (default 1h)")
-    p.add_argument("--history-limit", type=int, default=100,
-                   help="max keystone history entries (default 100)")
     p.add_argument("--describe-interaction", action="store_true",
                    help="emit the segment/mode/budget/prompt manifest and exit")
     return p
@@ -102,11 +98,6 @@ def main(argv: list[str] | None = None) -> int:
         result, source = asyncio.run(_read_market(args, args.mode))
         _emit(result, segment="ledger", mode=args.mode, source=source)
         return 0
-
-    if args.keystone_history:
-        result, source = asyncio.run(_read_keystone_history(args))
-        _emit(result, segment="history", mode="compact", source=source)
-        return 0 if result.get("data", {}).get("history") or result.get("data", {}).get("cycles") else 1
 
     if args.microstructure_status:
         result, source = asyncio.run(_read_microstructure_status(args))
@@ -172,19 +163,6 @@ async def _read_market(args: argparse.Namespace, mode: str) -> tuple[dict[str, A
         "market.read", payload, segment="ledger", mode=mode), source
 
 
-async def _read_keystone_history(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
-    payload, source = await _reads.read_history(
-        args.symbol.upper(), limit=int(args.history_limit or 100))
-    if not payload.get("history"):
-        surfaces = await _reads.read_surfaces(args.symbol.upper())
-        return _parsing.empty_read(
-            tool="market.keystone_history", segment="history", mode="compact",
-            symbol=args.symbol.upper(), surfaces=surfaces,
-            errors=["keystone ledger empty"]), source
-    return _parsing.wrap_result(
-        "market.keystone_history", payload, segment="history", mode="compact"), source
-
-
 async def _read_microstructure_status(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
     payload, source = await _reads.read_micro_status(args.symbol.upper())
     return _parsing.wrap_result(
@@ -199,7 +177,6 @@ __all__ = [
     "build_parser",
     "main",
     "_poller_control",
-    "_read_keystone_history",
     "_read_market",
     "_read_microstructure_status",
     "_read_substrates",

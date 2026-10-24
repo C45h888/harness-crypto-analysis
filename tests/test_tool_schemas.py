@@ -99,7 +99,7 @@ class TestToolSchemaBlock(unittest.TestCase):
         """Every known tool name should have an entry in TOOL_OUTPUT_SCHEMAS."""
         # The manifest has 44 tool names — let's check at least the common ones
         expected = [
-            "micro.capture_status",
+            "ns.read",
             "micro.fit_beta",
             "calc.ofi.intervals",
             "calc.depth.average",
@@ -108,9 +108,7 @@ class TestToolSchemaBlock(unittest.TestCase):
             "calc.scenario.evaluate",
             "calc.forward.forecast",
             "calc.hypothesis.test",
-            "substrate.read",
-            "substrate.invoke",
-            "market.read",
+            "ns.read",
         ]
         for tool in expected:
             self.assertIn(tool, TOOL_OUTPUT_SCHEMAS,
@@ -140,9 +138,10 @@ class TestExtractPhaseSummaries(unittest.TestCase):
                 [{"ofi": "0.5", "event_count": 10, "quality": "estimated"},
                  {"ofi": "-0.3", "event_count": 8, "quality": "estimated"}],
             ),
-            "micro.capture_status": wrap_tool_result(
-                "micro.capture_status",
-                {"state": "running", "sequence_gaps": 0, "reconnects": 0},
+            "micro.status": wrap_tool_result(
+                "micro.status",
+                {"state": "running", "sequence_gaps": 0, "reconnects": 0,
+                 "namespace": "micro.status", "key": "k", "age_ms": 500},
             ),
         }
         lines = extract_p1_summary(results)
@@ -186,17 +185,22 @@ class TestExtractPhaseSummaries(unittest.TestCase):
 
     def test_p3_summary(self):
         results = {
-            "substrate.read": wrap_tool_result(
-                "substrate.read",
-                {
-                    "substrates": {
-                        "tape": {"available": True, "age_ms": 12000, "status": "ok"},
-                        "density": {"available": True, "age_ms": 45000, "status": "ok"},
-                        "delta": {"available": False, "age_ms": None, "status": None},
-                    }
-                },
+            "substrate.tape": wrap_tool_result(
+                "substrate.tape",
+                {"available": True, "status": "ok"},
+            ),
+            "substrate.density": wrap_tool_result(
+                "substrate.density",
+                {"available": True, "status": "ok"},
+            ),
+            "substrate.delta": wrap_tool_result(
+                "substrate.delta",
+                {"available": False, "status": None},
             ),
         }
+        for _ns, _age in (("substrate.tape", 12000), ("substrate.density", 45000),
+                          ("substrate.delta", None)):
+            results[_ns]["age_ms"] = _age
         lines = extract_p3_summary(results)
         self.assertTrue(any("tape" in l for l in lines))
         self.assertTrue(any("delta" in l for l in lines))
@@ -382,7 +386,10 @@ class TestComposeFollowupPromptWithWrapped(unittest.TestCase):
         val_ctrl.observation = _ObsVal()
 
         accumulated = {
-            "micro.capture_status": {"state": "running", "sequence_gaps": 0},
+            "micro.status": {"tool": "ns.read", "status": "ok",
+                               "reason": None,
+                               "data": {"state": "running", "sequence_gaps": 0},
+                               "null_fields": []},
         }
         prompt = compose_repair_prompt(
             controller=val_ctrl,

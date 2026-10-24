@@ -170,11 +170,12 @@ TURN_CONTRACT_LINE = (
 )
 
 # The single citation grammar every prompt uses (L1 unification — one dialect,
-# not three): tool fields cite ``<tool> → data.<field>``, ledger values cite
+# not three): namespace reads cite ``<namespace> → <field>``, ledger values cite
 # ``deterministic_state.<key>``. Composers reference this constant instead of
 # restating the rule in local prose that can drift.
 CITATION_LINE = (
-    "Cite tool fields as ``<tool> → data.<field>`` and ledger values as "
+    "Cite namespace reads as ``<namespace> → <field>`` (e.g. "
+    "``micro.evidence → mark_price``) and ledger values as "
     "``deterministic_state.<key>`` — never recompute, never invent paths."
 )
 
@@ -192,11 +193,11 @@ FINAL_SHAPE_BLOCK = (
     '"evidence_refs": ["<tool-name>", …]}  (H0/H1 in line with the distribution + '
     'hypothesis frame: prove/disprove the prompt, never from scratch)\n'
     '  "hypothesis_probabilities": {"H0": {"probability": "low|medium|high", '
-    '"p": 0.0–1.0|null, "basis_path": "<tool> → data.<field>", "basis_value": "…"}, '
+    '"p": 0.0–1.0|null, "basis_path": "<namespace> → <field>", "basis_value": "…"}, '
     '"H1": {…}, "chosen": "H0|H1", "tiebreak": "…|null"} — weigh each live '
     'hypothesis against the distribution (comparator.* = baseline, top-level = '
     'multivariate), then choose the argmax; probabilities inform, never execute\n'
-    '  "evidence": [{"path": "<tool-name> → data.<field>" | "deterministic_state.…", '
+    '  "evidence": [{"path": "<namespace> → <field>" | "deterministic_state.…", '
     '"value": …, "interpretation": "…"}] — ≥2 distinct roots (different tool heads) '
     "including ≥1 fresh tool result and a calc.price.delta → … ΔP path\n"
     '  "confidence": "low|medium|high"\n'
@@ -281,7 +282,7 @@ def build_output_format() -> str:
         "{\n"
         '  "phase": "P1|P2|P3|P4|P5|P6 — the phase this turn advances (P6 = final output generation, no tools)",\n'
         '  "summary": "P4 explanation (≥200 chars: what the fits show AND why now), or null while tools are still pending",\n'
-        '  "evidence": [{"path": "deterministic_state.… OR <tool-name> → <field>", "value": …, "interpretation": "…", "metric_name": "…"}] or null,\n'
+        '  "evidence": [{"path": "<namespace> → <field>" OR "deterministic_state.…", "value": …, "interpretation": "…", "metric_name": "…"}] or null,\n'
         '  "confidence": "low|medium|high" or null,\n'
         '  "limitations": ["…"] or null,\n'
         '  "model_separation": "one sentence on why beta and c/lambda are read separately" or null,\n'
@@ -289,14 +290,14 @@ def build_output_format() -> str:
         '  "scenario": {"target_price": "…", "horizon": "15m|1h|4h", "direction": "up|down", "required_ofi": "…", "required_ofi_range": […] or null, "exceedance": "…", "exceedance_range": […] or null, "fit_status": "validated|provisional", "n_windows_usable": N, "r2": "…" or null, "probability": "low|medium|high", "verdict": "reachable|not_reachable|unevaluable", "rationale": "… (≥80 chars, name fit_status + usable windows + r2 beside the verdict)"} or null (REQUIRED at final ONLY when a SCENARIO block was given — echo numerics from calc.scenario.evaluate → … paths, never compute),\n'
         '  "forward_scenario": {"horizon_ms": N, "targets": [{"T": "…", "p_ge": "…", "p_lo": "…", "p_hi": "…"}], "invalidations": [{"S": "…", "p_le": "…"}], "fit_id": "…"} or null (OPTIONAL — horizon-native P(T)/P(S) from calc.forward.scenario → … paths; cite when the task bears horizons/targets),\n'
         '  "hypothesis_evidence": {"hypothesis_id": "…", "effect": "…", "se": "…", "ci": ["…", "…"], "p_value": "…", "n": N, "multiplicity_adj": "…"} or null (OPTIONAL — calc.hypothesis.test → … ledger entry, post-fit only; p<0.05 is evidence, never execution),\n'
-        '  "hypothesis_probabilities": {"H0": {"probability": "low|medium|high", "p": 0.0–1.0|null, "basis_path": "<tool> → data.<field>", "basis_value": "…"}, "H1": {…}, "chosen": "H0|H1", "tiebreak": "…|null"} or null (REQUIRED at final: weigh each live hypothesis against the distribution — comparator.* is the univariate baseline, top-level the multivariate fit — then choose the argmax; probabilities inform, never execute),\n'
+        '  "hypothesis_probabilities": {"H0": {"probability": "low|medium|high", "p": 0.0–1.0|null, "basis_path": "<namespace> → <field>", "basis_value": "…"}, "H1": {…}, "chosen": "H0|H1", "tiebreak": "…|null"} or null (REQUIRED at final: weigh each live hypothesis against the distribution — comparator.* is the univariate baseline, top-level the multivariate fit — then choose the argmax; probabilities inform, never execute),\n'
         '  "tool_calls": [{"name": "<ONE registry tool name>", "args": {"symbol": "<this cycle\'s symbol>", "venue": "<this cycle\'s venue>", "interval_seconds": 10, "window_minutes": 30, …}}],\n'
         '  KEY RULE: the tool-name key is EXACTLY "name" — never "tool", "tool_name", or any other key. Entries under any other key are dropped unread.\n'
         "}\n"
         "REGISTRY TOOL NAMES (use EXACTLY — any other name is denied):\n"
-        "  P1 OFI/tape: micro.capture_status, micro.events, micro.ofi_intervals, micro.replay, calc.ofi.intervals;\n"
-        "  P2 AD/fits: micro.fit_beta, micro.evidence, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
-        "  P3 correlate (substrate.read PRIMARY, market.read context): substrate.invoke + substrate.tape, substrate.density, substrate.delta, substrate.ladders, substrate.anchors, substrate.tiers, substrate.volume_profile, substrate.technicals, substrate.migration, substrate.oi, substrate.signals, substrate.large_print, then substrate.read; market.read, market.derivatives, market.keystone_history, market.wall_history;\n"
+        "  P1 OFI/tape: ns.read (micro.raw/micro.events/micro.ofi/micro.status/micro.book namespaces), micro.replay, calc.ofi.intervals;\n"
+        "  P2 AD/fits: ns.read (micro.evidence namespace), micro.fit_beta, calc.depth.average, calc.observation.build, calc.fit.price_impact, calc.fit.depth_scaling;\n"
+        "  P3 correlate: ns.read (derivatives.latest, substrate.<name>, analysis.<name>, inference.latest) — one namespace per call, cite <namespace> → <field>;\n"
         "  P5 derived (memory node pruned from the track — transport retained): calc.price.delta (alias calc.derived_diagnostic), calc.scenario.evaluate (price-target scenarios only);\n"
         "  P5 forward stack (Track D horizon-native): calc.forward.forecast (canonical ForecastResult), "
         "the feature/join/fit/distribution tools are diagnostic sub-tools, then calc.forward.scenario, "
@@ -311,9 +312,9 @@ def build_output_format() -> str:
         "does not dispose it, and it is never evidence.\n"
         "STAGED WORKFLOW (coverage is measured from tools you EXECUTE, not phases you declare):\n"
         "  P1 OFI inference → P2 AD inference (split — never merged) → P3 warm-plane correlation "
-        "(TWO-BEAT: invoke ≥1 substrate.* worker listed BEFORE substrate.read in the same tool_calls array; "
-        "substrate.read is the verdict, market.read is context; judge freshness via age_ms; "
-        "dormant/empty results are findings, never re-invoke) → "
+        "(command worker-state reads via ns.read on substrate.<name>/analysis.<name> namespaces; "
+        "ns.read returns the pared doc verbatim plus key/age_ms; "
+        "dormant/empty results are findings, never recompute) → "
         "P4 explanation (the why-now synthesis) → P5 derivation (calc.price.delta "
         "with an OFI value for the NUMERIC ΔP + band; H0/H1 grounding comes from the "
         "track's own evidence, formed in reasoning position 3) → "
@@ -395,7 +396,7 @@ TASK_CHAINS: dict[str, list[str]] = {
     # (loop_states.CHAIN_SUBLOOP + engine/core/chain.py). If this text ever
     # disagrees with that mapping, the mapping wins.
     "price_target": [
-        "market.read",
+        "ns.read",
         "calc.forward.forecast",
         "calc.forward.scenario",
         "calc.hypothesis.test",
@@ -406,7 +407,7 @@ TASK_CHAINS: dict[str, list[str]] = {
         # H0/H1-shaped task (task_directive.KINDS 'hypothesis'): the steady
         # track minus the scenario link — no target/invalidation is bound, so
         # calc.forward.scenario has nothing to price and would only refuse.
-        "market.read",
+        "ns.read",
         "calc.forward.forecast",
         "calc.hypothesis.test",
         "calc.decay.report",
@@ -419,7 +420,7 @@ TASK_CHAINS: dict[str, list[str]] = {
 }
 
 CHAIN_MEANING: dict[str, str] = {
-    "market.read": "current price + regime context (snapshot first)",
+    "ns.read": "current price + regime context (one namespace per call)",
     "calc.forward.forecast": "2b PROOF ONLY (never a context seed): schema-checked X_t, forward Y(h), train-only OOS, calibration gate, assumptions, and Route A/B diagnostics — earned by your interpret-position call; the plan-bound digest is context, not proof",
     "calc.feature.build": "condition on X_t — versioned state vector (diagnostic sub-step)",
     "calc.forward.join": "forward targets Y(h) + exclusion log (diagnostic sub-step)",
@@ -555,11 +556,10 @@ def json_dumps_short(value: Any, cap: int = 600) -> str:
 TOOL_WINDOWS: dict[str, str] = {
     "context": (
         "YOUR TOOLS THIS LOOP — gather in this order, cite each link: "
-        "micro.capture_status + micro.fit_beta (gate reads already done — do not re-pull); "
-        "market.read snapshot (current price + regime). "
-        "A substrate.* invoke is a REQUEST to the calculation plane, not a "
-        "guaranteed fresh compute — confirm what you actually got via "
-        "substrate.read age_ms. "
+        "ns.read on micro.status + micro.evidence namespaces (gate reads already done — do not re-pull); "
+        "ns.read for current price + regime (derivatives.latest, micro.evidence). "
+        "Worker state is read, never invoked — confirm what you actually got via "
+        "ns.read age_ms. "
         "The plan-bound calc.forward.forecast digest is CONTEXT (receipt authority, "
         "not agent proof) — read it from the envelope, do NOT re-call forecast here: "
         "the multivariate primary truth is earned agent-side in REASONING 2b only "
@@ -657,7 +657,7 @@ def seed_evidence_plan(
     task/scenario (no I/O, no LLM).
     """
     seeds: list[str] = [
-        "market.read",
+        "ns.read",
     ]
     rationale = ["context seeds are reads only — the multivariate proof "
                  "(calc.forward.forecast) is earned agent-side in 2b, never seeded"]
@@ -1317,22 +1317,19 @@ def compose_repair_prompt(
 
 PHASE_GUIDANCE: dict[str, str] = {
     "P1": ("PHASE P1 — OFI INFERENCE: call calc.ofi.intervals "
-           "(and/or micro.ofi_intervals). Judge tape quality: n vs minimum, "
+           "(and/or ns.read on the micro.ofi namespace). Judge tape quality: n vs minimum, "
            "capture gaps, hetero flag. Verdict: is this OFI tape usable or degraded, and why. "
            "You may vary interval_seconds (10/15/30) and window_minutes (15/30/60) in tool args."),
     "P2": ("PHASE P2 — AD INFERENCE: call calc.depth.average + "
            "calc.observation.build (and/or micro.fit_beta, calc.fit.price_impact). "
            "Judge AD stability and observation count separately from OFI — never merge. "
            "You may vary interval_seconds/window_minutes in tool args."),
-    "P3": ("PHASE P3 — CORRELATE: substrate.read is the PRIMARY evidence; market.read is context. "
-           "Available means: substrate.* workers (fire-tick invoke, then read), substrate.read, market.read "
-           "plus derivatives/keystone/wall histories as regime context. Work them in whatever order "
-           "answers the correlation — dispatches run sequentially, so order a read after the invoke "
-           "whose projection it must see. Constraints: an invoke is a REQUEST the calculation plane may "
-           "decline (cooldown gates) — available:false, fired:0, invoked:false, unreachable plane, or empty "
-           "upstream are FINDINGS to report and continue from, never reasons to retry, re-invoke, or stall. "
-           "Judge freshness from each projection's own age_ms against its own cadence (in the projection) — "
-           "never one global threshold. Cross-validate P1/P2 against the warm plane; name agreements AND "
+    "P3": ("PHASE P3 — CORRELATE: ns.read is the evidence (one namespace per call: "
+           "derivatives.latest, substrate.<name>, analysis.<name>, inference.latest as regime context). "
+           "Worker state is read-only — the agent never invokes workers. "
+           "Judge freshness from each read's own age_ms against its cadence — "
+           "never one global threshold. An empty read or unreachable plane is a FINDING "
+           "(report it and continue), never a retry. Cross-validate P1/P2 against the warm plane; name agreements AND "
            "contradictions explicitly."),
     "P4": ("PHASE P4 — EXPLAIN: no new tools required. Write the synthesis: what the fits show "
            f"(≥{SUMMARY_MIN_CHARS} chars in summary) AND why it is happening now — regime, capture quality, "

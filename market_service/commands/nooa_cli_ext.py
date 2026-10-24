@@ -134,7 +134,7 @@ async def _load_run_record(
             settings.redis_stream_maxlen,
         )
         try:
-            record = await redis.read_latest_canonical_output(
+            record = await redis.read("inference.latest", 
                 symbol.upper(), venue,
             )
             source = "redis"
@@ -247,36 +247,23 @@ def scope_cmd() -> None:
 def read_cmd(symbol: str, venue: str, run_id: str | None, mode: str) -> None:
     """Read LIVE venue-scoped Redis projections for one identity.
 
-    Shares ONE implementation with the agent's ``market.read`` tool. It used
-    to read the collated run plane, which has no writer (``publish_run`` and
-    ``insert_run`` have no production callers) — so the operator and the
-    agent could both be shown frozen prices with no age attached. Now both
-    read the live microstructure/derivative/substrate projections and every
-    number carries ``age_ms``.
+    Operator view over the live microstructure/derivative/substrate
+    projections — every number carries ``age_ms``. Shares its backend with
+    the interaction-plane read surface (``reads.read_ledger``).
     """
-    from market_service.nooa_harness.inference.tooling.tools_market import (
-        dispatch_market_read,
-    )
+    from market_service.interaction_plane import reads as _reads
 
     resolved = _resolve_args(symbol, venue)
 
     async def _op() -> dict:
-        settings = _settings()
-        redis = RedisRuntimeStore(
-            settings.redis_url, settings.redis_key_prefix,
-            settings.redis_stream_maxlen,
+        payload, _source, _ = await _reads.read_ledger(
+            resolved.symbol, mode=mode, venue=resolved.venue,
+            run_id=run_id,
         )
-        try:
-            payload, _log = await dispatch_market_read(
-                redis, resolved.symbol, mode=mode, venue=resolved.venue,
-                run_id=run_id,
-            )
-            return payload if payload is not None else {
-                "status": "denied", "symbol": resolved.symbol,
-                "venue": resolved.venue, "mode": mode,
-            }
-        finally:
-            await redis.close()
+        return payload if payload is not None else {
+            "status": "denied", "symbol": resolved.symbol,
+            "venue": resolved.venue, "mode": mode,
+        }
 
     _emit(asyncio.run(_op()))
 
@@ -664,7 +651,7 @@ def micro_fit(symbol: str, venue: str, interval_s: int, window_m: int,
         postgres = PostgresRuntimeStore(settings.database_url)
         try:
             # Capture-quality gate: refuse to fit over an unestablished capture.
-            status = await redis.read_microstructure_status(venue, symbol)
+            status = await redis.read("micro.status", ids={"venue": venue, "symbol": symbol})
             if status is None:
                 raise click.ClickException(
                     "no microstructure capture status found; start the "
@@ -676,7 +663,7 @@ def micro_fit(symbol: str, venue: str, interval_s: int, window_m: int,
                     "fitting is refused until capture quality is proven"
                 )
 
-            payloads = await redis.read_microstructure_events(venue, symbol)
+            payloads = await redis.read("micro.events", ids={"venue": venue, "symbol": symbol}, newest_first=False)
             events, dropped = fitting.replay_events_from_payloads(payloads)
             if not events:
                 raise click.ClickException(
@@ -727,7 +714,7 @@ def micro_fit(symbol: str, venue: str, interval_s: int, window_m: int,
             # Postgres-first durable ledger, then the Redis projection.
             await postgres.connect()
             persisted_pg = await postgres.insert_microstructure_evidence(evidence_dict)
-            await redis.publish_microstructure_evidence(venue, symbol, evidence_dict)
+            await redis.publish("micro.evidence", evidence_dict, ids={"venue": venue, "symbol": symbol})
 
             return {
                 "persisted": {"postgres": persisted_pg, "redis": True},
@@ -763,7 +750,7 @@ def micro_evidence(symbol: str, venue: str, evidence_id: str | None, use_latest:
                 symbol.upper(), venue, evidence_id,
             )
             if evidence is None and evidence_id is None:
-                evidence = await redis.read_microstructure_evidence(venue, symbol.upper())
+                evidence = await redis.read("micro.evidence", ids={"venue": venue, "symbol": symbol.upper()})
             return {"evidence": evidence}
         finally:
             await redis.close()
@@ -799,7 +786,7 @@ def micro_interpret(symbol: str, venue: str, evidence_id: str | None) -> None:
                 symbol.upper(), venue, evidence_id,
             )
             if evidence is None and evidence_id is None:
-                evidence = await redis.read_microstructure_evidence(venue, symbol.upper())
+                evidence = await redis.read("micro.evidence", ids={"venue": venue, "symbol": symbol.upper()})
             if evidence is None:
                 raise click.ClickException(
                     "no MicrostructureEvidence persisted; run "

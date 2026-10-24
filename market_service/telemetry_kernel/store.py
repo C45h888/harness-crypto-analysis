@@ -11,6 +11,9 @@ import json
 from typing import Any
 from urllib.parse import quote
 
+from market_service.runtime.redis_store import (
+    namespace_contract, namespace_key, namespace_retention,
+)
 from market_service.telemetry_kernel.contracts import TelemetryEvent
 
 _PUBLISH_EVENT_LUA = r"""
@@ -55,45 +58,62 @@ class TelemetryStore:
         postgres_store: Any | None = None,
         *,
         stream_maxlen: int | None = None,
-        marker_ttl_s: int = 2_592_000,
+        marker_ttl_s: int | None = None,
     ) -> None:
         self.redis_store = redis_store
         self.redis = redis_store.redis
         self.postgres_store = postgres_store
-        base_prefix = str(getattr(redis_store, "prefix", "marketflow") or "marketflow")
-        self.prefix = f"{base_prefix.strip(':')}:telemetry"
+        self.base_prefix = str(
+            getattr(redis_store, "prefix", "marketflow") or "marketflow"
+        ).strip(":")
+        # Introspection only — key composition goes through ``namespace_key``.
+        self.prefix = f"{self.base_prefix}:telemetry"
         self.stream_maxlen = max(1, int(
             stream_maxlen if stream_maxlen is not None
             else getattr(redis_store, "stream_maxlen", 10_000)
         ))
+        if marker_ttl_s is None:
+            marker_ttl_s = int(
+                namespace_retention("telemetry.dedupe").ttl_s or 0) or 2_592_000
         self.marker_ttl_s = max(1, int(marker_ttl_s))
 
     @staticmethod
     def _part(value: str) -> str:
         return quote(str(value), safe="-_.")
 
+    def _subject(self, plane: str, owner: str, subject_type: str,
+                 subject_id: str) -> dict[str, str]:
+        return dict(
+            plane=str(plane), owner=self._part(owner),
+            subject_type=self._part(subject_type),
+            subject_id=self._part(subject_id),
+        )
+
     def event_stream(self, event: TelemetryEvent) -> str:
-        return ":".join((
-            self.prefix, "events", event.plane, self._part(event.owner),
-            self._part(event.subject_type), self._part(event.subject_id),
-        ))
+        return namespace_key(
+            self.base_prefix, "telemetry.events",
+            **self._subject(event.plane, event.owner, event.subject_type,
+                            event.subject_id))
 
     def latest_key(self, event: TelemetryEvent) -> str:
-        return ":".join((
-            self.prefix, "latest", event.plane, self._part(event.owner),
-            self._part(event.subject_type), self._part(event.subject_id),
-        ))
+        return namespace_key(
+            self.base_prefix, "telemetry.latest",
+            **self._subject(event.plane, event.owner, event.subject_type,
+                            event.subject_id))
 
     def health_key(self, owner: str) -> str:
         """Per-owner sink/emitter health, OUTSIDE the event stream."""
-        return f"{self.prefix}:health:{self._part(owner)}"
+        return namespace_key(
+            self.base_prefix, "telemetry.health", owner=self._part(owner))
 
     def cursor_key(self, consumer: str) -> str:
         """Durable projection/replay cursor for one read consumer."""
-        return f"{self.prefix}:cursor:{self._part(consumer)}"
+        return namespace_key(
+            self.base_prefix, "telemetry.cursor", consumer=self._part(consumer))
 
     def _event_marker(self, event: TelemetryEvent) -> str:
-        return f"{self.prefix}:event-id:{event.event_id}"
+        return namespace_key(
+            self.base_prefix, "telemetry.dedupe", event_id=event.event_id)
 
     async def write_health(self, owner: str, payload: dict[str, Any]) -> None:
         """Write sink health directly — never through ``emit``.
@@ -102,6 +122,7 @@ class TelemetryStore:
         emit an event that can itself fail and re-degrade, unbounded. This
         is the non-recursive local surface the kernel owns.
         """
+        payload = namespace_contract("telemetry.health", payload)
         await self.redis.set(
             self.health_key(owner),
             json.dumps(payload, default=str, separators=(",", ":")),
@@ -111,6 +132,7 @@ class TelemetryStore:
         return await self._read_json(self.health_key(owner))
 
     async def write_cursor(self, consumer: str, cursor: dict[str, Any]) -> None:
+        cursor = namespace_contract("telemetry.cursor", cursor)
         await self.redis.set(
             self.cursor_key(consumer),
             json.dumps(cursor, default=str, separators=(",", ":")),
@@ -139,8 +161,14 @@ class TelemetryStore:
         return bool(await recorder(event.to_dict()))
 
     async def publish(self, event: TelemetryEvent, projection: dict[str, Any]) -> str:
-        body = json.dumps(event.to_dict(), default=str, separators=(",", ":"))
-        projected = json.dumps(projection, default=str, separators=(",", ":"))
+        body = json.dumps(
+            namespace_contract("telemetry.events", event.to_dict()),
+            default=str, separators=(",", ":"),
+        )
+        projected = json.dumps(
+            namespace_contract("telemetry.latest", projection),
+            default=str, separators=(",", ":"),
+        )
         result = await self.redis.eval(
             _PUBLISH_EVENT_LUA,
             3,
@@ -158,10 +186,9 @@ class TelemetryStore:
     async def read_projection(
         self, plane: str, owner: str, subject_type: str, subject_id: str,
     ) -> dict[str, Any] | None:
-        key = ":".join((
-            self.prefix, "latest", plane, self._part(owner),
-            self._part(subject_type), self._part(subject_id),
-        ))
+        key = namespace_key(
+            self.base_prefix, "telemetry.latest",
+            **self._subject(plane, owner, subject_type, subject_id))
         raw = await self.redis.get(key)
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
@@ -175,12 +202,12 @@ class TelemetryStore:
 
     async def replace_projection(self, projection: dict[str, Any]) -> None:
         """Restore a Redis materialized view from durable PG replay."""
-        key = ":".join((
-            self.prefix, "latest", str(projection["plane"]),
-            self._part(str(projection["owner"])),
-            self._part(str(projection["subject_type"])),
-            self._part(str(projection["subject_id"])),
-        ))
+        key = namespace_key(
+            self.base_prefix, "telemetry.latest",
+            **self._subject(
+                str(projection["plane"]), str(projection["owner"]),
+                str(projection["subject_type"]), str(projection["subject_id"]),
+            ))
         await self.redis.set(
             key, json.dumps(projection, default=str, separators=(",", ":")),
         )
@@ -201,10 +228,9 @@ class TelemetryStore:
                 subject_id=subject_id, limit=limit,
             )
         rows = await self.redis.xrevrange(
-            ":".join((
-                self.prefix, "events", plane, self._part(owner),
-                self._part(subject_type), self._part(subject_id),
-            )),
+            namespace_key(
+                self.base_prefix, "telemetry.events",
+                **self._subject(plane, owner, subject_type, subject_id)),
             count=max(1, int(limit)),
         )
         events: list[dict[str, Any]] = []

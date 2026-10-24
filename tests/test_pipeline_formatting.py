@@ -11,7 +11,6 @@ Covers the fixes to the information pipeline (2026-08 pass):
 - ``_adapt_wall_migration`` INSUFFICIENT_DATA shape on an empty book.
 - ``read_raw_window`` measured coverage block + evidence-time ``observed_at``.
 - ``_merge_derivatives`` records bar-period/series metadata.
-- ``_wall_snapshot_payload`` preserves null fuel metrics (no 0.0 fabrication).
 - ``_enrich_fut_keystone`` resolves only the ``ask`` alias.
 """
 
@@ -28,7 +27,6 @@ from market_service.nooa_harness.pipeline import (
     _adapt_wall_migration,
     _enrich_fut_keystone,
     _merge_derivatives,
-    _wall_snapshot_payload,
     read_raw_window,
     run_calculations,
 )
@@ -134,6 +132,16 @@ class ReadRawWindowCoverageTests(unittest.TestCase):
         async def read_raw_window(self, symbol: str, since_ms: int):
             return self._snapshots
 
+        async def read_raw_oldest_ms(self, symbol: str):
+            return None
+
+        async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+            if namespace == "raw.latest":
+                return self._latest
+            if namespace == "raw.stream":
+                return list(self._snapshots)
+            return None
+
     async def _run(self, latest, snapshots):
         return await read_raw_window(self._FakeRedis(latest, snapshots), "SOLUSDT", 15)
 
@@ -184,31 +192,6 @@ class MergeDerivativesMetaTests(unittest.TestCase):
     def test_no_derivatives_no_meta(self):
         out = _merge_derivatives({"spot": {}, "futures": {}}, None)
         self.assertNotIn("derivatives_meta", out)
-
-
-class WallSnapshotPayloadNullTests(unittest.TestCase):
-    def test_degraded_analysis_preserves_null_fuel(self):
-        analysis = {"analysis": {"wall_migration": {
-            "verdict": "INSUFFICIENT_DATA", "fuel_ratio": None,
-            "inputs_used": {"fuel_ratio_value": None, "ask_walls_built": 0,
-                            "ask_walls_eroded": 0},
-        }}}
-        evidence = {"futures": {"order_book": {"bids": [], "asks": []}}}
-        payload = _wall_snapshot_payload("SOLUSDT", "run-1", evidence, analysis)
-        self.assertIsNone(payload["fuel_ratio"])
-        self.assertIsNone(payload["bid_pool"])
-
-    def test_measured_fuel_is_kept(self):
-        analysis = {"analysis": {"wall_migration": {
-            "fuel_ratio": {"ratio": 1.3, "bid_pool": 10.0, "ask_pool": 7.0,
-                           "bid_floor": 97.0, "ask_target": 103.0},
-            "inputs_used": {"fuel_ratio_value": 1.3, "ask_walls_built": 1,
-                            "ask_walls_eroded": 0},
-        }}}
-        evidence = {"futures": {"order_book": {"bids": [], "asks": []}}}
-        payload = _wall_snapshot_payload("SOLUSDT", "run-1", evidence, analysis)
-        self.assertEqual(payload["fuel_ratio"], 1.3)
-        self.assertEqual(payload["bid_pool"], 10.0)
 
 
 class CorrelationSectionReuseTests(unittest.TestCase):

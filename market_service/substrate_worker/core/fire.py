@@ -665,8 +665,7 @@ class FireMixin(SubstrateBase):
         wanted = type(self).DERIVATIVE_INPUTS
         if not wanted:
             return None
-        reader = _store_fn(self.store, "read_derivative_evidence")
-        deriv = await reader(self.symbol) if callable(reader) else None
+        deriv = await self.store.read("derivatives.latest", ids={"symbol": self.symbol})
         observed = (deriv or {}).get("observed_at_ms")
         age_ms = now_ms - int(observed) if isinstance(observed, (int, float)) else None
         fresh_ms = type(self).DERIVATIVE_FRESH_MS
@@ -713,7 +712,7 @@ class FireMixin(SubstrateBase):
         loaded: dict[str, Any] = {}
         for name in type(self).DEPENDENCIES:
             try:
-                latest = await self.store.read_substrate_latest(name, self.symbol)
+                latest = await self.store.read(f"substrate.{name.lower()}", ids={"symbol": self.symbol})
             except Exception as exc:
                 log.warning("substrate %s dependency %s read failed: %s",
                             self.SUBSTRATE_NAME, name, exc)

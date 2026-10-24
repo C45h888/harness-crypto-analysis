@@ -49,6 +49,26 @@ class _FakeRedis:
 
 
 class _FakeStore:
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        from tests._singular_compat import fake_publish
+        return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
+
+    def ns(self, namespace):
+        from tests._singular_compat import fake_ns
+        return fake_ns(namespace)
+
+    def key(self, namespace, **ids):
+        try:
+            inner = ":".join(f"{k}={v}" for k, v in sorted(ids.items()))
+        except Exception:
+            inner = ""
+        return f"fake:{namespace}:{inner}"
     def __init__(self, *, capture_state: str = "running", event_len: int = 5_000):
         self.redis = _FakeRedis()
         self._capture_state = capture_state
@@ -186,7 +206,7 @@ def _good_narration(with_tools: bool = False) -> str:
     }
     if with_tools:
         payload["tool_calls"] = [
-            {"name": "micro.capture_status", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+            {"name": "ns.read", "args": {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.status"}},
         ]
     return json.dumps(payload)
 
@@ -237,7 +257,7 @@ def _staged_narration(phase: str, tools: list[dict] | None = None, *, final: boo
 
 # Agent-first fetch turn: the agent pulls the two gate reads itself.
 _FETCH_TURN = _staged_narration("P1", tools=[
-    {"name": "micro.capture_status", "args": {}},
+    {"name": "ns.read", "args": {"namespace": "micro.status"}},
     {"name": "micro.fit_beta", "args": {}},
 ])
 
@@ -401,14 +421,16 @@ class E2ETerminalTests(unittest.IsolatedAsyncioTestCase):
             _staged_narration("P1", tools=[
                 {"name": "calc.ofi.intervals",
                  "args": {"symbol": "BTCUSDT", "venue": "spot"}},
-                {"name": "micro.ofi_intervals",
-                 "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "ns.read",
+                 "args": {"symbol": "BTCUSDT", "venue": "spot",
+                         "namespace": "micro.ofi"}},
             ]),
             _staged_narration("P2", tools=[
                 {"name": "calc.depth.average",
                  "args": {"symbol": "BTCUSDT", "venue": "spot"}},
-                {"name": "market.derivatives",
-                 "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+                {"name": "ns.read",
+                 "args": {"symbol": "BTCUSDT", "venue": "spot",
+                         "namespace": "derivatives.latest"}},
             ]),
             _staged_narration("P5", tools=[
                 {"name": "calc.price.delta",

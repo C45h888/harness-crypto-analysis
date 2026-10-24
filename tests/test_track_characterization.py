@@ -42,11 +42,11 @@ def _evidence_prefix() -> list[str]:
     """
     return [
         _staged_narration("P1", tools=[
-            {"name": "micro.ofi_intervals", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+            {"name": "ns.read", "args": {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.ofi"}},
         ]),
         _staged_narration("P2", tools=[
             {"name": "calc.depth.average", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
-            {"name": "market.derivatives", "args": {"symbol": "BTCUSDT", "venue": "spot"}},
+            {"name": "ns.read", "args": {"symbol": "BTCUSDT", "venue": "spot", "namespace": "derivatives.latest"}},
         ]),
         _staged_narration("P5", tools=[
             {"name": "calc.price.delta", "args": {"symbol": "BTCUSDT", "venue": "spot", "ofi": "10"}},

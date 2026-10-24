@@ -38,6 +38,26 @@ def _event_payload(k: int, contribution: str, ts: int) -> dict:
 
 
 class _FakeStore:
+
+    async def read(self, namespace, *, ids=None, count=None, newest_first=True, start="-", end="+"):
+        from tests._singular_compat import fake_read
+        return await fake_read(self, namespace, ids=ids, count=count, newest_first=newest_first, start=start, end=end)
+
+    async def publish(self, namespace, payload, *, ids=None, **kw):
+        from tests._singular_compat import fake_publish
+        return await fake_publish(self, namespace, payload, ids=ids, **kw)
+
+
+    def ns(self, namespace):
+        from tests._singular_compat import fake_ns
+        return fake_ns(namespace)
+
+    def key(self, namespace, **ids):
+        try:
+            inner = ":".join(f"{k}={v}" for k, v in sorted(ids.items()))
+        except Exception:
+            inner = ""
+        return f"fake:{namespace}:{inner}"
     """Minimal store double: only the microstructure event/interval reads."""
 
     def __init__(self, events: list[dict] | None = None):
@@ -72,13 +92,12 @@ class _FakeStore:
 
 
 class ToolRegistryTests(unittest.TestCase):
-    def test_nineteen_tools_registered(self):
-        # 6 micro + 6 Pass-C split calc + calc.price.delta + calc.scenario.evaluate
-        # + 4 market (group removed with run_cycle) + 14 substrate
-        # + 11 Track A forward stack (canonical forecast + feature/forward x4/
-        # hypothesis/events x2/decay/discipline) + 4 agent memory tools
-        # (memory.remember/recall/forget/stats).
-        self.assertEqual(len(TOOL_NAMES), 47)
+    def test_registry_holds_the_pruned_surface(self):
+        # ns.read (the only state read) + micro replay/fit + calc families
+        # + 4 agent memory tools. Composite market/substrate/micro reads
+        # and substrate invoke aliases are deleted.
+        self.assertEqual(len(TOOL_NAMES), 26)
+        self.assertIn("ns.read", TOOL_NAMES)
 
     def test_every_tool_backed_by_a_capability(self):
         for tool, capability in TOOL_NAMES.items():
@@ -100,8 +119,8 @@ class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
     def test_out_of_scope_symbol_denied(self):
         from types import SimpleNamespace
         result, log = _run(execute_tool(
-            _FakeStore(), "micro.capture_status",
-            {"symbol": "XRPUSDT", "venue": "spot"},
+            _FakeStore(), "ns.read",
+            {"symbol": "XRPUSDT", "venue": "spot", "namespace": "micro.status"},
             settings=SimpleNamespace(symbols=("SOLUSDT",), venue="futures"),
         ))
         self.assertIsNone(result)
@@ -110,29 +129,30 @@ class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
 
     def test_out_of_scope_venue_denied(self):
         result, log = _run(execute_tool(
-            _FakeStore(), "micro.capture_status",
-            {"symbol": "BTCUSDT", "venue": "binance-options"},
+            _FakeStore(), "ns.read",
+            {"symbol": "BTCUSDT", "venue": "binance-options", "namespace": "micro.status"},
         ))
         self.assertIsNone(result)
         self.assertEqual(log["result"], "denied")
 
-    def test_capture_status_dispatches_ok(self):
+    def test_ns_read_status_dispatches_ok(self):
         result, log = _run(execute_tool(
-            _FakeStore(), "micro.capture_status",
-            {"symbol": "BTCUSDT", "venue": "spot"},
+            _FakeStore(), "ns.read",
+            {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.status"},
         ))
         self.assertEqual(log["result"], "ok")
-        self.assertEqual(result["state"], "running")
+        self.assertEqual(result["namespace"], "micro.status")
+        self.assertEqual(result["data"]["state"], "running")
 
-    def test_events_returns_payloads(self):
+    def test_ns_read_events_returns_payloads(self):
         payloads = [_event_payload(1, "5", 1_000), _event_payload(2, "3", 2_000)]
         result, log = _run(execute_tool(
-            _FakeStore(events=payloads), "micro.events",
-            {"symbol": "BTCUSDT", "venue": "spot"},
+            _FakeStore(events=payloads), "ns.read",
+            {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.events"},
         ))
         self.assertEqual(log["result"], "ok")
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["contribution"], "5")
+        self.assertEqual(len(result["data"]), 2)
+        self.assertEqual(result["data"][0]["contribution"], "5")
 
     def test_replay_is_pure_and_deterministic(self):
         payloads = [_event_payload(1, "5", 1_000)]
@@ -154,8 +174,8 @@ class ExecuteToolTests(unittest.IsolatedAsyncioTestCase):
 
     def test_log_entries_carry_capability_scope_result(self):
         _result, log = _run(execute_tool(
-            _FakeStore(), "micro.capture_status",
-            {"symbol": "BTCUSDT", "venue": "spot"},
+            _FakeStore(), "ns.read",
+            {"symbol": "BTCUSDT", "venue": "spot", "namespace": "micro.status"},
         ))
         self.assertIn("capability", log)
         self.assertIn("scope", log)
@@ -213,9 +233,8 @@ class ToolAliasTests(unittest.TestCase):
     def test_separator_variants_resolve(self):
         self.assertEqual(_normalize_tool_name("calc.ofi_intervals"), "calc.ofi.intervals")
         self.assertEqual(_normalize_tool_name("calc.depth_average"), "calc.depth.average")
-        self.assertEqual(_normalize_tool_name("micro.ofi.intervals"), "micro.ofi_intervals")
-        self.assertEqual(_normalize_tool_name("micro.fit.beta"), "micro.fit_beta")
-        self.assertEqual(_normalize_tool_name("  MARKET.READ  "), "market.read")
+        self.assertEqual(_normalize_tool_name("ns_read"), "ns.read")
+        self.assertEqual(_normalize_tool_name("  NS.READ  "), "ns.read")
 
     def test_truncated_aliases_resolve(self):
         self.assertEqual(_normalize_tool_name("calc.ofi"), "calc.ofi.intervals")

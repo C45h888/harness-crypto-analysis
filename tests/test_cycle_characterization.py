@@ -46,13 +46,13 @@ async def capture(case, stage_trace=None):
     # rejected on the missing discipline citation — the repair turn
     # dispatches calc.discipline.audit in the validation home, then the
     # final passes; the spare trailing P6 is the composition pass.
-    p1_read = _staged_narration("P1", tools=[{"name": "micro.capture_status"},
+    p1_read = _staged_narration("P1", tools=[{"name": "ns.read", "args": {"namespace": "micro.status", "symbol": "BTCUSDT", "venue": "spot"}},
                                             {"name": "micro.fit_beta"},
-                                            {"name": "market.read"}])
+                                            {"name": "ns.read", "args": {"namespace": "derivatives.latest", "symbol": "BTCUSDT", "venue": "spot"}}])
     success_turns = [
         p1_read,
         _staged_narration("P2", tools=[{"name": "calc.depth.average"},
-                                       {"name": "market.derivatives"}]),
+                                       {"name": "ns.read", "args": {"namespace": "derivatives.latest", "symbol": "BTCUSDT", "venue": "spot"}}]),
         _staged_narration("P5", tools=[{"name": "calc.price.delta"}]),
         _track_tools(*_TRACK_ASSEMBLE),
         _track_tools(*_TRACK_INTERPRET),
@@ -177,9 +177,13 @@ async def capture(case, stage_trace=None):
         effects.append(["postgres", output.to_dict()])
         return True
 
-    async def publish_redis(output):
-        effects.append(["redis", output.to_dict()])
-        return "fixture-id"
+    _real_publish = store.publish
+
+    async def publish_redis(namespace, payload, *, ids=None, **kw):
+        if namespace == "inference.latest":
+            effects.append(["redis", payload.to_dict()])
+            return "fixture-id"
+        return await _real_publish(namespace, payload, ids=ids, **kw)
 
     remember = memory.remember
     async def remember_spy(*args, **kwargs):
@@ -202,7 +206,7 @@ async def capture(case, stage_trace=None):
         engine, "_call_llm", side_effect=llm,
     ), patch.object(postgres, "insert_canonical_output", side_effect=place_pg), patch.object(
         postgres, "update_canonical_output", side_effect=update_pg,
-    ), patch.object(store, "publish_canonical_output", side_effect=publish_redis,
+    ), patch.object(store, "publish", side_effect=publish_redis,
     ), patch.object(memory, "remember", side_effect=remember_spy):
             output, meta = await engine.narrate_cycle(_wake(), {"decision": "fire"}, task="Explain the evidence")
     finally:

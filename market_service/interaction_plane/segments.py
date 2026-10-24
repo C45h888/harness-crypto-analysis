@@ -16,29 +16,20 @@ SEGMENTS: dict[str, dict] = {
     "warm": {
         "planes": ("redis",),
         "modes": ("compact", "full"),
-        "tools": ("substrate.read",),
-        "description": "warm-plane worker projections per (substrate, symbol) + age_ms",
+        "tools": ("ns.read",),
+        "description": "warm-plane worker projections per (substrate, symbol) + age_ms (via ns.read namespaces)",
     },
     "ledger": {
         "planes": ("redis",),
         "modes": ("snapshot", "inventory", "full"),
-        "tools": ("market.read",),
+        "tools": ("ns.read",),
         "description": "live venue-scoped projections (microstructure + derivatives + substrate), Redis-only",
     },
     "micro": {
         "planes": ("redis",),
         "modes": ("compact", "full"),
-        "tools": (
-            "micro.capture_status", "micro.events", "micro.ofi_intervals",
-            "micro.evidence", "micro.fit_beta",
-        ),
-        "description": "isolated microstructure capture health + tape",
-    },
-    "history": {
-        "planes": ("redis", "postgres"),
-        "modes": ("compact", "full"),
-        "tools": ("market.keystone_history", "market.wall_history"),
-        "description": "cross-cycle keystone / wall ledgers + migration verdict",
+        "tools": ("micro.status", "micro.events", "micro.ofi", "micro.evidence", "micro.fit_beta"),
+        "description": "isolated microstructure capture health + tape (via ns.read namespaces)",
     },
     "inference": {
         "planes": ("redis", "postgres"),
@@ -62,7 +53,6 @@ HUMAN_ONLY_MODES: frozenset[str] = frozenset({"full"})
 FLAG_SEGMENTS: dict[str, str] = {
     "substrate_read": "warm",
     "read": "ledger",
-    "keystone_history": "history",
     "microstructure_status": "micro",
     "inference": "inference",
     "poller": "control",

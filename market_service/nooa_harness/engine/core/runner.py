@@ -363,7 +363,7 @@ async def place_output(
         placement["redis_skipped"] = True
         return placement
     try:
-        await engine.store.publish_canonical_output(output)
+        await engine.store.publish("inference.latest", output, ids={"symbol": output.symbol, "venue": output.venue})
         placement["redis"] = True
     except Exception as exc:
         log.exception("canonical output projection failed")
@@ -419,7 +419,7 @@ async def finalize_output(
     if not result["postgres"]:
         return result
     try:
-        await engine.store.publish_canonical_output(output)
+        await engine.store.publish("inference.latest", output, ids={"symbol": output.symbol, "venue": output.venue})
         result["redis"] = True
     except Exception as exc:
         log.exception("canonical output projection refresh failed")

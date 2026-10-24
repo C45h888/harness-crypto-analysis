@@ -122,9 +122,9 @@ class AnalysisHttpApp:
         plane = "analysis"
         symbol = request.query.get("symbol", "SOLUSDT").upper()
         substrate = request.query.get("substrate", "").lower()
-        latest = await self.store.read_governance_latest(plane, symbol, substrate=substrate)
-        history = await self.store.read_governance_history(plane, symbol, count=50)
-        denials = await self.store.read_governance_denials(plane, symbol, count=20)
+        latest = await self.store.read("governance.latest", ids={"plane": plane, "symbol": symbol, "name": substrate} if substrate else {"plane": plane, "symbol": symbol})
+        history = await self.store.read("governance.stream", ids={"plane": plane, "symbol": symbol}, count=50)
+        denials = await self.store.read("governance.denials", ids={"plane": plane, "symbol": symbol}, count=20)
         alive = await self.store.governance_alive(plane, symbol)
         return web.json_response({
             "plane": plane,

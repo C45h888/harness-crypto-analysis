@@ -216,12 +216,7 @@ class MemoryNode:
         if not inserted:
             raise RuntimeError(f"memory insert returned no row for id={memory.memory_id}")
         # Live projection only after the durable row exists.
-        stream_id = await self.redis.publish_agent_artifact(
-            memory.session_id,
-            "memory",
-            memory.to_json(),
-            run_id=memory.run_id,
-        )
+        stream_id = await self.redis.publish("agent.artifacts", memory.to_json(), ids={"session": memory.session_id, "artifact": "memory"}, run_id=memory.run_id)
         log.debug(
             "memory.remember id=%s kind=%s run_id=%s redis=%s",
             memory.memory_id[:8], memory.kind, memory.run_id, stream_id,
@@ -257,7 +252,7 @@ class MemoryNode:
             raise ValueError("limit must be >= 1")
         memories: list[AgentMemory] = []
         if redis_first:
-            memories = await self.redis.read_recent_memories(session_id, count=limit * 4)
+            memories = await self.redis.read("agent.artifacts", ids={"session": session_id, "artifact": "memory"}, count=limit * 4)
             if kind is not None:
                 memories = [m for m in memories if m.kind == kind]
             if run_id is not None:
@@ -300,12 +295,7 @@ class MemoryNode:
             return None
         updated = await self.postgres.read_memory(memory_id)
         if updated is not None:
-            await self.redis.publish_agent_artifact(
-                str(session_id),
-                "memory",
-                updated.to_json(),
-                run_id=updated.run_id,
-            )
+            await self.redis.publish("agent.artifacts", updated.to_json(), ids={"session": str(session_id), "artifact": "memory"}, run_id=updated.run_id)
         return updated
 
     async def stats(self, session_id: str) -> dict[str, Any]:

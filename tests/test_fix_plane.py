@@ -221,7 +221,7 @@ class RootsIdentityTests(unittest.TestCase):
         }
         passed, missing = validate_final_turn(parsed, {
             "P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
-            "P3": {"market.read"}, "P5": {"calc.price.delta"}, "P6": {"declared"},
+            "P3": {"ns.read"}, "P5": {"calc.price.delta"}, "P6": {"declared"},
         })
         self.assertTrue(
             not any("roots" in m for m in missing), missing)
@@ -242,7 +242,7 @@ class RootsIdentityTests(unittest.TestCase):
         }
         _passed, missing = validate_final_turn(parsed, {
             "P1": {"calc.ofi.intervals"}, "P2": {"calc.depth.average"},
-            "P3": {"market.read"}, "P5": {"calc.price.delta"}, "P6": {"declared"},
+            "P3": {"ns.read"}, "P5": {"calc.price.delta"}, "P6": {"declared"},
         })
         self.assertTrue(any("roots" in m for m in missing), missing)
 
@@ -259,104 +259,72 @@ class SchemaParityTests(unittest.TestCase):
         }
         fields = set(NarrationTurn.model_fields)
         self.assertEqual(contract_keys - fields, set())
-
-
 class EmptyReadSurfaceTests(unittest.TestCase):
-    """An empty read returns the surface inventory as DATA, never a null."""
+    """An empty read names the probed key — never a null, never invented data."""
 
-    def test_empty_market_read_is_citable(self):
+    def test_empty_ns_read_is_citable(self):
         from market_service.nooa_harness.inference.tooling.tools_market import (
-            dispatch_market_read,
+            dispatch_ns_read,
         )
-
-        class _Redis:
-            async def get(self, key):
-                return None
-
-            async def xlen(self, key):
-                return 0
 
         class _Store:
             prefix = "marketflow"
-            redis = _Redis()
 
-            def collated_latest_key(self, symbol):
-                return f"marketflow:latest:{symbol}:collated"
-
-            def collated_stream(self, symbol):
-                return f"marketflow:stream:collated:{symbol}"
-
-            def domain_latest_key(self, symbol, source):
-                return f"marketflow:latest:{symbol}:{source}"
-
-            def wall_history_stream(self, symbol):
-                return f"marketflow:history:{symbol}:walls"
-
-            def keystone_history_stream(self, symbol):
-                return f"marketflow:history:{symbol}:keystones"
-
-        result, log = asyncio.run(dispatch_market_read(
-            _Store(), "SOLUSDT", venue="futures"))
-        self.assertIsNotNone(result)
-        self.assertEqual(result["status"], "empty")
-        self.assertIn("checked", result)
-        self.assertIn("read_tools", result)
-        self.assertIn("market.read", result["read_tools"])
-        self.assertEqual(log["detail"]["status"], "empty")
-
-    def test_surfaces_mode_lists_every_plane(self):
-        from market_service.nooa_harness.inference.tooling.tools_market import (
-            dispatch_market_read,
-        )
-
-        class _Redis:
-            async def get(self, key):
+            async def read(self, namespace, *, ids=None, count=None,
+                           newest_first=True, start="-", end="+"):
                 return None
 
-            async def xlen(self, key):
-                return 3
+            def key(self, namespace, **ids):
+                venue = str(ids.get("venue", "futures")).lower()
+                symbol = str(ids.get("symbol", "SOLUSDT")).upper()
+                return f"marketflow:latest:microstructure:{venue}:{symbol}:evidence"
+
+            def ns(self, namespace):
+                from tests._singular_compat import fake_ns
+                return fake_ns(namespace)
+
+            async def read_poller_symbols(self):
+                return None
+
+        result, log = asyncio.run(dispatch_ns_read(
+            _Store(), "SOLUSDT", namespace="micro.evidence", venue="futures"))
+        self.assertIsNone(result)
+        self.assertEqual(log["detail"]["status"], "empty")
+        self.assertEqual(log["detail"]["namespace"], "micro.evidence")
+        self.assertIn("microstructure:futures:SOLUSDT", log["detail"]["key"])
+
+    def test_unknown_namespace_is_a_structured_error(self):
+        from market_service.nooa_harness.inference.tooling.tools_market import (
+            dispatch_ns_read,
+        )
 
         class _Store:
-            redis = _Redis()
+            prefix = "marketflow"
 
-            def collated_latest_key(self, symbol):
-                return "a"
+            async def read(self, namespace, *, ids=None, count=None,
+                           newest_first=True, start="-", end="+"):
+                raise AssertionError("must not reach the store")
 
-            def collated_stream(self, symbol):
-                return "b"
+            async def read_poller_symbols(self):
+                return None
 
-            def domain_latest_key(self, symbol, source):
-                return f"d:{source}"
+        result, log = asyncio.run(dispatch_ns_read(
+            _Store(), "SOLUSDT", namespace="nope.unknown", venue="futures"))
+        self.assertIsNone(result)
+        self.assertEqual(log["result"], "error")
 
-            def wall_history_stream(self, symbol):
-                return "w"
 
-            def keystone_history_stream(self, symbol):
-                return "k"
-
-        result, _log = asyncio.run(dispatch_market_read(
-            _Store(), "SOLUSDT", venue="futures", mode="surfaces"))
-        self.assertIn("surfaces", result)
-        # The inventory names the LIVE planes this tool actually consults.
-        # The former collated / domain / wall / keystone planes were dropped:
-        # their publishers have no production caller, so an inventory of them
-        # described data nothing writes.
-        self.assertEqual(
-            set(result["surfaces"]),
-            {"microstructure", "derivatives", "substrate"})
-        self.assertIn("read_tools", result)
-        self.assertIn("market.read", result["read_tools"])
 
 
 class ArgContractTests(unittest.TestCase):
     """Arg domains are rendered from the deterministic base, not prose."""
 
-    def test_arg_block_names_horizon_domain_and_read_modes(self):
+    def test_arg_block_names_horizon_domain_and_ns_read(self):
         from market_service.nooa_harness.engine.tool_schemas import tool_arg_block
         block = tool_arg_block()
         self.assertIn("900000, 3600000, 14400000", block)
         self.assertIn("LONG-HORIZON BRIDGE", block)
-        self.assertIn("surfaces", block)
+        self.assertIn("ns.read", block)
         self.assertIn("ENGINE-SUPPLIED", block)
 
     def test_validation_retry_budget(self):
@@ -418,7 +386,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_HYPOTHESIZE),
             _good_narration(),                 # thin close, no H0
             # repair #1 pulls the audit AND covers P3 (market reads)
-            _track_tools("market.read", "market.derivatives",
+            _track_tools("ns.read:micro.evidence", "ns.read:derivatives.latest",
                          *_TRACK_DISCIPLINE),
             _good_narration(),                 # repair #1 close
             _good_narration(),                 # repair #2 close (budget 2)
@@ -492,7 +460,7 @@ class ForcedFinalTests(unittest.IsolatedAsyncioTestCase):
             _track_tools(*_TRACK_FORECAST),
             _track_tools(*_TRACK_HYPOTHESIZE),
             _good_narration(),
-            _track_tools("market.read", "market.derivatives",
+            _track_tools("ns.read:micro.evidence", "ns.read:derivatives.latest",
                          *_TRACK_DISCIPLINE),
             _good_narration(),
             _good_narration(),

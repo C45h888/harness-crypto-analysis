@@ -119,16 +119,11 @@ class GovernanceLedger:
 
         entry_id: str | None = None
         try:
-            publisher = getattr(self.store, "publish_governance_decision", None)
-            if callable(publisher):
-                entry_id = await publisher(
-                    record.plane, record.substrate, record.symbol,
-                    record.to_dict(),
-                )
-                self._stats.redis_written += 1
-            else:
-                self._stats.redis_failures += 1
-                self._stats.last_error = "redis: no governance keyspace surface"
+            entry_id = await self.store.publish(
+                "governance.latest", record.to_dict(),
+                ids={"plane": record.plane, "substrate": record.substrate, "symbol": record.symbol},
+            )
+            self._stats.redis_written += 1
         except Exception as exc:
             self._stats.redis_failures += 1
             self._stats.last_error = f"redis: {exc!r}"
@@ -153,11 +148,10 @@ class GovernanceLedger:
 
     async def inspect(self, plane: str, symbol: str) -> dict[str, Any]:
         """Read the plane's latest governance decisions (Redis-only, safe)."""
-        reader = getattr(self.store, "read_governance_latest", None)
-        if not callable(reader):
-            return {"plane": plane, "symbol": symbol.upper(), "available": False}
         try:
-            latest = await reader(plane, symbol)
+            latest = await self.store.read(
+                "governance.latest", ids={"plane": plane, "symbol": symbol},
+            )
         except Exception:
             latest = None
         return {

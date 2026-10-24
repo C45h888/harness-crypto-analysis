@@ -167,7 +167,7 @@ async def resolve_live_scope(settings: Any, store: Any) -> ScopeResolution:
     never hard-fail the scope read itself.
     """
     try:
-        control = await store.read_poller_symbols()
+        control = await store.read("poller.active", ids={})
     except Exception:  # noqa: BLE001 — fall back to env resolution
         control = None
     if control:
