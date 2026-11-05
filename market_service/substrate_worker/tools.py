@@ -20,6 +20,7 @@ Design rules (no legacy debt carried forward):
 from __future__ import annotations
 
 import time
+import os
 from typing import Any
 
 from market_service.runtime import read_paths
@@ -116,7 +117,7 @@ async def invoke_many(
     import asyncio as _asyncio
 
     names = [s.lower() for s in (substrates or sorted(WORKER_REGISTRY))]
-    sem = _asyncio.Semaphore(4)
+    sem = _asyncio.Semaphore(max(1, int(os.getenv("SUBSTRATE_INVOKE_CONCURRENCY", "2"))))
 
     async def _one(name: str) -> dict[str, Any]:
         async with sem:

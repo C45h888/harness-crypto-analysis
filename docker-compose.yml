@@ -10,6 +10,7 @@ services:
     user: "redis"
     command: ["/usr/local/bin/redis-entrypoint.sh"]
     environment:
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-1400mb}
       TELEMETRY_HYGIENE_INTERVAL_S: "86400"
       TELEMETRY_HYGIENE_MIN_AGE_S: "3600"
       REDIS_HYGIENE_URL: "unix:///tmp/redis.sock"
@@ -25,6 +26,8 @@ services:
       REDIS_PRUNE_URL: "unix:///tmp/redis.sock"
     ports:
       - "127.0.0.1:6379:6379"
+    cpus: ${REDIS_CPUS:-0.5}
+    mem_limit: ${REDIS_MEM_LIMIT:-1600m}
     volumes:
       - redis_data:/data
     healthcheck:
@@ -37,12 +40,15 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    command: ["postgres", "-c", "shared_buffers=${POSTGRES_SHARED_BUFFERS:-192MB}", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-60}"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-marketflow}
       POSTGRES_USER: ${POSTGRES_USER:-marketflow}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
       - "127.0.0.1:5433:5432"
+    cpus: ${POSTGRES_CPUS:-0.5}
+    mem_limit: ${POSTGRES_MEM_LIMIT:-768m}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
@@ -57,6 +63,8 @@ services:
   # One-shot schema bootstrap via Alembic. Runs once on `up`, exits.
   db-init:
     build: .
+    cpus: ${DB_INIT_CPUS:-0.5}
+    mem_limit: ${DB_INIT_MEM_LIMIT:-512m}
     command: ["alembic", "upgrade", "head"]
     env_file:
       - path: .env
@@ -77,6 +85,8 @@ services:
     build: .
     user: "marketflow"
     command: ["python", "-m", "market_service.poller"]
+    cpus: ${POLLER_CPUS:-0.5}
+    mem_limit: ${POLLER_MEM_LIMIT:-512m}
     env_file:
       - path: .env
         required: false
@@ -122,6 +132,8 @@ services:
     build: .
     user: "marketflow"
     command: ["python", "-m", "market_service.microstructure.capture", "${MICROSTRUCTURE_SYMBOL:-SOLUSDT}"]
+    cpus: ${MICROSTRUCTURE_CPUS:-0.5}
+    mem_limit: ${MICROSTRUCTURE_MEM_LIMIT:-512m}
     env_file:
       - path: .env
         required: false
@@ -130,7 +142,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-marketflow}
       MICROSTRUCTURE_VENUE: ${MICROSTRUCTURE_VENUE:-futures}
-      MICROSTRUCTURE_STREAM_MAXLEN: ${MICROSTRUCTURE_STREAM_MAXLEN:-100000}
+      MICROSTRUCTURE_STREAM_MAXLEN: ${MICROSTRUCTURE_STREAM_MAXLEN:-10000}
       MICROSTRUCTURE_SNAPSHOT_LEVELS: ${MICROSTRUCTURE_SNAPSHOT_LEVELS:-1000}
       MICROSTRUCTURE_RECONNECT_SECONDS: ${MICROSTRUCTURE_RECONNECT_SECONDS:-2}
       MICROSTRUCTURE_INTERVAL_SECONDS: ${MICROSTRUCTURE_INTERVAL_SECONDS:-10}
@@ -159,6 +171,8 @@ services:
     image: crypto-ai-anal-ooagent:latest
     user: "marketflow"
     entrypoint: ["python", "-m", "market_service.commands.nooa_cli"]
+    cpus: ${OOAGENT_CPUS:-0.75}
+    mem_limit: ${OOAGENT_MEM_LIMIT:-1024m}
     env_file:
       - path: .env
         required: false
@@ -205,6 +219,9 @@ services:
     image: crypto-ai-anal-calculation:latest
     user: "marketflow"
     command: ["python", "-m", "market_service.substrate_worker.dain_container"]
+    cpus: ${CALC_CPUS:-1.5}
+    cpuset: ${CALC_CPUSET:-0-1}
+    mem_limit: ${CALC_MEM_LIMIT:-2048m}
     ports:
       - "127.0.0.1:${CALC_CONTROL_PORT:-8041}:${CALC_CONTROL_PORT:-8041}"
     env_file:
@@ -253,6 +270,8 @@ services:
     image: crypto-ai-anal-analysis:latest
     user: "marketflow"
     command: ["python", "-m", "market_service.analysis_worker.analysis_container"]
+    cpus: ${ANALYSIS_CPUS:-1.0}
+    mem_limit: ${ANALYSIS_MEM_LIMIT:-1024m}
     ports:
       - "127.0.0.1:${ANALYSIS_CONTROL_PORT:-8042}:${ANALYSIS_CONTROL_PORT:-8042}"
     env_file:

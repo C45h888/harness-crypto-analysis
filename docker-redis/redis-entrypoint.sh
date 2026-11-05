@@ -19,7 +19,7 @@ set -e
 redis-server \
   --appendonly yes \
   --appendfsync everysec \
-  --maxmemory 3000mb \
+  --maxmemory "${REDIS_MAXMEMORY:-1400mb}" \
   --maxmemory-policy allkeys-lru \
   --auto-aof-rewrite-min-size 64mb \
   --auto-aof-rewrite-percentage 100 \

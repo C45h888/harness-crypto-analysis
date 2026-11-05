@@ -98,7 +98,8 @@ async def invoke_many(
 
     symbol = symbol.upper()
     names = list(analyses) if analyses else sorted(ANALYSIS_WORKER_REGISTRY)
-    sem = _asyncio.Semaphore(2)
+    import os as _os
+    sem = _asyncio.Semaphore(max(1, int(_os.getenv("ANALYSIS_INVOKE_CONCURRENCY", "1"))))
     out: dict[str, Any] = {}
 
     async def _one(name: str) -> tuple[str, dict[str, Any]]:
