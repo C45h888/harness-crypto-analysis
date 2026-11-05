@@ -98,7 +98,7 @@ and "how much budget" exists only as prose in the plan specs.
 
 | Family | Vocab | Where |
 |---|---|---|
-| payload health | healthy / degraded / insufficient_data | `substrate_worker/contracts.py` `PAYLOAD_STATUSES`; `fire.py` status logic |
+| payload health | healthy / degraded / insufficient_data | `substrate_worker/contracts.py` `PAYLOAD_STATUSES` + `with_status`; worker-owned fire in `core/base.py` |
 | span fit status | validated / provisional / insufficient | `runtime/horizon_spans.py` `STATUSES` |
 | bridge extrapolation | validated → provisional, `estimation_status: extrapolated` | `microstructure/horizon_bridge.py` |
 | transport liveness | running / gap / reconnecting | `microstructure/capture.py` WS status transitions |

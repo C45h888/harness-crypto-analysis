@@ -32,7 +32,7 @@ from market_service.calculations.substrates.tape import (
     summarize,
 )
 from market_service.runtime.horizons import fold_venue_totals
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
+from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 # Probe bands — the demand/auction verdict convention used across the
@@ -100,6 +100,130 @@ class TapeWorker(SubstrateWorkerCore):
         horizon_staleness_s=(("1h", 600), ("4h", 4 * 3600)),
     )
 
+    # ------------------------------------------------------------------
+    # Worker-owned scheduling — WHEN this substrate may compute.
+    #
+    # Absorbed from the deleted core/fire.py: this file (not shared code)
+    # owns the cascade order and gates below. Shared primitives (reads,
+    # evidence cache, governance gates, fail-closed dedupe, publish) live
+    # in core/base.py, governance/, substrate_worker/evidence.py.
+    # Policy: buy-share band cross or CVD surge, base plus fold-native 1h/4h. Cooldown 60s probe-only (hygiene bypasses);
+    # staleness 180s. 1h staleness at 10m; 4h at 4h.
+    # ------------------------------------------------------------------
+
+    async def decide(
+        self,
+        rows: list[dict[str, Any]],
+        now_ms: int,
+        *,
+        ws_rows: list[dict[str, Any]] | None = None,
+        recovery: bool = False,
+    ) -> None:
+        """TapeWorker: buy-share band cross or CVD surge, base plus fold-native 1h/4h."""
+        last_state = await self._read_own_state()
+        if last_state is not None:
+            try:
+                seen_version = int(last_state.get("schema_version") or 0)
+            except (TypeError, ValueError):
+                seen_version = 0
+            if seen_version != SUBSTRATE_STATE_SCHEMA_VERSION:
+                last_state = None
+
+        ws_rows = ws_rows or []
+        arrival = bool(rows) or bool(ws_rows)
+
+        if self.horizons:
+            self._fold_rows(rows)
+
+        # L4 — cold start: data arrived but no usable prior projection.
+        if last_state is None:
+            if not arrival:
+                return
+            if self.horizons and not self._horizons_backfilled:
+                await self._backfill_horizons()
+            decision = TriggerDecision(fired=True, source="cold_start",
+                                       predicates={"consumed_entries": len((rows or ws_rows))})
+            await self._fire(decision, last_state, now_ms, high_water=self._high_water((rows or ws_rows)))
+            return
+
+        # L4 — capture recovery (gap/reconnecting -> running) bypasses cooldown.
+        if recovery:
+            decision = TriggerDecision(fired=True, source="recovery",
+                                       predicates={"transition": "gap/reconnecting->running"})
+            await self._fire(decision, last_state, now_ms, high_water=self._high_water((rows or ws_rows)))
+            return
+
+        # L3 — staleness override (hygiene, bypasses cooldown).
+        computed_at = last_state.get("computed_at_ms")
+        age_ms = (now_ms - int(computed_at)) if isinstance(computed_at, (int, float)) else None
+        if age_ms is not None and age_ms > self.staleness_s * 1_000:
+            decision = TriggerDecision(
+                fired=True, source="staleness",
+                predicates={"age_ms": age_ms, "staleness_s": self.staleness_s},
+            )
+            await self._fire(decision, last_state, now_ms, high_water=self._high_water((rows or ws_rows)))
+            return
+        # L3 — per-horizon staleness on fold trade-time.
+        if self.horizons:
+            profile_hz = type(self).CADENCE
+            for hz in self.horizons:
+                bound_s = profile_hz.staleness_for(hz) if profile_hz is not None else self.staleness_s
+                segs = self._horizon_folds[hz]["segments"]
+                newest_fold_ms = max((s.get("last_trade_ms") or 0) for s in segs) if segs else None
+                if newest_fold_ms:
+                    hz_age_ms = now_ms - newest_fold_ms
+                    if hz_age_ms > bound_s * 1_000:
+                        decision = TriggerDecision(
+                            fired=True, source="staleness",
+                            predicates={"horizon": hz, "age_ms": hz_age_ms,
+                                        "staleness_s": bound_s},
+                        )
+                        await self._fire(decision, last_state, now_ms,
+                                         high_water=self._high_water((rows or ws_rows)))
+                        return
+
+
+        # L3 — window rollover.
+        rollover = self._rollover_decision((rows or ws_rows))
+        if rollover is not None:
+            await self._fire(rollover, last_state, now_ms, high_water=self._high_water((rows or ws_rows)))
+            return
+
+        # L1 — arrival gate: no new entries, no window build, no probe.
+        if not arrival:
+            return
+
+        window = await self._cached_evidence(now_ms)
+        self._last_dormant_reason = None
+        profile = type(self).CADENCE
+        min_depth = profile.min_book_depth if profile is not None else 1
+        min_trades = profile.min_trade_count if profile is not None else 0
+        if min_depth > 1 or min_trades > 0:
+            fut_book = (window.get("futures") or {}).get("order_book") or {}
+            book_depth = max(len(fut_book.get("bids") or []), len(fut_book.get("asks") or []))
+            coverage = window.get("coverage") or {}
+            trade_count = (
+                ((coverage.get("spot_trades") or {}).get("trade_count") or 0)
+                + ((coverage.get("futures_trades") or {}).get("trade_count") or 0)
+            )
+            if book_depth < min_depth or trade_count < min_trades:
+                self._last_dormant_reason = (
+                    f"insufficient_inputs: book_depth={book_depth} "
+                    f"(min {min_depth}) trade_count={trade_count} (min {min_trades})"
+                )
+                return
+        self._last_dormant_reason = None
+
+        decision = self.probe(window, last_state, now_ms)
+        if not decision.fired:
+            return
+        # Cooldown gates ONLY probe-source fires.
+        if self._last_fire_ms is not None:
+            if now_ms - self._last_fire_ms < self.cooldown_s * 1_000:
+                return
+        # Evidence-once: thread the probe snapshot into compute.
+        await self._fire(decision, last_state, now_ms, high_water=self._high_water((rows or ws_rows)),
+                         evidence=window)
     # ------------------------------------------------------------------
     # L2 — significance probe (demand bands + CVD surge)
     # ------------------------------------------------------------------

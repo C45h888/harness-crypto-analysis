@@ -11,8 +11,9 @@ meaning:
   observability only, never control);
 * ``liveness`` / ``fired_count`` — observability accessors.
 
-It does NOT own: read routing (``reader.py``), fire decisions (``fire.py``),
-or the worker's market semantics (the subclass file).
+It does NOT own: read routing (``reader``), worker-owned fire decisions
+(``base`` — the worker files own their scheduling; governance owns
+coordination), or the worker's market semantics (the subclass file).
 """
 
 from __future__ import annotations

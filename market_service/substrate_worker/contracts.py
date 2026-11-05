@@ -138,6 +138,65 @@ def bound_arrays(value: Any, cap: int = OUTPUT_ARRAY_CAP) -> Any:
     return value
 
 
+def with_status(
+    payload: SubstrateStatePayload, status: str, missing: list[str],
+) -> SubstrateStatePayload:
+    """Worker-owned pure helper (absorbed from fire.py::_with_status).
+
+    Rebuild the payload with a non-healthy status + missing inputs. Pure:
+    no transport, no clock, no governance.
+    """
+    return SubstrateStatePayload(
+        schema_version=payload.schema_version,
+        substrate=payload.substrate,
+        symbol=payload.symbol,
+        status=status,
+        observed_at_ms=payload.observed_at_ms,
+        computed_at_ms=payload.computed_at_ms,
+        trigger=payload.trigger,
+        freshness=payload.freshness,
+        output=payload.output,
+        missing_inputs=tuple(missing),
+        provenance=payload.provenance,
+        horizons=payload.horizons,
+    )
+
+
+def build_freshness(
+    evidence: dict[str, Any],
+    *,
+    window_minutes: int,
+    high_water: str | None,
+    horizons: tuple[str, ...] = (),
+    horizon_folds: dict[str, Any] | None = None,
+    horizons_rebuilt_from: str | None = None,
+) -> dict[str, Any]:
+    """Worker-owned pure helper (absorbed from fire.py::_freshness).
+
+    Freshness is MEASURED from the evidence snapshot the output was computed
+    from — never requested durations. Pure: reads the snapshot + worker fold
+    sizes, no I/O.
+    """
+    coverage = evidence.get("coverage") or {}
+    out: dict[str, Any] = {
+        "window_minutes": window_minutes,
+        "input_fingerprint": {
+            "observed_at_ms": evidence.get("observed_at_ms"),
+            "stream_staleness_ms": coverage.get("stream_staleness_ms"),
+            "spot_trade_count": (coverage.get("spot_trades") or {}).get("trade_count"),
+            "futures_trade_count": (coverage.get("futures_trades") or {}).get("trade_count"),
+            "high_water": high_water,
+        },
+    }
+    if horizons:
+        folds = horizon_folds or {}
+        out["horizons_rebuilt_from"] = horizons_rebuilt_from
+        out["horizon_segments"] = {
+            hz: len((folds.get(hz) or {}).get("segments", [])) for hz in horizons
+        }
+    return out
+
+
 @dataclass(frozen=True)
 class SubstrateStatePayload:
     """One substrate worker fire — the persisted calculation state.

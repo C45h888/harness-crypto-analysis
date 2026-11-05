@@ -19,15 +19,18 @@ information pipeline is continuously warm instead of computed on pull.
 
 ## 1. Detection doctrine (the deterministic core)
 
-Every worker runs the same four-layer fire decision. Fire =
-`(L1 ∧ L2) ∨ L3 ∨ L4`, then dedupe → compute → persist.
+Every worker owns its four-layer fire decision. Fire =
+`(L1 ∧ L2) ∨ L3 ∨ L4`, then governance dedupe → compute → persist.
+Scheduling policy lives in the worker files (inherited from
+`core/base.py`); governance owns coordination legality (FIRE/PUBLISH/PG_WRITE
+gates + fail-closed dedupe); the core keeps transport only (reads, heartbeat).
 
 | Layer | Name | Owner | Semantics |
 |---|---|---|---|
-| L1 | Arrival gate | core | ≥ N new entries on the worker's consumer group since its high-water. Anti-idle only; never sufficient alone. |
+| L1 | Arrival gate | worker file | ≥ N new entries on the worker's consumer group since its high-water. Anti-idle only; never sufficient alone. |
 | L2 | **Significance probe** | **worker file** | A cheap deterministic check computed from the arriving window + the worker's own last state, using **thresholds imported from the substrate module** (never redefined). The probe asks: *could this substrate's verdict have flipped?* |
-| L3 | Time guards | core | Cooldown (min seconds between fires) + **max-staleness heartbeat** (fire anyway with `trigger.source="staleness"` when the latest projection is older than `staleness_s`) + window rollovers. |
-| L4 | Liveness guards | core | Cold start (no prior `substrate:latest`) + capture recovery (status-transition stream) — lifted from `wake_worker`. |
+| L3 | Time guards | worker file | Cooldown (min seconds between fires) + **max-staleness heartbeat** (fire anyway with `trigger.source="staleness"` when the latest projection is older than `staleness_s`) + window rollovers. |
+| L4 | Liveness guards | worker file | Cold start (no prior `substrate:latest`) + capture recovery (status-transition stream) — lifted from `wake_worker`. |
 
 Closed deterministic loop: `last state → probe → fire? → compute → persist →
 new state`. Same stream entries + same prior state ⇒ same decision ⇒ same
@@ -84,32 +87,60 @@ market_service/substrate_worker/
     runner.py          process entrypoint (env-selected workers, --once smoke mode)
 ```
 
-### 3.1 `core.py` — what the core owns (and nothing else)
+### 3.1 Worker-owned fire (`core/base.py`) + transport (`reader`/`supervisor`) — `core/fire.py` deleted
 
-Adapted from `WakeSupervisor` (same discipline, substrate-generic):
+Worker files own their scheduling policy; governance owns coordination.
+`core/base.py` carries the inherited fire cycle (absorbed from the deleted
+`core/fire.py`, no shim); `reader.py` keeps consumer groups + blocking reads;
+`supervisor.py` keeps the heartbeat loop. Adapted from `WakeSupervisor`
+(same discipline, substrate-generic):
 
 - Consumer group per `(substrate, symbol)` on `stream:raw:{SYM}`
   (`XREADGROUP BLOCK 1000ms`, `count 500`, `noack=True` — at-most-once like
   wake; compute is idempotent, next event re-triggers).
-- L1 arrival gate, L3 cooldown/staleness/rollover, L4 cold-start/recovery.
-- Dedupe: the `_DEDUPE_LUA` pattern on the substrate supervisor key
-  (same-condition collapse across redundant worker instances).
+- L1 arrival gate, L3 cooldown/staleness/rollover, L4 cold-start/recovery —
+  decided in the worker (`decide`/`_handle_rows` in `base.py`, overridable
+  per worker file).
+- Dedupe: governance-owned fail-closed `governance/dedupe.py` (Lua
+  condition-identity collapse on the supervisor key; script-missing or eval
+  failure SUPPRESSES the fire with a short negative TTL — never fire-anyway).
 - Supervisor heartbeat: `{prefix}:substrate:{name}:{SYM}:supervisor`
   (TTL-bounded, carries pid/last-fire/last-error — observability, never control).
-- Evidence window build via `runtime/raw_window.build_raw_window(store,
-  symbol, window_minutes)` (extracted from `bedrock.read_raw_window`; bedrock
-  re-exports so nothing breaks — substrate_worker never imports nooa_harness).
+- Evidence window build via the shared `substrate_worker/evidence.py`
+  (process-global cache, one build per symbol+window per 2.5s slice; horizon
+  extras shared) over `runtime/raw_window.build_raw_window` (extracted from
+  `bedrock.read_raw_window`; bedrock re-exports so nothing breaks —
+  substrate_worker never imports nooa_harness).
 - Persistence seam: atomic `publish_substrate_state` (Lua SET latest + XADD
   stream); Phase 3 adds Postgres-first.
-- Dispatch: `asyncio.create_task` per fire (loop stays responsive), error
-  backoff on recoverable Redis exceptions.
+- Dispatch: per-worker single-flight with coalesce (one compute at a time;
+  a second decision while busy collapses into exactly one rerun), error
+  backoff on recoverable Redis exceptions. Evidence-once: the probe snapshot
+  (with derivatives/dependencies attached) is threaded into compute, not rebuilt.
 
-### 3.2 What each worker file implements (and nothing else)
+### 3.2 What each worker file implements (scheduling + semantics)
 
 ```python
 SUBSTRATE_NAME = "density"
 INPUT_STREAMS = ("raw",)                 # + "microstructure" in Phase 2
+```
 
+The worker file owns WHEN it fires and WHAT it computes:
+
+- `decide()` — the worker-owned scheduling cascade (cold start → recovery
+  → staleness → horizon staleness → rollover → arrival → evidence →
+  derivative/dependency dormancy → min-data → probe → probe-only cooldown →
+  fire with evidence-once). Each file declares which gates apply to it
+  (WS arrival for tape/delta/large_print; horizon blocks for
+  density/tape/migration/technicals; derivative gates for
+  delta/oi/technicals; the tape dependency gate for signals) and calls the
+  shared primitives in `core/base.py` + `governance/`.
+- `probe()` — L2 only, substrate thresholds imported from the substrate
+  module (never redefined).
+- `compute()` — the full substrate calculation (pure), substrate functions
+  only.
+
+```python
 def probe(window: dict, last_state: dict | None, now_ms: int) -> TriggerDecision:
     ...  # L2 only — imports constants from calculations.substrates.density
 

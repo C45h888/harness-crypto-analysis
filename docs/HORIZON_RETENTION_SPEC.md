@@ -273,7 +273,7 @@ substrate purity violation.
 | `substrate_worker/contracts.py` | 2.3 ROLLOVER_PERIOD_MS additions; 2.6 schema v2, CadenceProfile |
 | `substrate_worker/core/base.py` | 2.2 `HORIZONS` resolution + default no-op `fold` |
 | `substrate_worker/core/reader.py` | 2.4 fold invocation on read tick |
-| `substrate_worker/core/fire.py` | 2.5 backfill on cold_start/recovery; 2.7 horizon evidence assembly; payload horizons block |
+| `substrate_worker/core/base.py` (worker-owned fire, ex-fire.py) | 2.5 backfill on cold_start/recovery; 2.7 horizon evidence assembly; payload horizons block |
 | `substrate_worker/migration_worker.py` | **pilot** — declare `HORIZONS`, per-horizon probe (hour-bucket logic it already owns, lifted to the contract) |
 | `docker-compose.yml` / redis config | maxmemory raise per 1.3 table |
 | `runtime/postgres_store.py` | horizon checkpoint persistence (2.5 rebuild path) — same `record_substrate_state` JSONB, no schema migration |

@@ -34,8 +34,8 @@ from market_service.runtime.horizons import (
     fold_candles, fold_trades, new_fold_state,
 )
 from market_service.substrate_worker.contracts import CadenceProfile
-from market_service.substrate_worker.core import fire as fire_module
-from market_service.substrate_worker.core.fire import FireMixin
+from market_service.runtime import raw_window as raw_window_module
+from market_service.substrate_worker.core.base import SubstrateBase
 
 
 def _utc_epoch_ms(iso: str) -> int:
@@ -126,7 +126,7 @@ class PGRestoreTests(unittest.TestCase):
         ]}}
         async def _fake_build(redis, symbol, minutes):
             return raw_window
-        with patch.object(fire_module, "build_raw_window", _fake_build):
+        with patch.object(raw_window_module, "build_raw_window", _fake_build):
             asyncio.run(worker._backfill_horizons())
         self.assertTrue(worker._horizons_backfilled)
         self.assertEqual(worker._horizons_rebuilt_from, "pg")
@@ -143,7 +143,7 @@ class PGRestoreTests(unittest.TestCase):
         raw_window = {"futures": {"trades_normalized": []}}
         async def _fake_build(redis, symbol, minutes):
             return raw_window
-        with patch.object(fire_module, "build_raw_window", _fake_build):
+        with patch.object(raw_window_module, "build_raw_window", _fake_build):
             asyncio.run(worker._backfill_horizons())
         self.assertEqual(worker._horizons_rebuilt_from, "raw")
 
@@ -161,7 +161,7 @@ class PGRestoreTests(unittest.TestCase):
         worker._horizons_rebuilt_from = "pg"
         worker._horizon_folds = {hz: new_fold_state(hz) for hz in worker.horizons}
         worker.window_minutes = 15
-        out = FireMixin._freshness(worker, {"coverage": {}}, high_water=None)
+        out = worker._freshness({"coverage": {}}, high_water=None)
         self.assertEqual(out["horizons_rebuilt_from"], "pg")
         self.assertEqual(out["horizon_segments"]["4h"], 0)
 

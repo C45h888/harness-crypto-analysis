@@ -9,8 +9,10 @@ what order" surface of a substrate worker:
   status-transition recovery signal;
 * read-time boundaries: window rollover detection and high-water mark.
 
-It does NOT own: fire decisions, dedupe, compute, persistence, or the
-supervisor heartbeat. Those live in ``fire.py`` / ``supervisor.py``.
+It does NOT own: worker-owned fire decisions (``base`` — the worker files
+own their scheduling; governance owns dedupe coordination), compute,
+persistence, or the supervisor heartbeat. Those live in ``base`` /
+``supervisor.py`` plus ``governance/dedupe.py``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from market_service.substrate_worker.core.base import SubstrateBase, _now_ms, _store_fn
+from market_service.governance.dedupe import DEDUPE_LUA as _DEDUPE_LUA
 from market_service.substrate_worker.contracts import (
     ROLLOVER_PERIOD_MS,
     TriggerDecision,
@@ -317,23 +320,3 @@ class ReaderMixin(SubstrateBase):
     def _high_water(rows: list[dict[str, Any]]) -> str:
         """The newest consumed entry id — the dedupe/collapse water mark."""
         return rows[-1]["id"] if rows else ""
-
-
-_DEDUPE_LUA = r"""
--- deterministic substrate fire dedupe (condition-identity collapse)
--- KEYS[1] = supervisor key; ARGV[1] = candidate json; ARGV[2] = cooldown_ms;
--- ARGV[3] = high_water (consumed entry id or ''); ARGV[4] = trigger source
-local current = redis.call("GET", KEYS[1])
-if current then
-    local ok, dec = pcall(cjson.decode, current)
-    if ok and type(dec) == "table" then
-        local last_water = tostring(dec.high_water or "")
-        local last_source = tostring(dec.trigger_source or "")
-        if tostring(ARGV[3]) == last_water and tostring(ARGV[4]) == last_source then
-            return "0"
-        end
-    end
-end
-redis.call("SET", KEYS[1], ARGV[1])
-return "1"
-"""
