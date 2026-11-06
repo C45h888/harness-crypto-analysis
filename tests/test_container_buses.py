@@ -39,11 +39,11 @@ class _BusWorker(SubstrateWorkerCore):
         self.probe_calls = 0
         self._decision = TriggerDecision(fired=False, source="probe")
 
-    def probe(self, window, last_state, now_ms):
+    def probe(self, window, last_state, now_ms, seed=None):
         self.probe_calls += 1
         return self._decision
 
-    def compute(self, evidence, depth):
+    def compute(self, evidence, depth, artifacts=None):
         return {"bus": 1}
 
 

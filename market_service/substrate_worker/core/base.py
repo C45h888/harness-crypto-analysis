@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 from market_service.runtime.horizons import (
@@ -35,6 +36,7 @@ from market_service.runtime.horizons import (
 from market_service.runtime.redis_store import RedisRuntimeStore
 from market_service.substrate_worker.contracts import (
     SUBSTRATE_STATE_SCHEMA_VERSION,
+    ArtifactBundle,
     CadenceProfile,
     SubstrateStatePayload,
     TriggerDecision,
@@ -95,6 +97,13 @@ class SubstrateBase:
     # state maintained by the cadence layer, per-horizon evidence windows
     # attached to compute input, and horizon-tagged rollover fires.
     HORIZONS: tuple[str, ...] = ()
+    # Fold-native horizons need NO raw horizon evidence: the worker computes
+    # its per-horizon outputs from the bounded in-memory folds (tape CVD /
+    # technicals fold-candles), which never touch evidence["horizons"].
+    # True = _build_evidence also materializes one raw window per declared
+    # horizon (migration runs hz keystone migration on them; density runs
+    # hz trade intensity on them). False = base window only.
+    RAW_HORIZON_EVIDENCE: bool = True
 
     def __init__(
         self,
@@ -154,7 +163,11 @@ class SubstrateBase:
         # (byte-identical to before this seam existed). The core never imports
         # governance — the plane's governor is injected at construction.
         self.governor = governor
-        self.pg_store = pg_store
+        # PG is horizon persistence, not a latest sink: only workers that
+        # restore folds from PG (non-empty HORIZONS) keep a live pg_store.
+        # The other eight workers run PG-free — no insert, no strict abort,
+        # no breaker — so PG semantics stay pure to the workers that need it.
+        self.pg_store = pg_store if type(self).HORIZONS else None
         self.pg_strict = pg_strict
         # Observational mirror only: the plane FSM remains the legality owner.
         self.telemetry = telemetry
@@ -217,7 +230,7 @@ class SubstrateBase:
         # Worker-owned single-flight: one compute at a time per worker;
         # a second decision while busy coalesces into exactly one rerun.
         self._fire_lock: asyncio.Semaphore = asyncio.Semaphore(1)
-        self._pending: tuple[Any, Any, int, str, dict[str, Any] | None] | None = None
+        self._pending: tuple[Any, Any, int, str, dict[str, Any] | None, Any] | None = None
         # Governance-owned dedupe slot (fail-closed); the Lua lives in
         # market_service/governance/dedupe.py, this dict is the worker's slot.
         self._dedupe_state: dict[str, Any] = {}
@@ -284,6 +297,18 @@ class SubstrateBase:
     ) -> TriggerDecision:
         """L2 significance probe — deterministic; substrate thresholds only."""
         raise NotImplementedError
+
+    async def screen(
+        self, latest: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+    ) -> bool:
+        """Stage-one gate: cheap latest-only check authorizing the heavy read.
+
+        Default True (history workers: probes accumulate window history, so
+        no latest-only predicate is a safe necessary condition). Point-in-time
+        workers override with the SAME probe over latest-only state (exact —
+        screen quiet implies full-probe quiet, zero miss risk).
+        """
+        return True
 
     def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
         """Full substrate calculation over the evidence window (pure)."""
@@ -458,12 +483,18 @@ class SubstrateBase:
         high_water: str,
         rows: list[dict[str, Any]] | None = None,
         evidence: dict[str, Any] | None = None,
+        artifacts: ArtifactBundle | None = None,
     ) -> None:
         """Governance FIRE gate → fail-closed dedupe → single-flight dispatch.
 
-        ORDER IS THE CONTRACT: governance first, then dedupe, then the
+        ORDER IS THE CONTRACT: breaker, governance, then dedupe, then the
         cooldown stamp and fired counter. A denial burns nothing.
         """
+        # Breaker first: a PG-dependent fire into a dead sink stands down
+        # before governance, dedupe, slots, or compute burn anything.
+        if self.pg_store is not None and await self._pg_circuit_skip(now_ms):
+            self._last_dormant_reason = "pg_circuit_open"
+            return
         if not await self._govern("fire"):
             return
         allowed = await self._dedupe(decision, high_water, now_ms)
@@ -480,12 +511,62 @@ class SubstrateBase:
         # Single-flight with coalesce: a second decision while compute is in
         # flight collapses into exactly one rerun — never N tasks.
         if self._fire_lock.locked():
-            self._pending = (decision, last_state, now_ms, high_water, evidence)
+            self._pending = (decision, last_state, now_ms, high_water, evidence, artifacts)
             return
         task = asyncio.create_task(
-            self._fire_guarded(decision, last_state, now_ms, rows=rows, evidence=evidence))
+            self._fire_guarded(decision, last_state, now_ms, rows=rows,
+                              evidence=evidence, artifacts=artifacts))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def _pg_circuit_skip(self, now_ms: int) -> bool:
+        """Duck-typed breaker consult — ungoverned workers never skip."""
+        gov = getattr(self, "governor", None)
+        consult = getattr(gov, "pg_circuit_skip", None)
+        if not callable(consult):
+            return False
+        try:
+            return bool(consult(int(now_ms)))
+        except Exception:
+            return False
+
+    def _pg_record(self, ok: bool, now_ms: int) -> None:
+        """Feed a PG round-trip outcome to the breaker (never raises)."""
+        gov = getattr(self, "governor", None)
+        if gov is None:
+            return
+        try:
+            if ok:
+                success = getattr(gov, "pg_record_success", None)
+                if callable(success):
+                    success()
+            else:
+                failure = getattr(gov, "pg_record_failure", None)
+                if callable(failure):
+                    failure(int(now_ms))
+        except Exception:
+            pass
+
+    @asynccontextmanager
+    async def _compute_slot(self, reason: str):
+        """FSM-governed compute slot (vector 3): one plane-wide bound.
+
+        The governor's fair semaphore serializes heavy sections across all
+        workers of the plane — cold-start backfills and fire computes queue
+        in batches of the FSM's number. Ungoverned seams (bare test workers
+        without a governor) run unbounded, byte-identical to before.
+        """
+        gov = getattr(self, "governor", None)
+        acquire = getattr(gov, "acquire_compute_slot", None)
+        release = getattr(gov, "release_compute_slot", None)
+        if not (callable(acquire) and callable(release)):
+            yield
+            return
+        await acquire(symbol=self.symbol, substrate=self.SUBSTRATE_NAME, reason=reason)  # type: ignore[misc]
+        try:
+            yield
+        finally:
+            await release(symbol=self.symbol, substrate=self.SUBSTRATE_NAME)  # type: ignore[misc]
 
     async def _backfill_horizons(self) -> None:
         source = "raw"
@@ -497,14 +578,22 @@ class SubstrateBase:
                         self.SUBSTRATE_NAME, exc)
             self._last_error = f"horizon_pg_restore: {exc}"
         try:
-            from market_service.runtime.raw_window import build_raw_window as _build
+            # Shared single-flight horizon build (vector 1): all horizon
+            # workers cold-starting together coalesce on one widened
+            # materialization per (symbol, minutes) instead of each paying
+            # a full unshared 4h read. The PG-restored folds make the merge
+            # free (monotonic-id dedupe folds only the ledger-to-now delta).
+            from market_service.substrate_worker import evidence as _ev
             max_minutes = max(horizon_minutes(hz) for hz in self.horizons)
-            window = await _build(self.store, self.symbol, max_minutes)
-            for hz in self.horizons:
-                state = self._horizon_folds[hz]
-                for venue in ("spot", "futures"):
-                    trades = ((window.get(venue) or {}).get("trades_normalized")) or []
-                    fold_trades(state, trades, venue)
+            # The widened build + fold runs under the governed slot: all
+            # horizon workers cold-starting together queue here in batches.
+            async with self._compute_slot("backfill"):
+                window = await _ev.horizon_window(self.store, self.symbol, max_minutes)
+                for hz in self.horizons:
+                    state = self._horizon_folds[hz]
+                    for venue in ("spot", "futures"):
+                        trades = ((window.get(venue) or {}).get("trades_normalized")) or []
+                        fold_trades(state, trades, venue)
             self._horizons_backfilled = True
             self._horizons_rebuilt_from = source
         except Exception as exc:
@@ -526,6 +615,10 @@ class SubstrateBase:
         except Exception as exc:
             log.warning("substrate %s ledger read failed: %s",
                         self.SUBSTRATE_NAME, exc)
+            # A dead PG at cold start trips the breaker through the restore
+            # path, not through twelve doomed computes. Healthy-empty (no
+            # rows below) records nothing — absence of history is not failure.
+            self._pg_record(False, int(time.time() * 1000))
             return False
         if not rows or not isinstance(rows[0], dict):
             return False
@@ -552,6 +645,8 @@ class SubstrateBase:
             except (KeyError, TypeError, ValueError) as exc:
                 log.warning("substrate %s fold restore %s failed: %s",
                             self.SUBSTRATE_NAME, hz, exc)
+        if restored_any:
+            self._pg_record(True, int(time.time() * 1000))
         return restored_any
 
     def _fold_rows(self, rows: list[dict[str, Any]]) -> None:
@@ -582,7 +677,7 @@ class SubstrateBase:
             ws=bool(self.ws_input and "microstructure" in self.INPUT_STREAMS),
             ws_venue=self.ws_venue,
         )
-        if self.horizons:
+        if self.horizons and type(self).RAW_HORIZON_EVIDENCE:
             horizon_windows: dict[str, dict[str, Any]] = {}
             for hz in self.horizons:
                 minutes = horizon_minutes(hz)
@@ -611,14 +706,19 @@ class SubstrateBase:
         *,
         rows: list[dict[str, Any]] | None = None,
         evidence: dict[str, Any] | None = None,
+        artifacts: ArtifactBundle | None = None,
     ) -> None:
         """Compute the substrate and persist the state payload (never raises).
 
         Evidence-once: the probe snapshot is threaded through — derivatives
         and dependencies attached for the probe are reused, not refetched.
-        Hygiene fires (evidence=None) build once here.
+        Artifact-once: the probe's derivations ride the bundle — compute
+        reuses them after verifying the binding instead of recomputing.
+        Hygiene fires (evidence=None) build once here. The whole cycle runs
+        under the FSM-governed compute slot (vector 3): at most the plane's
+        number of workers hold evidence + compute + persist at once.
         """
-        async with self._fire_lock:
+        async with self._fire_lock, self._compute_slot("compute"):
             try:
                 try:
                     if evidence is None:
@@ -640,7 +740,8 @@ class SubstrateBase:
                     evidence = {**evidence, "own_last_output": (
                         (last_state or {}).get("output") or {}
                     )}
-                    output = self.compute(evidence, self.depth if self.depth is not None else evidence.get("depth_levels") or 20)
+                    output = self.compute(evidence, self.depth if self.depth is not None else evidence.get("depth_levels") or 20,
+                                              artifacts=artifacts)
                     missing: list[str] = []
                     status = "healthy"
                     horizons_block: dict[str, Any] = {}
@@ -706,14 +807,24 @@ class SubstrateBase:
                                 timeout=self._PG_INSERT_TIMEOUT_S,
                             )
                         except Exception as exc:
+                            self._pg_record(False, now_ms)
                             if self.pg_strict:
                                 log.error("substrate %s PG insert failed (strict: fire aborted): %s",
                                             self.SUBSTRATE_NAME, exc)
                                 self._last_error = f"pg: {exc}"
+                                # PG-aborted fires re-arm the cooldown: failure
+                                # quiets the worker instead of shouting into
+                                # a dead sink every tick until the breaker
+                                # counts it open. Only PG workers reach here
+                                # (decoupled at construction).
+                                self._last_fire_ms = now_ms
+                                self._last_dormant_reason = "pg_insert_failed"
                                 return
                             log.warning("substrate %s PG insert failed (lax: continuing): %s",
                                         self.SUBSTRATE_NAME, exc)
                             self._last_error = f"pg (lax, continuing): {exc}"
+                        else:
+                            self._pg_record(True, now_ms)
                     stream_id = await self._publish_own_state(payload.to_dict())
                     await self._emit_telemetry_state(
                         "state_adjudicated", payload.to_dict(),
@@ -733,9 +844,10 @@ class SubstrateBase:
             finally:
                 pending, self._pending = self._pending, None
                 if pending is not None:
-                    p_decision, p_last, p_now, p_water, p_ev = pending
+                    p_decision, p_last, p_now, p_water, p_ev, p_art = pending
                     task = asyncio.create_task(
-                        self._fire_guarded(p_decision, p_last, p_now, evidence=p_ev))
+                        self._fire_guarded(p_decision, p_last, p_now, evidence=p_ev,
+                                           artifacts=p_art))
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
 

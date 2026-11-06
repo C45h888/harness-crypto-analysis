@@ -26,7 +26,7 @@ from market_service.calculations.substrates.technicals import (
     trend_slope,
 )
 from market_service.runtime.horizons import fold_candles
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 EMA_SHORT_KEY = "ema21"  # the watched EMA leg (price vs ema21)
@@ -54,6 +54,9 @@ class TechnicalsWorker(SubstrateWorkerCore):
     # are computed from fold segments (each segment becomes a kline-shaped
     # row) — no extra derivative fetch. Base 5m EMA stays on klines.
     HORIZONS = ("1h", "4h")
+    # Fold-native: compute/probe read only fold_candles(), never
+    # evidence["horizons"] — skip the raw 1h/4h materializations (vector 2).
+    RAW_HORIZON_EVIDENCE = False
     CADENCE = CadenceProfile(
         cooldown_s=60, staleness_s=300, rollovers=("bar_5m",),
         horizons=("1h", "4h"),
@@ -199,6 +202,7 @@ class TechnicalsWorker(SubstrateWorkerCore):
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         klines = (window.get("futures") or {}).get("klines") or []
         closes = _closes(klines)
@@ -243,7 +247,8 @@ class TechnicalsWorker(SubstrateWorkerCore):
     # Compute — technicals substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         klines = (evidence.get("futures") or {}).get("klines") or []
         closes = _closes(klines)
         if not closes:

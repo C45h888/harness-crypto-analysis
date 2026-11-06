@@ -168,11 +168,11 @@ class _ProbeWorker(SubstrateWorkerCore):
         self.probe_calls: list[tuple] = []
         self.compute_calls = 0
 
-    def probe(self, window, last_state, now_ms):
+    def probe(self, window, last_state, now_ms, seed=None):
         self.probe_calls.append((window, last_state, now_ms))
         return self._decision
 
-    def compute(self, evidence, depth):
+    def compute(self, evidence, depth, artifacts=None):
         self.compute_calls += 1
         return dict(self._computed)
 

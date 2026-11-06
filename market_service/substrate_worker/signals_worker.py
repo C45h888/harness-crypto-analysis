@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from market_service.calculations.substrates.signals import deterministic_signals
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 
@@ -138,6 +138,17 @@ class SignalsWorker(SubstrateWorkerCore):
         if not arrival:
             return
 
+        # Stage-one screen (ns.read discipline): the probe inputs for
+        # this worker are point-in-time (latest snapshot + last state),
+        # so run the SAME probe on latest-only state first. Quiet screen
+        # skips the heavy window materialization entirely; a firing screen
+        # proceeds to the full window + confirming probe below. Zero miss
+        # risk: screen and probe read identical inputs here.
+        latest = await self.store.read("raw.latest", ids={"symbol": self.symbol})
+        if latest is not None and not await self.screen(latest, last_state, now_ms):
+            self._last_dormant_reason = "screen: latest state shows no likely flip"
+            return
+
         window = await self._cached_evidence(now_ms)
         dep_reason = await self._attach_dependencies(window, now_ms)
         if dep_reason is not None:
@@ -173,12 +184,30 @@ class SignalsWorker(SubstrateWorkerCore):
         # Evidence-once: thread the probe snapshot into compute.
         await self._fire(decision, last_state, now_ms, high_water=self._high_water(rows),
                          evidence=window)
+    async def screen(
+        self, latest: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+    ) -> bool:
+        """Stage-one: signals probe over tape:latest + latest OI (exact).
+
+        The snapshot is a pure function of the tape dependency projection
+        plus the latest raw OI — the window adds nothing. One extra GET
+        (the tape projection) replaces the full window materialization.
+        """
+        deps = await self._load_dependencies()
+        window = {
+            "futures": (latest.get("futures") or {}),
+            "spot": (latest.get("spot") or {}),
+            "substrate_dependencies": deps,
+        }
+        return self.probe(window, last_state, now_ms).fired
+
     # ------------------------------------------------------------------
     # L2 — significance probe (any rule trips)
     # ------------------------------------------------------------------
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         snapshot = _snapshot_from(window)
         if snapshot is None:
@@ -198,7 +227,8 @@ class SignalsWorker(SubstrateWorkerCore):
     # Compute — signals substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         snapshot = _snapshot_from(evidence)
         if snapshot is None:
             # Null discipline: without the tape dependency there is no

@@ -28,7 +28,7 @@ from market_service.calculations.substrates.large_print import (
     seller_aggression_classify,
     tiered_large_flow,
 )
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 # The substrate's large tier: tiered_large_flow's default tiers are
@@ -174,6 +174,7 @@ class LargePrintWorker(SubstrateWorkerCore):
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         fut_trades = (window.get("futures") or {}).get("trades_normalized") or []
         if not fut_trades:
@@ -213,7 +214,8 @@ class LargePrintWorker(SubstrateWorkerCore):
     # Compute — large_print substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         fut_trades = (evidence.get("futures") or {}).get("trades_normalized") or []
         if not fut_trades:
             # Null discipline: no tape means no print classification.

@@ -342,6 +342,16 @@ class PlaneGovernanceFSM:
         """Intra-plane parallelism for this plane (plane override hook)."""
         return 4
 
+    def compute_concurrency(self) -> int:
+        """Max concurrent compute slots for this plane (RAM/CPU bound).
+
+        The governor enforces this as a FIFO fair semaphore shared by every
+        worker of the plane in the process: cold-start backfills and fire
+        computes queue in batches of this size instead of all firing at
+        once. Plane override hook — the FSM owns the number.
+        """
+        return 2
+
     @staticmethod
     def quarantine_from_denials(
         denials: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None,

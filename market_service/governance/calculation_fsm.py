@@ -38,6 +38,10 @@ class CalculationGovernanceFSM(PlaneGovernanceFSM):
         "density", "delta", "migration", "oi", "signals", "technicals", "volume_profile",
     )
     CALC_INTRA_PARALLEL = 4
+    #: Max concurrent compute slots: 12 calculation workers share one loop
+    #: and one PG pool; full substrate math plus widened horizon builds run
+    #: at most 2-at-a-time (cold-start queue batches in twos).
+    CALC_COMPUTE_CONCURRENCY = 2
 
     def dispatch_group_rank(self, substrate: str) -> int:
         name = str(substrate).lower()
@@ -49,6 +53,9 @@ class CalculationGovernanceFSM(PlaneGovernanceFSM):
 
     def dispatch_intra_parallel(self) -> int:
         return self.CALC_INTRA_PARALLEL
+
+    def compute_concurrency(self) -> int:
+        return self.CALC_COMPUTE_CONCURRENCY
 
     def _plane_rules(
         self,

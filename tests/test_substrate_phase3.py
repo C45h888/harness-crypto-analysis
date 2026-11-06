@@ -75,7 +75,7 @@ BOOK = {
 
 class PgFirstPathTests(unittest.TestCase):
     def _fire(self, worker, payload_out=None):
-        worker.compute = lambda evidence, depth: dict(payload_out or {"m": 1.0})
+        worker.compute = lambda evidence, depth, artifacts=None: dict(payload_out or {"m": 1.0})
         decision = TriggerDecision(fired=True, source="probe")
         loop = asyncio.new_event_loop()
         try:

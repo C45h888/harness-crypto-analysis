@@ -748,6 +748,51 @@ class RedisRuntimeStore:
                 out.append(value)
         return out
 
+    async def read_stream_pages(
+        self, namespace: str, *, ids: dict[str, Any],
+        start: str = "-", end: str = "+", page: int = 500,
+    ):
+        """Bounded oldest-first page iterator over a stream namespace.
+
+        The ns.read discipline for heavy readers: every XRANGE carries an
+        explicit COUNT so no call ever materializes the whole range, and
+        decoded entries stream one page at a time so the caller can fold
+        each snapshot and release it before fetching the next. Entries
+        that do not decode to a dict are skipped, same as read_stream.
+        """
+        self.ns(namespace)
+        key = self.key(namespace, **ids)
+        try:
+            page_n = max(1, int(page))
+        except (TypeError, ValueError):
+            page_n = 500
+        pos = start
+        while True:
+            rows = await self.redis.xrange(key, min=pos, max=end, count=page_n)
+            if not rows:
+                return
+            for _entry_id, fields in rows:
+                raw = (fields or {}).get("payload")
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    value = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    yield value
+            last = rows[-1][0]
+            if isinstance(last, bytes):
+                last = last.decode("utf-8", errors="replace")
+            nxt = f"({last}"
+            if nxt == pos:
+                return  # no progress — never spin on a stuck range
+            pos = nxt
+            if len(rows) < page_n:
+                return
+
     @staticmethod
     def _normalize_ids(ids: dict[str, Any]) -> dict[str, Any]:
         """Canonicalise identity tokens inside key ids (symbol/venue)."""

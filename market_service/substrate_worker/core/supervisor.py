@@ -79,6 +79,14 @@ class SupervisorMixin(SubstrateBase):
     async def _tick(self, now_ms: int) -> None:
         """Supervisor heartbeat — proves liveness in the deployment."""
         try:
+            slot_status: dict[str, int] | None = None
+            status_fn = getattr(getattr(self, "governor", None),
+                                "compute_slot_status", None)
+            if callable(status_fn):
+                try:
+                    slot_status = status_fn()  # type: ignore[assignment]
+                except Exception:
+                    slot_status = None
             payload = {
                 "state": "running",
                 "substrate": self.SUBSTRATE_NAME,
@@ -90,6 +98,7 @@ class SupervisorMixin(SubstrateBase):
                 "dormant_reason": self._last_dormant_reason,
                 "ws_input": self._ws_stream is not None,
                 "last_tick_ms": now_ms,
+                "compute_slots": slot_status,
             }
             await self._redis.setex(
                 self._supervisor_key, self.supervisor_ms // 1000 + 2,

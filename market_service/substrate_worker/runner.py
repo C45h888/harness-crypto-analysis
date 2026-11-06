@@ -17,6 +17,14 @@ Env:
     SUBSTRATE_COOLDOWN_S    min seconds between fires per worker (default 30)
     SUBSTRATE_STALENESS_S   max projection age before a staleness override
                             fire (default 120)
+    SUBSTRATE_COMPUTE_SLOTS max concurrent compute slots per plane
+                            (default: FSM number — 2 calculation, 3 analysis)
+    SUBSTRATE_SLOT_LEASE_S  max seconds one worker may hold a compute slot
+                            (default 120; overruns counted, never preempted)
+    SUBSTRATE_PG_BREAKER_THRESHOLD consecutive PG failures that open the
+                            breaker (default 3)
+    SUBSTRATE_PG_BREAKER_COOLDOWN_S seconds an open breaker parks PG fires
+                            dormant before one trial passes (default 60)
     DEPTH_LEVELS            canonical order-book depth (default resolver)
     LOG_LEVEL               (default INFO)
 """

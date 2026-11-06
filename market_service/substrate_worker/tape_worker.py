@@ -32,7 +32,7 @@ from market_service.calculations.substrates.tape import (
     summarize,
 )
 from market_service.runtime.horizons import fold_venue_totals
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 # Probe bands — the demand/auction verdict convention used across the
@@ -94,6 +94,9 @@ class TapeWorker(SubstrateWorkerCore):
     # are computed from the cadence layer's fold aggregates (no extra
     # evidence windows). Probe predicates are horizon-tagged.
     HORIZONS = ("1h", "4h")
+    # Fold-native: compute/probe read only self._horizon_folds, never
+    # evidence["horizons"] — skip the raw 1h/4h materializations (vector 2).
+    RAW_HORIZON_EVIDENCE = False
     CADENCE = CadenceProfile(
         cooldown_s=60, staleness_s=180, ws_input=True,
         horizons=("1h", "4h"),
@@ -230,6 +233,7 @@ class TapeWorker(SubstrateWorkerCore):
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         spot_trades = (window.get("spot") or {}).get("trades_normalized") or []
         fut_trades = (window.get("futures") or {}).get("trades_normalized") or []
@@ -315,7 +319,8 @@ class TapeWorker(SubstrateWorkerCore):
     # Compute — tape substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         spot = evidence.get("spot") or {}
         fut = evidence.get("futures") or {}
         spot_trades = spot.get("trades_normalized") or []

@@ -27,7 +27,7 @@ from market_service.analysis.oi import (
     proactiveness_verdict,
 )
 from market_service.analysis_worker.core import AnalysisPlaneMixin
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 
@@ -75,7 +75,8 @@ class OIAnalysisWorker(AnalysisPlaneMixin, SubstrateWorkerCore):
     # Compute — oi substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         oi_hist, tbr, klines = _series(evidence)
         bars = align_oi_rows(oi_hist, tbr, klines)
         if not bars:

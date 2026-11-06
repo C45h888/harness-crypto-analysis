@@ -27,7 +27,7 @@ from typing import Any
 
 from market_service.analysis.demand import demand_verdict, dx_from_flows
 from market_service.analysis_worker.core import AnalysisPlaneMixin
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 
@@ -128,7 +128,8 @@ class DemandWorker(AnalysisPlaneMixin, SubstrateWorkerCore):
     # Compute — demand substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         dx = compose_demand_input(evidence)
         if dx is None:
             # Null discipline: no futures flow -> no demand verdict, ever.

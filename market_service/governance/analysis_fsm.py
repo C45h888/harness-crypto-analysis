@@ -39,6 +39,9 @@ class AnalysisGovernanceFSM(PlaneGovernanceFSM):
         "path_absorption", "wall_migration", "macro", "liquidations", "oi", "market",
     )
     ANALYSIS_INTRA_PARALLEL = 2
+    #: Analysis reductions run over substrate state (not raw windows), so
+    #: the plane allows one more concurrent slot than calculation.
+    ANALYSIS_COMPUTE_CONCURRENCY = 3
 
     def dispatch_group_rank(self, substrate: str) -> int:
         name = str(substrate).lower()
@@ -48,6 +51,9 @@ class AnalysisGovernanceFSM(PlaneGovernanceFSM):
 
     def dispatch_intra_parallel(self) -> int:
         return self.ANALYSIS_INTRA_PARALLEL
+
+    def compute_concurrency(self) -> int:
+        return self.ANALYSIS_COMPUTE_CONCURRENCY
 
     def _plane_rules(
         self,

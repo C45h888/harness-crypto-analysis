@@ -41,10 +41,10 @@ class _CadenceWorker(SubstrateWorkerCore):
         self._decision = decision or TriggerDecision(fired=False, source="probe")
         self.compute_calls = 0
 
-    def probe(self, window, last_state, now_ms):
+    def probe(self, window, last_state, now_ms, seed=None):
         return self._decision
 
-    def compute(self, evidence, depth):
+    def compute(self, evidence, depth, artifacts=None):
         self.compute_calls += 1
         return {"metric": 1.0}
 

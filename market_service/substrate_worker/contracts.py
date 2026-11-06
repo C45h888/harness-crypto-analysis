@@ -121,6 +121,48 @@ class TriggerDecision:
         return {"source": self.source, "predicates": dict(self.predicates)}
 
 
+@dataclass(frozen=True)
+class ArtifactBundle:
+    """Probe-produced derivations threaded into compute (vector 5).
+
+    The probe runs first and already evaluates the heavy substrate math to
+    decide; without this envelope compute would evaluate it again on the
+    same window. The bundle carries the derivations alongside the decision
+    so one evaluation serves both stages.
+
+    ``binding`` pins the exact inputs the derivations were computed from
+    (``artifact_binding`` over symbol/scope/build-nonce). Compute reuses
+    ``values`` ONLY when the bundle's producer and binding match its own —
+    anything else falls back to recomputing. A stale artifact can never
+    poison a fresh projection; at worst it costs the recompute we pay today.
+    """
+
+    producer: str
+    binding: str
+    values: dict[str, Any] = field(default_factory=dict)
+
+    def usable_for(self, producer: str, binding: str) -> bool:
+        """True when these derivations may serve this compute."""
+        return (
+            bool(self.producer)
+            and self.producer == producer
+            and bool(self.binding)
+            and self.binding == binding
+        )
+
+
+def artifact_binding(symbol: str, scope: str, nonce: int) -> str:
+    """Input identity for an artifact bundle (cheap integer compare).
+
+    The nonce is stamped by the shared evidence builders onto every window
+    they hand out — one build, one nonce, shared process-wide. Two stages
+    holding windows from the same build share the nonce; anything else
+    (different tick, different window, hand-built test evidence) mismatches
+    and recomputes. Symbol/scope guard against cross-worker reuse.
+    """
+    return f"{str(symbol).upper()}|{scope}|{int(nonce)}"
+
+
 def bound_arrays(value: Any, cap: int = OUTPUT_ARRAY_CAP) -> Any:
     """Bound every list in a payload at ``cap`` items with explicit truncation.
 

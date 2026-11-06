@@ -26,7 +26,7 @@ from typing import Any
 from market_service.calculations.substrates.delta import (
     multi_timeframe_delta,
 )
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION, artifact_binding
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 # TBR neutral band: 50% taker-buy is neutral flow; ±5 marks the
@@ -194,7 +194,22 @@ class DeltaWorker(SubstrateWorkerCore):
                 return
         self._last_dormant_reason = None
 
-        decision = self.probe(window, last_state, now_ms)
+        # Artifact-once: the heavy derivation runs exactly once per tick.
+        # decide evaluates _delta_of a single time; the probe consumes it as
+        # seed and compute reuses it from the bundle after verifying the
+        # build-nonce binding. At worst (no nonce) both recompute as before.
+        current = _delta_of(window)
+        bundle = (
+            ArtifactBundle(
+                producer=self.SUBSTRATE_NAME,
+                binding=artifact_binding(
+                    self.symbol, "delta",
+                    int(window.get("_artifact_nonce") or 0)),
+                values={"delta": current},
+            )
+            if current is not None else None
+        )
+        decision = self.probe(window, last_state, now_ms, seed=current)
         if not decision.fired:
             return
         # Cooldown gates ONLY probe-source fires.
@@ -203,15 +218,19 @@ class DeltaWorker(SubstrateWorkerCore):
                 return
         # Evidence-once: thread the probe snapshot into compute.
         await self._fire(decision, last_state, now_ms, high_water=self._high_water((rows or ws_rows)),
-                         evidence=window)
+                         evidence=window, artifacts=bundle)
     # ------------------------------------------------------------------
     # L2 — significance probe (state-band flip / TBR band cross)
     # ------------------------------------------------------------------
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
-        current = _delta_of(window)
+        # Seed is the decide-stage _delta_of result on this same window:
+        # reuse it instead of evaluating a second time. Anything else
+        # (None, foreign shape) evaluates fresh — purity preserved.
+        current = seed if seed else _delta_of(window)
         if current is None:
             return TriggerDecision(fired=False, source="probe",
                                    predicates={"reason": "no_book_mid"})
@@ -255,8 +274,25 @@ class DeltaWorker(SubstrateWorkerCore):
     # Compute — delta substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
-        current = _delta_of(evidence)
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
+        # Artifact-once: reuse the probe-stage derivation when its binding
+        # proves it came from this same window build. No nonce (hand-built
+        # evidence, foreign bundle) recomputes — never a stale reuse.
+        current: dict[str, Any] | None = None
+        nonce = evidence.get("_artifact_nonce")
+        if artifacts is not None and nonce:
+            try:
+                if artifacts.usable_for(
+                    self.SUBSTRATE_NAME,
+                    artifact_binding(self.symbol, "delta", int(nonce)),
+                ):
+                    maybe = artifacts.values.get("delta")
+                    current = maybe if isinstance(maybe, dict) and maybe else None
+            except Exception:
+                current = None
+        if current is None:
+            current = _delta_of(evidence)
         if current is None:
             # Null discipline: without a real mid the DELTA math cannot run.
             return {}

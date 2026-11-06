@@ -25,7 +25,7 @@ from typing import Any
 
 from market_service.analysis.stage import infer_stage, stage_window_inputs
 from market_service.analysis_worker.core import AnalysisPlaneMixin
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 
@@ -123,7 +123,8 @@ class StageWorker(AnalysisPlaneMixin, SubstrateWorkerCore):
     # Compute — stage substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         kw = compose_stage_input(evidence)
         if kw is None:
             # Null discipline: no klines -> no market stage, ever.

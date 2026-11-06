@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import Any
 
 from market_service.calculations.substrates.migration import hourly_keystone_migration
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 MIGRATION_BUCKET = 0.05  # composition orderbook section convention
@@ -59,6 +59,12 @@ class MigrationWorker(SubstrateWorkerCore):
     # "where is notional concentrating across the session" question the
     # 15m window cannot; cadence/staleness for it live in the profile.
     HORIZONS = ("1h", "4h")
+    # Vector-2 review verdict: RETAINED. Hourly keystone migration needs
+    # individual trades in hour buckets; fold segments are 5m/15m aggregates
+    # without per-trade prices, so no fold-native equivalent exists without
+    # changing detection semantics. The windows are now streaming-built
+    # (vector 1) and shared/single-flight (vector 4).
+    RAW_HORIZON_EVIDENCE = True
     CADENCE = CadenceProfile(
         cooldown_s=300, staleness_s=900, rollovers=("hour",),
         horizons=("1h", "4h"),
@@ -196,6 +202,7 @@ class MigrationWorker(SubstrateWorkerCore):
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         fut_trades = (window.get("futures") or {}).get("trades_normalized") or []
         if not fut_trades:
@@ -252,7 +259,8 @@ class MigrationWorker(SubstrateWorkerCore):
     # Compute — migration substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         fut_trades = (evidence.get("futures") or {}).get("trades_normalized") or []
         if not fut_trades:
             # Null discipline: no tape means no migration geometry.

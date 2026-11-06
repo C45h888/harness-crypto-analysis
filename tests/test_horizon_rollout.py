@@ -35,6 +35,7 @@ from market_service.runtime.horizons import (
 )
 from market_service.substrate_worker.contracts import CadenceProfile
 from market_service.runtime import raw_window as raw_window_module
+from market_service.substrate_worker import evidence as evidence_module
 from market_service.substrate_worker.core.base import SubstrateBase
 
 
@@ -126,7 +127,9 @@ class PGRestoreTests(unittest.TestCase):
         ]}}
         async def _fake_build(redis, symbol, minutes):
             return raw_window
-        with patch.object(raw_window_module, "build_raw_window", _fake_build):
+        evidence_module._EVIDENCE_CACHE.clear()
+        evidence_module._INFLIGHT.clear()
+        with patch.object(evidence_module, "build_raw_window", _fake_build):
             asyncio.run(worker._backfill_horizons())
         self.assertTrue(worker._horizons_backfilled)
         self.assertEqual(worker._horizons_rebuilt_from, "pg")
@@ -143,7 +146,9 @@ class PGRestoreTests(unittest.TestCase):
         raw_window = {"futures": {"trades_normalized": []}}
         async def _fake_build(redis, symbol, minutes):
             return raw_window
-        with patch.object(raw_window_module, "build_raw_window", _fake_build):
+        evidence_module._EVIDENCE_CACHE.clear()
+        evidence_module._INFLIGHT.clear()
+        with patch.object(evidence_module, "build_raw_window", _fake_build):
             asyncio.run(worker._backfill_horizons())
         self.assertEqual(worker._horizons_rebuilt_from, "raw")
 

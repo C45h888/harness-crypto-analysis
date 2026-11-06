@@ -38,7 +38,7 @@ from typing import Any
 
 from market_service.analysis.wall_migration import wall_delta  # noqa: F401 (imported semantics)
 from market_service.analysis_worker.core import AnalysisPlaneMixin
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 # Wall-set classification threshold (SOL window qty). Imported semantics:
@@ -170,7 +170,8 @@ class WallMigrationWorker(AnalysisPlaneMixin, SubstrateWorkerCore):
     # Compute — wall_migration substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         deps = evidence.get("substrate_dependencies") or {}
         density = _density_view(deps.get("density"))
         if density is None:

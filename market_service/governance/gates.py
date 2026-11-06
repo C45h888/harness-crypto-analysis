@@ -27,7 +27,10 @@ task, sleeps nowhere, and never schedules.
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import logging
+import os
 import time
 from typing import Any, Mapping
 
@@ -63,6 +66,122 @@ def _payload_fields(payload: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
+class _FairSemaphore:
+    """FIFO fair semaphore: queued acquirers grant in arrival order.
+
+    asyncio.Semaphore wakes waiters in no guaranteed order; cold-start
+    bursts need deterministic batching (first waiter in, first granted),
+    so the queue is explicit. Cancellation while queued withdraws cleanly;
+    cancellation after the grant frees the slot for the next waiter.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self._held = 0
+        self._queue: collections.deque[asyncio.Future] = collections.deque()
+
+    @property
+    def in_use(self) -> int:
+        return self._held
+
+    @property
+    def queued(self) -> int:
+        return sum(1 for f in self._queue if not f.done())
+
+    async def acquire(self) -> None:
+        if self._held < self.limit and not self._queue:
+            self._held += 1
+            return
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._queue.append(fut)
+        try:
+            await fut
+        except BaseException:
+            if fut.done() and not fut.cancelled():
+                # Grant landed before the cancellation: the slot is ours;
+                # free it for the next waiter instead of leaking it.
+                self.release()
+            else:
+                try:
+                    self._queue.remove(fut)
+                except ValueError:
+                    pass
+            raise
+
+    def release(self) -> None:
+        while self._queue:
+            nxt = self._queue.popleft()
+            if nxt.done():
+                continue
+            nxt.set_result(None)
+            return
+        self._held = max(0, self._held - 1)
+
+
+# Process-wide compute slots, one fair semaphore per plane. Every governor
+# of the plane (container workers AND invoke transients share this process)
+# enforces against the same slot, so the FSM's concurrency number is a real
+# bound, not a per-instance wish.
+_COMPUTE_SLOTS: dict[str, _FairSemaphore] = {}
+
+
+class PgCircuitBreaker:
+    """Failure quiets the worker: consecutive PG failures open the breaker.
+
+    Open = every PG-dependent fire stands down (dormant, no compute, no
+    ten-second doomed PG wait) until the cooldown lapses; then exactly one
+    trial fire passes while the rest keep skipping, so recovery never
+    stampedes. Success closes it. A single shared sink gets a single
+    process-wide breaker — per-worker counting would let twelve workers
+    trip twelve separate breakers on the same outage.
+    """
+
+    def __init__(self) -> None:
+        self.failures = 0
+        self.opened_at_ms: int | None = None
+        self.trial_in_flight = False
+
+    @staticmethod
+    def _threshold() -> int:
+        try:
+            return max(1, int(os.getenv("SUBSTRATE_PG_BREAKER_THRESHOLD", "3")))
+        except (TypeError, ValueError):
+            return 3
+
+    @staticmethod
+    def _cooldown_ms() -> int:
+        try:
+            return max(1_000, int(os.getenv("SUBSTRATE_PG_BREAKER_COOLDOWN_S", "60")) * 1_000)
+        except (TypeError, ValueError):
+            return 60_000
+
+    def should_skip(self, now_ms: int) -> bool:
+        """True = stand down. False = proceed (possibly the single trial)."""
+        if self.opened_at_ms is None:
+            return False
+        if now_ms - self.opened_at_ms < self._cooldown_ms():
+            return True
+        if self.trial_in_flight:
+            return True
+        self.trial_in_flight = True
+        return False
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.opened_at_ms = None
+        self.trial_in_flight = False
+
+    def record_failure(self, now_ms: int) -> None:
+        self.failures += 1
+        self.trial_in_flight = False
+        if self.failures >= self._threshold():
+            self.opened_at_ms = int(now_ms)
+
+
+_PG_BREAKER = PgCircuitBreaker()
+
+
 class GovernanceGovernor:
     """The per-plane governor a worker is gated by.
 
@@ -82,6 +201,11 @@ class GovernanceGovernor:
         self.fsm = fsm
         self.store = store
         self.ledger = ledger if ledger is not None else GovernanceLedger(store)
+        # Slot-lease accounting (vector 5 delegation windows): live holds
+        # keyed by holder task id → grant monotonic; overruns counted, never
+        # preempted (killing mid-publish risks a half-written state).
+        self._slot_holds: dict[int, float] = {}
+        self._slot_violations = 0
 
     @property
     def plane(self) -> GovernancePlane:
@@ -364,6 +488,127 @@ class GovernanceGovernor:
                 self._dispatch_lease_key(self.plane.value, symbol))
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Compute slots — FSM-governed concurrency bound (vector 3).
+    # ------------------------------------------------------------------
+
+    def _compute_limit(self) -> int:
+        """Effective slot count: env override, else the FSM's number."""
+        env = os.getenv("SUBSTRATE_COMPUTE_SLOTS")
+        if env:
+            try:
+                return max(1, int(env))
+            except (TypeError, ValueError):
+                pass
+        try:
+            return max(1, int(self.fsm.compute_concurrency()))
+        except (AttributeError, TypeError, ValueError):
+            return 2
+
+    def _compute_semaphore(self) -> _FairSemaphore:
+        """The plane's process-wide slot (shared across governor instances)."""
+        key = self.plane.value
+        sem = _COMPUTE_SLOTS.get(key)
+        need = self._compute_limit()
+        if sem is None or (sem.limit != need and sem.in_use == 0 and sem.queued == 0):
+            sem = _FairSemaphore(need)
+            _COMPUTE_SLOTS[key] = sem
+        return sem
+
+    async def acquire_compute_slot(
+        self, *, symbol: str, substrate: str, reason: str = "compute",
+    ) -> None:
+        """Block (FIFO) until this plane has a free compute slot.
+
+        Workers hold one slot across the whole heavy section (evidence
+        build + compute + persist; backfills hold one across the widened
+        build + fold). Cold starts therefore queue in batches of the FSM's
+        number instead of stampeding. Slot waits are coordination, never
+        denials — nothing is written to the ledger here.
+        """
+        await self._compute_semaphore().acquire()
+        try:
+            holder = id(asyncio.current_task())
+        except RuntimeError:
+            holder = -1
+        self._slot_holds[holder] = time.monotonic()
+
+    async def release_compute_slot(self, *, symbol: str, substrate: str) -> None:
+        """Free a compute slot for the next queued worker. Never raises."""
+        try:
+            try:
+                holder = id(asyncio.current_task())
+            except RuntimeError:
+                holder = -1
+            started = self._slot_holds.pop(holder, None)
+            if started is not None:
+                held_s = time.monotonic() - started
+                if held_s > self._slot_lease_s():
+                    self._slot_violations += 1
+                    log.warning("compute slot overrun plane=%s substrate=%s "
+                                "held=%.1fs lease=%ds",
+                                self.plane.value, substrate, held_s,
+                                self._slot_lease_s())
+            sem = _COMPUTE_SLOTS.get(self.plane.value)
+            if sem is not None:
+                sem.release()
+        except Exception:  # noqa: BLE001 — release must never brick a fire
+            pass
+
+    @staticmethod
+    def _slot_lease_s() -> int:
+        """Max seconds one worker may hold a slot (delegation window)."""
+        try:
+            return max(30, int(os.getenv("SUBSTRATE_SLOT_LEASE_S", "120")))
+        except (TypeError, ValueError):
+            return 120
+
+    def _slot_oldest_hold_s(self) -> int:
+        try:
+            if not self._slot_holds:
+                return 0
+            return int(time.monotonic() - min(self._slot_holds.values()))
+        except Exception:
+            return 0
+
+    # ------------------------------------------------------------------
+    # PG circuit breaker — failure quiets the worker (vector 5 treadmill).
+    # ------------------------------------------------------------------
+
+    def pg_circuit_skip(self, now_ms: int) -> bool:
+        """True when a PG-dependent fire must stand down (never raises)."""
+        try:
+            return _PG_BREAKER.should_skip(int(now_ms))
+        except Exception:
+            return False
+
+    def pg_record_success(self) -> None:
+        """A PG round-trip worked — close the breaker if it was open."""
+        try:
+            _PG_BREAKER.record_success()
+        except Exception:
+            pass
+
+    def pg_record_failure(self, now_ms: int) -> None:
+        """A PG round-trip failed — count toward opening the breaker."""
+        try:
+            _PG_BREAKER.record_failure(int(now_ms))
+        except Exception:
+            pass
+
+    def compute_slot_status(self) -> dict[str, int]:
+        """Observability for the supervisor heartbeat (never raises)."""
+        try:
+            sem = self._compute_semaphore()
+            return {"limit": sem.limit, "in_use": sem.in_use,
+                    "queued": sem.queued,
+                    "lease_s": self._slot_lease_s(),
+                    "lease_violations": self._slot_violations,
+                    "oldest_hold_s": self._slot_oldest_hold_s()}
+        except Exception:
+            return {"limit": 0, "in_use": 0, "queued": 0,
+                    "lease_s": 0, "lease_violations": 0, "oldest_hold_s": 0}
 
     # ------------------------------------------------------------------
     # Observability

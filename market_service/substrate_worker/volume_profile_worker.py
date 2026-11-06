@@ -18,7 +18,7 @@ from market_service.calculations.substrates.volume_profile import (
     side_split,
     volume_profile_summary,
 )
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 BUCKET_SIZE = 0.05  # composition volume_profile section convention
@@ -136,6 +136,7 @@ class VolumeProfileWorker(SubstrateWorkerCore):
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         fut_trades = (window.get("futures") or {}).get("trades_normalized") or []
         if not fut_trades:
@@ -180,7 +181,8 @@ class VolumeProfileWorker(SubstrateWorkerCore):
     # Compute — volume_profile substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         fut_trades = (evidence.get("futures") or {}).get("trades_normalized") or []
         if not fut_trades:
             # Null discipline: no tape means no distribution geometry.

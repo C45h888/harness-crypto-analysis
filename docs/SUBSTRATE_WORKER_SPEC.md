@@ -117,6 +117,23 @@ Worker files own their scheduling policy; governance owns coordination.
   a second decision while busy collapses into exactly one rerun), error
   backoff on recoverable Redis exceptions. Evidence-once: the probe snapshot
   (with derivatives/dependencies attached) is threaded into compute, not rebuilt.
+- Compute slots (vector 3): every backfill and fire compute holds one
+  FSM-governed slot (`compute_concurrency`: 2 calculation, 3 analysis,
+  `SUBSTRATE_COMPUTE_SLOTS` overrides) from a process-wide FIFO fair
+  semaphore — cold starts queue in batches instead of stampeding 12-wide.
+  Slot status rides the supervisor heartbeat; waits are coordination, never
+  ledger denials. Each grant carries a lease (`SUBSTRATE_SLOT_LEASE_S`,
+  default 120s): overruns are counted and logged, never preempted.
+- Artifact-once (vector 5): the probe's derivations ride an ArtifactBundle
+  bound to the window's build nonce — compute reuses them after verifying
+  the binding instead of recomputing. Mismatch recomputes; a stale artifact
+  can never poison a fresh projection. Delta is the reference conversion.
+- PG is horizon persistence (vector 5): only horizon workers keep a live
+  pg_store; the other eight run PG-free. Consecutive PG failures open a
+  process-wide breaker (3 failures / 60s cooldown, both tunable): PG fires
+  stand down dormant before burning compute, one trial passes per cooldown.
+  A strict PG-aborted fire re-arms the cooldown so failure quiets the
+  worker instead of shouting into a dead sink.
 
 ### 3.2 What each worker file implements (scheduling + semantics)
 

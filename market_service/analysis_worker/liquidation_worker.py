@@ -28,6 +28,7 @@ from market_service.analysis.liquidations import (
 )
 from market_service.analysis_worker.core import AnalysisPlaneMixin
 from market_service.substrate_worker.contracts import (
+    ArtifactBundle,
     CadenceProfile,
     TriggerDecision,
     bound_arrays,
@@ -80,7 +81,8 @@ class LiquidationWorker(AnalysisPlaneMixin, SubstrateWorkerCore):
     # Compute — liquidations substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         result = compose_liquidation_input(evidence)
         if result is None:
             # Null discipline: no OI/price series -> no liquidation call, ever.

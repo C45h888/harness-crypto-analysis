@@ -22,7 +22,7 @@ from market_service.calculations.substrates.ladders import (
     absorption_ladder,
     ask_wall_ladder,
 )
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision, SUBSTRATE_STATE_SCHEMA_VERSION
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 # Wall direction threshold — the BUILT UP / ERODED semantics shared with
@@ -127,6 +127,17 @@ class LaddersWorker(SubstrateWorkerCore):
         if not arrival:
             return
 
+        # Stage-one screen (ns.read discipline): the probe inputs for
+        # this worker are point-in-time (latest snapshot + last state),
+        # so run the SAME probe on latest-only state first. Quiet screen
+        # skips the heavy window materialization entirely; a firing screen
+        # proceeds to the full window + confirming probe below. Zero miss
+        # risk: screen and probe read identical inputs here.
+        latest = await self.store.read("raw.latest", ids={"symbol": self.symbol})
+        if latest is not None and not await self.screen(latest, last_state, now_ms):
+            self._last_dormant_reason = "screen: latest state shows no likely flip"
+            return
+
         window = await self._cached_evidence(now_ms)
         self._last_dormant_reason = None
         profile = type(self).CADENCE
@@ -158,12 +169,20 @@ class LaddersWorker(SubstrateWorkerCore):
         # Evidence-once: thread the probe snapshot into compute.
         await self._fire(decision, last_state, now_ms, high_water=self._high_water(rows),
                          evidence=window)
+    async def screen(
+        self, latest: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+    ) -> bool:
+        """Stage-one: ladders probe over latest-only book (exact)."""
+        window = {"futures": (latest.get("futures") or {}), "spot": (latest.get("spot") or {})}
+        return self.probe(window, last_state, now_ms).fired
+
     # ------------------------------------------------------------------
     # L2 — significance probe (mid-relative rung structure)
     # ------------------------------------------------------------------
 
     def probe(
         self, window: dict[str, Any], last_state: dict[str, Any] | None, now_ms: int,
+        seed: dict[str, Any] | None = None,
     ) -> TriggerDecision:
         fut_book = (window.get("futures") or {}).get("order_book") or {}
         bids = _pairs(fut_book.get("bids"))
@@ -213,7 +232,8 @@ class LaddersWorker(SubstrateWorkerCore):
     # Compute — ladders substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         fut_book = (evidence.get("futures") or {}).get("order_book") or {}
         bids = _pairs(fut_book.get("bids"))
         asks = _pairs(fut_book.get("asks"))

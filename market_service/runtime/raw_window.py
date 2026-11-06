@@ -65,58 +65,100 @@ async def build_raw_window(
         }
 
     since_ms = int(time.time() * 1000) - window_minutes * 60_000
-    snapshots = await redis.read("raw.stream", ids={"symbol": symbol}, newest_first=False, start=str(since_ms), end="+")
 
-    def _dedupe(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen: set[int] = set()
-        out: list[dict[str, Any]] = []
-        for t in trades:
-            if not isinstance(t, dict):
-                continue
-            tid = t.get("id")
-            if tid is not None:
-                try:
-                    key = int(tid)
-                except (TypeError, ValueError):
+    async def _snapshots():
+        """Stream snapshots oldest-first without retaining the range.
+
+        ns.read discipline for heavy readers: bounded COUNT pages folded
+        one at a time. Stores offering read_stream_pages stream; older
+        seams (tests) fall back to the single legacy read.
+        """
+        pages = getattr(redis, "read_stream_pages", None)
+        if callable(pages):
+            async for snap in pages(
+                "raw.stream", ids={"symbol": symbol},
+                start=str(since_ms), end="+", page=500,
+            ):
+                yield snap
+            return
+        snaps = await redis.read("raw.stream", ids={"symbol": symbol}, newest_first=False, start=str(since_ms), end="+")
+        for snap in snaps or []:
+            yield snap
+
+    def _ts(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    # Single-pass fold: each snapshot's trades merge into the id-keyed
+    # accumulators (first occurrence wins, oldest-first — identical to the
+    # old retain-then-dedupe), coverage stats update inline, and the
+    # snapshot is released before the next page arrives. Peak is one page
+    # plus the accumulator, never 3-4x the window (vector 1).
+    spot_trades: list[dict[str, Any]] = []
+    fut_trades: list[dict[str, Any]] = []
+    spot_seen: set[int] = set()
+    fut_seen: set[int] = set()
+    raw_spot_count = 0
+    raw_fut_count = 0
+    snapshots_used = 0
+    spot_first: int | None = None
+    spot_last: int | None = None
+    fut_first: int | None = None
+    fut_last: int | None = None
+    async for snap in _snapshots():
+        if not isinstance(snap, dict):
+            continue
+        snapshots_used += 1
+        for venue, out, seen in (
+            ("spot", spot_trades, spot_seen),
+            ("futures", fut_trades, fut_seen),
+        ):
+            trades = (snap.get(venue) or {}).get("trades_normalized") or []
+            for t in trades:
+                if venue == "spot":
+                    raw_spot_count += 1
+                else:
+                    raw_fut_count += 1
+                if not isinstance(t, dict):
                     continue
-                if key in seen:
-                    continue
-                seen.add(key)
-            out.append(t)
-        return out
-
-    # Accumulate trades across all snapshots in the window (already oldest-first).
-    spot_raw: list[dict[str, Any]] = []
-    fut_raw: list[dict[str, Any]] = []
-    for snap in snapshots:
-        spot_raw.extend(snap.get("spot", {}).get("trades_normalized", []))
-        fut_raw.extend(snap.get("futures", {}).get("trades_normalized", []))
-
-    spot_trades = _dedupe(spot_raw)
-    fut_trades = _dedupe(fut_raw)
+                tid = t.get("id")
+                if tid is not None:
+                    try:
+                        key = int(tid)
+                    except (TypeError, ValueError):
+                        continue
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                out.append(t)
+                ts = _ts(t.get("ts"))
+                if ts is not None:
+                    if venue == "spot":
+                        spot_first = ts if spot_first is None else min(spot_first, ts)
+                        spot_last = ts if spot_last is None else max(spot_last, ts)
+                    else:
+                        fut_first = ts if fut_first is None else min(fut_first, ts)
+                        fut_last = ts if fut_last is None else max(fut_last, ts)
 
     # Actual coverage — measured, not requested. The doctrine requires the
     # envelope to record what the window REALLY contains: the true trade span,
     # dedupe effectiveness, how many snapshots fed the window, and how stale
     # the latest stream entry is. Never claim a window the data doesn't cover.
-    def _trade_coverage(trades: list[dict[str, Any]], raw_count: int) -> dict[str, Any]:
-        tss: list[int] = []
-        for t in trades:
-            try:
-                tss.append(int(t["ts"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-        if tss:
-            span = {"first_trade_ms": min(tss), "last_trade_ms": max(tss),
-                    "span_seconds": (max(tss) - min(tss)) / 1000.0}
+    def _trade_coverage(
+        trades: list[dict[str, Any]], raw_count: int,
+        first_ms: int | None, last_ms: int | None,
+    ) -> dict[str, Any]:
+        if first_ms is not None and last_ms is not None:
+            span = {"first_trade_ms": first_ms, "last_trade_ms": last_ms,
+                    "span_seconds": (last_ms - first_ms) / 1000.0}
         else:
             span = {"first_trade_ms": None, "last_trade_ms": None,
                     "span_seconds": None}
         return {"trade_count": len(trades), "raw_trade_count": raw_count,
                 "duplicates_removed": raw_count - len(trades), **span}
 
-    raw_spot_count = sum(len(s.get("spot", {}).get("trades_normalized") or []) for s in snapshots)
-    raw_fut_count = sum(len(s.get("futures", {}).get("trades_normalized") or []) for s in snapshots)
     latest_observed_ms = latest.get("observed_at_ms")
     now_ms = int(time.time() * 1000)
 
@@ -145,14 +187,14 @@ async def build_raw_window(
             "oldest_entry_ms": oldest_entry_ms,
             "horizon_degraded": horizon_degraded,
         },
-        "snapshots_used": len(snapshots),
+        "snapshots_used": snapshots_used,
         "latest_observed_at_ms": latest_observed_ms,
         "stream_staleness_ms": (
             now_ms - int(latest_observed_ms)
             if isinstance(latest_observed_ms, (int, float)) else None
         ),
-        "spot_trades": _trade_coverage(spot_trades, raw_spot_count),
-        "futures_trades": _trade_coverage(fut_trades, raw_fut_count),
+        "spot_trades": _trade_coverage(spot_trades, raw_spot_count, spot_first, spot_last),
+        "futures_trades": _trade_coverage(fut_trades, raw_fut_count, fut_first, fut_last),
     }
     if horizon_degraded:
         coverage["horizon_note"] = (
@@ -288,13 +330,30 @@ async def build_ws_surface(
     augments, never replaces, the poller REST path.
     """
     now_ms = int(time.time() * 1000)
+    cap = int(window_minutes * 60 * 1000 // 100)
     try:
-        # Read the window (oldest-first xrange); bucket via age below.
-        deltas = await redis.read(
-            "micro.raw", ids={"venue": venue, "symbol": symbol},
-            newest_first=False, start="-", end="+",
-            count=int(window_minutes * 60 * 1000 // 100),
-        )
+        # ns.read discipline: bounded pages folded incrementally — never
+        # one unbounded materialization (vector 1). Same oldest-first
+        # contract as the legacy count-capped XRANGE below.
+        pages = getattr(redis, "read_stream_pages", None)
+        if callable(pages):
+            deltas: list[dict[str, Any]] = []
+            async for snap in pages(
+                "micro.raw", ids={"venue": venue, "symbol": symbol},
+                start="-", end="+", page=500,
+            ):
+                if not isinstance(snap, dict):
+                    continue
+                deltas.append(snap)
+                if cap > 0 and len(deltas) >= cap:
+                    break
+        else:
+            # Read the window (oldest-first xrange); bucket by age below.
+            deltas = await redis.read(
+                "micro.raw", ids={"venue": venue, "symbol": symbol},
+                newest_first=False, start="-", end="+",
+                count=cap,
+            )
     except Exception:
         # WS is best-effort; never let an absent WS surface fail a REST fire.
         return {"source": "microstructure_ws", "delta_count": 0, "deltas": []}

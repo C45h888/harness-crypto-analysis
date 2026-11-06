@@ -26,7 +26,7 @@ from typing import Any
 
 from market_service.analysis.regime import regime_verdict
 from market_service.analysis_worker.core import AnalysisPlaneMixin
-from market_service.substrate_worker.contracts import CadenceProfile, TriggerDecision
+from market_service.substrate_worker.contracts import ArtifactBundle, CadenceProfile, TriggerDecision
 from market_service.substrate_worker.core import SubstrateWorkerCore
 
 
@@ -114,7 +114,8 @@ class RegimeWorker(AnalysisPlaneMixin, SubstrateWorkerCore):
     # Compute — regime substrate functions ONLY
     # ------------------------------------------------------------------
 
-    def compute(self, evidence: dict[str, Any], depth: int) -> dict[str, Any]:
+    def compute(self, evidence: dict[str, Any], depth: int,
+                artifacts: ArtifactBundle | None = None) -> dict[str, Any]:
         composed = compose_regime_input(evidence)
         if composed is None:
             # Null discipline: no flow → no regime verdict, ever.
